@@ -1,10 +1,11 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
+from pydantic import BaseModel
 from datetime import datetime
 import sqlite3
 
 app = FastAPI()
 
-# SQLite database
+# Database setup
 conn = sqlite3.connect("trades.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -22,31 +23,31 @@ CREATE TABLE IF NOT EXISTS trades (
 
 conn.commit()
 
+# Request schema
+class TradeSignal(BaseModel):
+    signal: str
+    symbol: str
+    entry: float
+    sl: float
+    target: float
+
 @app.get("/")
 def home():
     return {"status": "running"}
 
 @app.post("/webhook")
-async def webhook(request: Request):
-
-    data = await request.json()
-
-    signal = data.get("signal")
-    symbol = data.get("symbol")
-    entry = data.get("entry")
-    sl = data.get("sl")
-    target = data.get("target")
+async def webhook(data: TradeSignal):
 
     cursor.execute("""
     INSERT INTO trades
     (signal, symbol, entry, sl, target, time)
     VALUES (?, ?, ?, ?, ?, ?)
     """, (
-        signal,
-        symbol,
-        entry,
-        sl,
-        target,
+        data.signal,
+        data.symbol,
+        data.entry,
+        data.sl,
+        data.target,
         datetime.now().isoformat()
     ))
 
