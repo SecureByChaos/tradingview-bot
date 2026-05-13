@@ -4,6 +4,7 @@ import sqlite3
 
 app = FastAPI()
 
+# SQLite database
 conn = sqlite3.connect("trades.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -30,16 +31,22 @@ async def webhook(request: Request):
 
     data = await request.json()
 
+    signal = data.get("signal")
+    symbol = data.get("symbol")
+    entry = data.get("entry")
+    sl = data.get("sl")
+    target = data.get("target")
+
     cursor.execute("""
     INSERT INTO trades
     (signal, symbol, entry, sl, target, time)
     VALUES (?, ?, ?, ?, ?, ?)
     """, (
-        data.get("signal"),
-        data.get("symbol"),
-        data.get("entry"),
-        data.get("sl"),
-        data.get("target"),
+        signal,
+        symbol,
+        entry,
+        sl,
+        target,
         datetime.now().isoformat()
     ))
 
@@ -47,5 +54,5 @@ async def webhook(request: Request):
 
     return {
         "success": True,
-        "data": data
+        "received": data
     }
