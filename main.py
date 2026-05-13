@@ -51,6 +51,18 @@ async def webhook(data: TradeSignal):
         datetime.now().isoformat()
     ))
 
+@app.get("/trades")
+def get_trades():
+
+    cursor.execute("""
+    SELECT * FROM trades
+    ORDER BY id DESC
+    """)
+
+    rows = cursor.fetchall()
+
+    return {"trades": rows}
+
     conn.commit()
 
     return {
