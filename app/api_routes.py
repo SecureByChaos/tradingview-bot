@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.auth import require_admin_api
+from app.database import get_db
+from app.db_models import BotStatus
+from app.db_models import TradingMode
+from app.platform import (
+    api_status,
+    get_or_create_settings,
+    get_or_create_state,
+    log_event,
+    rebuild_daily_stats,
+    set_bot_state,
+    sync_trade_row,
+    trades_query_for_filter,
+)
+from app.telegram_service import TelegramService
+from app.trade_manager import TradeManager
+
+router = APIRouter(prefix="/api")
+
+
+class SettingsPayload(BaseModel):
+    trading_mode: str
+    stop_loss_percent: float = Field(gt=0)
+    target_percent: float = Field(gt=0)
+    max_trades_per_day: int = Field(gt=0)
+    max_consecutive_losses: int = Field(gt=0)
+    daily_max_loss_percent: float
+    square_off_time: str
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+
+def manager() -> TradeManager:
+    return router.trade_manager  # type: ignore[attr-defined]
+
+
+def telegram() -> TelegramService:
+    return router.telegram  # type: ignore[attr-defined]
+
+
+@router.get("/status")
+def status(
+    db: Annotated[Session, Depends(get_db)],
+    trade_manager: Annotated[TradeManager, Depends(manager)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, Any]:
+    return api_status(db, trade_manager.get_active_trade())
+
+
+@router.get("/active-trade")
+def active_trade(
+    trade_manager: Annotated[TradeManager, Depends(manager)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> Any:
+    return trade_manager.get_active_trade()
+
+
+@router.get("/trades")
+def trades(
+    db: Annotated[Session, Depends(get_db)],
+    filter: str = "30d",
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> list[dict[str, Any]]:
+    records = db.scalars(trades_query_for_filter(filter, None, None))
+    return [
+        {
+            "date": record.date.isoformat(),
+            "signal": record.signal,
+            "strike": record.strike,
+            "entry": record.entry_price,
+            "exit": record.exit_price,
+            "pnl_percent": record.pnl_percent,
+            "exit_reason": record.exit_reason,
+            "trading_mode": record.trading_mode,
+        }
+        for record in records
+    ]
+
+
+@router.get("/settings")
+def get_settings_api(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, Any]:
+    settings = get_or_create_settings(db)
+    return {
+        column: getattr(settings, column)
+        for column in [
+            "trading_mode",
+            "stop_loss_percent",
+            "target_percent",
+            "max_trades_per_day",
+            "max_consecutive_losses",
+            "daily_max_loss_percent",
+            "square_off_time",
+            "telegram_bot_token",
+            "telegram_chat_id",
+        ]
+    }
+
+
+@router.post("/settings")
+def update_settings_api(
+    payload: SettingsPayload,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, str]:
+    if payload.trading_mode not in {TradingMode.PAPER, TradingMode.LIVE}:
+        raise HTTPException(status_code=400, detail="Invalid trading mode")
+    settings = get_or_create_settings(db)
+    for key, value in payload.model_dump().items():
+        setattr(settings, key, value)
+    db.commit()
+    log_event(db, "BOT", "Settings updated from API")
+    return {"status": "ok"}
+
+
+@router.post("/start")
+def start_bot(
+    db: Annotated[Session, Depends(get_db)],
+    notifier: Annotated[TelegramService, Depends(telegram)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, str]:
+    set_bot_state(db, BotStatus.RUNNING, trading_allowed=True, risk_locked=False)
+    log_event(db, "BOT", "Bot started")
+    notifier.send(db, "Bot Started")
+    return {"status": BotStatus.RUNNING}
+
+
+@router.post("/stop")
+def stop_bot(
+    db: Annotated[Session, Depends(get_db)],
+    notifier: Annotated[TelegramService, Depends(telegram)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, str]:
+    set_bot_state(db, BotStatus.STOPPED, trading_allowed=False)
+    log_event(db, "BOT", "Bot stopped")
+    notifier.send(db, "Bot Stopped")
+    return {"status": BotStatus.STOPPED}
+
+
+@router.post("/restart")
+def restart_bot(
+    db: Annotated[Session, Depends(get_db)],
+    notifier: Annotated[TelegramService, Depends(telegram)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, str]:
+    scheduler = router.scheduler  # type: ignore[attr-defined]
+    if scheduler.running:
+        try:
+            scheduler.pause_job("trade-monitor")
+            scheduler.resume_job("trade-monitor")
+        except Exception:
+            pass
+    set_bot_state(db, BotStatus.RUNNING, trading_allowed=True, risk_locked=False)
+    log_event(db, "BOT", "Bot restarted")
+    notifier.send(db, "Bot Restarted")
+    return {"status": BotStatus.RUNNING}
+
+
+@router.post("/kill-switch")
+def kill_switch(
+    db: Annotated[Session, Depends(get_db)],
+    trade_manager: Annotated[TradeManager, Depends(manager)],
+    notifier: Annotated[TelegramService, Depends(telegram)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, str]:
+    active = trade_manager.get_active_trade()
+    if active is not None:
+        trade_manager.square_off_open_trade()
+        rows = router.trade_logger.read_all()  # type: ignore[attr-defined]
+        if rows:
+            sync_trade_row(db, rows[-1], get_or_create_settings(db).trading_mode)
+    set_bot_state(db, BotStatus.STOPPED, trading_allowed=False)
+    log_event(db, "RISK", "Kill switch activated", "WARNING")
+    notifier.send(db, "Kill Switch Activated")
+    return {"status": BotStatus.STOPPED}
+
+
+@router.post("/reset-daily-lock")
+def reset_daily_lock(
+    db: Annotated[Session, Depends(get_db)],
+    notifier: Annotated[TelegramService, Depends(telegram)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, str]:
+    stats = rebuild_daily_stats(db)
+    stats.risk_locked = False
+    db.commit()
+    state = get_or_create_state(db)
+    state.risk_locked = False
+    state.status = BotStatus.STOPPED
+    state.trading_allowed = False
+    db.commit()
+    log_event(db, "RISK", "Daily risk lock reset by admin")
+    notifier.send(db, "Daily Risk Lock Reset")
+    return {"status": "RESET"}

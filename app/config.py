@@ -35,6 +35,11 @@ class Settings:
     trades_csv_path: Path = DATA_DIR / "trades.csv"
     active_trade_path: Path = DATA_DIR / "active_trade.json"
     instrument_cache_path: Path = DATA_DIR / "instruments.json"
+    database_url: str = f"sqlite:///{DATA_DIR / 'platform.sqlite3'}"
+    admin_username: str = "admin"
+    admin_password: str = ""
+    session_secret_key: str = "change-me-in-production"
+    secure_cookies: bool = False
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @property
@@ -75,5 +80,10 @@ def get_settings() -> Settings:
             "INSTRUMENT_MASTER_URL",
             DEFAULT_INSTRUMENT_MASTER_URL,
         ),
+        database_url=os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'platform.sqlite3'}"),
+        admin_username=os.getenv("ADMIN_USERNAME", "admin"),
+        admin_password=os.getenv("ADMIN_PASSWORD", ""),
+        session_secret_key=os.getenv("SESSION_SECRET_KEY", "change-me-in-production"),
+        secure_cookies=_get_bool("SECURE_COOKIES", False),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),  # type: ignore[arg-type]
     )

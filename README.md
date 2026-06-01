@@ -12,6 +12,11 @@ TradingView -> Webhook -> FastAPI -> Trade Manager -> Angel One SmartAPI
 ## Features
 
 - `POST /webhook` accepts only `BUY_CE` and `BUY_PE`.
+- Single-admin login with signed session cookies.
+- Bootstrap 5 dark dashboard with bot status, active trade, history, controls, settings, and logs.
+- SQLite-backed platform state for bot status, settings, daily stats, trade records, and structured logs.
+- REST API under `/api/*` for status, trades, settings, bot controls, kill switch, and daily-lock reset.
+- Telegram notifications for bot events, trade events, exits, risk locks, and system errors.
 - Automatically selects the current ATM BankNifty CE/PE from live BankNifty spot.
 - One open trade at a time.
 - Maximum two completed trades per day.
@@ -34,6 +39,14 @@ pip install -r requirements.txt
 copy .env.example .env
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+Create a bcrypt admin password hash:
+
+```bash
+python -c "import bcrypt; print(bcrypt.hashpw(b'your-password', bcrypt.gensalt()).decode())"
+```
+
+Put the generated value in `ADMIN_PASSWORD`.
 
 Check health:
 
@@ -58,6 +71,11 @@ curl -X POST http://localhost:8000/webhook ^
 | `SMARTAPI_PIN` | Angel One PIN |
 | `SMARTAPI_TOTP_SECRET` | TOTP secret from SmartAPI setup |
 | `SMARTAPI_LIVE_TRADING` | Set `true` only when ready for real orders |
+| `ADMIN_USERNAME` | Dashboard admin username |
+| `ADMIN_PASSWORD` | Dashboard admin password as a bcrypt hash |
+| `SESSION_SECRET_KEY` | Long random secret for signed session cookies |
+| `SECURE_COOKIES` | Set `true` when serving over HTTPS |
+| `DATABASE_URL` | SQLAlchemy DB URL, defaults to SQLite in `data/` |
 | `QUANTITY_LOTS` | Number of BankNifty lots to trade |
 | `BANKNIFTY_LOT_SIZE` | Current BankNifty lot size from NSE/broker contract specs |
 | `BANKNIFTY_SPOT_TOKEN` | SmartAPI token for BankNifty index |
@@ -131,6 +149,8 @@ For production exposure, terminate TLS with Nginx or a Lightsail load balancer a
 
 ## API
 
+Dashboard pages require login at `/login`.
+
 ### `GET /health`
 
 Returns service status and live-trading mode.
@@ -156,6 +176,34 @@ or:
 ```json
 {"signal":"BUY_PE"}
 ```
+
+### Admin REST API
+
+Authenticated session required:
+
+- `GET /api/status`
+- `GET /api/active-trade`
+- `GET /api/trades`
+- `GET /api/settings`
+- `POST /api/settings`
+- `POST /api/start`
+- `POST /api/stop`
+- `POST /api/restart`
+- `POST /api/kill-switch`
+- `POST /api/reset-daily-lock`
+
+## Dashboard
+
+- `/` shows status, daily stats, active trade, risk status, and recent logs.
+- `/active-trade-page` shows live active trade details.
+- `/history` shows filtered trade history.
+- `/control` provides start, stop, restart, kill switch, and daily-lock reset.
+- `/settings` persists trading, risk, square-off, and Telegram settings in SQLite.
+- `/logs` shows structured event logs.
+
+## Daily Risk Lock
+
+The platform computes cumulative daily P&L from completed trades. If it is less than or equal to `Daily Max Loss %` (default `-20%`), the risk service closes the active position, disables new trades, sets bot status to `RISK_LOCKED`, sends a Telegram alert, and shows a dashboard warning. Admin reset is required from `/control`.
 
 ## Tests
 

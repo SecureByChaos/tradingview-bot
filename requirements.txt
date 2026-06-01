@@ -1,6 +1,11 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.5
+SQLAlchemy==2.0.36
+bcrypt==4.2.1
+python-multipart==0.0.20
+itsdangerous==2.2.0
+Jinja2==3.1.4
 smartapi-python==1.5.5
 logzero==1.7.0
 websocket-client==1.8.0

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row justify-content-center align-items-center" style="min-height:85vh">
+  <div class="col-md-4">
+    <div class="metric">
+      <h3 class="mb-3">Admin Login</h3>
+      {% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}
+      <form method="post" action="/login">
+        <div class="mb-3">
+          <label class="form-label">Username</label>
+          <input class="form-control" name="username" autocomplete="username" required>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">Password</label>
+          <input class="form-control" type="password" name="password" autocomplete="current-password" required>
+        </div>
+        <button class="btn btn-primary w-100" type="submit">Login</button>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

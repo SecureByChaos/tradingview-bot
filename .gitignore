@@ -11,5 +11,9 @@ pytest-cache-files-*/
 venv/
 data/active_trade.json
 data/instruments.json
+data/*.db
+data/*.db-*
+data/*.sqlite3
+data/*.sqlite3-*
 *.log
 .DS_Store

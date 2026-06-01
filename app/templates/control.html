@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="mb-3">Bot Control</h2>
+{% if summary.risk_locked %}
+<div class="alert alert-danger">Risk lock active. Use Reset Daily Lock to manually re-enable controls.</div>
+{% endif %}
+<div class="metric mb-3">
+  <div>Status: <strong>{{ summary.bot_status }}</strong></div>
+  <div>Trading Allowed: <strong>{{ "YES" if summary.trading_allowed else "NO" }}</strong></div>
+</div>
+<div class="d-flex flex-wrap gap-2">
+  <button class="btn btn-success" onclick="postAction('/api/start')">START BOT</button>
+  <button class="btn btn-warning" onclick="postAction('/api/stop')">STOP BOT</button>
+  <button class="btn btn-info" onclick="postAction('/api/restart')">RESTART BOT</button>
+  <button class="btn btn-danger" onclick="confirmKill()">KILL SWITCH</button>
+  <button class="btn btn-outline-warning" onclick="postAction('/api/reset-daily-lock')">RESET DAILY LOCK</button>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+async function postAction(url) {
+  const res = await fetch(url, {method: 'POST'});
+  if (!res.ok) alert(await res.text());
+  window.location.reload();
+}
+function confirmKill() {
+  if (confirm('Kill switch will close the active position immediately and stop trading. Continue?')) {
+    postAction('/api/kill-switch');
+  }
+}
+</script>
+{% endblock %}

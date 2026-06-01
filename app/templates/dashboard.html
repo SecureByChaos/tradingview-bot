@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% set refresh = 10 %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h2>Dashboard</h2>
+  <span class="badge {% if summary.risk_locked %}text-bg-danger{% elif summary.trading_allowed %}text-bg-success{% else %}text-bg-warning{% endif %}">
+    {{ summary.bot_status }}
+  </span>
+</div>
+{% if summary.risk_locked %}
+<div class="alert alert-danger">Daily risk lock is active. Manual reset is required before trading can resume.</div>
+{% endif %}
+<div class="row g-3">
+  <div class="col-md-3"><div class="metric"><div class="label">Bot Status</div><div class="value">{{ summary.bot_status }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Trading Mode</div><div class="value">{{ summary.trading_mode }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Active Trade</div><div class="value">{{ summary.active_trade.signal.value if summary.active_trade else "NONE" }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Today's Trade Count</div><div class="value">{{ summary.trade_count }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Today's Winners</div><div class="value profit">{{ summary.wins }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Today's Losers</div><div class="value loss">{{ summary.losses }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Today's P&L %</div><div class="value {% if summary.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(summary.pnl_percent) }}%</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Consecutive Loss Count</div><div class="value warn">{{ summary.consecutive_losses }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Trading Allowed</div><div class="value">{{ "YES" if summary.trading_allowed else "NO" }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Daily Risk Status</div><div class="value {% if summary.daily_risk_status == 'OK' %}profit{% else %}loss{% endif %}">{{ summary.daily_risk_status }}</div></div></div>
+</div>
+<h4 class="mt-4">Recent Logs</h4>
+<div class="table-responsive">
+  <table class="table table-dark table-sm align-middle">
+    <thead><tr><th>Time</th><th>Type</th><th>Level</th><th>Message</th></tr></thead>
+    <tbody>
+    {% for log in logs %}
+      <tr><td>{{ log.created_at }}</td><td>{{ log.event_type }}</td><td>{{ log.level }}</td><td>{{ log.message }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
