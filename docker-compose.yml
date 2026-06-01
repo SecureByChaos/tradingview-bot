@@ -1,0 +1,11 @@
+services:
+  banknifty-trading-bot:
+    build: .
+    container_name: banknifty-trading-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data

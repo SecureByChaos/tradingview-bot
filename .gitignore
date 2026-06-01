@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.test-tmp/
+.test-runs/
+pytest-cache-files-*/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+data/active_trade.json
+data/instruments.json
+*.log
+.DS_Store
