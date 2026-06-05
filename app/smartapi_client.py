@@ -61,14 +61,14 @@ class SmartAPIClient:
             self.settings.live_trading,
         )
 
-        def _refresh_session(self) -> None:
+    def _refresh_session(self) -> None:
         logger.warning("SmartAPI session expired. Re-authenticating...")
         self._client = None
         self._jwt_token = None
         self.authenticate()
         logger.info("SmartAPI re-authentication successful")
 
-    	def _call_with_reauth(self, func, *args, **kwargs):
+    def _call_with_reauth(self, func, *args, **kwargs):
         response = func(*args, **kwargs)
 
         if (
@@ -92,10 +92,10 @@ class SmartAPIClient:
         if self._client is None:
             raise SmartAPIError("SmartAPI is not authenticated; configure credentials for market data")
         response = self._call_with_reauth(
-    		self.client.ltpData,
-    		exchange,
-    		tradingsymbol,
-    		symboltoken,
+    	    self.client.ltpData,
+    	    exchange,
+    	    tradingsymbol,
+    	    symboltoken,
 	)
         if not response or response.get("status") is False:
             raise SmartAPIError(f"LTP request failed for {tradingsymbol}: {response}")
@@ -141,8 +141,8 @@ class SmartAPIClient:
             "quantity": str(quantity),
         }
         response = self._call_with_reauth(
-    		self.client.placeOrder,
-    		orderparams,
+    	    self.client.placeOrder,
+    	    orderparams,
 	)
         if isinstance(response, str):
             return response
