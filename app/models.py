@@ -19,6 +19,7 @@ class ExitReason(str, Enum):
 
 
 class WebhookPayload(BaseModel):
+    strategy: str | None = None
     signal: Signal
 
 

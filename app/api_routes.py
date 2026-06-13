@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import csv
+from io import StringIO
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.auth import require_admin_api
 from app.database import get_db
-from app.db_models import BotStatus
+from app.db_models import BotStatus, StrategyConfig, StrategyTrade, TradeStatus
 from app.db_models import TradingMode
 from app.platform import (
     api_status,
@@ -17,9 +20,12 @@ from app.platform import (
     log_event,
     rebuild_daily_stats,
     set_bot_state,
+    serialize_strategy_trade,
     sync_trade_row,
-    trades_query_for_filter,
+    strategy_metrics,
+    strategy_trades_query_for_filter,
 )
+from sqlalchemy import select
 from app.telegram_service import TelegramService
 from app.trade_manager import TradeManager
 
@@ -42,6 +48,10 @@ def manager() -> TradeManager:
     return router.trade_manager  # type: ignore[attr-defined]
 
 
+def multi_manager():
+    return router.multi_strategy_manager  # type: ignore[attr-defined]
+
+
 def telegram() -> TelegramService:
     return router.telegram  # type: ignore[attr-defined]
 
@@ -52,15 +62,31 @@ def status(
     trade_manager: Annotated[TradeManager, Depends(manager)],
     _: Annotated[None, Depends(require_admin_api)] = None,
 ) -> dict[str, Any]:
-    return api_status(db, trade_manager.get_active_trade())
+    payload = api_status(db, trade_manager.get_active_trade())
+    payload["strategies"] = [
+        {
+            "name": item["strategy"].name,
+            "mode": item["strategy"].mode,
+            "open_trades": item["open_trades"],
+            "total_trades": item["total_trades"],
+            "wins": item["wins"],
+            "losses": item["losses"],
+            "win_rate": item["win_rate"],
+            "net_pnl": item["net_pnl"],
+            "enabled": item["strategy"].enabled,
+        }
+        for item in strategy_metrics(db)
+    ]
+    return payload
 
 
 @router.get("/active-trade")
 def active_trade(
-    trade_manager: Annotated[TradeManager, Depends(manager)],
+    db: Annotated[Session, Depends(get_db)],
     _: Annotated[None, Depends(require_admin_api)] = None,
 ) -> Any:
-    return trade_manager.get_active_trade()
+    trades = db.scalars(select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN).order_by(StrategyTrade.entry_time.desc()))
+    return [serialize_strategy_trade(trade) for trade in trades]
 
 
 @router.get("/trades")
@@ -69,19 +95,84 @@ def trades(
     filter: str = "30d",
     _: Annotated[None, Depends(require_admin_api)] = None,
 ) -> list[dict[str, Any]]:
-    records = db.scalars(trades_query_for_filter(filter, None, None))
+    records = db.scalars(strategy_trades_query_for_filter(filter, None, None))
+    return [serialize_strategy_trade(record) for record in records]
+
+
+@router.get("/trades/export")
+def trades_export(
+    db: Annotated[Session, Depends(get_db)],
+    filter: str = "30d",
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> StreamingResponse:
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "Trade ID",
+            "Strategy",
+            "Signal",
+            "Date (IST)",
+            "Entry Time (IST)",
+            "Exit Time (IST)",
+            "Duration",
+            "Entry",
+            "Exit",
+            "P&L",
+            "P&L %",
+            "Result",
+            "Status",
+            "Mode",
+        ],
+    )
+    writer.writeheader()
+    for trade in db.scalars(strategy_trades_query_for_filter(filter, None, None)):
+        row = serialize_strategy_trade(trade)
+        writer.writerow(
+            {
+                "Trade ID": row["trade_id"],
+                "Strategy": row["strategy_name"],
+                "Signal": row["signal"],
+                "Date (IST)": row["entry_time_ist"].split(" ", 1)[0] if row["entry_time_ist"] else "",
+                "Entry Time (IST)": row["entry_time_ist"],
+                "Exit Time (IST)": row["exit_time_ist"],
+                "Duration": row["duration"],
+                "Entry": row["entry_price"],
+                "Exit": row["exit_price"],
+                "P&L": row["profit_loss"],
+                "P&L %": row["pnl_percent"],
+                "Result": row["result"],
+                "Status": row["status"],
+                "Mode": row["mode"],
+            }
+        )
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=strategy_trades_ist.csv"},
+    )
+
+
+@router.get("/strategies")
+def strategies(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> list[dict[str, Any]]:
     return [
         {
-            "date": record.date.isoformat(),
-            "signal": record.signal,
-            "strike": record.strike,
-            "entry": record.entry_price,
-            "exit": record.exit_price,
-            "pnl_percent": record.pnl_percent,
-            "exit_reason": record.exit_reason,
-            "trading_mode": record.trading_mode,
+            "id": strategy.id,
+            "name": strategy.name,
+            "enabled": strategy.enabled,
+            "mode": strategy.mode,
+            "tp_percent": strategy.tp_percent,
+            "sl_percent": strategy.sl_percent,
+            "max_active_trades": strategy.max_active_trades,
+            "capital_per_trade": strategy.capital_per_trade,
+            "paper_trade": strategy.paper_trade,
+            "live_trade": strategy.live_trade,
         }
-        for record in records
+        for strategy in db.scalars(select(StrategyConfig).order_by(StrategyConfig.name))
     ]
 
 
@@ -174,11 +265,10 @@ def kill_switch(
     _: Annotated[None, Depends(require_admin_api)] = None,
 ) -> dict[str, str]:
     active = trade_manager.get_active_trade()
+    multi = router.multi_strategy_manager  # type: ignore[attr-defined]
+    multi.square_off_all(db)
     if active is not None:
         trade_manager.square_off_open_trade()
-        rows = router.trade_logger.read_all()  # type: ignore[attr-defined]
-        if rows:
-            sync_trade_row(db, rows[-1], get_or_create_settings(db).trading_mode)
     set_bot_state(db, BotStatus.STOPPED, trading_allowed=False)
     log_event(db, "RISK", "Kill switch activated", "WARNING")
     notifier.send(db, "Kill Switch Activated")

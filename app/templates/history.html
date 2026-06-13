@@ -16,14 +16,14 @@
 </form>
 <div class="table-responsive">
   <table class="table table-dark table-hover align-middle">
-    <thead><tr><th>Date</th><th>Signal</th><th>Strike</th><th>Entry</th><th>Exit</th><th>P&L %</th><th>Exit Reason</th><th>Trading Mode</th></tr></thead>
+    <thead><tr><th>Strategy</th><th>Entry Time (IST)</th><th>Exit Time (IST)</th><th>Duration</th><th>Signal</th><th>Strike</th><th>Entry</th><th>Exit</th><th>P&L %</th><th>Result</th><th>Status</th><th>Mode</th></tr></thead>
     <tbody>
     {% for trade in trades %}
       <tr>
-        <td>{{ trade.date }}</td><td>{{ trade.signal }}</td><td>{{ trade.strike }}</td>
-        <td>{{ trade.entry_price }}</td><td>{{ trade.exit_price }}</td>
+        <td>{{ trade.strategy_name }}</td><td>{{ trade.entry_time|ist }}</td><td>{{ trade.exit_time|ist }}</td><td>{{ trade.entry_time|duration(trade.exit_time) }}</td><td>{{ trade.signal }}</td><td>{{ trade.strike }}</td>
+        <td>{{ trade.entry_price }}</td><td>{{ trade.exit_price or "" }}</td>
         <td class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
-        <td>{{ trade.exit_reason }}</td><td>{{ trade.trading_mode }}</td>
+        <td>{{ trade.result }}</td><td>{{ trade.status }}</td><td>{{ trade.mode }}</td>
       </tr>
     {% endfor %}
     </tbody>

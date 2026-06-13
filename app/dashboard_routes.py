@@ -10,18 +10,23 @@ from sqlalchemy.orm import Session
 
 from app.auth import authenticate_admin, require_admin_page
 from app.database import get_db
-from app.db_models import BotStatus, PlatformSettings, TradingMode
+from app.db_models import BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
 from app.platform import (
     get_dashboard_summary,
     get_or_create_settings,
     latest_logs,
     log_event,
-    trades_query_for_filter,
+    strategy_metrics,
+    strategy_trades_query_for_filter,
 )
+from sqlalchemy import select
 from app.smartapi_client import SmartAPIError
+from app.time_utils import duration_label, format_ist
 from app.trade_manager import TradeManager
 
 templates = Jinja2Templates(directory="app/templates")
+templates.env.filters["ist"] = format_ist
+templates.env.filters["duration"] = duration_label
 router = APIRouter()
 
 
@@ -68,7 +73,10 @@ def dashboard(
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     summary = get_dashboard_summary(db, trade_manager.get_active_trade())
-    return templates.TemplateResponse("dashboard.html", {"request": request, "summary": summary, "logs": latest_logs(db, 20)})
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {"request": request, "summary": summary, "logs": latest_logs(db, 20), "strategy_metrics": strategy_metrics(db)},
+    )
 
 
 @router.get("/active-trade-page", response_class=HTMLResponse)
@@ -79,18 +87,17 @@ def active_trade_page(
     smartapi: Annotated[object, Depends(get_smartapi)],
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    trade = trade_manager.get_active_trade()
-    current_premium = None
-    live_pnl = None
-    if trade is not None:
+    open_trades = list(db.scalars(select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN).order_by(StrategyTrade.entry_time.desc())))
+    for trade in open_trades:
         try:
-            current_premium = smartapi.get_ltp(trade.contract.exchange, trade.contract.tradingsymbol, trade.contract.symboltoken)
-            live_pnl = round(((current_premium - trade.entry_price) / trade.entry_price) * 100, 2)
+            current_premium = smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+            trade.current_premium = round(current_premium, 2)
+            trade.pnl_percent = round(((current_premium - trade.entry_price) / trade.entry_price) * 100, 2)
         except Exception:
-            current_premium = None
+            pass
     return templates.TemplateResponse(
         "active_trade.html",
-        {"request": request, "trade": trade, "current_premium": current_premium, "live_pnl": live_pnl},
+        {"request": request, "trades": open_trades},
     )
 
 
@@ -103,7 +110,7 @@ def history(
     end: str | None = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    trades = list(db.scalars(trades_query_for_filter(filter, parse_date(start), parse_date(end))))
+    trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end))))
     return templates.TemplateResponse(
         "history.html",
         {"request": request, "trades": trades, "filter": filter, "start": start or "", "end": end or ""},
@@ -118,6 +125,100 @@ def control_page(
 ) -> HTMLResponse:
     summary = get_dashboard_summary(db, router.trade_manager.get_active_trade())  # type: ignore[attr-defined]
     return templates.TemplateResponse("control.html", {"request": request, "summary": summary})
+
+
+@router.get("/strategies", response_class=HTMLResponse)
+def strategies_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    strategies = list(db.scalars(select(StrategyConfig).order_by(StrategyConfig.name)))
+    metrics = strategy_metrics(db)
+    return templates.TemplateResponse(
+        "strategies.html",
+        {"request": request, "strategies": strategies, "metrics": metrics, "metrics_by_id": {item["strategy"].id: item for item in metrics}},
+    )
+
+
+@router.post("/strategies")
+def create_strategy(
+    db: Annotated[Session, Depends(get_db)],
+    name: Annotated[str, Form()],
+    mode: Annotated[str, Form()],
+    tp_percent: Annotated[float, Form()],
+    sl_percent: Annotated[float, Form()],
+    max_active_trades: Annotated[int, Form()],
+    capital_per_trade: Annotated[float, Form()],
+    enabled: Annotated[str | None, Form()] = None,
+    paper_trade: Annotated[str | None, Form()] = None,
+    live_trade: Annotated[str | None, Form()] = None,
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    if mode not in {TradingMode.PAPER, TradingMode.LIVE}:
+        raise HTTPException(status_code=400, detail="Invalid trading mode")
+    strategy = StrategyConfig(
+        name=name.strip(),
+        enabled=enabled == "on",
+        mode=mode,
+        tp_percent=tp_percent,
+        sl_percent=sl_percent,
+        max_active_trades=max_active_trades,
+        capital_per_trade=capital_per_trade,
+        paper_trade=paper_trade == "on",
+        live_trade=live_trade == "on",
+    )
+    db.add(strategy)
+    db.commit()
+    log_event(db, "BOT", f"Strategy created: {strategy.name}")
+    return RedirectResponse("/strategies", status_code=303)
+
+
+@router.post("/strategies/{strategy_id}")
+def update_strategy(
+    strategy_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    name: Annotated[str, Form()],
+    mode: Annotated[str, Form()],
+    tp_percent: Annotated[float, Form()],
+    sl_percent: Annotated[float, Form()],
+    max_active_trades: Annotated[int, Form()],
+    capital_per_trade: Annotated[float, Form()],
+    enabled: Annotated[str | None, Form()] = None,
+    paper_trade: Annotated[str | None, Form()] = None,
+    live_trade: Annotated[str | None, Form()] = None,
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    strategy = db.get(StrategyConfig, strategy_id)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    strategy.name = name.strip()
+    strategy.enabled = enabled == "on"
+    strategy.mode = mode
+    strategy.tp_percent = tp_percent
+    strategy.sl_percent = sl_percent
+    strategy.max_active_trades = max_active_trades
+    strategy.capital_per_trade = capital_per_trade
+    strategy.paper_trade = paper_trade == "on"
+    strategy.live_trade = live_trade == "on"
+    db.commit()
+    log_event(db, "BOT", f"Strategy updated: {strategy.name}")
+    return RedirectResponse("/strategies", status_code=303)
+
+
+@router.post("/strategies/{strategy_id}/delete")
+def delete_strategy(
+    strategy_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    strategy = db.get(StrategyConfig, strategy_id)
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    db.delete(strategy)
+    db.commit()
+    log_event(db, "BOT", f"Strategy deleted: {strategy.name}")
+    return RedirectResponse("/strategies", status_code=303)
 
 
 @router.get("/settings", response_class=HTMLResponse)

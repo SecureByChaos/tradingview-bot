@@ -40,6 +40,7 @@ class Settings:
     admin_password: str = ""
     session_secret_key: str = "change-me-in-production"
     secure_cookies: bool = False
+    default_strategy_name: str = "V5.1"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @property
@@ -85,5 +86,6 @@ def get_settings() -> Settings:
         admin_password=os.getenv("ADMIN_PASSWORD", ""),
         session_secret_key=os.getenv("SESSION_SECRET_KEY", "change-me-in-production"),
         secure_cookies=_get_bool("SECURE_COOKIES", False),
+        default_strategy_name=os.getenv("DEFAULT_STRATEGY_NAME", "V5.1"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),  # type: ignore[arg-type]
     )

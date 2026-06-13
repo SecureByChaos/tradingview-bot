@@ -11,10 +11,13 @@ from app import api_routes, dashboard_routes
 from app.config import get_settings
 from app.database import SessionLocal, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
-from app.models import ActiveTrade, WebhookPayload, WebhookResponse
+from app.db_models import StrategyTrade, TradeStatus
+from app.models import WebhookPayload, WebhookResponse
+from app.multi_strategy import MultiStrategyTradeManager
+from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
-from app.platform import get_or_create_settings, log_event, trading_allowed
-from app.platform_monitor import PlatformTradeMonitor
+from app.platform import get_or_create_settings, log_event, serialize_strategy_trade, strategy_trades_query_for_filter, trading_allowed
+from sqlalchemy import select
 from app.risk import RiskProtectionService
 from app.scheduler import create_scheduler
 from app.smartapi_client import SmartAPIClient
@@ -31,8 +34,9 @@ smartapi = SmartAPIClient(settings)
 option_finder = OptionFinder(settings, smartapi)
 trade_manager = TradeManager(settings, smartapi, option_finder, trade_logger)
 telegram = TelegramService()
-risk_service = RiskProtectionService(trade_manager, telegram)
-monitor = PlatformTradeMonitor(trade_manager, trade_logger, telegram, risk_service)
+multi_strategy_manager = MultiStrategyTradeManager(settings, smartapi, option_finder, telegram)
+risk_service = RiskProtectionService(multi_strategy_manager, telegram)
+monitor = MultiStrategyMonitor(multi_strategy_manager, risk_service)
 scheduler = create_scheduler(monitor)
 
 
@@ -72,10 +76,12 @@ app.add_middleware(
 )
 
 api_routes.router.trade_manager = trade_manager  # type: ignore[attr-defined]
+api_routes.router.multi_strategy_manager = multi_strategy_manager  # type: ignore[attr-defined]
 api_routes.router.telegram = telegram  # type: ignore[attr-defined]
 api_routes.router.scheduler = scheduler  # type: ignore[attr-defined]
 api_routes.router.trade_logger = trade_logger  # type: ignore[attr-defined]
 dashboard_routes.router.trade_manager = trade_manager  # type: ignore[attr-defined]
+dashboard_routes.router.multi_strategy_manager = multi_strategy_manager  # type: ignore[attr-defined]
 dashboard_routes.router.smartapi = smartapi  # type: ignore[attr-defined]
 
 app.include_router(dashboard_routes.router)
@@ -87,28 +93,29 @@ def health() -> dict[str, str | bool]:
     return {"status": "ok", "live_trading": settings.live_trading}
 
 
-@app.get("/active-trade", response_model=ActiveTrade | None)
-def active_trade() -> ActiveTrade | None:
-    return trade_manager.get_active_trade()
+@app.get("/active-trade")
+def active_trade(db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    trades = db.scalars(select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN).order_by(StrategyTrade.entry_time.desc()))
+    return [serialize_strategy_trade(trade) for trade in trades]
 
 
 @app.get("/trades")
-def trades() -> list[dict[str, str]]:
-    return trade_logger.read_all()
+def trades(db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return [serialize_strategy_trade(trade) for trade in db.scalars(strategy_trades_query_for_filter("30d", None, None))]
 
 
 @app.post("/webhook", response_model=WebhookResponse)
 def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookResponse:
     try:
         allowed, message = trading_allowed(db)
-        log_event(db, "WEBHOOK", f"Webhook received: {payload.signal.value}")
+        strategy_name = payload.strategy or settings.default_strategy_name
+        log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
         if not allowed:
             log_event(db, "WEBHOOK", f"Webhook ignored: {message}", "WARNING")
             return WebhookResponse(accepted=False, message=message)
-        response = trade_manager.handle_signal(payload.signal)
+        response = multi_strategy_manager.handle_signal(db, payload.strategy, payload.signal)
         if response.accepted:
-            log_event(db, "TRADE", f"Trade opened: {payload.signal.value}", payload=response.active_trade.model_dump() if response.active_trade else {})
-            telegram.send(db, f"Trade Opened\nSignal: {payload.signal.value}")
+            telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
         else:
             log_event(db, "WEBHOOK", f"Signal ignored: {response.message}", "WARNING")
         return response

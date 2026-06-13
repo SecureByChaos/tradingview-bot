@@ -8,7 +8,8 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import BotState, BotStatus, DailyStats, LogEvent, PlatformSettings, TradeRecord, TradingMode
+from app.db_models import BotState, BotStatus, DailyStats, LogEvent, PlatformSettings, StrategyConfig, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.time_utils import duration_label, format_ist, iso_utc
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -133,12 +134,19 @@ def sync_trade_row(db: Session, row: dict[str, str], trading_mode: str) -> Trade
 
 def rebuild_daily_stats(db: Session, trade_date: date | None = None) -> DailyStats:
     day = trade_date or today_ist()
-    records = list(db.scalars(select(TradeRecord).where(TradeRecord.date == day).order_by(TradeRecord.exit_time)))
+    records = list(
+        db.scalars(
+            select(StrategyTrade).where(
+                func.date(StrategyTrade.exit_time) == day.isoformat(),
+                StrategyTrade.status == TradeStatus.CLOSED,
+            ).order_by(StrategyTrade.exit_time)
+        )
+    )
     stats = get_or_create_daily_stats(db, day)
     stats.trade_count = len(records)
     stats.pnl_percent = round(sum(record.pnl_percent for record in records), 2)
-    stats.wins = sum(1 for record in records if record.pnl_percent > 0)
-    stats.losses = sum(1 for record in records if record.pnl_percent < 0)
+    stats.wins = sum(1 for record in records if record.result == TradeResult.WIN)
+    stats.losses = sum(1 for record in records if record.result == TradeResult.LOSS)
     consecutive = 0
     for record in reversed(records):
         if record.pnl_percent < 0:
@@ -155,10 +163,12 @@ def get_dashboard_summary(db: Session, active_trade: Any | None) -> dict[str, An
     state = get_or_create_state(db)
     settings = get_or_create_settings(db)
     stats = rebuild_daily_stats(db)
+    open_count = int(db.scalar(select(func.count()).select_from(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN)) or 0)
     return {
         "bot_status": state.status,
         "trading_mode": settings.trading_mode,
         "active_trade": active_trade,
+        "open_trades": open_count,
         "trade_count": stats.trade_count,
         "wins": stats.wins,
         "losses": stats.losses,
@@ -188,6 +198,75 @@ def trades_query_for_filter(filter_name: str, start: date | None, end: date | No
     if end is not None:
         query = query.where(TradeRecord.date <= end)
     return query.order_by(TradeRecord.exit_time.desc())
+
+
+def strategy_trades_query_for_filter(filter_name: str, start: date | None, end: date | None) -> Select[tuple[StrategyTrade]]:
+    today = today_ist()
+    if filter_name == "7d":
+        start = today - timedelta(days=6)
+        end = today
+    elif filter_name == "30d":
+        start = today - timedelta(days=29)
+        end = today
+    elif filter_name == "today":
+        start = today
+        end = today
+
+    query = select(StrategyTrade)
+    if start is not None:
+        query = query.where(func.date(StrategyTrade.entry_time) >= start.isoformat())
+    if end is not None:
+        query = query.where(func.date(StrategyTrade.entry_time) <= end.isoformat())
+    return query.order_by(StrategyTrade.entry_time.desc())
+
+
+def strategy_metrics(db: Session) -> list[dict[str, Any]]:
+    strategies = list(db.scalars(select(StrategyConfig).order_by(StrategyConfig.name)))
+    metrics: list[dict[str, Any]] = []
+    for strategy in strategies:
+        trades = list(db.scalars(select(StrategyTrade).where(StrategyTrade.strategy_name == strategy.name)))
+        closed = [trade for trade in trades if trade.status == TradeStatus.CLOSED]
+        wins = sum(1 for trade in closed if trade.result == TradeResult.WIN)
+        losses = sum(1 for trade in closed if trade.result == TradeResult.LOSS)
+        open_trades = sum(1 for trade in trades if trade.status == TradeStatus.OPEN)
+        total = len(closed)
+        metrics.append(
+            {
+                "strategy": strategy,
+                "open_trades": open_trades,
+                "total_trades": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+                "net_pnl": round(sum(trade.profit_loss for trade in closed), 2),
+            }
+        )
+    return metrics
+
+
+def serialize_strategy_trade(trade: StrategyTrade) -> dict[str, Any]:
+    return {
+        "trade_id": trade.trade_id,
+        "strategy_name": trade.strategy_name,
+        "signal": trade.signal,
+        "strike": trade.strike,
+        "entry_price": trade.entry_price,
+        "exit_price": trade.exit_price,
+        "entry_time": trade.entry_time,
+        "entry_time_utc": iso_utc(trade.entry_time),
+        "entry_time_ist": format_ist(trade.entry_time),
+        "exit_time": trade.exit_time,
+        "exit_time_utc": iso_utc(trade.exit_time),
+        "exit_time_ist": format_ist(trade.exit_time),
+        "duration": duration_label(trade.entry_time, trade.exit_time),
+        "profit_loss": trade.profit_loss,
+        "pnl_percent": trade.pnl_percent,
+        "result": trade.result,
+        "status": trade.status,
+        "mode": trade.mode,
+        "exit_reason": trade.exit_reason,
+        "current_premium": trade.current_premium,
+    }
 
 
 def latest_logs(db: Session, limit: int = 100) -> list[LogEvent]:

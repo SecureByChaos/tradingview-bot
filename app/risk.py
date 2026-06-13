@@ -9,7 +9,7 @@ from app.trade_manager import TradeManager
 
 
 class RiskProtectionService:
-    def __init__(self, trade_manager: TradeManager, telegram: TelegramService) -> None:
+    def __init__(self, trade_manager: TradeManager | object, telegram: TelegramService) -> None:
         self.trade_manager = trade_manager
         self.telegram = telegram
 
@@ -19,8 +19,9 @@ class RiskProtectionService:
         if stats.risk_locked:
             return True
         if stats.pnl_percent <= settings.daily_max_loss_percent:
-            active = self.trade_manager.get_active_trade()
-            if active is not None:
+            if hasattr(self.trade_manager, "square_off_all"):
+                self.trade_manager.square_off_all(db)
+            elif hasattr(self.trade_manager, "get_active_trade") and self.trade_manager.get_active_trade() is not None:
                 self.trade_manager.square_off_open_trade()
             stats.risk_locked = True
             db.commit()

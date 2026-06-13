@@ -12,9 +12,12 @@ TradingView -> Webhook -> FastAPI -> Trade Manager -> Angel One SmartAPI
 ## Features
 
 - `POST /webhook` accepts only `BUY_CE` and `BUY_PE`.
+- Dynamic multi-strategy engine driven by database strategy configuration.
+- Supports simultaneous independent trades per strategy without a global active-trade lock.
+- Strategy-specific PAPER/LIVE mode, TP/SL, max active trades, and capital allocation.
 - Single-admin login with signed session cookies.
 - Bootstrap 5 dark dashboard with bot status, active trade, history, controls, settings, and logs.
-- SQLite-backed platform state for bot status, settings, daily stats, trade records, and structured logs.
+- SQLite-backed platform state for bot status, settings, strategy configs, strategy trades, daily stats, and structured logs.
 - REST API under `/api/*` for status, trades, settings, bot controls, kill switch, and daily-lock reset.
 - Telegram notifications for bot events, trade events, exits, risk locks, and system errors.
 - Automatically selects the current ATM BankNifty CE/PE from live BankNifty spot.
@@ -102,16 +105,77 @@ http://YOUR_SERVER_IP:8000/webhook
 Alert message for CE:
 
 ```json
-{"signal":"BUY_CE"}
+{"strategy":"V5.1","signal":"BUY_CE"}
 ```
 
 Alert message for PE:
 
 ```json
-{"signal":"BUY_PE"}
+{"strategy":"V6 Momentum","signal":"BUY_PE"}
 ```
 
-Signals should already be time-filtered in TradingView. The Python bot only enforces risk, daily limits, one-position-at-a-time behavior, and 15:15 IST square-off.
+Signals should already be time-filtered in TradingView. The Python bot enforces platform state, strategy enabled state, per-strategy active trade limits, risk settings, and 15:15 IST square-off.
+
+Legacy payloads without `strategy` still route to `DEFAULT_STRATEGY_NAME` from `.env`.
+
+## Multi-Strategy Operation
+
+Strategies are stored in the `strategy_configs` table and managed from `/strategies`. The backend does not require code changes for new strategy names.
+
+Each strategy has:
+
+- `name`
+- `enabled`
+- `mode`: `PAPER` or `LIVE`
+- `tp_percent`
+- `sl_percent`
+- `max_active_trades`
+- `capital_per_trade`
+- `paper_trade`
+- `live_trade`
+
+When a webhook arrives, the engine:
+
+1. Loads the strategy by name.
+2. Rejects the signal if the strategy does not exist or is disabled.
+3. Checks open trades only for that strategy.
+4. Rejects the signal if `max_active_trades` is reached.
+5. Selects the ATM BankNifty option for the signal.
+6. Sizes the position from `capital_per_trade`.
+7. Opens PAPER or LIVE according to strategy config and global `SMARTAPI_LIVE_TRADING`.
+8. Monitors TP, SL, and square-off independently for every open strategy trade.
+
+Example simultaneous state:
+
+```text
+V5.1 -> BUY_CE open
+V6 Momentum -> BUY_PE open
+Scalper -> 2 open trades
+```
+
+These trades are independent and are never merged.
+
+## PAPER and LIVE Modes
+
+`PAPER` records simulated orders while still using live premium data for entry and monitoring.
+
+`LIVE` sends broker orders only when:
+
+- Strategy `mode` is `LIVE`
+- Strategy `live_trade` is enabled
+- Global `SMARTAPI_LIVE_TRADING=true`
+
+This keeps a deployment-level safety switch above per-strategy settings.
+
+## TP/SL and Capital
+
+TP and SL are loaded from each strategy row. Position size is calculated from:
+
+```text
+capital_per_trade / (entry_price * option_lot_size)
+```
+
+The result is rounded down to whole lots.
 
 ## AWS Lightsail Deployment
 
@@ -184,6 +248,8 @@ Authenticated session required:
 - `GET /api/status`
 - `GET /api/active-trade`
 - `GET /api/trades`
+- `GET /api/trades/export`
+- `GET /api/strategies`
 - `GET /api/settings`
 - `POST /api/settings`
 - `POST /api/start`
@@ -195,8 +261,9 @@ Authenticated session required:
 ## Dashboard
 
 - `/` shows status, daily stats, active trade, risk status, and recent logs.
-- `/active-trade-page` shows live active trade details.
-- `/history` shows filtered trade history.
+- `/active-trade-page` shows all live active strategy trades.
+- `/history` shows filtered multi-strategy trade history.
+- `/strategies` adds, edits, enables/disables, and deletes strategies.
 - `/control` provides start, stop, restart, kill switch, and daily-lock reset.
 - `/settings` persists trading, risk, square-off, and Telegram settings in SQLite.
 - `/logs` shows structured event logs.
@@ -204,6 +271,19 @@ Authenticated session required:
 ## Daily Risk Lock
 
 The platform computes cumulative daily P&L from completed trades. If it is less than or equal to `Daily Max Loss %` (default `-20%`), the risk service closes the active position, disables new trades, sets bot status to `RISK_LOCKED`, sends a Telegram alert, and shows a dashboard warning. Admin reset is required from `/control`.
+
+## Timezone
+
+User-facing timestamps are displayed in IST (`Asia/Kolkata`, UTC+05:30). API trade responses include both UTC and IST timestamp fields, for example:
+
+```json
+{
+  "entry_time_utc": "2026-06-09T06:33:00Z",
+  "entry_time_ist": "09-Jun-2026 12:03 PM IST"
+}
+```
+
+CSV exports from `/api/trades/export` include IST date/time columns.
 
 ## Tests
 

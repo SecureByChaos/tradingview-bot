@@ -2,21 +2,23 @@
 {% set refresh = 10 %}
 {% block content %}
 <h2 class="mb-3">Active Trade</h2>
-{% if trade %}
-<div class="row g-3">
-  <div class="col-md-3"><div class="metric"><div class="label">Signal</div><div class="value">{{ trade.signal.value }}</div></div></div>
-  <div class="col-md-3"><div class="metric"><div class="label">Strike</div><div class="value">{{ trade.contract.strike }}</div></div></div>
-  <div class="col-md-3"><div class="metric"><div class="label">Entry Price</div><div class="value">{{ trade.entry_price }}</div></div></div>
-  <div class="col-md-3"><div class="metric"><div class="label">Current Premium</div><div class="value">{{ current_premium if current_premium is not none else "Unavailable" }}</div></div></div>
-  <div class="col-md-3"><div class="metric"><div class="label">Stop Loss</div><div class="value loss">{{ trade.stoploss }}</div></div></div>
-  <div class="col-md-3"><div class="metric"><div class="label">Target</div><div class="value profit">{{ trade.target }}</div></div></div>
-  <div class="col-md-3"><div class="metric"><div class="label">Live P&L %</div><div class="value {% if live_pnl is not none and live_pnl >= 0 %}profit{% else %}loss{% endif %}">{{ live_pnl if live_pnl is not none else "Unavailable" }}</div></div></div>
-  <div class="col-md-3"><div class="metric"><div class="label">Entry Time</div><div class="value fs-6">{{ trade.entry_time }}</div></div></div>
+{% if trades %}
+{% for trade in trades %}
+<div class="metric mb-3">
+  <h5>{{ trade.strategy_name }} · {{ trade.signal }}</h5>
+  <div class="row g-3">
+    <div class="col-md-3"><div class="label">Strike</div><div class="value">{{ trade.strike }}</div></div>
+    <div class="col-md-3"><div class="label">Entry Price</div><div class="value">{{ trade.entry_price }}</div></div>
+    <div class="col-md-3"><div class="label">Current Premium</div><div class="value">{{ trade.current_premium if trade.current_premium is not none else "Unavailable" }}</div></div>
+    <div class="col-md-3"><div class="label">Stop Loss</div><div class="value loss">{{ trade.stoploss }}</div></div>
+    <div class="col-md-3"><div class="label">Target</div><div class="value profit">{{ trade.target }}</div></div>
+    <div class="col-md-3"><div class="label">Live P&L %</div><div class="value {% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</div></div>
+    <div class="col-md-3"><div class="label">Mode</div><div class="value">{{ trade.mode }}</div></div>
+    <div class="col-md-3"><div class="label">Entry Time</div><div class="value fs-6">{{ trade.entry_time|ist }}</div></div>
+  </div>
+  <p class="mb-0 mt-3">Exit when premium <= {{ trade.stoploss }}, premium >= {{ trade.target }}, or current time >= 15:15 IST.</p>
 </div>
-<div class="metric mt-3">
-  <h5>Exit Conditions</h5>
-  <p class="mb-0">Exit when premium <= {{ trade.stoploss }}, premium >= {{ trade.target }}, or current time >= 15:15 IST.</p>
-</div>
+{% endfor %}
 {% else %}
 <div class="alert alert-secondary">No active trade.</div>
 {% endif %}
