@@ -18,6 +18,7 @@ class ExitReason(str, Enum):
     TARGET = "TARGET"
     STOPLOSS = "STOPLOSS"
     TIME_EXIT = "TIME_EXIT"
+    TV_EXIT = "TV_EXIT"
 
 
 class WebhookPayload(BaseModel):

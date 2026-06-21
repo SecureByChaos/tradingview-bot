@@ -38,6 +38,8 @@ class MultiStrategyTradeManager:
         strategy = self.get_strategy(db, resolved_name)
         if strategy is None:
             return WebhookResponse(accepted=False, message=f"Rejected: strategy '{resolved_name}' does not exist")
+        if strategy.name.upper() == "V7" and signal in {Signal.SELL_CE, Signal.SELL_PE}:
+            return self.handle_v7_tv_exit(db, strategy.name, signal)
         if not strategy.enabled:
             return WebhookResponse(accepted=False, message=f"Rejected: strategy '{strategy.name}' is disabled")
         if strategy.mode == TradingMode.PAPER and not strategy.paper_trade:
@@ -105,6 +107,26 @@ class MultiStrategyTradeManager:
         )
         self.telegram.send(db, f"Trade Opened\n[{strategy.name}] {signal.value}\nEntry: {trade.entry_price}")
         return WebhookResponse(accepted=True, message="Trade opened")
+
+    def handle_v7_tv_exit(self, db: Session, strategy_name: str, signal: Signal) -> WebhookResponse:
+        option_type = "CE" if signal == Signal.SELL_CE else "PE"
+        log_event(db, "WEBHOOK", f"[V7] TradingView exit signal received: {signal.value}")
+        trade = db.scalar(
+            select(StrategyTrade)
+            .where(
+                StrategyTrade.strategy_name == strategy_name,
+                StrategyTrade.option_type == option_type,
+                StrategyTrade.status == TradeStatus.OPEN,
+            )
+            .order_by(StrategyTrade.entry_time.desc())
+            .limit(1)
+        )
+        if trade is None:
+            return WebhookResponse(accepted=True, message=f"No active {option_type} trade to close")
+        premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+        self.close_trade(db, trade, premium, ExitReason.TV_EXIT)
+        log_event(db, "TRADE", f"[V7] Closed active trade: {trade.trade_id}")
+        return WebhookResponse(accepted=True, message=f"Closed active {option_type} trade")
 
     def monitor_open_trades(self, db: Session) -> list[StrategyTrade]:
         closed: list[StrategyTrade] = []

@@ -112,6 +112,8 @@ def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookRe
         allowed, message = trading_allowed(db)
         strategy_name = (payload.strategy or settings.default_strategy_name).strip()
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
+        if strategy_name.upper() == "V7" and payload.signal.value in {"SELL_CE", "SELL_PE"}:
+            return multi_strategy_manager.handle_signal(db, strategy_name, payload.signal)
         if not allowed:
             log_event(db, "WEBHOOK", f"Webhook ignored: {message}", "WARNING")
             return WebhookResponse(accepted=False, message=message)
@@ -154,7 +156,7 @@ def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookRe
             return WebhookResponse(accepted=False, message=message)
 
         response = multi_strategy_manager.handle_signal(db, strategy_name, payload.signal)
-        if response.accepted:
+        if response.accepted and not payload.signal.value.startswith("SELL"):
             telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
         else:
             log_event(db, "WEBHOOK", f"Signal ignored: {response.message}", "WARNING")
