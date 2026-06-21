@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,59 @@ logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 
 
+def get_atm_option_token(spot_price: float, signal_type: str) -> dict:
+    if signal_type not in {"BUY_CE", "BUY_PE"}:
+        raise ValueError("signal_type must be BUY_CE or BUY_PE")
+
+    option_type = "CE" if signal_type == "BUY_CE" else "PE"
+    atm_strike = int(round(float(spot_price) / 100) * 100)
+    cache_path = Path(os.getenv("INSTRUMENT_CACHE_PATH", "data/instruments.json"))
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if cache_path.exists() and cache_path.stat().st_size > 0:
+        instruments = json.loads(cache_path.read_text(encoding="utf-8"))
+    else:
+        url = os.getenv(
+            "INSTRUMENT_MASTER_URL",
+            "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json",
+        )
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        instruments = response.json()
+        cache_path.write_text(json.dumps(instruments), encoding="utf-8")
+
+    today = datetime.now(IST).date()
+    matches: list[tuple[object, dict, int]] = []
+    for item in instruments:
+        if item.get("exch_seg") != "NFO" or item.get("instrumenttype") != "OPTIDX":
+            continue
+        if str(item.get("name", "")).upper() != "BANKNIFTY":
+            continue
+        if not str(item.get("symbol", "")).upper().endswith(option_type):
+            continue
+        try:
+            expiry_dt = datetime.strptime(str(item["expiry"]), "%d%b%Y").date()
+        except (KeyError, ValueError):
+            continue
+        if expiry_dt < today:
+            continue
+        strike_raw = float(item.get("strike", 0))
+        strike = int(strike_raw / 100 if strike_raw > 100000 else strike_raw)
+        if strike == atm_strike:
+            matches.append((expiry_dt, item, strike))
+
+    if not matches:
+        raise LookupError(f"No BANKNIFTY {option_type} ATM contract found for strike {atm_strike}")
+
+    expiry_dt, item, strike = sorted(matches, key=lambda row: row[0])[0]
+    return {
+        "symboltoken": str(item["token"]),
+        "tradingsymbol": str(item["symbol"]),
+        "strike": strike,
+        "expiry": expiry_dt.isoformat(),
+    }
+
+
 class OptionFinder:
     def __init__(self, settings: Settings, smartapi: SmartAPIClient) -> None:
         self.settings = settings
@@ -26,7 +80,7 @@ class OptionFinder:
     def find_atm_contract(self, signal: Signal) -> OptionContract:
         spot_price = self.smartapi.get_banknifty_spot()
         atm_strike = int(round(spot_price / 100) * 100)
-        option_type = "CE" if signal == Signal.BUY_CE else "PE"
+        option_type = "CE" if signal.value.endswith("CE") else "PE"
         instruments = self._load_instruments()
         matches = self._filter_banknifty_options(instruments, option_type)
         if matches.empty:

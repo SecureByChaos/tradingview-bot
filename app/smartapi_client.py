@@ -20,6 +20,8 @@ class SmartAPIClient:
         self.settings = settings
         self._client: Any = None
         self._jwt_token: Optional[str] = None
+        self._refresh_token: Optional[str] = None
+        self._feed_token: Optional[str] = None
 
     def authenticate(self) -> None:
         missing = [
@@ -54,27 +56,46 @@ class SmartAPIClient:
         )
         if not session or session.get("status") is False:
             raise SmartAPIError(f"SmartAPI login failed: {session}")
-        self._jwt_token = session.get("data", {}).get("jwtToken")
+        data = session.get("data", {})
+        self._jwt_token = data.get("jwtToken")
+        self._refresh_token = data.get("refreshToken")
+        self._feed_token = self._client.getfeedToken()
         logger.info(
             "SmartAPI authenticated for client %s; live orders enabled=%s",
             self.settings.smartapi_client_id,
             self.settings.live_trading,
         )
 
+    def _token_expired(self, response: object) -> bool:
+        if not isinstance(response, dict):
+            return False
+        message = str(response.get("message", "")).lower()
+        return response.get("errorCode") in {"AG8001", "AB8050"} or ("token" in message and "expired" in message)
+
     def _refresh_session(self) -> None:
-        logger.warning("SmartAPI session expired. Re-authenticating...")
-        self._client = None
-        self._jwt_token = None
-        self.authenticate()
-        logger.info("SmartAPI re-authentication successful")
+        if not self._client or not self._refresh_token:
+            self.authenticate()
+            return
+        try:
+            response = self._client.generateToken(self._refresh_token)
+            if not response or response.get("status") is False:
+                raise SmartAPIError(f"SmartAPI refresh failed: {response}")
+            data = response.get("data", {})
+            self._jwt_token = data.get("jwtToken") or self._jwt_token
+            self._refresh_token = data.get("refreshToken") or self._refresh_token
+            self._feed_token = self._client.getfeedToken()
+        except Exception:
+            logger.exception("SmartAPI refresh failed; performing full TOTP login")
+            self._client = None
+            self._jwt_token = None
+            self._refresh_token = None
+            self._feed_token = None
+            self.authenticate()
 
     def _call_with_reauth(self, func, *args, **kwargs):
         response = func(*args, **kwargs)
 
-        if (
-            isinstance(response, dict)
-            and response.get("errorCode") == "AG8001"
-        ):
+        if self._token_expired(response):
             self._refresh_session()
             response = func(*args, **kwargs)
 

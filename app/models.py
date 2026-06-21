@@ -9,7 +9,9 @@ from pydantic import BaseModel, Field
 
 class Signal(str, Enum):
     BUY_CE = "BUY_CE"
+    SELL_CE = "SELL_CE"
     BUY_PE = "BUY_PE"
+    SELL_PE = "SELL_PE"
 
 
 class ExitReason(str, Enum):

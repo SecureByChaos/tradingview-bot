@@ -104,6 +104,10 @@ class StrategyTrade(Base):
     exit_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     entry_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     exit_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    highest_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    lowest_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trailing_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trailing_stop: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

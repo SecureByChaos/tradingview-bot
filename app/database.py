@@ -47,7 +47,8 @@ def init_db() -> None:
 
 def _ensure_columns() -> None:
     inspector = inspect(engine)
-    if "strategy_configs" not in inspector.get_table_names():
+    table_names = inspector.get_table_names()
+    if "strategy_configs" not in table_names:
         return
     existing = {column["name"] for column in inspector.get_columns("strategy_configs")}
     statements = {
@@ -59,6 +60,18 @@ def _ensure_columns() -> None:
         for column, statement in statements.items():
             if column not in existing:
                 connection.execute(text(statement))
+    if "strategy_trades" in table_names:
+        existing_trade_columns = {column["name"] for column in inspector.get_columns("strategy_trades")}
+        trade_statements = {
+            "highest_price": "ALTER TABLE strategy_trades ADD COLUMN highest_price FLOAT",
+            "lowest_price": "ALTER TABLE strategy_trades ADD COLUMN lowest_price FLOAT",
+            "trailing_active": "ALTER TABLE strategy_trades ADD COLUMN trailing_active BOOLEAN NOT NULL DEFAULT 0",
+            "trailing_stop": "ALTER TABLE strategy_trades ADD COLUMN trailing_stop FLOAT",
+        }
+        with engine.begin() as connection:
+            for column, statement in trade_statements.items():
+                if column not in existing_trade_columns:
+                    connection.execute(text(statement))
 
 
 def _seed_default_strategy() -> None:

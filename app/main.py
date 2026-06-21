@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
@@ -11,17 +12,18 @@ from app import api_routes, dashboard_routes
 from app.config import get_settings
 from app.database import SessionLocal, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
-from app.db_models import StrategyTrade, TradeStatus
+from app.db_models import DailyStats, StrategyConfig, StrategyTrade, TradeResult, TradeStatus
 from app.models import WebhookPayload, WebhookResponse
 from app.multi_strategy import MultiStrategyTradeManager
 from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
-from app.platform import get_or_create_settings, log_event, serialize_strategy_trade, strategy_trades_query_for_filter, trading_allowed
+from app.platform import get_or_create_settings, log_event, serialize_strategy_trade, strategy_trades_query_for_filter, today_ist, trading_allowed
 from sqlalchemy import select
 from app.risk import RiskProtectionService
 from app.scheduler import create_scheduler
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
+from app.time_utils import utc_now
 from app.trade_manager import TradeManager
 
 settings = get_settings()
@@ -108,12 +110,50 @@ def trades(db: Session = Depends(get_db)) -> list[dict[str, object]]:
 def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookResponse:
     try:
         allowed, message = trading_allowed(db)
-        strategy_name = payload.strategy or settings.default_strategy_name
+        strategy_name = (payload.strategy or settings.default_strategy_name).strip()
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
         if not allowed:
             log_event(db, "WEBHOOK", f"Webhook ignored: {message}", "WARNING")
             return WebhookResponse(accepted=False, message=message)
-        response = multi_strategy_manager.handle_signal(db, payload.strategy, payload.signal)
+
+        strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == strategy_name))
+        if strategy is None:
+            message = f"Rejected: strategy '{strategy_name}' does not exist"
+            log_event(db, "WEBHOOK", message, "WARNING")
+            return WebhookResponse(accepted=False, message=message)
+
+        platform_settings = get_or_create_settings(db)
+        today_stats = db.scalar(select(DailyStats).where(DailyStats.trade_date == today_ist()))
+        if today_stats:
+            if today_stats.risk_locked:
+                message = "Signal rejected: daily risk lock active"
+                log_event(db, "WEBHOOK", message, "WARNING")
+                return WebhookResponse(accepted=False, message=message)
+            if today_stats.consecutive_losses >= platform_settings.max_consecutive_losses:
+                message = "Signal rejected: consecutive loss circuit active"
+                log_event(db, "WEBHOOK", message, "WARNING")
+                return WebhookResponse(accepted=False, message=message)
+            if today_stats.pnl_percent <= platform_settings.daily_max_loss_percent:
+                message = "Signal rejected: daily loss limit exceeded"
+                log_event(db, "WEBHOOK", message, "WARNING")
+                return WebhookResponse(accepted=False, message=message)
+
+        recent_loss = db.scalar(
+            select(StrategyTrade.id)
+            .where(
+                StrategyTrade.strategy_name == strategy_name,
+                StrategyTrade.result == TradeResult.LOSS,
+                StrategyTrade.exit_time.is_not(None),
+                StrategyTrade.exit_time >= utc_now() - timedelta(minutes=30),
+            )
+            .limit(1)
+        )
+        if recent_loss is not None:
+            message = "Signal rejected due to cooldown after recent loss."
+            log_event(db, "WEBHOOK", message, "WARNING")
+            return WebhookResponse(accepted=False, message=message)
+
+        response = multi_strategy_manager.handle_signal(db, strategy_name, payload.signal)
         if response.accepted:
             telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
         else:

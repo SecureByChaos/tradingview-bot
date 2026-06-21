@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from uuid import uuid4
 
@@ -61,12 +62,13 @@ class MultiStrategyTradeManager:
             )
 
         mode = self.resolve_mode(strategy)
+        is_short = signal.value.startswith("SELL")
         order_id = None
         if mode == TradingMode.LIVE:
-            order_id = self.smartapi.place_market_order(contract, "BUY", quantity)
+            order_id = self.smartapi.place_market_order(contract, "SELL" if is_short else "BUY", quantity)
 
-        stoploss = round(entry_price * (1 - strategy.sl_percent / 100), 2)
-        target = round(entry_price * (1 + strategy.tp_percent / 100), 2)
+        stoploss = round(entry_price * (1 + strategy.sl_percent / 100), 2) if is_short else round(entry_price * (1 - strategy.sl_percent / 100), 2)
+        target = round(entry_price * (1 - strategy.tp_percent / 100), 2) if is_short else round(entry_price * (1 + strategy.tp_percent / 100), 2)
         now = utc_now()
         trade = StrategyTrade(
             trade_id=uuid4().hex,
@@ -88,6 +90,9 @@ class MultiStrategyTradeManager:
             status=TradeStatus.OPEN,
             result=TradeResult.OPEN,
             entry_order_id=order_id,
+            highest_price=round(entry_price, 2),
+            lowest_price=round(entry_price, 2),
+            trailing_active=False,
         )
         db.add(trade)
         db.commit()
@@ -110,12 +115,37 @@ class MultiStrategyTradeManager:
                 premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
                 trade.current_premium = round(premium, 2)
                 trade.pnl_percent = round(((premium - trade.entry_price) / trade.entry_price) * 100, 2)
+                is_short = trade.signal.startswith("SELL")
+                activation_threshold = round(trade.entry_price * (float(os.getenv("TRAILING_ACTIVATION_PERCENT", "10")) / 100), 2)
+                trailing_offset = round(trade.entry_price * (float(os.getenv("TRAILING_OFFSET_PERCENT", "5")) / 100), 2)
                 reason: ExitReason | None = None
-                if premium <= trade.stoploss:
-                    reason = ExitReason.STOPLOSS
-                elif premium >= trade.target:
-                    reason = ExitReason.TARGET
-                elif now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 15):
+
+                if is_short:
+                    trade.lowest_price = premium if trade.lowest_price is None else min(trade.lowest_price, premium)
+                    if not trade.trailing_active and premium <= trade.entry_price - activation_threshold:
+                        trade.trailing_active = True
+                    if trade.trailing_active:
+                        trade.trailing_stop = round(trade.lowest_price + trailing_offset, 2)
+                    if trade.trailing_active and trade.trailing_stop is not None and premium >= trade.trailing_stop:
+                        reason = ExitReason.STOPLOSS
+                    elif premium >= trade.stoploss:
+                        reason = ExitReason.STOPLOSS
+                    elif premium <= trade.target:
+                        reason = ExitReason.TARGET
+                else:
+                    trade.highest_price = premium if trade.highest_price is None else max(trade.highest_price, premium)
+                    if not trade.trailing_active and premium >= trade.entry_price + activation_threshold:
+                        trade.trailing_active = True
+                    if trade.trailing_active:
+                        trade.trailing_stop = round(trade.highest_price - trailing_offset, 2)
+                    if trade.trailing_active and trade.trailing_stop is not None and premium <= trade.trailing_stop:
+                        reason = ExitReason.STOPLOSS
+                    elif premium <= trade.stoploss:
+                        reason = ExitReason.STOPLOSS
+                    elif premium >= trade.target:
+                        reason = ExitReason.TARGET
+
+                if reason is None and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 15)):
                     reason = ExitReason.TIME_EXIT
                 if reason is not None:
                     self.close_trade(db, trade, premium, reason)
@@ -142,12 +172,17 @@ class MultiStrategyTradeManager:
                 option_type=trade.option_type,
                 lot_size=max(trade.quantity, 1),
             )
-            trade.exit_order_id = self.smartapi.close_position(contract, trade.quantity)
+            trade.exit_order_id = self.smartapi.place_market_order(
+                contract,
+                "BUY" if trade.signal.startswith("SELL") else "SELL",
+                trade.quantity,
+            )
         trade.exit_price = round(exit_price, 2)
         trade.current_premium = round(exit_price, 2)
         trade.exit_time = utc_now()
-        trade.profit_loss = round((exit_price - trade.entry_price) * trade.quantity, 2)
-        trade.pnl_percent = round(((exit_price - trade.entry_price) / trade.entry_price) * 100, 2)
+        direction = -1 if trade.signal.startswith("SELL") else 1
+        trade.profit_loss = round((exit_price - trade.entry_price) * trade.quantity * direction, 2)
+        trade.pnl_percent = round(((exit_price - trade.entry_price) / trade.entry_price) * 100 * direction, 2)
         trade.result = self.result_for_pnl(trade.pnl_percent)
         trade.status = TradeStatus.CLOSED
         trade.exit_reason = reason.value

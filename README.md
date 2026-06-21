@@ -1,17 +1,17 @@
 # banknifty-trading-bot
 
-Production-ready FastAPI webhook bot for BankNifty option buying signals from TradingView, with Angel One SmartAPI execution, active-trade persistence, scheduled monitoring, and CSV trade logs.
+Production-ready FastAPI webhook bot for BankNifty option signals from TradingView, with Angel One SmartAPI execution, SQLite-backed multi-strategy trade state, scheduled monitoring, and dashboard controls.
 
 ## Architecture
 
 ```text
-TradingView -> Webhook -> FastAPI -> Trade Manager -> Angel One SmartAPI
-                                      -> Trade Monitor -> CSV Trade Logger
+TradingView -> Webhook -> FastAPI -> Multi-Strategy Engine -> Angel One SmartAPI
+                                      -> Trade Monitor -> SQLite Trade History
 ```
 
 ## Features
 
-- `POST /webhook` accepts only `BUY_CE` and `BUY_PE`.
+- `POST /webhook` accepts `BUY_CE`, `SELL_CE`, `BUY_PE`, and `SELL_PE`.
 - Dynamic multi-strategy engine driven by database strategy configuration.
 - Supports simultaneous independent trades per strategy without a global active-trade lock.
 - Strategy-specific PAPER/LIVE mode, TP/SL, max active trades, and capital allocation.
@@ -20,15 +20,14 @@ TradingView -> Webhook -> FastAPI -> Trade Manager -> Angel One SmartAPI
 - SQLite-backed platform state for bot status, settings, strategy configs, strategy trades, daily stats, and structured logs.
 - REST API under `/api/*` for status, trades, settings, bot controls, kill switch, and daily-lock reset.
 - Telegram notifications for bot events, trade events, exits, risk locks, and system errors.
-- Automatically selects the current ATM BankNifty CE/PE from live BankNifty spot.
-- One open trade at a time.
-- Maximum two completed trades per day.
-- Stops trading after two same-day stoploss exits.
-- Entry risk management: 10% stoploss and 20% target.
+- Automatically resolves the nearest weekly ATM BankNifty CE/PE contract from cached Angel One Scrip Master data.
+- Per-strategy active trade limits.
+- 30-minute same-strategy loss cooldown circuit.
+- Daily risk lock and consecutive-loss circuit checks before trade execution.
+- Strategy-level TP/SL plus server-side trailing stop support.
 - Monitors active trades every 30 seconds.
 - Squares off open positions at 15:15 IST.
-- Persists active trade state in `data/active_trade.json`.
-- Logs completed trades to `data/trades.csv`.
+- Persists active and completed strategy trades in SQLite.
 - Safe-by-default paper mode via `SMARTAPI_LIVE_TRADING=false`.
 
 ## Local Setup
@@ -62,7 +61,7 @@ Send a test signal:
 ```bash
 curl -X POST http://localhost:8000/webhook ^
   -H "Content-Type: application/json" ^
-  -d "{\"signal\":\"BUY_CE\"}"
+  -d "{\"strategy\":\"V7\",\"signal\":\"BUY_CE\"}"
 ```
 
 ## Environment Variables
@@ -82,6 +81,11 @@ curl -X POST http://localhost:8000/webhook ^
 | `QUANTITY_LOTS` | Number of BankNifty lots to trade |
 | `BANKNIFTY_LOT_SIZE` | Current BankNifty lot size from NSE/broker contract specs |
 | `BANKNIFTY_SPOT_TOKEN` | SmartAPI token for BankNifty index |
+| `DEFAULT_STRATEGY_NAME` | Strategy used for legacy webhook payloads without `strategy` |
+| `INSTRUMENT_CACHE_PATH` | Cached Angel One Scrip Master JSON path |
+| `INSTRUMENT_MASTER_URL` | Angel One Scrip Master source URL |
+| `TRAILING_ACTIVATION_PERCENT` | Trailing stop activation threshold, default `10` |
+| `TRAILING_OFFSET_PERCENT` | Trailing stop offset buffer, default `5` |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
 
 ## SmartAPI Setup
@@ -92,7 +96,7 @@ curl -X POST http://localhost:8000/webhook ^
 4. Start with `SMARTAPI_LIVE_TRADING=false`.
 5. After paper testing, set `SMARTAPI_LIVE_TRADING=true` and restart the app.
 
-The code uses Angel One's SmartAPI Python SDK through a local adapter in `app/smartapi_client.py`. This keeps broker-specific behavior isolated for future changes.
+The code uses Angel One's SmartAPI Python SDK through `app/smartapi_client.py`. It performs TOTP login, stores JWT/refresh/feed tokens, retries API calls after token-expiry responses, refreshes the session when possible, and falls back to full TOTP login if refresh fails.
 
 ## TradingView Webhook Setup
 
@@ -112,6 +116,16 @@ Alert message for PE:
 
 ```json
 {"strategy":"V6 Momentum","signal":"BUY_PE"}
+```
+
+Short-side examples:
+
+```json
+{"strategy":"V7","signal":"SELL_CE"}
+```
+
+```json
+{"strategy":"V7","signal":"SELL_PE"}
 ```
 
 Signals should already be time-filtered in TradingView. The Python bot enforces platform state, strategy enabled state, per-strategy active trade limits, risk settings, and 15:15 IST square-off.
@@ -138,18 +152,20 @@ When a webhook arrives, the engine:
 
 1. Loads the strategy by name.
 2. Rejects the signal if the strategy does not exist or is disabled.
-3. Checks open trades only for that strategy.
-4. Rejects the signal if `max_active_trades` is reached.
-5. Selects the ATM BankNifty option for the signal.
-6. Sizes the position from `capital_per_trade`.
-7. Opens PAPER or LIVE according to strategy config and global `SMARTAPI_LIVE_TRADING`.
-8. Monitors TP, SL, and square-off independently for every open strategy trade.
+3. Checks bot status, daily lock, consecutive-loss limit, daily loss limit, and recent-loss cooldown.
+4. Checks open trades only for that strategy.
+5. Rejects the signal if `max_active_trades` is reached.
+6. Selects the nearest weekly ATM BankNifty option for the signal.
+7. Sizes the position from `capital_per_trade`.
+8. Opens PAPER or LIVE according to strategy config and global `SMARTAPI_LIVE_TRADING`.
+9. Monitors TP, SL, trailing stop, and square-off independently for every open strategy trade.
 
 Example simultaneous state:
 
 ```text
 V5.1 -> BUY_CE open
 V6 Momentum -> BUY_PE open
+V7 -> SELL_CE open
 Scalper -> 2 open trades
 ```
 
@@ -176,6 +192,38 @@ capital_per_trade / (entry_price * option_lot_size)
 ```
 
 The result is rounded down to whole lots.
+
+## V7 Circuits and Trailing Stop
+
+Before a webhook can open a trade, the backend checks:
+
+- Bot trading allowed state.
+- `daily_stats.risk_locked`.
+- `daily_stats.consecutive_losses` against configured max consecutive losses.
+- `daily_stats.pnl_percent` against configured daily max loss.
+- Same-strategy `LOSS` exits within the last 30 minutes.
+
+Open trades track:
+
+- `highest_price`
+- `lowest_price`
+- `trailing_active`
+- `trailing_stop`
+
+For long entries (`BUY_CE`, `BUY_PE`), trailing activates after price advances by `TRAILING_ACTIVATION_PERCENT`; the stop trails below `highest_price` by `TRAILING_OFFSET_PERCENT`.
+
+For short entries (`SELL_CE`, `SELL_PE`), trailing activates after price falls by `TRAILING_ACTIVATION_PERCENT`; the stop trails above `lowest_price` by `TRAILING_OFFSET_PERCENT`.
+
+## Database Migration
+
+`init_db()` auto-adds the V7 trailing columns when missing. Manual SQL:
+
+```sql
+ALTER TABLE strategy_trades ADD COLUMN highest_price FLOAT;
+ALTER TABLE strategy_trades ADD COLUMN lowest_price FLOAT;
+ALTER TABLE strategy_trades ADD COLUMN trailing_active BOOLEAN NOT NULL DEFAULT 0;
+ALTER TABLE strategy_trades ADD COLUMN trailing_stop FLOAT;
+```
 
 ## AWS Lightsail Deployment
 
@@ -221,24 +269,24 @@ Returns service status and live-trading mode.
 
 ### `GET /active-trade`
 
-Returns the persisted active trade, or `null`.
+Returns open strategy trades.
 
 ### `GET /trades`
 
-Returns completed trade rows from `data/trades.csv`.
+Returns recent strategy trades from SQLite.
 
 ### `POST /webhook`
 
 Payload:
 
 ```json
-{"signal":"BUY_CE"}
+{"strategy":"V7","signal":"BUY_CE"}
 ```
 
 or:
 
 ```json
-{"signal":"BUY_PE"}
+{"strategy":"V7","signal":"SELL_PE"}
 ```
 
 ### Admin REST API
