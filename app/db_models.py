@@ -75,6 +75,16 @@ class StrategyConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class StrategyStats(Base):
+    __tablename__ = "strategy_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_name: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    consecutive_losses: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    risk_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class StrategyTrade(Base):
     __tablename__ = "strategy_trades"
 

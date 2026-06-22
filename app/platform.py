@@ -8,7 +8,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import BotState, BotStatus, DailyStats, LogEvent, PlatformSettings, StrategyConfig, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.db_models import BotState, BotStatus, DailyStats, LogEvent, PlatformSettings, StrategyConfig, StrategyStats, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.time_utils import duration_label, format_ist, iso_utc
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -46,6 +46,30 @@ def get_or_create_daily_stats(db: Session, trade_date: date | None = None) -> Da
         db.add(stats)
         db.commit()
         db.refresh(stats)
+    return stats
+
+
+def get_or_create_strategy_stats(db: Session, strategy_name: str) -> StrategyStats:
+    stats = db.scalar(select(StrategyStats).where(StrategyStats.strategy_name == strategy_name))
+    if stats is None:
+        stats = StrategyStats(strategy_name=strategy_name)
+        db.add(stats)
+        db.commit()
+        db.refresh(stats)
+    return stats
+
+
+def update_strategy_stats_after_close(db: Session, strategy_name: str, result: str) -> StrategyStats:
+    settings = get_or_create_settings(db)
+    stats = get_or_create_strategy_stats(db, strategy_name)
+    if result == TradeResult.LOSS:
+        stats.consecutive_losses += 1
+        stats.risk_locked = stats.consecutive_losses >= settings.max_consecutive_losses
+    elif result == TradeResult.WIN:
+        stats.consecutive_losses = 0
+        stats.risk_locked = False
+    db.commit()
+    db.refresh(stats)
     return stats
 
 
@@ -90,8 +114,6 @@ def trading_allowed(db: Session) -> tuple[bool, str]:
         return False, "Trading disabled by admin"
     if stats.trade_count >= settings.max_trades_per_day:
         return False, "Trading disabled: maximum trades per day reached"
-    if stats.consecutive_losses >= settings.max_consecutive_losses:
-        return False, "Trading disabled: maximum consecutive losses reached"
     if stats.pnl_percent <= settings.daily_max_loss_percent:
         return False, "Trading disabled: daily max loss reached"
     return True, "Trading allowed"
@@ -233,6 +255,7 @@ def strategy_metrics(db: Session) -> list[dict[str, Any]]:
         metrics.append(
             {
                 "strategy": strategy,
+                "stats": get_or_create_strategy_stats(db, strategy.name),
                 "open_trades": open_trades,
                 "total_trades": total,
                 "wins": wins,

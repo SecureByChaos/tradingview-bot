@@ -13,6 +13,7 @@ from app.database import get_db
 from app.db_models import BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
 from app.platform import (
     get_dashboard_summary,
+    get_or_create_strategy_stats,
     get_or_create_settings,
     latest_logs,
     log_event,
@@ -170,6 +171,7 @@ def create_strategy(
     )
     db.add(strategy)
     db.commit()
+    get_or_create_strategy_stats(db, strategy.name)
     log_event(db, "BOT", f"Strategy created: {strategy.name}")
     return RedirectResponse("/strategies", status_code=303)
 
@@ -202,6 +204,7 @@ def update_strategy(
     strategy.paper_trade = paper_trade == "on"
     strategy.live_trade = live_trade == "on"
     db.commit()
+    get_or_create_strategy_stats(db, strategy.name)
     log_event(db, "BOT", f"Strategy updated: {strategy.name}")
     return RedirectResponse("/strategies", status_code=303)
 

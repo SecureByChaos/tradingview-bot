@@ -77,11 +77,15 @@ def _ensure_columns() -> None:
 def _seed_default_strategy() -> None:
     from sqlalchemy import select
 
-    from app.db_models import StrategyConfig, TradingMode
+    from app.db_models import StrategyConfig, StrategyStats, TradingMode
 
     with SessionLocal() as db:
         strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == settings.default_strategy_name))
         if strategy is not None:
+            stats = db.scalar(select(StrategyStats).where(StrategyStats.strategy_name == strategy.name))
+            if stats is None:
+                db.add(StrategyStats(strategy_name=strategy.name))
+                db.commit()
             return
         strategy = StrategyConfig(
             name=settings.default_strategy_name,
@@ -95,4 +99,5 @@ def _seed_default_strategy() -> None:
             live_trade=False,
         )
         db.add(strategy)
+        db.add(StrategyStats(strategy_name=strategy.name))
         db.commit()

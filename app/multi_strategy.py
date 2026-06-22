@@ -12,7 +12,7 @@ from app.config import Settings
 from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, Signal, WebhookResponse
 from app.option_finder import OptionFinder
-from app.platform import log_event
+from app.platform import log_event, update_strategy_stats_after_close
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
 from app.time_utils import IST, format_ist, utc_now
@@ -208,6 +208,7 @@ class MultiStrategyTradeManager:
         trade.result = self.result_for_pnl(trade.pnl_percent)
         trade.status = TradeStatus.CLOSED
         trade.exit_reason = reason.value
+        stats = update_strategy_stats_after_close(db, trade.strategy_name, trade.result)
         db.commit()
         db.refresh(trade)
         log_event(
@@ -216,6 +217,9 @@ class MultiStrategyTradeManager:
             f"[{trade.strategy_name}] trade closed: {reason.value}",
             payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time)},
         )
+        if stats.risk_locked:
+            log_event(db, "RISK", f"Strategy {trade.strategy_name} locked due to consecutive losses", "WARNING")
+            self.telegram.send(db, f"Strategy Risk Lock\n[{trade.strategy_name}] consecutive losses: {stats.consecutive_losses}")
         self.telegram.send(db, f"Trade Closed\n[{trade.strategy_name}] {reason.value}\nP&L: {trade.pnl_percent:.2f}%")
         return trade
 

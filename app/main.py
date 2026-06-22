@@ -12,12 +12,12 @@ from app import api_routes, dashboard_routes
 from app.config import get_settings
 from app.database import SessionLocal, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
-from app.db_models import DailyStats, StrategyConfig, StrategyTrade, TradeResult, TradeStatus
+from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus
 from app.models import WebhookPayload, WebhookResponse
 from app.multi_strategy import MultiStrategyTradeManager
 from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
-from app.platform import get_or_create_settings, log_event, serialize_strategy_trade, strategy_trades_query_for_filter, today_ist, trading_allowed
+from app.platform import get_or_create_settings, get_or_create_state, get_or_create_strategy_stats, log_event, rebuild_daily_stats, serialize_strategy_trade, strategy_trades_query_for_filter, today_ist, trading_allowed
 from sqlalchemy import select
 from app.risk import RiskProtectionService
 from app.scheduler import create_scheduler
@@ -109,14 +109,10 @@ def trades(db: Session = Depends(get_db)) -> list[dict[str, object]]:
 @app.post("/webhook", response_model=WebhookResponse)
 def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookResponse:
     try:
-        allowed, message = trading_allowed(db)
         strategy_name = (payload.strategy or settings.default_strategy_name).strip()
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
         if strategy_name.upper() == "V7" and payload.signal.value in {"SELL_CE", "SELL_PE"}:
             return multi_strategy_manager.handle_signal(db, strategy_name, payload.signal)
-        if not allowed:
-            log_event(db, "WEBHOOK", f"Webhook ignored: {message}", "WARNING")
-            return WebhookResponse(accepted=False, message=message)
 
         strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == strategy_name))
         if strategy is None:
@@ -124,21 +120,24 @@ def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookRe
             log_event(db, "WEBHOOK", message, "WARNING")
             return WebhookResponse(accepted=False, message=message)
 
+        strategy_stats = get_or_create_strategy_stats(db, strategy.name)
+        if strategy_stats.risk_locked:
+            message = f"Strategy {strategy.name} locked due to consecutive losses"
+            log_event(db, "WEBHOOK", message, "WARNING")
+            return WebhookResponse(accepted=False, message=message)
+
         platform_settings = get_or_create_settings(db)
-        today_stats = db.scalar(select(DailyStats).where(DailyStats.trade_date == today_ist()))
-        if today_stats:
-            if today_stats.risk_locked:
-                message = "Signal rejected: daily risk lock active"
-                log_event(db, "WEBHOOK", message, "WARNING")
-                return WebhookResponse(accepted=False, message=message)
-            if today_stats.consecutive_losses >= platform_settings.max_consecutive_losses:
-                message = "Signal rejected: consecutive loss circuit active"
-                log_event(db, "WEBHOOK", message, "WARNING")
-                return WebhookResponse(accepted=False, message=message)
-            if today_stats.pnl_percent <= platform_settings.daily_max_loss_percent:
-                message = "Signal rejected: daily loss limit exceeded"
-                log_event(db, "WEBHOOK", message, "WARNING")
-                return WebhookResponse(accepted=False, message=message)
+        state = get_or_create_state(db)
+        today_stats = rebuild_daily_stats(db, today_ist())
+        if state.risk_locked or today_stats.risk_locked or today_stats.pnl_percent <= platform_settings.daily_max_loss_percent:
+            message = "Global risk lock active"
+            log_event(db, "WEBHOOK", message, "WARNING")
+            return WebhookResponse(accepted=False, message=message)
+
+        allowed, message = trading_allowed(db)
+        if not allowed:
+            log_event(db, "WEBHOOK", f"Webhook ignored: {message}", "WARNING")
+            return WebhookResponse(accepted=False, message=message)
 
         recent_loss = db.scalar(
             select(StrategyTrade.id)

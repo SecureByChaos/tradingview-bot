@@ -15,6 +15,7 @@ from app.db_models import BotStatus, StrategyConfig, StrategyTrade, TradeStatus
 from app.db_models import TradingMode
 from app.platform import (
     api_status,
+    get_or_create_strategy_stats,
     get_or_create_settings,
     get_or_create_state,
     log_event,
@@ -73,6 +74,8 @@ def status(
             "losses": item["losses"],
             "win_rate": item["win_rate"],
             "net_pnl": item["net_pnl"],
+            "consecutive_losses": item["stats"].consecutive_losses,
+            "risk_locked": item["stats"].risk_locked,
             "enabled": item["strategy"].enabled,
         }
         for item in strategy_metrics(db)
@@ -159,8 +162,10 @@ def strategies(
     db: Annotated[Session, Depends(get_db)],
     _: Annotated[None, Depends(require_admin_api)] = None,
 ) -> list[dict[str, Any]]:
-    return [
-        {
+    payload = []
+    for strategy in db.scalars(select(StrategyConfig).order_by(StrategyConfig.name)):
+        stats = get_or_create_strategy_stats(db, strategy.name)
+        payload.append({
             "id": strategy.id,
             "name": strategy.name,
             "enabled": strategy.enabled,
@@ -171,8 +176,24 @@ def strategies(
             "capital_per_trade": strategy.capital_per_trade,
             "paper_trade": strategy.paper_trade,
             "live_trade": strategy.live_trade,
+            "consecutive_losses": stats.consecutive_losses,
+            "risk_locked": stats.risk_locked,
+        })
+    return payload
+
+
+@router.get("/strategy-stats")
+def strategy_stats(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "strategy_name": item["strategy"].name,
+            "consecutive_losses": item["stats"].consecutive_losses,
+            "risk_locked": item["stats"].risk_locked,
         }
-        for strategy in db.scalars(select(StrategyConfig).order_by(StrategyConfig.name))
+        for item in strategy_metrics(db)
     ]
 
 
