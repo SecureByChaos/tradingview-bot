@@ -130,7 +130,14 @@ class MultiStrategyTradeManager:
 
     def monitor_open_trades(self, db: Session) -> list[StrategyTrade]:
         closed: list[StrategyTrade] = []
-        trades = list(db.scalars(select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN)))
+        trades = list(
+            db.scalars(
+                select(StrategyTrade).where(
+                    StrategyTrade.status == TradeStatus.OPEN,
+                    func.upper(StrategyTrade.strategy_name) != "V7",
+                )
+            )
+        )
         now_ist = datetime.now(IST)
         for trade in trades:
             try:
@@ -225,7 +232,14 @@ class MultiStrategyTradeManager:
 
     def square_off_all(self, db: Session) -> list[StrategyTrade]:
         closed: list[StrategyTrade] = []
-        trades = list(db.scalars(select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN)))
+        trades = list(
+            db.scalars(
+                select(StrategyTrade).where(
+                    StrategyTrade.status == TradeStatus.OPEN,
+                    func.upper(StrategyTrade.strategy_name) != "V7",
+                )
+            )
+        )
         for trade in trades:
             premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
             closed.append(self.close_trade(db, trade, premium, ExitReason.TIME_EXIT))

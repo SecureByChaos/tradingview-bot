@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
-from app import api_routes, dashboard_routes
+from app import api_routes, dashboard_routes, v7_router
 from app.config import get_settings
 from app.database import SessionLocal, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
@@ -25,6 +25,7 @@ from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
 from app.time_utils import utc_now
 from app.trade_manager import TradeManager
+from app.v7_manager import V7Manager
 
 settings = get_settings()
 settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -37,6 +38,7 @@ option_finder = OptionFinder(settings, smartapi)
 trade_manager = TradeManager(settings, smartapi, option_finder, trade_logger)
 telegram = TelegramService()
 multi_strategy_manager = MultiStrategyTradeManager(settings, smartapi, option_finder, telegram)
+v7_manager = V7Manager(settings, smartapi, option_finder, telegram)
 risk_service = RiskProtectionService(multi_strategy_manager, telegram)
 monitor = MultiStrategyMonitor(multi_strategy_manager, risk_service)
 scheduler = create_scheduler(monitor)
@@ -85,9 +87,11 @@ api_routes.router.trade_logger = trade_logger  # type: ignore[attr-defined]
 dashboard_routes.router.trade_manager = trade_manager  # type: ignore[attr-defined]
 dashboard_routes.router.multi_strategy_manager = multi_strategy_manager  # type: ignore[attr-defined]
 dashboard_routes.router.smartapi = smartapi  # type: ignore[attr-defined]
+v7_router.router.v7_manager = v7_manager  # type: ignore[attr-defined]
 
 app.include_router(dashboard_routes.router)
 app.include_router(api_routes.router)
+app.include_router(v7_router.router)
 
 
 @app.get("/health")
@@ -111,8 +115,8 @@ def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookRe
     try:
         strategy_name = (payload.strategy or settings.default_strategy_name).strip()
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
-        if strategy_name.upper() == "V7" and payload.signal.value in {"SELL_CE", "SELL_PE"}:
-            return multi_strategy_manager.handle_signal(db, strategy_name, payload.signal)
+        if strategy_name.upper() == "V7":
+            return v7_manager.handle_signal(db, payload.signal)
 
         strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == strategy_name))
         if strategy is None:
