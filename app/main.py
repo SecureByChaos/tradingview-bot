@@ -17,7 +17,7 @@ from app.models import WebhookPayload, WebhookResponse
 from app.multi_strategy import MultiStrategyTradeManager
 from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
-from app.platform import get_or_create_settings, get_or_create_state, get_or_create_strategy_stats, log_event, rebuild_daily_stats, serialize_strategy_trade, strategy_trades_query_for_filter, today_ist, trading_allowed
+from app.platform import get_or_create_settings, get_or_create_state, get_or_create_strategy_stats, log_event, rebuild_daily_stats, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, today_ist, trading_allowed
 from sqlalchemy import select
 from app.risk import RiskProtectionService
 from app.scheduler import create_scheduler
@@ -113,6 +113,7 @@ def trades(db: Session = Depends(get_db)) -> list[dict[str, object]]:
 @app.post("/webhook", response_model=WebhookResponse)
 def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookResponse:
     try:
+        reset_daily_risk_if_needed(db)
         strategy_name = (payload.strategy or settings.default_strategy_name).strip()
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
         if strategy_name.upper() == "V7":

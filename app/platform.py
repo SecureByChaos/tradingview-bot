@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
 from app.db_models import BotState, BotStatus, DailyStats, LogEvent, PlatformSettings, StrategyConfig, StrategyStats, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
-from app.time_utils import duration_label, format_ist, iso_utc
+from app.time_utils import duration_label, format_ist, iso_utc, to_ist
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -57,6 +57,24 @@ def get_or_create_strategy_stats(db: Session, strategy_name: str) -> StrategySta
         db.commit()
         db.refresh(stats)
     return stats
+
+
+def reset_daily_risk_if_needed(db: Session) -> None:
+    message = "Daily risk reset completed."
+    last_reset = db.scalar(select(LogEvent).where(LogEvent.message == message).order_by(LogEvent.created_at.desc()).limit(1))
+    if last_reset is not None and to_ist(last_reset.created_at).date() == today_ist():
+        return
+
+    for stats in db.scalars(select(StrategyStats)):
+        stats.consecutive_losses = 0
+        stats.risk_locked = False
+    state = get_or_create_state(db)
+    state.risk_locked = False
+    daily_stats = get_or_create_daily_stats(db, today_ist())
+    daily_stats.consecutive_losses = 0
+    daily_stats.risk_locked = False
+    db.commit()
+    log_event(db, "RISK", message)
 
 
 def update_strategy_stats_after_close(db: Session, strategy_name: str, result: str) -> StrategyStats:
