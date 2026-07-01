@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<h2 class="mb-3">AI Reviews</h2>
+<form class="metric mb-4" method="get" action="/ai-reviews">
+  <div class="row g-3 align-items-end">
+    <div class="col-md-2"><label class="form-label">Date</label><input class="form-control" type="date" name="review_date" value="{{ filters.review_date }}"></div>
+    <div class="col-md-2"><label class="form-label">Strategy</label><select class="form-select" name="strategy"><option value="">All</option>{% for value in strategies %}<option value="{{ value }}" {% if filters.strategy == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div class="col-md-2"><label class="form-label">Provider</label><select class="form-select" name="provider"><option value="">All</option>{% for value in providers %}<option value="{{ value }}" {% if filters.provider == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div class="col-md-2"><label class="form-label">Decision</label><select class="form-select" name="decision"><option value="">All</option>{% for value in ["APPROVE", "WATCH", "REJECT", "ERROR"] %}<option value="{{ value }}" {% if filters.decision == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div class="col-md-2"><label class="form-label">Trade Result</label><select class="form-select" name="trade_result"><option value="">All</option>{% for value in ["WIN", "LOSS", "BREAKEVEN"] %}<option value="{{ value }}" {% if filters.trade_result == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div class="col-md-2"><button class="btn btn-primary w-100" type="submit">Filter</button></div>
+  </div>
+</form>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-2"><div class="metric"><div class="label">Reviews</div><div class="value">{{ summary.reviews }}</div></div></div>
+  <div class="col-md-2"><div class="metric"><div class="label">Approved</div><div class="value profit">{{ summary.approved }}</div></div></div>
+  <div class="col-md-2"><div class="metric"><div class="label">Watch</div><div class="value warn">{{ summary.watch }}</div></div></div>
+  <div class="col-md-2"><div class="metric"><div class="label">Rejected</div><div class="value loss">{{ summary.rejected }}</div></div></div>
+  <div class="col-md-2"><div class="metric"><div class="label">Average Confidence</div><div class="value">{{ summary.confidence }}%</div></div></div>
+  <div class="col-md-2"><div class="metric"><div class="label">Average Latency</div><div class="value">{{ summary.latency }} ms</div></div></div>
+</div>
+
+{% for group in groups %}
+<h5 class="mt-4 mb-2">{{ group.date }}</h5>
+<div class="table-responsive">
+  <table class="table table-dark table-hover align-middle">
+    <thead><tr><th>Time</th><th>Strategy</th><th>Signal</th><th>Provider</th><th>Decision</th><th>Confidence</th><th>Trade Result</th><th>PnL</th><th></th></tr></thead>
+    <tbody>
+    {% for item in group.reviews %}{% set review = item.review %}
+      <tr>
+        <td>{{ review.created_at | ist }}</td><td>{{ review.strategy }}</td><td>{{ review.signal }}</td><td>{{ review.provider }}</td>
+        <td>{{ review.decision }}</td><td>{{ review.confidence }}%</td><td>{{ review.actual_result or "-" }}</td><td>{{ review.actual_pnl if review.actual_pnl is not none else "-" }}</td>
+        <td><button class="btn btn-sm btn-outline-light" type="button" data-bs-toggle="collapse" data-bs-target="#review-{{ review.id }}">Details</button></td>
+      </tr>
+      <tr class="collapse" id="review-{{ review.id }}"><td colspan="9">
+        <div class="row g-3 py-2">
+          <div class="col-md-6"><strong>Reason To Buy</strong><div>{{ item.reason_to_buy | join(", ") or "-" }}</div></div>
+          <div class="col-md-6"><strong>Reason Not To Buy</strong><div>{{ item.reason_not_to_buy | join(", ") or "-" }}</div></div>
+          <div class="col-12"><strong>Summary</strong><div>{{ review.summary or "-" }}</div></div>
+          <div class="col-md-3"><strong>Prompt Version</strong><div>{{ review.prompt_version }}</div></div>
+          <div class="col-md-3"><strong>Context Version</strong><div>{{ review.context_version }}</div></div>
+          <div class="col-md-3"><strong>Framework Version</strong><div>{{ review.framework_version }}</div></div>
+          <div class="col-md-3"><strong>Latency</strong><div>{{ review.latency_ms }} ms</div></div>
+          <div class="col-md-3"><strong>Model</strong><div>{{ review.model or "-" }}</div></div>
+          <div class="col-md-3"><strong>Market Type</strong><div>{{ review.market_type or "-" }}</div></div>
+          <div class="col-md-3"><strong>Entry Quality</strong><div>{{ review.entry_quality or "-" }}</div></div>
+          <div class="col-md-3"><strong>Risk</strong><div>{{ review.risk or "-" }}</div></div>
+        </div>
+      </td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="metric">No AI reviews found.</div>
+{% endfor %}
+
+{% if pages > 1 %}<nav class="d-flex justify-content-between align-items-center mt-4">
+  <a class="btn btn-outline-light {% if page <= 1 %}disabled{% endif %}" href="{{ previous_url }}">Previous</a>
+  <span>Page {{ page }} of {{ pages }}</span>
+  <a class="btn btn-outline-light {% if page >= pages %}disabled{% endif %}" href="{{ next_url }}">Next</a>
+</nav>{% endif %}
+{% endblock %}

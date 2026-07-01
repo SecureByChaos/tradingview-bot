@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
+import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -13,7 +14,7 @@ from app.ai.context_builder import SignalContextBuilder
 from app.ai.factory import create_reviewer
 from app.ai.repository import create_settings as create_ai_settings, get_settings as get_ai_settings, update_settings as update_ai_settings
 from app.database import get_db
-from app.db_models import BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
+from app.db_models import AITradeReview, BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
 from app.platform import (
     get_dashboard_summary,
     get_or_create_strategy_stats,
@@ -23,9 +24,9 @@ from app.platform import (
     strategy_metrics,
     strategy_trades_query_for_filter,
 )
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from app.smartapi_client import SmartAPIError
-from app.time_utils import duration_label, format_ist
+from app.time_utils import IST, duration_label, format_ist, to_ist
 from app.trade_manager import TradeManager
 
 templates = Jinja2Templates(directory="app/templates")
@@ -346,6 +347,87 @@ def logs_page(
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     return templates.TemplateResponse("logs.html", {"request": request, "logs": latest_logs(db, 200)})
+
+
+@router.get("/ai-reviews", response_class=HTMLResponse)
+def ai_reviews_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    review_date: str = "",
+    strategy: str = "",
+    provider: str = "",
+    decision: str = "",
+    trade_result: str = "",
+    page: int = 1,
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    query = select(AITradeReview)
+    if review_date:
+        day = date.fromisoformat(review_date)
+        start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+        end = datetime.combine(day, time.max, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+        query = query.where(AITradeReview.created_at.between(start, end))
+    if strategy:
+        query = query.where(AITradeReview.strategy == strategy)
+    if provider:
+        query = query.where(AITradeReview.provider == provider)
+    if decision:
+        query = query.where(AITradeReview.decision == decision)
+    if trade_result:
+        query = query.where(AITradeReview.actual_result == trade_result)
+
+    filtered = query.subquery()
+    summary = db.execute(
+        select(
+            func.count(filtered.c.id),
+            func.sum(case((filtered.c.decision == "APPROVE", 1), else_=0)),
+            func.sum(case((filtered.c.decision == "WATCH", 1), else_=0)),
+            func.sum(case((filtered.c.decision == "REJECT", 1), else_=0)),
+            func.avg(filtered.c.confidence),
+            func.avg(filtered.c.latency_ms),
+        )
+    ).one()
+    page_size = 25
+    total = int(summary[0] or 0)
+    pages = max((total + page_size - 1) // page_size, 1)
+    page = min(max(page, 1), pages)
+    reviews = list(db.scalars(query.order_by(AITradeReview.created_at.desc()).offset((page - 1) * page_size).limit(page_size)))
+    groups: list[dict[str, object]] = []
+    for review in reviews:
+        day_label = to_ist(review.created_at).strftime("%d %b %Y")
+        if not groups or groups[-1]["date"] != day_label:
+            groups.append({"date": day_label, "reviews": []})
+        groups[-1]["reviews"].append(
+            {
+                "review": review,
+                "reason_to_buy": _review_list(review.reason_to_buy),
+                "reason_not_to_buy": _review_list(review.reason_not_to_buy),
+            }
+        )
+    filters = {"review_date": review_date, "strategy": strategy, "provider": provider, "decision": decision, "trade_result": trade_result}
+    return templates.TemplateResponse(
+        "ai_reviews.html",
+        {
+            "request": request,
+            "groups": groups,
+            "summary": {"reviews": total, "approved": summary[1] or 0, "watch": summary[2] or 0, "rejected": summary[3] or 0, "confidence": round(summary[4] or 0, 2), "latency": round(summary[5] or 0, 2)},
+            "strategies": list(db.scalars(select(AITradeReview.strategy).distinct().order_by(AITradeReview.strategy))),
+            "providers": list(db.scalars(select(AITradeReview.provider).distinct().order_by(AITradeReview.provider))),
+            "filters": filters,
+            "page": page,
+            "pages": pages,
+            "previous_url": str(request.url.include_query_params(page=page - 1)),
+            "next_url": str(request.url.include_query_params(page=page + 1)),
+        },
+    )
+
+
+def _review_list(value: str) -> list[str]:
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else [str(parsed)]
+    except (TypeError, ValueError):
+        return []
 
 
 def apply_settings(
