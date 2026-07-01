@@ -7,6 +7,7 @@ Production-ready FastAPI webhook bot for BankNifty option signals from TradingVi
 ```text
 TradingView -> Webhook -> FastAPI -> Multi-Strategy Engine -> Angel One SmartAPI
                                       -> Trade Monitor -> SQLite Trade History
+                         -> Background AI Shadow Review -> SQLite AI Reviews
 ```
 
 ## Features
@@ -29,6 +30,9 @@ TradingView -> Webhook -> FastAPI -> Multi-Strategy Engine -> Angel One SmartAPI
 - Squares off open positions at 15:15 IST.
 - Persists active and completed strategy trades in SQLite.
 - Safe-by-default paper mode via `SMARTAPI_LIVE_TRADING=false`.
+- Provider-independent AI review framework with Dummy and OpenAI providers.
+- Optional background Shadow Mode reviews that never block or modify trades.
+- Audited AI requests using request IDs and prompt hashes without logging API keys, full prompts, or raw provider responses.
 
 ## Local Setup
 
@@ -193,17 +197,21 @@ capital_per_trade / (entry_price * option_lot_size)
 
 The result is rounded down to whole lots.
 
-## V7 Circuits and Trailing Stop
+## V7 TradingView-Managed Execution
 
-Before a webhook can open a trade, the backend checks:
+V7 uses a separate execution path. `BUY_CE` and `BUY_PE` open ATM option trades; `SELL_CE` and `SELL_PE` close the matching open V7 option trade.
 
-- Bot trading allowed state.
-- `daily_stats.risk_locked`.
-- `daily_stats.consecutive_losses` against configured max consecutive losses.
-- `daily_stats.pnl_percent` against configured daily max loss.
-- Same-strategy `LOSS` exits within the last 30 minutes.
+For V7 only, exits are managed by TradingView. The server-side stop-loss, target, trailing-stop, cooldown, strategy-lock, and daily-lock engines do not manage V7 trades. SmartAPI execution, paper trading, trade history, Telegram alerts, and ATM strike resolution remain active.
 
-Open trades track:
+The V7 portal is available at `/v7` and shows status, mode, active trades, and the latest 20 V7 trades.
+
+## Risk Locks
+
+Consecutive-loss counts and locks are stored independently per strategy. A strategy lock does not block other strategies. Global daily account-loss protection remains separate from strategy locks.
+
+At the first webhook of each new `Asia/Kolkata` trading day, strategy consecutive-loss counts, strategy locks, and daily risk status reset automatically. The reset is persisted and logged once per IST day.
+
+Non-V7 open trades track:
 
 - `highest_price`
 - `lowest_price`
@@ -224,6 +232,30 @@ ALTER TABLE strategy_trades ADD COLUMN lowest_price FLOAT;
 ALTER TABLE strategy_trades ADD COLUMN trailing_active BOOLEAN NOT NULL DEFAULT 0;
 ALTER TABLE strategy_trades ADD COLUMN trailing_stop FLOAT;
 ```
+
+Apply the AI migrations in order for existing databases:
+
+```bash
+sqlite3 data/platform.sqlite3 ".read migrations/001_create_ai_settings.sql"
+sqlite3 data/platform.sqlite3 ".read migrations/002_create_ai_trade_reviews.sql"
+```
+
+`001_create_ai_settings.sql` creates the provider configuration and default Dummy/Shadow settings. `002_create_ai_trade_reviews.sql` stores AI reviews and later trade outcomes. Historical trade rows are not modified.
+
+## AI Reviews
+
+AI configuration is available to authenticated admins at `/ai-settings`.
+
+Supported settings include enable/disable, mode, provider, model, API key, base URL, temperature, timeout, confidence threshold, and system prompt. The API key is write-only in the page and is shown only as a masked placeholder after saving.
+
+Current providers:
+
+- `dummy`: returns the safe fallback response when AI is not configured.
+- `openai`: uses the shared HTTP client, prompt builder, response validator, and audit logger without an OpenAI SDK.
+
+When AI is enabled with mode `SHADOW`, each successfully processed TradingView signal queues a background review after normal webhook execution. AI cannot accept, reject, execute, resize, or alter a trade. Provider failures are logged and do not interrupt trading. Reviews store provider/model and framework versions, normalized decisions, confidence, reasoning, latency, and the linked trade outcome when available.
+
+The **Test Connection** button runs the configured provider independently of trading and displays only provider, model, latency, status, and a sanitized error.
 
 ## AWS Lightsail Deployment
 
@@ -314,11 +346,13 @@ Authenticated session required:
 - `/strategies` adds, edits, enables/disables, and deletes strategies.
 - `/control` provides start, stop, restart, kill switch, and daily-lock reset.
 - `/settings` persists trading, risk, square-off, and Telegram settings in SQLite.
+- `/ai-settings` configures and tests the optional AI provider.
+- `/v7` shows the TradingView-managed V7 portal.
 - `/logs` shows structured event logs.
 
 ## Daily Risk Lock
 
-The platform computes cumulative daily P&L from completed trades. If it is less than or equal to `Daily Max Loss %` (default `-20%`), the risk service closes the active position, disables new trades, sets bot status to `RISK_LOCKED`, sends a Telegram alert, and shows a dashboard warning. Admin reset is required from `/control`.
+The platform computes cumulative daily P&L from completed trades. If it is less than or equal to `Daily Max Loss %` (default `-20%`), the global risk service disables new non-V7 trades, sends a Telegram alert, and shows a dashboard warning. The lock resets automatically before the first webhook of the next IST trading day; an admin can also reset it from `/control`.
 
 ## Timezone
 
