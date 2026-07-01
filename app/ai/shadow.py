@@ -21,8 +21,16 @@ FRAMEWORK_VERSION = "v1"
 def run_shadow_review(strategy: str, signal: str, timestamp: datetime, trade_id: Optional[str]) -> None:
     try:
         with SessionLocal() as db:
+            logger.info("[AI] Shadow started")
             settings = get_settings(db)
-            if settings is None or not settings.enabled or settings.mode != "SHADOW":
+            if settings is None:
+                logger.info("[AI] Shadow skipped: ai_settings row not found")
+                return
+            if not settings.enabled:
+                logger.info("[AI] Shadow skipped: AI disabled")
+                return
+            if settings.mode != "SHADOW":
+                logger.info("[AI] Shadow skipped: mode is %s", settings.mode)
                 return
             context = SignalContextBuilder().build(strategy, signal, timestamp)
             PromptBuilder().build_signal_prompt(context, settings.system_prompt, PROMPT_VERSION)
@@ -34,17 +42,23 @@ def run_shadow_review(strategy: str, signal: str, timestamp: datetime, trade_id:
                     "latency_ms": provider_result.latency_ms,
                 }
             )
+            logger.info("[AI] Review parsed")
             if result.decision == "ERROR":
                 logger.error("AI shadow review failed: %s", result.summary)
-            save_review(
-                db,
-                trade_id,
-                strategy,
-                signal,
-                result,
-                PROMPT_VERSION,
-                CONTEXT_VERSION,
-                FRAMEWORK_VERSION,
-            )
+            try:
+                logger.info("[AI] Saving review trade_id=%s", trade_id)
+                review = save_review(
+                    db,
+                    trade_id,
+                    strategy,
+                    signal,
+                    result,
+                    PROMPT_VERSION,
+                    CONTEXT_VERSION,
+                    FRAMEWORK_VERSION,
+                )
+                logger.info("[AI] Review saved id=%s", review.id)
+            except Exception as exc:
+                logger.exception("[AI] Review save failed: %s", exc)
     except Exception:
         logger.exception("AI shadow review failed")

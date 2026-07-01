@@ -118,14 +118,16 @@ def queue_shadow_review(
     signal: str,
     response: WebhookResponse,
 ) -> WebhookResponse:
-    if response.accepted:
-        query = select(StrategyTrade).where(StrategyTrade.strategy_name == strategy_name)
-        if strategy_name.upper() == "V7" and signal.startswith("SELL"):
-            query = query.where(StrategyTrade.option_type == signal[-2:]).order_by(StrategyTrade.exit_time.desc())
-        else:
-            query = query.where(StrategyTrade.signal == signal).order_by(StrategyTrade.created_at.desc())
-        trade = db.scalar(query.limit(1))
-        background_tasks.add_task(run_shadow_review, strategy_name, signal, utc_now(), trade.trade_id if trade else None)
+    if not response.accepted:
+        logger.info("[AI] Shadow skipped: webhook response not accepted")
+        return response
+    query = select(StrategyTrade).where(StrategyTrade.strategy_name == strategy_name)
+    if strategy_name.upper() == "V7" and signal.startswith("SELL"):
+        query = query.where(StrategyTrade.option_type == signal[-2:]).order_by(StrategyTrade.exit_time.desc())
+    else:
+        query = query.where(StrategyTrade.signal == signal).order_by(StrategyTrade.created_at.desc())
+    trade = db.scalar(query.limit(1))
+    background_tasks.add_task(run_shadow_review, strategy_name, signal, utc_now(), trade.trade_id if trade else None)
     return response
 
 

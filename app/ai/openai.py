@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from app.ai.base import AIReviewer
 from app.ai.client import AIClient
 from app.ai.logger import AILogger
@@ -7,6 +9,8 @@ from app.ai.models import AIContext, ReviewResult
 from app.ai.prompt_builder import PromptBuilder
 from app.ai.validator import AIResponseValidator
 from app.db_models import AISettings
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAIReviewer(AIReviewer):
@@ -48,6 +52,7 @@ class OpenAIReviewer(AIReviewer):
                 },
                 timeout=self.settings.timeout_seconds,
             )
+            logger.info("[AI] OpenAI request completed")
             if response.error:
                 return self._logged_error(request_id, prompt_version, response.error, response.latency_ms)
 

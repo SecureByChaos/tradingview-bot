@@ -43,6 +43,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_columns()
     _seed_default_strategy()
+    _seed_default_ai_settings()
 
 
 def _ensure_columns() -> None:
@@ -101,3 +102,15 @@ def _seed_default_strategy() -> None:
         db.add(strategy)
         db.add(StrategyStats(strategy_name=strategy.name))
         db.commit()
+
+
+def _seed_default_ai_settings() -> None:
+    from sqlalchemy import select
+
+    from app.db_models import AISettings
+
+    with SessionLocal() as db:
+        settings_row = db.scalar(select(AISettings).limit(1))
+        if settings_row is None:
+            db.add(AISettings(id=1))
+            db.commit()
