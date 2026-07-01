@@ -56,14 +56,23 @@ class MultiStrategyTradeManager:
 
         contract = self.option_finder.find_atm_contract(signal)
         entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
+        mode = self.resolve_mode(strategy)
+        required_capital = round(entry_price * contract.lot_size, 2)
+        available_capital = "N/A (no capital balance ledger)"
         quantity = self.calculate_quantity(strategy, entry_price, contract.lot_size)
+        if mode == TradingMode.PAPER and quantity <= 0 and strategy.capital_per_trade > 0:
+            quantity = contract.lot_size
+        reject_reason = "capital_per_trade is insufficient" if quantity <= 0 else ""
+        logger.info(
+            "Mode: %s | Configured capital_per_trade: %.2f | Available capital: %s | Required capital: %.2f | Trade quantity: %s | Reject reason: %s",
+            mode, strategy.capital_per_trade, available_capital, required_capital, quantity, reject_reason,
+        )
         if quantity <= 0:
             return WebhookResponse(
                 accepted=False,
                 message=f"Rejected: capital_per_trade is insufficient for {contract.tradingsymbol}",
             )
 
-        mode = self.resolve_mode(strategy)
         is_short = signal.value.startswith("SELL")
         order_id = None
         if mode == TradingMode.LIVE:
