@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -14,6 +14,7 @@ from app.database import SessionLocal, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
 from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus
 from app.models import WebhookPayload, WebhookResponse
+from app.ai.shadow import run_shadow_review
 from app.multi_strategy import MultiStrategyTradeManager
 from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
@@ -110,14 +111,34 @@ def trades(db: Session = Depends(get_db)) -> list[dict[str, object]]:
     return [serialize_strategy_trade(trade) for trade in db.scalars(strategy_trades_query_for_filter("30d", None, None))]
 
 
+def queue_shadow_review(
+    background_tasks: BackgroundTasks,
+    db: Session,
+    strategy_name: str,
+    signal: str,
+    response: WebhookResponse,
+) -> WebhookResponse:
+    if response.accepted:
+        query = select(StrategyTrade).where(StrategyTrade.strategy_name == strategy_name)
+        if strategy_name.upper() == "V7" and signal.startswith("SELL"):
+            query = query.where(StrategyTrade.option_type == signal[-2:]).order_by(StrategyTrade.exit_time.desc())
+        else:
+            query = query.where(StrategyTrade.signal == signal).order_by(StrategyTrade.created_at.desc())
+        trade = db.scalar(query.limit(1))
+        background_tasks.add_task(run_shadow_review, strategy_name, signal, utc_now(), trade.trade_id if trade else None)
+    return response
+
+
 @app.post("/webhook", response_model=WebhookResponse)
-def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookResponse:
+def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> WebhookResponse:
     try:
         reset_daily_risk_if_needed(db)
         strategy_name = (payload.strategy or settings.default_strategy_name).strip()
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
         if strategy_name.upper() == "V7":
-            return v7_manager.handle_signal(db, payload.signal)
+            return queue_shadow_review(
+                background_tasks, db, strategy_name, payload.signal.value, v7_manager.handle_signal(db, payload.signal)
+            )
 
         strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == strategy_name))
         if strategy is None:
@@ -164,7 +185,7 @@ def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookRe
             telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
         else:
             log_event(db, "WEBHOOK", f"Signal ignored: {response.message}", "WARNING")
-        return response
+        return queue_shadow_review(background_tasks, db, strategy_name, payload.signal.value, response)
     except Exception as exc:
         logger.exception("Webhook processing failed")
         log_event(db, "ERROR", "Webhook processing failed", "ERROR", {"error": str(exc)})

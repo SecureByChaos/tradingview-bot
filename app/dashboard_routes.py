@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
@@ -9,6 +9,9 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.auth import authenticate_admin, require_admin_page
+from app.ai.context_builder import SignalContextBuilder
+from app.ai.factory import create_reviewer
+from app.ai.repository import create_settings as create_ai_settings, get_settings as get_ai_settings, update_settings as update_ai_settings
 from app.database import get_db
 from app.db_models import BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
 from app.platform import (
@@ -263,6 +266,77 @@ def update_settings_page(
     db.commit()
     log_event(db, "BOT", "Settings updated from dashboard")
     return RedirectResponse("/settings", status_code=303)
+
+
+@router.get("/ai-settings", response_class=HTMLResponse)
+def ai_settings_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    settings = get_ai_settings(db) or create_ai_settings(db, id=1)
+    return templates.TemplateResponse("ai_settings.html", {"request": request, "settings": settings, "test_result": None})
+
+
+@router.post("/ai-settings")
+def update_ai_settings_page(
+    db: Annotated[Session, Depends(get_db)],
+    mode: Annotated[str, Form()],
+    provider: Annotated[str, Form()],
+    model: Annotated[str, Form()],
+    api_key: Annotated[str, Form()],
+    base_url: Annotated[str, Form()],
+    temperature: Annotated[float, Form()],
+    timeout_seconds: Annotated[int, Form()],
+    confidence_threshold: Annotated[int, Form()],
+    system_prompt: Annotated[str, Form()],
+    enabled: Annotated[str | None, Form()] = None,
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    if (
+        mode not in {"DISABLED", "SHADOW", "ADVISORY", "BLOCKING"}
+        or provider not in {"dummy", "openai"}
+        or not 0 <= temperature <= 2
+        or timeout_seconds < 1
+        or not 0 <= confidence_threshold <= 100
+    ):
+        raise HTTPException(status_code=400, detail="Invalid AI configuration")
+    settings = get_ai_settings(db) or create_ai_settings(db, id=1)
+    values = {
+        "enabled": enabled == "on",
+        "mode": mode,
+        "provider": provider,
+        "model": model.strip(),
+        "base_url": base_url.strip(),
+        "temperature": temperature,
+        "timeout_seconds": timeout_seconds,
+        "confidence_threshold": confidence_threshold,
+        "system_prompt": system_prompt,
+    }
+    if api_key:
+        values["api_key"] = api_key
+    update_ai_settings(db, settings, **values)
+    return RedirectResponse("/ai-settings", status_code=303)
+
+
+@router.post("/ai-settings/test", response_class=HTMLResponse)
+def test_ai_settings(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    settings = get_ai_settings(db) or create_ai_settings(db, id=1)
+    result = create_reviewer(settings).analyze_signal(
+        SignalContextBuilder().build("CONNECTION_TEST", "TEST", datetime.now(timezone.utc))
+    )
+    test_result = {
+        "provider": settings.provider,
+        "model": settings.model,
+        "latency": result.latency_ms,
+        "status": "ERROR" if result.decision == "ERROR" else "OK",
+        "error": result.summary if result.decision == "ERROR" else "",
+    }
+    return templates.TemplateResponse("ai_settings.html", {"request": request, "settings": settings, "test_result": test_result})
 
 
 @router.get("/logs", response_class=HTMLResponse)

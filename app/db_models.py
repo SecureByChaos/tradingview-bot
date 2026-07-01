@@ -58,6 +58,51 @@ class PlatformSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
+class AISettings(Base):
+    __tablename__ = "ai_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), default="SHADOW", nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), default="dummy", nullable=False)
+    model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    api_key: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    base_url: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    temperature: Mapped[float] = mapped_column(Float, default=0.2, nullable=False)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    confidence_threshold: Mapped[int] = mapped_column(Integer, default=90, nullable=False)
+    system_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class AITradeReview(Base):
+    __tablename__ = "ai_trade_reviews"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    strategy: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    signal: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    context_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    framework_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    entry_quality: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    market_type: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    risk: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    reason_to_buy: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    reason_not_to_buy: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    actual_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    actual_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ai_correct: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class StrategyConfig(Base):
     __tablename__ = "strategy_configs"
 
