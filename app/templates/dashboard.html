@@ -29,6 +29,17 @@
   <div class="metric"><div class="label">Last Checked</div><div>{{ health.run_time }}</div></div>
   <div class="metric"><div class="label">Recovery Count Today</div><div class="value">{{ health.recovery_count }}</div></div>
 </div>
+<div class="section-header"><h5>Broker Health</h5></div>
+<div class="metric-grid">
+  <div class="metric"><div class="label">Broker Status</div><div class="value">{{ health.broker_state.status or '-' }}</div></div>
+  <div class="metric"><div class="label">Authentication Status</div><div class="value">{{ health.broker_state.authentication_status or '-' }}</div></div>
+  <div class="metric"><div class="label">Last Login</div><div>{{ health.broker_state.last_login|ist if health.broker_state.last_login else '-' }}</div></div>
+  <div class="metric"><div class="label">Last Refresh</div><div>{{ health.broker_state.last_refresh|ist if health.broker_state.last_refresh else '-' }}</div></div>
+  <div class="metric"><div class="label">Recovery Count</div><div class="value">{{ health.broker_state.recovery_count if health.broker_state.recovery_count is not none else 0 }}</div></div>
+  <div class="metric"><div class="label">JWT Status</div><div class="value">{{ health.broker_state.jwt_status or '-' }}</div></div>
+  <div class="metric"><div class="label">Feed Token Status</div><div class="value">{{ health.broker_state.feed_token_status or '-' }}</div></div>
+  <div class="metric"><div class="label">LTP Status</div><div class="value">{{ health.broker_state.ltp_status or '-' }}</div></div>
+</div>
 <div class="table-responsive responsive-table mt-3">
   <table class="table table-dark table-sm align-middle">
     <thead><tr><th>Broker</th><th>Authentication</th><th>LTP</th><th>Database</th><th>Webhook</th><th>Trading</th><th>AI</th><th>Server</th></tr></thead>

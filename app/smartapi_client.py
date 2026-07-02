@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -17,6 +19,11 @@ class SmartAPIError(RuntimeError):
     pass
 
 
+BROKER_CONNECTED = "CONNECTED"
+BROKER_RECONNECTING = "RECONNECTING"
+BROKER_FAILED = "FAILED"
+
+
 class SmartAPIClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -24,8 +31,67 @@ class SmartAPIClient:
         self._jwt_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._feed_token: Optional[str] = None
+        self._auth_lock = threading.RLock()
+        self._status = BROKER_RECONNECTING
+        self._last_login: Optional[datetime] = None
+        self._last_refresh: Optional[datetime] = None
+        self._last_login_monotonic: float = 0.0
+        self._last_refresh_monotonic: float = 0.0
+        self._last_error: str = ""
+        self._ltp_status: str = "UNKNOWN"
+        self._auth_status: str = "DISCONNECTED"
+        self._jwt_status: str = "MISSING"
+        self._feed_status: str = "MISSING"
+        self._recovery_count_total = 0
         self._recovery_count = 0
         self._recovery_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+
+    @staticmethod
+    def _now_ist() -> datetime:
+        return datetime.now(ZoneInfo("Asia/Kolkata"))
+
+    @staticmethod
+    def _strip_bearer(token: str | None) -> str | None:
+        if not token:
+            return token
+        if token.lower().startswith("bearer "):
+            return token[7:].strip()
+        return token
+
+    def _mark_failed(self, reason: str) -> None:
+        self._status = BROKER_FAILED
+        self._auth_status = "FAILED"
+        self._last_error = reason
+        logger.error("[AUTH] Broker FAILED")
+
+    def _apply_tokens(self, jwt: str | None, refresh: str | None, feed: str | None) -> None:
+        self._jwt_token = self._strip_bearer(jwt)
+        self._refresh_token = refresh
+        self._feed_token = feed
+        if self._client is not None:
+            if self._jwt_token:
+                self._client.setAccessToken(self._jwt_token)
+            if self._refresh_token:
+                self._client.setRefreshToken(self._refresh_token)
+            if self._feed_token:
+                self._client.setFeedToken(self._feed_token)
+        self._jwt_status = "VALID" if self._jwt_token else "MISSING"
+        self._feed_status = "VALID" if self._feed_token else "MISSING"
+        self._auth_status = "OK" if self._jwt_token and self._feed_token else "FAILED"
+
+    def get_broker_health(self) -> dict[str, object]:
+        return {
+            "status": self._status,
+            "authentication_status": self._auth_status,
+            "last_login": self._last_login,
+            "last_refresh": self._last_refresh,
+            "last_error": self._last_error,
+            "recovery_count": self._recovery_count,
+            "recovery_count_total": self._recovery_count_total,
+            "jwt_status": self._jwt_status,
+            "feed_token_status": self._feed_status,
+            "ltp_status": self._ltp_status,
+        }
 
     def authenticate(self) -> None:
         missing = [
@@ -51,97 +117,191 @@ class SmartAPIClient:
         except ImportError as exc:
             raise SmartAPIError("SmartAPI SDK is not installed. Run pip install -r requirements.txt") from exc
 
-        logger.info("[AUTH] Starting re-login")
-        self._client = SmartConnect(self.settings.smartapi_api_key)
-        try:
-            totp = pyotp.TOTP(self.settings.smartapi_totp_secret).now()
-            logger.info("[AUTH] TOTP generated")
-            session = self._client.generateSession(
-                self.settings.smartapi_client_id,
-                self.settings.smartapi_pin,
-                totp,
-            )
-        except Exception:
-            logger.exception("[AUTH] Re-login failed")
-            raise
-        if not session or session.get("status") is False:
-            logger.error("[AUTH] Re-login API response: %s", session)
-            raise SmartAPIError(f"SmartAPI login failed: {session}")
-        logger.info("[AUTH] Login successful")
-        data = session.get("data", {})
-        self._jwt_token = data.get("jwtToken")
-        logger.info("[AUTH] JWT updated")
-        self._refresh_token = data.get("refreshToken")
-        self._feed_token = self._client.getfeedToken()
-        logger.info("[AUTH] Feed token updated")
-        logger.info(
-            "SmartAPI authenticated for client %s; live orders enabled=%s",
-            self.settings.smartapi_client_id,
-            self.settings.live_trading,
-        )
+        with self._auth_lock:
+            if self._status == BROKER_FAILED:
+                raise SmartAPIError(f"Broker in FAILED state: {self._last_error}")
+            if self._client is not None and self._jwt_token and self._feed_token and self._status == BROKER_CONNECTED:
+                return
+            if (
+                self._client is not None
+                and self._jwt_token
+                and self._feed_token
+                and time.monotonic() - self._last_login_monotonic < 2.0
+            ):
+                return
+            self._status = BROKER_RECONNECTING
+            self._auth_status = "RECONNECTING"
+            last_error = ""
+            for attempt in range(3):
+                try:
+                    logger.info("[AUTH] Login started")
+                    self._client = SmartConnect(self.settings.smartapi_api_key)
+                    totp = pyotp.TOTP(self.settings.smartapi_totp_secret).now()
+                    logger.info("[AUTH] TOTP generated")
+                    session = self._client.generateSession(
+                        self.settings.smartapi_client_id,
+                        self.settings.smartapi_pin,
+                        totp,
+                    )
+                    if not session or session.get("status") is False:
+                        raise SmartAPIError(f"SmartAPI login failed: {session}")
+                    data = session.get("data", {})
+                    jwt = self._strip_bearer(data.get("jwtToken"))
+                    refresh = data.get("refreshToken")
+                    feed = data.get("feedToken") or self._client.getfeedToken()
+                    if not jwt or not feed:
+                        raise SmartAPIError("SmartAPI login failed: missing session tokens")
+                    self._apply_tokens(jwt, refresh, feed)
+                    self._last_login = self._now_ist()
+                    self._last_login_monotonic = time.monotonic()
+                    self._last_error = ""
+                    self._status = BROKER_CONNECTED
+                    logger.info("[AUTH] Login successful")
+                    logger.info("[AUTH] JWT updated")
+                    logger.info("[AUTH] Feed token updated")
+                    return
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.exception("[AUTH] Recovery failed")
+                    if attempt < 2:
+                        time.sleep(0.5 * (2 ** attempt))
+                        continue
+                    self._mark_failed(last_error)
+                    raise SmartAPIError(last_error) from exc
 
     def _token_expired(self, response: object) -> bool:
         if not isinstance(response, dict):
             return False
         message = str(response.get("message", "")).lower()
-        return response.get("errorCode") in {"AG8001", "AB8050"} or ("token" in message and "expired" in message)
+        return response.get("errorCode") in {"AG8001", "AG8003", "AB8050"} or ("token" in message and ("expired" in message or "missing" in message))
+
+    def _rate_limited(self, response: object) -> bool:
+        if not isinstance(response, dict):
+            return False
+        message = str(response.get("message", "")).lower()
+        return "access rate" in message or "rate limit" in message
 
     def _refresh_session(self) -> None:
-        if not self._client or not self._refresh_token:
-            self.authenticate()
-            return
-        try:
-            response = self._client.generateToken(self._refresh_token)
-            if not response or response.get("status") is False:
-                raise SmartAPIError(f"SmartAPI refresh failed: {response}")
-            data = response.get("data", {})
-            self._jwt_token = data.get("jwtToken") or self._jwt_token
-            self._refresh_token = data.get("refreshToken") or self._refresh_token
-            self._feed_token = self._client.getfeedToken()
-        except Exception:
-            logger.exception("SmartAPI refresh failed; performing full TOTP login")
-            self._client = None
-            self._jwt_token = None
-            self._refresh_token = None
-            self._feed_token = None
-            self.authenticate()
+        with self._auth_lock:
+            if self._status == BROKER_FAILED:
+                raise SmartAPIError(f"Broker in FAILED state: {self._last_error}")
+            if not self._client or not self._refresh_token:
+                self.authenticate()
+                return
+            if self._jwt_token and self._feed_token and time.monotonic() - self._last_refresh_monotonic < 2.0:
+                return
+            self._status = BROKER_RECONNECTING
+            self._auth_status = "RECONNECTING"
+            last_error = ""
+            for attempt in range(3):
+                try:
+                    logger.info("[AUTH] Refresh started")
+                    response = self._client.generateToken(self._refresh_token)
+                    if not response or response.get("status") is False:
+                        raise SmartAPIError(f"SmartAPI refresh failed: {response}")
+                    data = response.get("data", {})
+                    jwt = self._strip_bearer(data.get("jwtToken") or self._jwt_token)
+                    refresh = data.get("refreshToken") or self._refresh_token
+                    feed = data.get("feedToken") or self._client.getfeedToken() or self._feed_token
+                    if not jwt or not feed:
+                        raise SmartAPIError("SmartAPI refresh failed: missing refreshed tokens")
+                    self._apply_tokens(jwt, refresh, feed)
+                    self._last_refresh = self._now_ist()
+                    self._last_refresh_monotonic = time.monotonic()
+                    self._last_error = ""
+                    self._status = BROKER_CONNECTED
+                    logger.info("[AUTH] Refresh successful")
+                    logger.info("[AUTH] JWT updated")
+                    logger.info("[AUTH] Feed token updated")
+                    return
+                except Exception as exc:
+                    last_error = str(exc)
+                    logger.exception("[AUTH] Recovery failed")
+                    if attempt < 2:
+                        time.sleep(0.5 * (2 ** attempt))
+                        continue
+                    logger.exception("[AUTH] Refresh failed; performing full TOTP login")
+                    self._client = None
+                    self._jwt_token = None
+                    self._refresh_token = None
+                    self._feed_token = None
+                    self._jwt_status = "MISSING"
+                    self._feed_status = "MISSING"
+                    self.authenticate()
+                    return
+            self._mark_failed(last_error)
+            raise SmartAPIError(last_error)
 
     def _call_with_reauth(self, func, *args, **kwargs):
+        if self._status == BROKER_FAILED:
+            raise SmartAPIError(f"Broker in FAILED state: {self._last_error}")
         response = func(*args, **kwargs)
+        auth_error = self._token_expired(response)
+        rate_limited = self._rate_limited(response)
+        if not auth_error and not rate_limited:
+            return response
 
-        if self._token_expired(response):
-            method_name = getattr(func, "__name__", None)
-            if isinstance(response, dict) and response.get("errorCode") == "AG8001":
+        code = ""
+        if isinstance(response, dict):
+            code = str(response.get("errorCode") or "")
+            if code == "AG8001":
                 logger.info("[AUTH] AG8001 detected")
-                try:
-                    self.authenticate()
-                except Exception:
-                    logger.exception("[AUTH] AG8001 recovery failed; API response: %s", response)
-                    raise
-            else:
-                self._refresh_session()
-            retry_func = getattr(self._client, method_name, func) if method_name else func
-            logger.info("[AUTH] Retrying original request")
-            response = retry_func(*args, **kwargs)
-            if self._token_expired(response) or (isinstance(response, dict) and response.get("status") is False):
-                logger.error("[AUTH] Recovery failed; API response: %s", response)
-            else:
-                logger.info("[AUTH] Recovery successful")
-                today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
-                if self._recovery_date != today:
-                    self._recovery_count = 0
-                    self._recovery_date = today
-                self._recovery_count += 1
+            elif code == "AG8003":
+                logger.info("[AUTH] AG8003 detected")
+            elif code == "AB8050":
+                logger.info("[AUTH] AB8050 detected")
+            elif rate_limited:
+                logger.warning("[AUTH] Access rate limit detected")
 
-        return response
+        method_name = getattr(func, "__name__", None)
+        try:
+            if auth_error:
+                self._refresh_session()
+            elif rate_limited:
+                for attempt in range(3):
+                    delay = 0.5 * (2 ** attempt)
+                    time.sleep(delay)
+                    retry_func = getattr(self._client, method_name, func) if method_name and self._client is not None else func
+                    logger.info("[AUTH] Retrying original request")
+                    retry_response = retry_func(*args, **kwargs)
+                    if not self._rate_limited(retry_response):
+                        logger.info("[AUTH] Recovery successful")
+                        return retry_response
+                    if attempt == 2:
+                        self._mark_failed(f"Rate limit persists: {retry_response}")
+                        logger.error("[AUTH] Recovery failed; API response: %s", retry_response)
+                        raise SmartAPIError(f"SmartAPI rate limit recovery failed: {retry_response}")
+                raise SmartAPIError("SmartAPI rate limit recovery failed")
+        except Exception:
+            logger.exception("[AUTH] Recovery failed")
+            raise
+
+        retry_func = getattr(self._client, method_name, func) if method_name and self._client is not None else func
+        logger.info("[AUTH] Retrying original request")
+        retry_response = retry_func(*args, **kwargs)
+        if self._token_expired(retry_response) or self._rate_limited(retry_response):
+            self._mark_failed(f"Recovery failed: {retry_response}")
+            logger.error("[AUTH] Recovery failed; API response: %s", retry_response)
+            raise SmartAPIError(f"SmartAPI recovery failed: {retry_response}")
+        logger.info("[AUTH] Recovery successful")
+        today = self._now_ist().date()
+        if self._recovery_date != today:
+            self._recovery_count = 0
+            self._recovery_date = today
+        self._recovery_count += 1
+        self._recovery_count_total += 1
+        return retry_response
 
     @property
     def client(self) -> Any:
         if self._client is None:
             self.authenticate()
+        if self._status == BROKER_FAILED:
+            raise SmartAPIError(f"Broker in FAILED state: {self._last_error}")
         return self._client
 
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
+        started = time.perf_counter()
         if self._client is None:
             self.authenticate()
         if self._client is None:
@@ -153,10 +313,15 @@ class SmartAPIClient:
     	    symboltoken,
 	)
         if not response or response.get("status") is False:
+            self._ltp_status = "FAILED"
             raise SmartAPIError(f"LTP request failed for {tradingsymbol}: {response}")
         try:
-            return float(response["data"]["ltp"])
+            value = float(response["data"]["ltp"])
+            self._ltp_status = "OK"
+            logger.info("SmartAPI ltpData latency_ms=%.2f", (time.perf_counter() - started) * 1000)
+            return value
         except (KeyError, TypeError, ValueError) as exc:
+            self._ltp_status = "FAILED"
             raise SmartAPIError(f"Unexpected LTP response for {tradingsymbol}: {response}") from exc
 
     def get_banknifty_spot(self) -> float:

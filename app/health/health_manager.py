@@ -81,9 +81,11 @@ class HealthManager:
         if row is None:
             return None
         report = json.loads(row.message)
-        report["recovery_count"] = getattr(self.smartapi, "_recovery_count", 0)
+        broker_state = self.smartapi.get_broker_health() if hasattr(self.smartapi, "get_broker_health") else {}
+        report["broker_state"] = broker_state
+        report["recovery_count"] = int(broker_state.get("recovery_count", getattr(self.smartapi, "_recovery_count", 0)))
         messages = [item["message"] for item in report["components"].values() if item["status"] in {WARNING, CRITICAL}]
-        report["last_error"] = messages[0] if messages else ""
+        report["last_error"] = str(broker_state.get("last_error") or (messages[0] if messages else ""))
         return report
 
     def _broker(self) -> tuple[HealthResult, HealthResult, HealthResult]:
