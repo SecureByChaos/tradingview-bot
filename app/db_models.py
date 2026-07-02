@@ -103,6 +103,27 @@ class AITradeReview(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class SystemHealthLog(Base):
+    __tablename__ = "system_health_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    overall_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    health_score: Mapped[float] = mapped_column(Float, nullable=False)
+    broker_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    database_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    webhook_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    trading_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    ai_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    server_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    ltp_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cpu_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ram_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    disk_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class StrategyConfig(Base):
     __tablename__ = "strategy_configs"
 

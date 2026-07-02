@@ -10,7 +10,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from app import api_routes, dashboard_routes, v7_router
 from app.config import get_settings
-from app.database import SessionLocal, get_db, init_db
+from app.database import SessionLocal, engine, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
 from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus
 from app.models import WebhookPayload, WebhookResponse
@@ -27,6 +27,7 @@ from app.telegram_service import TelegramService
 from app.time_utils import utc_now
 from app.trade_manager import TradeManager
 from app.v7_manager import V7Manager
+from app.health.health_manager import HealthManager
 
 settings = get_settings()
 settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -42,7 +43,9 @@ multi_strategy_manager = MultiStrategyTradeManager(settings, smartapi, option_fi
 v7_manager = V7Manager(settings, smartapi, option_finder, telegram)
 risk_service = RiskProtectionService(multi_strategy_manager, telegram)
 monitor = MultiStrategyMonitor(multi_strategy_manager, risk_service)
-scheduler = create_scheduler(monitor)
+health_manager = HealthManager(smartapi, engine, telegram)
+scheduler = create_scheduler(monitor, health_manager)
+health_manager.scheduler = scheduler
 
 
 @asynccontextmanager
@@ -79,6 +82,7 @@ app.add_middleware(
     same_site="lax",
     max_age=60 * 60 * 8,
 )
+health_manager.app = app
 
 api_routes.router.trade_manager = trade_manager  # type: ignore[attr-defined]
 api_routes.router.multi_strategy_manager = multi_strategy_manager  # type: ignore[attr-defined]
@@ -88,6 +92,7 @@ api_routes.router.trade_logger = trade_logger  # type: ignore[attr-defined]
 dashboard_routes.router.trade_manager = trade_manager  # type: ignore[attr-defined]
 dashboard_routes.router.multi_strategy_manager = multi_strategy_manager  # type: ignore[attr-defined]
 dashboard_routes.router.smartapi = smartapi  # type: ignore[attr-defined]
+dashboard_routes.router.health_manager = health_manager  # type: ignore[attr-defined]
 v7_router.router.v7_manager = v7_manager  # type: ignore[attr-defined]
 
 app.include_router(dashboard_routes.router)

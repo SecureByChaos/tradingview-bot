@@ -10,7 +10,7 @@ from app.monitor import TradeMonitor
 IST = ZoneInfo("Asia/Kolkata")
 
 
-def create_scheduler(monitor: TradeMonitor) -> BackgroundScheduler:
+def create_scheduler(monitor: TradeMonitor, health_manager: object | None = None) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(
         monitor.tick,
@@ -28,4 +28,13 @@ def create_scheduler(monitor: TradeMonitor) -> BackgroundScheduler:
         max_instances=1,
         coalesce=True,
     )
+    if health_manager is not None:
+        scheduler.add_job(
+            health_manager.run,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=0, timezone=IST),
+            id="pre-market-health",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     return scheduler

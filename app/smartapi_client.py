@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import pyotp
 
@@ -22,6 +24,8 @@ class SmartAPIClient:
         self._jwt_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._feed_token: Optional[str] = None
+        self._recovery_count = 0
+        self._recovery_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
     def authenticate(self) -> None:
         missing = [
@@ -47,19 +51,29 @@ class SmartAPIClient:
         except ImportError as exc:
             raise SmartAPIError("SmartAPI SDK is not installed. Run pip install -r requirements.txt") from exc
 
+        logger.info("[AUTH] Starting re-login")
         self._client = SmartConnect(self.settings.smartapi_api_key)
-        totp = pyotp.TOTP(self.settings.smartapi_totp_secret).now()
-        session = self._client.generateSession(
-            self.settings.smartapi_client_id,
-            self.settings.smartapi_pin,
-            totp,
-        )
+        try:
+            totp = pyotp.TOTP(self.settings.smartapi_totp_secret).now()
+            logger.info("[AUTH] TOTP generated")
+            session = self._client.generateSession(
+                self.settings.smartapi_client_id,
+                self.settings.smartapi_pin,
+                totp,
+            )
+        except Exception:
+            logger.exception("[AUTH] Re-login failed")
+            raise
         if not session or session.get("status") is False:
+            logger.error("[AUTH] Re-login API response: %s", session)
             raise SmartAPIError(f"SmartAPI login failed: {session}")
+        logger.info("[AUTH] Login successful")
         data = session.get("data", {})
         self._jwt_token = data.get("jwtToken")
+        logger.info("[AUTH] JWT updated")
         self._refresh_token = data.get("refreshToken")
         self._feed_token = self._client.getfeedToken()
+        logger.info("[AUTH] Feed token updated")
         logger.info(
             "SmartAPI authenticated for client %s; live orders enabled=%s",
             self.settings.smartapi_client_id,
@@ -96,8 +110,28 @@ class SmartAPIClient:
         response = func(*args, **kwargs)
 
         if self._token_expired(response):
-            self._refresh_session()
-            response = func(*args, **kwargs)
+            method_name = getattr(func, "__name__", None)
+            if isinstance(response, dict) and response.get("errorCode") == "AG8001":
+                logger.info("[AUTH] AG8001 detected")
+                try:
+                    self.authenticate()
+                except Exception:
+                    logger.exception("[AUTH] AG8001 recovery failed; API response: %s", response)
+                    raise
+            else:
+                self._refresh_session()
+            retry_func = getattr(self._client, method_name, func) if method_name else func
+            logger.info("[AUTH] Retrying original request")
+            response = retry_func(*args, **kwargs)
+            if self._token_expired(response) or (isinstance(response, dict) and response.get("status") is False):
+                logger.error("[AUTH] Recovery failed; API response: %s", response)
+            else:
+                logger.info("[AUTH] Recovery successful")
+                today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+                if self._recovery_date != today:
+                    self._recovery_count = 0
+                    self._recovery_date = today
+                self._recovery_count += 1
 
         return response
 

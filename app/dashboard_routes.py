@@ -43,6 +43,10 @@ def get_smartapi() -> object:
     return router.smartapi  # type: ignore[attr-defined]
 
 
+def get_health_manager() -> object:
+    return router.health_manager  # type: ignore[attr-defined]
+
+
 def parse_date(value: str | None) -> date | None:
     if not value:
         return None
@@ -75,13 +79,23 @@ def dashboard(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
     trade_manager: Annotated[TradeManager, Depends(get_trade_manager)],
+    health_manager: Annotated[object, Depends(get_health_manager)],
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     summary = get_dashboard_summary(db, trade_manager.get_active_trade())
     return templates.TemplateResponse(
         "dashboard.html",
-        {"request": request, "summary": summary, "logs": latest_logs(db, 20), "strategy_metrics": strategy_metrics(db)},
+        {"request": request, "summary": summary, "health": health_manager.latest(db), "logs": latest_logs(db, 20), "strategy_metrics": strategy_metrics(db)},
     )
+
+
+@router.post("/health-check")
+def run_health_check(
+    health_manager: Annotated[object, Depends(get_health_manager)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    health_manager.run(notify=False)
+    return RedirectResponse("/", status_code=303)
 
 
 @router.get("/active-trade-page", response_class=HTMLResponse)

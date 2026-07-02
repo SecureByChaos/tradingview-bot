@@ -22,6 +22,32 @@
   <div class="col-md-3"><div class="metric"><div class="label">Trading Allowed</div><div class="value">{{ "YES" if summary.trading_allowed else "NO" }}</div></div></div>
   <div class="col-md-3"><div class="metric"><div class="label">Daily Risk Status</div><div class="value {% if summary.daily_risk_status == 'OK' %}profit{% else %}loss{% endif %}">{{ summary.daily_risk_status }}</div></div></div>
 </div>
+<div class="d-flex justify-content-between align-items-center mt-4 mb-2">
+  <h4 class="mb-0">Pre-Market Health</h4>
+  <form method="post" action="/health-check"><button class="btn btn-sm btn-outline-info" type="submit">Run Health Check</button></form>
+</div>
+{% if health %}
+<div class="row g-3">
+  <div class="col-md-3"><div class="metric"><div class="label">Overall Status</div><div class="value {% if health.overall_status == 'READY' %}profit{% elif health.overall_status == 'WARNING' %}warn{% else %}loss{% endif %}">{{ health.overall_status }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Health Score</div><div class="value">{{ health.health_score }}%</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Last Checked</div><div>{{ health.run_time }}</div></div></div>
+  <div class="col-md-3"><div class="metric"><div class="label">Recovery Count Today</div><div class="value">{{ health.recovery_count }}</div></div></div>
+</div>
+<div class="table-responsive mt-3">
+  <table class="table table-dark table-sm align-middle">
+    <thead><tr><th>Broker</th><th>Authentication</th><th>LTP</th><th>Database</th><th>Webhook</th><th>Trading</th><th>AI</th><th>Server</th></tr></thead>
+    <tbody><tr>
+      {% for name in ['broker', 'authentication', 'ltp', 'database', 'webhook', 'trading', 'ai', 'server'] %}
+      {% set item = health.components[name] %}
+      <td class="{% if item.status == 'Healthy' or item.status == 'Disabled' %}profit{% elif item.status == 'Warning' %}warn{% else %}loss{% endif %}" title="{{ item.message }}">{{ item.status }}</td>
+      {% endfor %}
+    </tr></tbody>
+  </table>
+</div>
+<div class="metric"><div class="label">Last Error</div><div>{{ health.last_error or 'None' }}</div></div>
+{% else %}
+<div class="metric">No health check has run yet.</div>
+{% endif %}
 <h4 class="mt-4">Recent Logs</h4>
 <div class="table-responsive">
   <table class="table table-dark table-sm align-middle">
