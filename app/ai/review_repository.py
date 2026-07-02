@@ -20,6 +20,15 @@ def save_review(
     context_version: str,
     framework_version: str,
 ) -> AITradeReview:
+    if trade_id:
+        existing = db.scalar(
+            select(AITradeReview).where(
+                AITradeReview.trade_id == trade_id,
+                AITradeReview.signal == signal,
+            )
+        )
+        if existing is not None:
+            return existing
     trade = db.scalar(select(StrategyTrade).where(StrategyTrade.trade_id == trade_id)) if trade_id else None
     review = AITradeReview(
         trade_id=trade_id,

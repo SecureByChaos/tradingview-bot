@@ -17,7 +17,10 @@ class AIResponseValidator:
             decision = str(data.get("decision", "ERROR")).upper()
             if decision not in self._DECISIONS:
                 decision = "ERROR"
-            confidence = self._confidence(data.get("confidence", 0))
+            confidence = 0.0 if decision == "ERROR" else self._confidence(data.get("confidence", 0))
+            summary = str(data.get("summary") or "")
+            if decision == "ERROR" and not summary:
+                summary = "AI response validation failed."
             return ReviewResult(
                 decision=decision,
                 confidence=confidence,
@@ -26,7 +29,7 @@ class AIResponseValidator:
                 entry_quality=str(data.get("entry_quality") or ""),
                 reason_to_buy=self._list(data.get("reason_to_buy")),
                 reason_not_to_buy=self._list(data.get("reason_not_to_buy")),
-                summary=str(data.get("summary") or ""),
+                summary=summary,
                 provider="",
             )
         except Exception:

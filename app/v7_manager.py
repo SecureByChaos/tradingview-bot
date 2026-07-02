@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.ai.shadow import exit_signal_for_entry, run_shadow_review
 from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, OptionContract, Signal, WebhookResponse
 from app.option_finder import OptionFinder
@@ -148,6 +149,7 @@ class V7Manager:
             payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time)},
         )
         self.telegram.send(db, f"Trade Closed\n[V7] {option_type} TV_EXIT\nP&L: {trade.pnl_percent:.2f}%")
+        run_shadow_review(trade.strategy_name, exit_signal_for_entry(trade.signal), utc_now(), trade.trade_id)
         return WebhookResponse(accepted=True, message=f"V7 {option_type} trade closed")
 
     def get_strategy(self, db: Session) -> StrategyConfig | None:

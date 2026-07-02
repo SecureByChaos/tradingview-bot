@@ -16,12 +16,25 @@ logger = logging.getLogger(__name__)
 PROMPT_VERSION = "v1"
 CONTEXT_VERSION = "v1"
 FRAMEWORK_VERSION = "v1"
+_EXIT_SIGNAL_MAP = {
+    "BUY_CE": "SELL_CE",
+    "BUY_PE": "SELL_PE",
+    "SELL_CE": "BUY_CE",
+    "SELL_PE": "BUY_PE",
+}
+
+
+def exit_signal_for_entry(signal: str) -> str:
+    return _EXIT_SIGNAL_MAP.get(signal, signal)
 
 
 def run_shadow_review(strategy: str, signal: str, timestamp: datetime, trade_id: Optional[str]) -> None:
     try:
         with SessionLocal() as db:
             logger.info("[AI] Shadow started")
+            if not trade_id:
+                logger.info("[AI] Shadow skipped: trade_id missing")
+                return
             settings = get_settings(db)
             if settings is None:
                 logger.info("[AI] Shadow skipped: ai_settings row not found")

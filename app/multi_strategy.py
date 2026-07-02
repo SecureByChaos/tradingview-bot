@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
+from app.ai.shadow import exit_signal_for_entry, run_shadow_review
 from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, Signal, WebhookResponse
 from app.option_finder import OptionFinder
@@ -237,6 +238,7 @@ class MultiStrategyTradeManager:
             log_event(db, "RISK", f"Strategy {trade.strategy_name} locked due to consecutive losses", "WARNING")
             self.telegram.send(db, f"Strategy Risk Lock\n[{trade.strategy_name}] consecutive losses: {stats.consecutive_losses}")
         self.telegram.send(db, f"Trade Closed\n[{trade.strategy_name}] {reason.value}\nP&L: {trade.pnl_percent:.2f}%")
+        run_shadow_review(trade.strategy_name, exit_signal_for_entry(trade.signal), utc_now(), trade.trade_id)
         return trade
 
     def square_off_all(self, db: Session) -> list[StrategyTrade]:
