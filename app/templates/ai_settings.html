@@ -1,6 +1,7 @@
 {% extends "base.html" %}
+{% from "components.html" import page_header %}
 {% block content %}
-<h2 class="mb-3">AI Settings</h2>
+{{ page_header("AI Settings") }}
 {% if test_result %}
 <div class="alert {% if test_result.status == 'OK' %}alert-success{% else %}alert-danger{% endif %}">
   Provider: {{ test_result.provider }} &middot; Model: {{ test_result.model or "-" }} &middot;
@@ -13,24 +14,24 @@
     <input class="form-check-input" type="checkbox" name="enabled" id="enabled" {% if settings.enabled %}checked{% endif %}>
     <label class="form-check-label" for="enabled">Enable AI</label>
   </div>
-  <div class="row g-3">
-    <div class="col-md-6"><label class="form-label">Mode</label><select class="form-select" name="mode">
+  <div class="form-grid">
+    <div><label class="form-label">Mode</label><select class="form-select" name="mode">
       {% for value, label in [("DISABLED", "Disabled"), ("SHADOW", "Shadow"), ("ADVISORY", "Advisory"), ("BLOCKING", "Blocking")] %}
       <option value="{{ value }}" {% if settings.mode == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
     </select></div>
-    <div class="col-md-6"><label class="form-label">Provider</label><select class="form-select" name="provider">
+    <div><label class="form-label">Provider</label><select class="form-select" name="provider">
       <option value="dummy" {% if settings.provider == "dummy" %}selected{% endif %}>Dummy</option>
       <option value="openai" {% if settings.provider == "openai" %}selected{% endif %}>OpenAI</option>
     </select></div>
-    <div class="col-md-6"><label class="form-label">Model</label><input class="form-control" name="model" value="{{ settings.model }}"></div>
-    <div class="col-md-6"><label class="form-label">API Key</label><input class="form-control" type="password" name="api_key" value="" placeholder="{% if settings.api_key %}********{% endif %}" autocomplete="new-password"></div>
-    <div class="col-12"><label class="form-label">Base URL</label><input class="form-control" type="url" name="base_url" value="{{ settings.base_url }}"></div>
-    <div class="col-md-4"><label class="form-label">Temperature</label><input class="form-control" type="number" step="0.1" min="0" max="2" name="temperature" value="{{ settings.temperature }}"></div>
-    <div class="col-md-4"><label class="form-label">Timeout</label><input class="form-control" type="number" min="1" name="timeout_seconds" value="{{ settings.timeout_seconds }}"></div>
-    <div class="col-md-4"><label class="form-label">Confidence Threshold</label><input class="form-control" type="number" min="0" max="100" name="confidence_threshold" value="{{ settings.confidence_threshold }}"></div>
-    <div class="col-12"><label class="form-label">System Prompt</label><textarea class="form-control" rows="6" name="system_prompt">{{ settings.system_prompt }}</textarea></div>
+    <div><label class="form-label">Model</label><input class="form-control" name="model" value="{{ settings.model }}"></div>
+    <div><label class="form-label">API Key</label><input class="form-control" type="password" name="api_key" value="" placeholder="{% if settings.api_key %}********{% endif %}" autocomplete="new-password"></div>
+    <div class="full"><label class="form-label">Base URL</label><input class="form-control" type="url" name="base_url" value="{{ settings.base_url }}"></div>
+    <div><label class="form-label">Temperature</label><input class="form-control" type="number" step="0.1" min="0" max="2" name="temperature" value="{{ settings.temperature }}"></div>
+    <div><label class="form-label">Timeout</label><input class="form-control" type="number" min="1" name="timeout_seconds" value="{{ settings.timeout_seconds }}"></div>
+    <div><label class="form-label">Confidence Threshold</label><input class="form-control" type="number" min="0" max="100" name="confidence_threshold" value="{{ settings.confidence_threshold }}"></div>
+    <div class="full"><label class="form-label">System Prompt</label><textarea class="form-control" rows="6" name="system_prompt">{{ settings.system_prompt }}</textarea></div>
   </div>
-  <button class="btn btn-primary mt-4" type="submit">Save</button>
+  <div class="form-actions"><button class="btn btn-primary" type="submit">Save</button></div>
 </form>
 <form method="post" action="/ai-settings/test">
   <button class="btn btn-outline-light mt-3" type="submit">Test Connection</button>

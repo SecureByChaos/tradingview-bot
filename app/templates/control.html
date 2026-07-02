@@ -1,6 +1,7 @@
 {% extends "base.html" %}
+{% from "components.html" import page_header %}
 {% block content %}
-<h2 class="mb-3">Bot Control</h2>
+{{ page_header("Bot Control") }}
 {% if summary.risk_locked %}
 <div class="alert alert-danger">Risk lock active. Use Reset Daily Lock to manually re-enable controls.</div>
 {% endif %}
@@ -8,7 +9,7 @@
   <div>Status: <strong>{{ summary.bot_status }}</strong></div>
   <div>Trading Allowed: <strong>{{ "YES" if summary.trading_allowed else "NO" }}</strong></div>
 </div>
-<div class="d-flex flex-wrap gap-2">
+<div class="form-actions">
   <button class="btn btn-success" onclick="postAction('/api/start')">START BOT</button>
   <button class="btn btn-warning" onclick="postAction('/api/stop')">STOP BOT</button>
   <button class="btn btn-info" onclick="postAction('/api/restart')">RESTART BOT</button>

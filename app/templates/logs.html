@@ -1,17 +1,19 @@
 {% extends "base.html" %}
+{% from "components.html" import page_header, empty_state %}
 {% block content %}
-<h2 class="mb-3">System Logs</h2>
-<div class="table-responsive">
+{{ page_header("System Logs") }}
+{% if logs %}<div class="table-responsive responsive-table">
   <table class="table table-dark table-sm align-middle">
     <thead><tr><th>Time</th><th>Type</th><th>Level</th><th>Message</th><th>Payload</th></tr></thead>
     <tbody>
     {% for log in logs %}
       <tr>
-        <td>{{ log.created_at|ist }}</td><td>{{ log.event_type }}</td><td>{{ log.level }}</td>
-        <td>{{ log.message }}</td><td><code>{{ log.payload }}</code></td>
+        <td data-label="Time">{{ log.created_at|ist }}</td><td data-label="Type">{{ log.event_type }}</td><td data-label="Level">{{ log.level }}</td>
+        <td data-label="Message">{{ log.message }}</td><td data-label="Payload"><code>{{ log.payload }}</code></td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
 </div>
+{% else %}{{ empty_state("No log entries.") }}{% endif %}
 {% endblock %}

@@ -7,6 +7,7 @@ from datetime import timedelta
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app import api_routes, dashboard_routes, v7_router
 from app.config import get_settings
@@ -82,6 +83,7 @@ app.add_middleware(
     same_site="lax",
     max_age=60 * 60 * 8,
 )
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 health_manager.app = app
 
 api_routes.router.trade_manager = trade_manager  # type: ignore[attr-defined]

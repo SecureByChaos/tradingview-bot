@@ -1,6 +1,7 @@
 {% extends "base.html" %}
+{% from "components.html" import page_header %}
 {% block content %}
-<h2 class="mb-3">Settings</h2>
+{{ page_header("Settings") }}
 <form class="metric" method="post" action="/settings">
   <h5>Trading Mode</h5>
   <div class="mb-3">
@@ -10,18 +11,18 @@
     </select>
   </div>
   <h5>Risk Settings</h5>
-  <div class="row g-3">
-    <div class="col-md-4"><label class="form-label">Stop Loss %</label><input class="form-control" type="number" step="0.01" name="stop_loss_percent" value="{{ settings.stop_loss_percent }}"></div>
-    <div class="col-md-4"><label class="form-label">Target %</label><input class="form-control" type="number" step="0.01" name="target_percent" value="{{ settings.target_percent }}"></div>
-    <div class="col-md-4"><label class="form-label">Max Trades Per Day</label><input class="form-control" type="number" name="max_trades_per_day" value="{{ settings.max_trades_per_day }}"></div>
-    <div class="col-md-4"><label class="form-label">Max Consecutive Losses</label><input class="form-control" type="number" name="max_consecutive_losses" value="{{ settings.max_consecutive_losses }}"></div>
-    <div class="col-md-4"><label class="form-label">Daily Max Loss %</label><input class="form-control" type="number" step="0.01" name="daily_max_loss_percent" value="{{ settings.daily_max_loss_percent }}"></div>
-    <div class="col-md-4"><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"></div>
+  <div class="form-grid">
+    <div><label class="form-label">Stop Loss %</label><input class="form-control" type="number" step="0.01" name="stop_loss_percent" value="{{ settings.stop_loss_percent }}"></div>
+    <div><label class="form-label">Target %</label><input class="form-control" type="number" step="0.01" name="target_percent" value="{{ settings.target_percent }}"></div>
+    <div><label class="form-label">Max Trades Per Day</label><input class="form-control" type="number" name="max_trades_per_day" value="{{ settings.max_trades_per_day }}"></div>
+    <div><label class="form-label">Max Consecutive Losses</label><input class="form-control" type="number" name="max_consecutive_losses" value="{{ settings.max_consecutive_losses }}"></div>
+    <div><label class="form-label">Daily Max Loss %</label><input class="form-control" type="number" step="0.01" name="daily_max_loss_percent" value="{{ settings.daily_max_loss_percent }}"></div>
+    <div><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"></div>
   </div>
   <h5 class="mt-4">Telegram Settings</h5>
-  <div class="row g-3">
-    <div class="col-md-6"><label class="form-label">Telegram Bot Token</label><input class="form-control" name="telegram_bot_token" value="{{ settings.telegram_bot_token }}"></div>
-    <div class="col-md-6"><label class="form-label">Telegram Chat ID</label><input class="form-control" name="telegram_chat_id" value="{{ settings.telegram_chat_id }}"></div>
+  <div class="form-grid">
+    <div><label class="form-label">Telegram Bot Token</label><input class="form-control" name="telegram_bot_token" value="{{ settings.telegram_bot_token }}"></div>
+    <div><label class="form-label">Telegram Chat ID</label><input class="form-control" name="telegram_chat_id" value="{{ settings.telegram_chat_id }}"></div>
   </div>
   <button class="btn btn-primary mt-4" type="submit">Save Settings</button>
 </form>

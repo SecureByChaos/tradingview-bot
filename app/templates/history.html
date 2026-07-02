@@ -1,8 +1,9 @@
 {% extends "base.html" %}
+{% from "components.html" import page_header, empty_state %}
 {% block content %}
-<h2 class="mb-3">Trade History</h2>
-<form class="row g-2 mb-3" method="get">
-  <div class="col-md-2">
+{{ page_header("Trade History") }}
+<form class="filter-form filter-grid mb-3" method="get">
+  <div >
     <select class="form-select" name="filter">
       <option value="today" {% if filter == "today" %}selected{% endif %}>Today</option>
       <option value="7d" {% if filter == "7d" %}selected{% endif %}>Last 7 Days</option>
@@ -10,23 +11,24 @@
       <option value="custom" {% if filter == "custom" %}selected{% endif %}>Custom</option>
     </select>
   </div>
-  <div class="col-md-2"><input class="form-control" type="date" name="start" value="{{ start }}"></div>
-  <div class="col-md-2"><input class="form-control" type="date" name="end" value="{{ end }}"></div>
-  <div class="col-md-2"><button class="btn btn-primary" type="submit">Filter</button></div>
+  <div ><input class="form-control" type="date" name="start" value="{{ start }}"></div>
+  <div ><input class="form-control" type="date" name="end" value="{{ end }}"></div>
+  <div ><button class="btn btn-primary" type="submit">Filter</button></div>
 </form>
-<div class="table-responsive">
+{% if trades %}<div class="table-responsive responsive-table">
   <table class="table table-dark table-hover align-middle">
     <thead><tr><th>Strategy</th><th>Entry Time (IST)</th><th>Exit Time (IST)</th><th>Duration</th><th>Signal</th><th>Strike</th><th>Entry</th><th>Exit</th><th>P&L %</th><th>Result</th><th>Status</th><th>Mode</th></tr></thead>
     <tbody>
     {% for trade in trades %}
       <tr>
-        <td>{{ trade.strategy_name }}</td><td>{{ trade.entry_time|ist }}</td><td>{{ trade.exit_time|ist }}</td><td>{{ trade.entry_time|duration(trade.exit_time) }}</td><td>{{ trade.signal }}</td><td>{{ trade.strike }}</td>
-        <td>{{ trade.entry_price }}</td><td>{{ trade.exit_price or "" }}</td>
-        <td class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
-        <td>{{ trade.result }}</td><td>{{ trade.status }}</td><td>{{ trade.mode }}</td>
+        <td data-label="Strategy">{{ trade.strategy_name }}</td><td data-label="Entry Time">{{ trade.entry_time|ist }}</td><td data-label="Exit Time">{{ trade.exit_time|ist }}</td><td data-label="Duration">{{ trade.entry_time|duration(trade.exit_time) }}</td><td data-label="Signal">{{ trade.signal }}</td><td data-label="Strike">{{ trade.strike }}</td>
+        <td data-label="Entry">{{ trade.entry_price }}</td><td data-label="Exit">{{ trade.exit_price or "" }}</td>
+        <td data-label="P&amp;L %" class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
+        <td data-label="Result">{{ trade.result }}</td><td data-label="Status">{{ trade.status }}</td><td data-label="Mode">{{ trade.mode }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
 </div>
+{% else %}{{ empty_state("No trade history available.") }}{% endif %}
 {% endblock %}
