@@ -65,13 +65,13 @@ class HealthManager:
                 ai_status=ai.status, server_status=server.status,
                 ltp_latency_ms=ltp.latency_ms, cpu_percent=resources.get("cpu_percent"),
                 ram_percent=resources.get("ram_percent"), disk_percent=resources.get("disk_percent"),
-                message=json.dumps(report),
+                message=json.dumps(report, default=str),
             )
             db.add(row)
             db.execute(SystemHealthLog.__table__.delete().where(SystemHealthLog.run_time < datetime.now(UTC) - timedelta(days=30)))
             db.commit()
             logger.info("[HEALTH] Overall %s", overall)
-            logger.info("[HEALTH] Complete report: %s", json.dumps(report))
+            logger.info("[HEALTH] Complete report: %s", json.dumps(report, default=str))
             if notify:
                 self.telegram.send(db, self._notification(report))
             return report
