@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% from "components.html" import page_header, empty_state %}
+{% block content %}
+{{ page_header("AI Context Inspector") }}
+{% if context_log %}
+<div class="metric-grid compact mb-4">
+  <div class="metric"><div class="label">Strategy</div><div class="value">{{ context_log.strategy }}</div></div>
+  <div class="metric"><div class="label">Signal</div><div class="value">{{ context_log.signal }}</div></div>
+  <div class="metric"><div class="label">Event Type</div><div class="value">{{ context_log.event_type }}</div></div>
+  <div class="metric"><div class="label">Timestamp</div><div>{{ context_log.timestamp | ist }}</div></div>
+  <div class="metric"><div class="label">Context Completeness</div><div class="value">{{ context_log.completeness_percent }}%</div></div>
+  <div class="metric"><div class="label">Payload Size</div><div class="value">{{ (context_log.payload_size / 1024)|round(2) }} KB</div></div>
+  <div class="metric"><div class="label">Model</div><div>{{ context_log.model or "-" }}</div></div>
+  <div class="metric"><div class="label">Prompt Version</div><div>{{ context_log.prompt_version }}</div></div>
+  <div class="metric"><div class="label">AI Latency</div><div>{{ context_log.latency_ms if context_log.latency_ms is not none else "-" }} ms</div></div>
+  <div class="metric"><div class="label">Decision</div><div class="value">{{ context_log.decision or "-" }}</div></div>
+  <div class="metric"><div class="label">Confidence</div><div class="value">{{ context_log.confidence if context_log.confidence is not none else "-" }}</div></div>
+  <div class="metric"><div class="label">Missing Fields</div><div>{{ missing_fields | join(", ") or "None" }}</div></div>
+</div>
+<div class="panel mb-4">
+  <div class="field-label mb-2">Summary</div>
+  <div>{{ context_log.summary or "-" }}</div>
+  <div class="field-label mt-3 mb-1">Reason To Buy</div>
+  <div>{{ reason_to_buy | join(", ") or "-" }}</div>
+  <div class="field-label mt-3 mb-1">Reason Not To Buy</div>
+  <div>{{ reason_not_to_buy | join(", ") or "-" }}</div>
+</div>
+<div class="panel mb-4">
+  <details open>
+    <summary class="mb-2">Context JSON</summary>
+    <pre class="mb-0"><code>{{ context_json | tojson(indent=2) }}</code></pre>
+  </details>
+</div>
+<div class="panel">
+  <details>
+    <summary class="mb-2">Request JSON Sent To Provider</summary>
+    <pre class="mb-0"><code>{{ request_json | tojson(indent=2) }}</code></pre>
+  </details>
+</div>
+{% else %}
+{{ empty_state("No AI context logs available.") }}
+{% endif %}
+{% endblock %}

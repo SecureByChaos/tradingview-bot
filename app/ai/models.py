@@ -29,6 +29,9 @@ class ReviewResult(BaseModel):
     reason_not_to_buy: List[str] = Field(default_factory=list)
     summary: str
     expected_probability: Optional[float] = None
+    received_fields: List[str] = Field(default_factory=list)
+    missing_fields: List[str] = Field(default_factory=list)
+    context_quality: Optional[str] = None
     provider: str
     model: Optional[str] = None
     latency_ms: float = Field(default=0, ge=0)

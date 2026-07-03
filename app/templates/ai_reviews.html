@@ -47,6 +47,12 @@
           <div class="col-md-3"><strong>Market Type</strong><div>{{ review.market_type or "-" }}</div></div>
           <div class="col-md-3"><strong>Entry Quality</strong><div>{{ review.entry_quality or "-" }}</div></div>
           <div class="col-md-3"><strong>Risk</strong><div>{{ review.risk or "-" }}</div></div>
+          <div class="col-12"><strong>Context Used</strong>
+            {% if item.context_log %}
+            <div class="small text-muted mb-1">Completeness: {{ item.context_log.completeness_percent }}% · Payload: {{ (item.context_log.payload_size / 1024)|round(2) }} KB · Missing: {{ item.context_missing_fields | join(", ") or "None" }}</div>
+            <pre class="mb-0"><code>{{ item.context_json | tojson(indent=2) }}</code></pre>
+            {% else %}<div>-</div>{% endif %}
+          </div>
         </div>
       </td></tr>
     {% endfor %}

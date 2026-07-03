@@ -103,6 +103,35 @@ class AITradeReview(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class AIContextLog(Base):
+    __tablename__ = "ai_context_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    strategy: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    signal: Mapped[str] = mapped_column(String(16), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    paper_live: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    trade_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    trade_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    session: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    context_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    request_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    payload_size: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    context_version: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    completeness_percent: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    missing_fields: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    decision: Mapped[str] = mapped_column(String(16), default="", nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason_to_buy: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    reason_not_to_buy: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class SystemHealthLog(Base):
     __tablename__ = "system_health_logs"
 

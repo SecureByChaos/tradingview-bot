@@ -83,7 +83,8 @@ class PromptBuilder:
         user_prompt += (
             "\n\n" + review_instruction +
             "\nReturn ONLY valid JSON with these keys: decision, confidence, market_type, "
-            "risk, entry_quality, reason_to_buy, reason_not_to_buy, summary, expected_probability. "
+            "risk, entry_quality, reason_to_buy, reason_not_to_buy, summary, expected_probability, "
+            "received_fields, missing_fields, context_quality. "
             "Do not include markdown, code fences, or additional text."
         )
         return {

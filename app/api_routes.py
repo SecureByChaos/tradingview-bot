@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from io import StringIO
 from typing import Annotated, Any
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.auth import require_admin_api
+from app.ai.context_repository import get_latest_context_log
 from app.database import get_db
 from app.db_models import BotStatus, StrategyConfig, StrategyTrade, TradeStatus
 from app.db_models import TradingMode
@@ -197,6 +199,42 @@ def strategy_stats(
     ]
 
 
+@router.get("/ai/latest-context")
+def latest_ai_context(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, Any]:
+    row = get_latest_context_log(db)
+    if row is None:
+        return {}
+    return {
+        "id": row.id,
+        "timestamp": row.timestamp,
+        "strategy": row.strategy,
+        "signal": row.signal,
+        "event_type": row.event_type,
+        "paper_live": row.paper_live,
+        "trade_id": row.trade_id,
+        "trade_number": row.trade_number,
+        "session": row.session,
+        "context_json": _safe_json(row.context_json),
+        "request_json": _safe_json(row.request_json),
+        "payload_size": row.payload_size,
+        "context_version": row.context_version,
+        "prompt_version": row.prompt_version,
+        "model": row.model,
+        "completeness_percent": row.completeness_percent,
+        "missing_fields": _safe_json(row.missing_fields),
+        "latency_ms": row.latency_ms,
+        "decision": row.decision,
+        "confidence": row.confidence,
+        "reason_to_buy": _safe_json(row.reason_to_buy),
+        "reason_not_to_buy": _safe_json(row.reason_not_to_buy),
+        "summary": row.summary,
+        "created_at": row.created_at,
+    }
+
+
 @router.get("/settings")
 def get_settings_api(
     db: Annotated[Session, Depends(get_db)],
@@ -313,3 +351,10 @@ def reset_daily_lock(
     log_event(db, "RISK", "Daily risk lock reset by admin")
     notifier.send(db, "Daily Risk Lock Reset")
     return {"status": "RESET"}
+
+
+def _safe_json(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except Exception:
+        return value

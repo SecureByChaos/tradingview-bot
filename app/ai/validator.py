@@ -31,6 +31,9 @@ class AIResponseValidator:
                 reason_not_to_buy=self._list(data.get("reason_not_to_buy")),
                 summary=summary,
                 expected_probability=self._optional_confidence(data.get("expected_probability")),
+                received_fields=self._list(data.get("received_fields")),
+                missing_fields=self._list(data.get("missing_fields")),
+                context_quality=str(data.get("context_quality") or ""),
                 provider="",
             )
         except Exception:

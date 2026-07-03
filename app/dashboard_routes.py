@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import authenticate_admin, require_admin_page
 from app.ai.context_builder import SignalContextBuilder
+from app.ai.context_repository import get_context_log_for_review, get_latest_context_log
 from app.ai.factory import create_reviewer
 from app.ai.repository import create_settings as create_ai_settings, get_settings as get_ai_settings, update_settings as update_ai_settings
 from app.database import get_db
@@ -411,11 +412,15 @@ def ai_reviews_page(
         day_label = to_ist(review.created_at).strftime("%d %b %Y")
         if not groups or groups[-1]["date"] != day_label:
             groups.append({"date": day_label, "reviews": []})
+        context_log = get_context_log_for_review(db, review.trade_id, review.signal)
         groups[-1]["reviews"].append(
             {
                 "review": review,
                 "reason_to_buy": _review_list(review.reason_to_buy),
                 "reason_not_to_buy": _review_list(review.reason_not_to_buy),
+                "context_log": context_log,
+                "context_json": _context_json(context_log.context_json) if context_log is not None else {},
+                "context_missing_fields": _review_list(context_log.missing_fields) if context_log is not None else [],
             }
         )
     filters = {"review_date": review_date, "strategy": strategy, "provider": provider, "decision": decision, "trade_result": trade_result}
@@ -436,12 +441,41 @@ def ai_reviews_page(
     )
 
 
+@router.get("/ai-context-inspector", response_class=HTMLResponse)
+def ai_context_inspector_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    context_log = get_latest_context_log(db)
+    return templates.TemplateResponse(
+        "ai_context_inspector.html",
+        {
+            "request": request,
+            "context_log": context_log,
+            "context_json": _context_json(context_log.context_json) if context_log is not None else {},
+            "request_json": _context_json(context_log.request_json) if context_log is not None else {},
+            "missing_fields": _review_list(context_log.missing_fields) if context_log is not None else [],
+            "reason_to_buy": _review_list(context_log.reason_to_buy) if context_log is not None else [],
+            "reason_not_to_buy": _review_list(context_log.reason_not_to_buy) if context_log is not None else [],
+        },
+    )
+
+
 def _review_list(value: str) -> list[str]:
     try:
         parsed = json.loads(value)
         return parsed if isinstance(parsed, list) else [str(parsed)]
     except (TypeError, ValueError):
         return []
+
+
+def _context_json(value: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
 
 
 def apply_settings(
