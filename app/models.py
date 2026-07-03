@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Signal(str, Enum):
@@ -22,8 +22,12 @@ class ExitReason(str, Enum):
 
 
 class WebhookPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
     strategy: str | None = None
     signal: Signal
+    market_data: dict[str, Any] | None = None
+    indicators: dict[str, Any] | None = None
+    trade_state: dict[str, Any] | None = None
 
 
 class OptionContract(BaseModel):

@@ -74,7 +74,15 @@ def exit_signal_for_entry(signal: str) -> str:
     return _EXIT_SIGNAL_MAP.get(signal, signal)
 
 
-def run_shadow_review(strategy: str, signal: str, timestamp: datetime, trade_id: Optional[str]) -> None:
+def run_shadow_review(
+    strategy: str,
+    signal: str,
+    timestamp: datetime,
+    trade_id: Optional[str],
+    market_data_override: Optional[dict[str, object]] = None,
+    indicators_override: Optional[dict[str, object]] = None,
+    trade_state_override: Optional[dict[str, object]] = None,
+) -> None:
     try:
         with SessionLocal() as db:
             logger.info("[AI] Shadow started")
@@ -88,7 +96,7 @@ def run_shadow_review(strategy: str, signal: str, timestamp: datetime, trade_id:
             if not settings.enabled:
                 logger.info("[AI] Shadow skipped: AI disabled")
                 return
-            if settings.mode != "SHADOW":
+            if settings.mode == "DISABLED":
                 logger.info("[AI] Shadow skipped: mode is %s", settings.mode)
                 return
             trade = db.scalar(select(StrategyTrade).where(StrategyTrade.trade_id == trade_id)) if trade_id else None
@@ -182,6 +190,9 @@ def run_shadow_review(strategy: str, signal: str, timestamp: datetime, trade_id:
                 "running_pnl": (trade.profit_loss if trade is not None else None),
                 "holding_minutes": holding_minutes,
             }
+            _merge_context_data(market_data, market_data_override)
+            _merge_context_data(indicators, indicators_override)
+            _merge_context_data(trade_state, trade_state_override)
             context = SignalContextBuilder().build(strategy, signal, timestamp, market_data, indicators, trade_state)
             logger.info("[AI] Context built")
             logger.info("[AI] Exit review" if event_type.startswith("CLOSE_") else "[AI] Entry review")
@@ -393,3 +404,15 @@ def _missing_context_fields(context_data: dict[str, object]) -> list[str]:
         "position_state": trade_state.get("position_state"),
     }
     return [name for name in _COMPLETENESS_FIELDS if not _is_present(field_map.get(name))]
+
+
+def _merge_context_data(base: dict[str, object], override: Optional[dict[str, object]]) -> None:
+    if not override:
+        return
+    for key, value in override.items():
+        if key == "filters" and isinstance(value, dict) and isinstance(base.get("filters"), dict):
+            merged = dict(base["filters"])
+            merged.update(value)
+            base["filters"] = merged
+            continue
+        base[key] = value

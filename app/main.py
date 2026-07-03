@@ -140,7 +140,15 @@ def queue_shadow_review(
     if trade is None:
         logger.info("[AI] Shadow skipped: no matching BUY trade found")
         return response
-    background_tasks.add_task(run_shadow_review, strategy_name, signal, utc_now(), trade.trade_id if trade else None)
+    market_data = _build_shadow_market_data(trade)
+    background_tasks.add_task(
+        run_shadow_review,
+        strategy_name,
+        signal,
+        utc_now(),
+        trade.trade_id if trade else None,
+        market_data,
+    )
     return response
 
 
@@ -206,3 +214,23 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
         log_event(db, "ERROR", "Webhook processing failed", "ERROR", {"error": str(exc)})
         telegram.send(db, f"System Error\nWebhook processing failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _build_shadow_market_data(trade: StrategyTrade) -> dict[str, object]:
+    market_data: dict[str, object] = {
+        "strike": trade.strike,
+        "expiry": trade.expiry,
+        "option_price": trade.current_premium if trade.current_premium is not None else trade.entry_price,
+    }
+    try:
+        market_data["banknifty_price"] = round(smartapi.get_banknifty_spot(), 2)
+    except Exception as exc:
+        logger.info("[AI] Shadow market fetch skipped: BANKNIFTY spot unavailable (%s)", exc)
+    try:
+        market_data["option_price"] = round(
+            smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken),
+            2,
+        )
+    except Exception as exc:
+        logger.info("[AI] Shadow market fetch skipped: option premium unavailable (%s)", exc)
+    return market_data

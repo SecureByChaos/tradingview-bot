@@ -279,7 +279,22 @@ class MultiStrategyTradeManager:
             log_event(db, "RISK", f"Strategy {trade.strategy_name} locked due to consecutive losses", "WARNING")
             self.telegram.send(db, f"Strategy Risk Lock\n[{trade.strategy_name}] consecutive losses: {stats.consecutive_losses}")
         self.telegram.send(db, f"Trade Closed\n[{trade.strategy_name}] {reason.value}\nP&L: {trade.pnl_percent:.2f}%")
-        run_shadow_review(trade.strategy_name, exit_signal_for_entry(trade.signal), utc_now(), trade.trade_id)
+        shadow_market_data = {
+            "strike": trade.strike,
+            "expiry": trade.expiry,
+            "option_price": round(exit_price, 2),
+        }
+        try:
+            shadow_market_data["banknifty_price"] = round(self.smartapi.get_banknifty_spot(), 2)
+        except Exception as exc:
+            logger.info("[AI] Shadow market fetch skipped: BANKNIFTY spot unavailable (%s)", exc)
+        run_shadow_review(
+            trade.strategy_name,
+            exit_signal_for_entry(trade.signal),
+            utc_now(),
+            trade.trade_id,
+            shadow_market_data,
+        )
         return trade
 
     def current_state(self, db: Session, strategy_name: str) -> str:
