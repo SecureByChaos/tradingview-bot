@@ -30,6 +30,7 @@ class AIResponseValidator:
                 reason_to_buy=self._list(data.get("reason_to_buy")),
                 reason_not_to_buy=self._list(data.get("reason_not_to_buy")),
                 summary=summary,
+                expected_probability=self._optional_confidence(data.get("expected_probability")),
                 provider="",
             )
         except Exception:
@@ -41,6 +42,12 @@ class AIResponseValidator:
             return min(100.0, max(0.0, float(value)))
         except (TypeError, ValueError):
             return 0.0
+
+    @classmethod
+    def _optional_confidence(cls, value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        return cls._confidence(value)
 
     @staticmethod
     def _list(value: Any) -> List[str]:

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class AIContext(BaseModel):
     strategy_name: str
     signal: str
+    event_type: Optional[str] = None
     timestamp: datetime
     symbol: Optional[str] = None
     spot_price: Optional[float] = None
@@ -27,6 +28,7 @@ class ReviewResult(BaseModel):
     reason_to_buy: List[str] = Field(default_factory=list)
     reason_not_to_buy: List[str] = Field(default_factory=list)
     summary: str
+    expected_probability: Optional[float] = None
     provider: str
     model: Optional[str] = None
     latency_ms: float = Field(default=0, ge=0)

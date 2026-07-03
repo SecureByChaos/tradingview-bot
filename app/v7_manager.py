@@ -35,10 +35,25 @@ class V7Manager:
         self.telegram = telegram
 
     def handle_signal(self, db: Session, signal: Signal) -> WebhookResponse:
+        state = self.current_state(db)
         if signal in {Signal.BUY_CE, Signal.BUY_PE}:
+            if state != "FLAT":
+                event = "OPEN_CE" if signal == Signal.BUY_CE else "OPEN_PE"
+                message = f"[STATE] {event} ignored"
+                log_event(db, "STATE", message, "WARNING")
+                return WebhookResponse(accepted=False, message=message)
+            log_event(db, "STATE", "[STATE] OPEN_CE accepted" if signal == Signal.BUY_CE else "[STATE] OPEN_PE accepted")
             return self.open_trade(db, signal)
         if signal in {Signal.SELL_CE, Signal.SELL_PE}:
-            return self.close_trade(db, "CE" if signal == Signal.SELL_CE else "PE")
+            option_type = "CE" if signal == Signal.SELL_CE else "PE"
+            expected_state = "LONG_CE" if option_type == "CE" else "LONG_PE"
+            event = "CLOSE_CE" if option_type == "CE" else "CLOSE_PE"
+            if state != expected_state:
+                message = f"Ignored {event} because no active {option_type} position exists."
+                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": message})
+                return WebhookResponse(accepted=False, message=message)
+            log_event(db, "STATE", f"[STATE] {event} accepted")
+            return self.close_trade(db, option_type)
         return WebhookResponse(accepted=False, message=f"Rejected: unsupported V7 signal {signal.value}")
 
     def open_trade(self, db: Session, signal: Signal) -> WebhookResponse:
@@ -46,8 +61,18 @@ class V7Manager:
         if strategy is None:
             return WebhookResponse(accepted=False, message="Rejected: strategy 'V7' does not exist")
 
-        contract = self.option_finder.find_atm_contract(signal)
-        entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
+        try:
+            contract = self.option_finder.find_atm_contract(signal)
+            entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
+        except Exception as exc:
+            log_event(
+                db,
+                "STATE",
+                f"[STATE] FAILED_ENTRY {signal.value}",
+                "WARNING",
+                {"strategy": self.strategy_name, "error": str(exc)},
+            )
+            raise
         mode = self.resolve_mode(strategy)
         required_capital = round(entry_price * contract.lot_size, 2)
         available_capital = "N/A (no capital balance ledger)"
@@ -60,6 +85,13 @@ class V7Manager:
             mode, strategy.capital_per_trade, available_capital, required_capital, quantity, reject_reason,
         )
         if quantity <= 0:
+            log_event(
+                db,
+                "STATE",
+                f"[STATE] FAILED_ENTRY {signal.value}",
+                "WARNING",
+                {"strategy": self.strategy_name, "reason": "capital_per_trade is insufficient"},
+            )
             return WebhookResponse(
                 accepted=False,
                 message=f"Rejected: capital_per_trade is insufficient for {contract.tradingsymbol}",
@@ -117,7 +149,9 @@ class V7Manager:
             .limit(1)
         )
         if trade is None:
-            return WebhookResponse(accepted=True, message=f"No active V7 {option_type} trade to close")
+            message = f"Ignored CLOSE_{option_type} because no active {option_type} position exists."
+            log_event(db, "STATE", f"[STATE] CLOSE_{option_type} ignored", "WARNING", {"reason": message})
+            return WebhookResponse(accepted=False, message=message)
 
         exit_price = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
         if trade.mode == TradingMode.LIVE:
@@ -151,6 +185,23 @@ class V7Manager:
         self.telegram.send(db, f"Trade Closed\n[V7] {option_type} TV_EXIT\nP&L: {trade.pnl_percent:.2f}%")
         run_shadow_review(trade.strategy_name, exit_signal_for_entry(trade.signal), utc_now(), trade.trade_id)
         return WebhookResponse(accepted=True, message=f"V7 {option_type} trade closed")
+
+    def current_state(self, db: Session) -> str:
+        trades = list(
+            db.scalars(
+                select(StrategyTrade).where(
+                    StrategyTrade.strategy_name == self.strategy_name,
+                    StrategyTrade.status == TradeStatus.OPEN,
+                )
+            )
+        )
+        if not trades:
+            return "FLAT"
+        if any(trade.option_type == "CE" for trade in trades):
+            return "LONG_CE"
+        if any(trade.option_type == "PE" for trade in trades):
+            return "LONG_PE"
+        return "FLAT"
 
     def get_strategy(self, db: Session) -> StrategyConfig | None:
         return db.scalar(select(StrategyConfig).where(func.upper(StrategyConfig.name) == self.strategy_name))

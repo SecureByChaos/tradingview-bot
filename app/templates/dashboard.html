@@ -17,6 +17,7 @@
   <div class="metric"><div class="label">Consecutive Loss Count</div><div class="value warn">{{ summary.consecutive_losses }}</div></div>
   <div class="metric"><div class="label">Trading Allowed</div><div class="value">{{ "YES" if summary.trading_allowed else "NO" }}</div></div>
   <div class="metric"><div class="label">Daily Risk Status</div><div class="value {% if summary.daily_risk_status == 'OK' %}profit{% else %}loss{% endif %}">{{ summary.daily_risk_status }}</div></div>
+  <div class="metric"><div class="label">Current State</div><div class="value">{{ summary.current_state }}</div></div>
 </div>
 <div class="section-header">
   <h4 class="mb-0">Pre-Market Health</h4>

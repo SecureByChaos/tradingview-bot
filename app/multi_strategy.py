@@ -41,6 +41,31 @@ class MultiStrategyTradeManager:
             return WebhookResponse(accepted=False, message=f"Rejected: strategy '{resolved_name}' does not exist")
         if strategy.name.upper() == "V7" and signal in {Signal.SELL_CE, Signal.SELL_PE}:
             return self.handle_v7_tv_exit(db, strategy.name, signal)
+        state = self.current_state(db, strategy.name)
+        if signal in {Signal.BUY_CE, Signal.BUY_PE}:
+            if state != "FLAT":
+                event = "OPEN_CE" if signal == Signal.BUY_CE else "OPEN_PE"
+                message = f"[STATE] {event} ignored"
+                log_event(db, "STATE", message, "WARNING")
+                return WebhookResponse(accepted=False, message=message)
+            log_event(db, "STATE", "[STATE] OPEN_CE accepted" if signal == Signal.BUY_CE else "[STATE] OPEN_PE accepted")
+        elif signal in {Signal.SELL_CE, Signal.SELL_PE}:
+            option_type = "CE" if signal == Signal.SELL_CE else "PE"
+            event = "CLOSE_CE" if option_type == "CE" else "CLOSE_PE"
+            expected_state = "LONG_CE" if option_type == "CE" else "LONG_PE"
+            if state != expected_state:
+                message = f"Ignored {event} because no active {option_type} position exists."
+                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": message})
+                return WebhookResponse(accepted=False, message=message)
+            trade = self.latest_open_trade_for_option(db, strategy.name, option_type)
+            if trade is None:
+                message = f"Ignored {event} because no active {option_type} position exists."
+                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": message})
+                return WebhookResponse(accepted=False, message=message)
+            log_event(db, "STATE", f"[STATE] {event} accepted")
+            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+            self.close_trade(db, trade, premium, ExitReason.TV_EXIT)
+            return WebhookResponse(accepted=True, message=f"Closed active {option_type} trade")
         if not strategy.enabled:
             return WebhookResponse(accepted=False, message=f"Rejected: strategy '{strategy.name}' is disabled")
         if strategy.mode == TradingMode.PAPER and not strategy.paper_trade:
@@ -54,9 +79,18 @@ class MultiStrategyTradeManager:
                 accepted=False,
                 message=f"Rejected: strategy '{strategy.name}' active trade limit reached",
             )
-
-        contract = self.option_finder.find_atm_contract(signal)
-        entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
+        try:
+            contract = self.option_finder.find_atm_contract(signal)
+            entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
+        except Exception as exc:
+            log_event(
+                db,
+                "STATE",
+                f"[STATE] FAILED_ENTRY {signal.value}",
+                "WARNING",
+                {"strategy": strategy.name, "error": str(exc)},
+            )
+            raise
         mode = self.resolve_mode(strategy)
         required_capital = round(entry_price * contract.lot_size, 2)
         available_capital = "N/A (no capital balance ledger)"
@@ -69,6 +103,13 @@ class MultiStrategyTradeManager:
             mode, strategy.capital_per_trade, available_capital, required_capital, quantity, reject_reason,
         )
         if quantity <= 0:
+            log_event(
+                db,
+                "STATE",
+                f"[STATE] FAILED_ENTRY {signal.value}",
+                "WARNING",
+                {"strategy": strategy.name, "reason": "capital_per_trade is insufficient"},
+            )
             return WebhookResponse(
                 accepted=False,
                 message=f"Rejected: capital_per_trade is insufficient for {contract.tradingsymbol}",
@@ -240,6 +281,35 @@ class MultiStrategyTradeManager:
         self.telegram.send(db, f"Trade Closed\n[{trade.strategy_name}] {reason.value}\nP&L: {trade.pnl_percent:.2f}%")
         run_shadow_review(trade.strategy_name, exit_signal_for_entry(trade.signal), utc_now(), trade.trade_id)
         return trade
+
+    def current_state(self, db: Session, strategy_name: str) -> str:
+        trades = list(
+            db.scalars(
+                select(StrategyTrade).where(
+                    StrategyTrade.strategy_name == strategy_name,
+                    StrategyTrade.status == TradeStatus.OPEN,
+                )
+            )
+        )
+        if not trades:
+            return "FLAT"
+        if any(trade.option_type == "CE" for trade in trades):
+            return "LONG_CE"
+        if any(trade.option_type == "PE" for trade in trades):
+            return "LONG_PE"
+        return "FLAT"
+
+    def latest_open_trade_for_option(self, db: Session, strategy_name: str, option_type: str) -> StrategyTrade | None:
+        return db.scalar(
+            select(StrategyTrade)
+            .where(
+                StrategyTrade.strategy_name == strategy_name,
+                StrategyTrade.status == TradeStatus.OPEN,
+                StrategyTrade.option_type == option_type,
+            )
+            .order_by(StrategyTrade.entry_time.desc())
+            .limit(1)
+        )
 
     def square_off_all(self, db: Session) -> list[StrategyTrade]:
         closed: list[StrategyTrade] = []

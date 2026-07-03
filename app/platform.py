@@ -204,6 +204,24 @@ def get_dashboard_summary(db: Session, active_trade: Any | None) -> dict[str, An
     settings = get_or_create_settings(db)
     stats = rebuild_daily_stats(db)
     open_count = int(db.scalar(select(func.count()).select_from(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN)) or 0)
+    open_option_types = list(
+        db.scalars(
+            select(StrategyTrade.option_type).where(StrategyTrade.status == TradeStatus.OPEN)
+        )
+    )
+    current_state = "FLAT"
+    if "CE" in open_option_types:
+        current_state = "LONG_CE"
+    elif "PE" in open_option_types:
+        current_state = "LONG_PE"
+    failed_entry = db.scalar(
+        select(LogEvent)
+        .where(LogEvent.event_type == "STATE", LogEvent.message.like("%FAILED_ENTRY%"))
+        .order_by(LogEvent.created_at.desc())
+        .limit(1)
+    )
+    if current_state == "FLAT" and failed_entry is not None:
+        current_state = "FAILED_ENTRY"
     return {
         "bot_status": state.status,
         "trading_mode": settings.trading_mode,
@@ -217,6 +235,7 @@ def get_dashboard_summary(db: Session, active_trade: Any | None) -> dict[str, An
         "trading_allowed": state.trading_allowed and state.status == BotStatus.RUNNING and not state.risk_locked,
         "daily_risk_status": "LOCKED" if state.risk_locked else "OK",
         "risk_locked": state.risk_locked,
+        "current_state": current_state,
     }
 
 
