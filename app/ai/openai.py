@@ -35,6 +35,7 @@ class OpenAIReviewer(AIReviewer):
                 return self._logged_error(request_id, prompt_version, "OpenAI model is not configured.")
 
             endpoint = (self.settings.base_url or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+            logger.info("[AI] Calling OpenAI")
             response = self.client.send(
                 endpoint=endpoint,
                 headers={
@@ -52,7 +53,7 @@ class OpenAIReviewer(AIReviewer):
                 },
                 timeout=self.settings.timeout_seconds,
             )
-            logger.info("[AI] OpenAI request completed")
+            logger.info("[AI] OpenAI response received")
             if response.error:
                 return self._logged_error(request_id, prompt_version, response.error, response.latency_ms)
 

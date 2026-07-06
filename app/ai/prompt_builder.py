@@ -81,7 +81,8 @@ class PromptBuilder:
             else "This is an ENTRY review. Evaluate whether this entry should be taken."
         )
         user_prompt += (
-            "\n\n" + review_instruction +
+            "\n\nReview Type: " + ("EXIT" if event_type.startswith("CLOSE_") else "ENTRY") +
+            "\n" + review_instruction +
             "\nReturn ONLY valid JSON with these keys: decision, confidence, market_type, "
             "risk, entry_quality, reason_to_buy, reason_not_to_buy, summary, expected_probability, "
             "received_fields, missing_fields, context_quality. "

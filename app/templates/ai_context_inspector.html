@@ -16,6 +16,10 @@
   <div class="metric"><div class="label">Decision</div><div class="value">{{ context_log.decision or "-" }}</div></div>
   <div class="metric"><div class="label">Confidence</div><div class="value">{{ context_log.confidence if context_log.confidence is not none else "-" }}</div></div>
   <div class="metric"><div class="label">Missing Fields</div><div>{{ missing_fields | join(", ") or "None" }}</div></div>
+  <div class="metric"><div class="label">TradingView Fields</div><div class="value">{{ source_breakdown.tradingview if source_breakdown else 0 }}</div></div>
+  <div class="metric"><div class="label">SmartAPI Fields</div><div class="value">{{ source_breakdown.smartapi if source_breakdown else 0 }}</div></div>
+  <div class="metric"><div class="label">Database Fields</div><div class="value">{{ source_breakdown.database if source_breakdown else 0 }}</div></div>
+  <div class="metric"><div class="label">Not Supplied</div><div class="value">{{ source_breakdown.not_supplied if source_breakdown else 0 }}</div></div>
 </div>
 <div class="panel mb-4">
   <div class="field-label mb-2">Summary</div>
@@ -24,6 +28,42 @@
   <div>{{ reason_to_buy | join(", ") or "-" }}</div>
   <div class="field-label mt-3 mb-1">Reason Not To Buy</div>
   <div>{{ reason_not_to_buy | join(", ") or "-" }}</div>
+</div>
+<div class="panel mb-4">
+  <div class="field-label mb-2">TradingView Indicators</div>
+  <div class="table-responsive responsive-table">
+    <table class="table table-dark table-sm align-middle">
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{% for row in tradingview_indicators %}<tr><td data-label="Field">{{ row.field }}</td><td data-label="Value">{{ row.value }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+</div>
+<div class="panel mb-4">
+  <div class="field-label mb-2">Market Data</div>
+  <div class="table-responsive responsive-table">
+    <table class="table table-dark table-sm align-middle">
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{% for row in tradingview_market_data %}<tr><td data-label="Field">{{ row.field }}</td><td data-label="Value">{{ row.value }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+</div>
+<div class="panel mb-4">
+  <div class="field-label mb-2">Trade Data</div>
+  <div class="table-responsive responsive-table">
+    <table class="table table-dark table-sm align-middle">
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{% for row in trade_data %}<tr><td data-label="Field">{{ row.field }}</td><td data-label="Value">{{ row.value }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
+</div>
+<div class="panel mb-4">
+  <div class="field-label mb-2">Broker Data</div>
+  <div class="table-responsive responsive-table">
+    <table class="table table-dark table-sm align-middle">
+      <thead><tr><th>Field</th><th>Value</th></tr></thead>
+      <tbody>{% for row in broker_data %}<tr><td data-label="Field">{{ row.field }}</td><td data-label="Value">{{ row.value }}</td></tr>{% endfor %}</tbody>
+    </table>
+  </div>
 </div>
 <div class="panel mb-4">
   <details open>

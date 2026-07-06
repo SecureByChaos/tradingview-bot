@@ -49,6 +49,8 @@ _COMPLETENESS_FIELDS = (
     "rsi",
     "atr",
     "adx",
+    "di_plus",
+    "di_minus",
     "supertrend",
     "orb_high",
     "orb_low",
@@ -65,7 +67,24 @@ _COMPLETENESS_FIELDS = (
     "rr_ratio",
     "running_pnl",
     "position",
+    "option_type",
     "holding_minutes",
+    "position_state",
+)
+_REQUIRED_COMPLETENESS_FIELDS = (
+    "strategy",
+    "signal",
+    "event_type",
+    "paper_live",
+    "trade_id",
+    "trade_number",
+    "session",
+    "spot_price",
+    "option_price",
+    "strike",
+    "expiry",
+    "premium",
+    "entry",
     "position_state",
 )
 
@@ -79,9 +98,10 @@ def run_shadow_review(
     signal: str,
     timestamp: datetime,
     trade_id: Optional[str],
-    market_data_override: Optional[dict[str, object]] = None,
-    indicators_override: Optional[dict[str, object]] = None,
-    trade_state_override: Optional[dict[str, object]] = None,
+    smartapi_market_data: Optional[dict[str, object]] = None,
+    tradingview_market_data: Optional[dict[str, object]] = None,
+    tradingview_indicators: Optional[dict[str, object]] = None,
+    tradingview_trade_state: Optional[dict[str, object]] = None,
 ) -> None:
     try:
         with SessionLocal() as db:
@@ -144,6 +164,7 @@ def run_shadow_review(
                 "option_price": (trade.current_premium if trade is not None else None),
                 "strike": (trade.strike if trade is not None else None),
                 "expiry": (trade.expiry if trade is not None else None),
+                "option_type": (trade.option_type if trade is not None else ""),
                 "atm_distance": "",
                 "previous_close": "",
                 "day_high": "",
@@ -168,6 +189,8 @@ def run_shadow_review(
                 "atr": "",
                 "supertrend": "",
                 "adx": "",
+                "di_plus": "",
+                "di_minus": "",
                 "volume_ratio": "",
                 "orb_high": "",
                 "orb_low": "",
@@ -182,6 +205,7 @@ def run_shadow_review(
                 "paper_live": market_data["paper_live"],
                 "trade_number_today": trade_number_today,
                 "position_state": position_state,
+                "position": (f"LONG_{trade.option_type}" if trade is not None and trade.option_type else ""),
                 "entry_price": (trade.entry_price if trade is not None else None),
                 "stop_loss": (trade.stoploss if trade is not None else None),
                 "target": (trade.target if trade is not None else None),
@@ -190,9 +214,15 @@ def run_shadow_review(
                 "running_pnl": (trade.profit_loss if trade is not None else None),
                 "holding_minutes": holding_minutes,
             }
-            _merge_context_data(market_data, market_data_override)
-            _merge_context_data(indicators, indicators_override)
-            _merge_context_data(trade_state, trade_state_override)
+            logger.info("[AI] %s review triggered", "Exit" if event_type.startswith("CLOSE_") else "Entry")
+            logger.info("[AI] Building context")
+            market_sources = _seed_sources(market_data, "Database")
+            indicator_sources = _seed_sources(indicators, "Database")
+            trade_sources = _seed_sources(trade_state, "Database")
+            _merge_context_data(market_data, smartapi_market_data, market_sources, "SmartAPI")
+            _merge_context_data(market_data, tradingview_market_data, market_sources, "TradingView")
+            _merge_context_data(indicators, tradingview_indicators, indicator_sources, "TradingView")
+            _merge_context_data(trade_state, tradingview_trade_state, trade_sources, "TradingView")
             context = SignalContextBuilder().build(strategy, signal, timestamp, market_data, indicators, trade_state)
             logger.info("[AI] Context built")
             logger.info("[AI] Exit review" if event_type.startswith("CLOSE_") else "[AI] Entry review")
@@ -202,9 +232,25 @@ def run_shadow_review(
                 trade_id=trade_id,
                 trade_number_today=trade_number_today,
                 session=session,
+                tradingview_market_data=tradingview_market_data or {},
+                tradingview_indicators=tradingview_indicators or {},
+                tradingview_trade_state=tradingview_trade_state or {},
+                smartapi_market_data=smartapi_market_data or {},
+                market_sources=market_sources,
+                indicator_sources=indicator_sources,
+                trade_sources=trade_sources,
             )
-            missing_fields = _missing_context_fields(context_data)
-            completeness = round((1 - (len(missing_fields) / len(_COMPLETENESS_FIELDS))) * 100, 1)
+            missing_fields, expected_count = _missing_context_fields(context_data)
+            completeness = round((1 - (len(missing_fields) / max(expected_count, 1))) * 100, 1)
+            breakdown = context_data.get("source_breakdown") or {}
+            logger.info(
+                "[AI] Context sources TradingView=%s SmartAPI=%s Database=%s NotSupplied=%s Overall=%s%%",
+                breakdown.get("tradingview", 0),
+                breakdown.get("smartapi", 0),
+                breakdown.get("database", 0),
+                breakdown.get("not_supplied", 0),
+                completeness,
+            )
             request_data = {
                 "provider": settings.provider,
                 "model": settings.model,
@@ -215,8 +261,8 @@ def run_shadow_review(
                 ],
             }
             payload_size = len(json.dumps(request_data, default=str).encode("utf-8"))
-            logger.info("[AI] Context completeness %.0f%%", completeness)
-            logger.info("[AI] Payload size %.1f KB", payload_size / 1024 if payload_size else 0.0)
+            logger.info("[AI] Context completeness: %.0f%%", completeness)
+            logger.info("[AI] Payload size: %.1f KB", payload_size / 1024 if payload_size else 0.0)
             logger.info(
                 "[AI] Missing fields: %s",
                 "None" if not missing_fields else ", ".join(missing_fields),
@@ -240,7 +286,9 @@ def run_shadow_review(
                 completeness_percent=completeness,
                 missing_fields=missing_fields,
             )
+            logger.info("[AI] Calling OpenAI")
             provider_result = create_reviewer(settings).analyze_signal(context)
+            logger.info("[AI] OpenAI response received")
             result = AIResponseValidator().validate(provider_result.model_dump()).model_copy(
                 update={
                     "provider": provider_result.provider,
@@ -262,7 +310,7 @@ def run_shadow_review(
                 summary=result.summary,
             )
             try:
-                logger.info("[AI] Saving review trade_id=%s", trade_id)
+                logger.info("[AI] Saving review")
                 review = save_review(
                     db,
                     trade_id,
@@ -273,7 +321,7 @@ def run_shadow_review(
                     CONTEXT_VERSION,
                     FRAMEWORK_VERSION,
                 )
-                logger.info("[AI] Review saved id=%s", review.id)
+                logger.info("[AI] Review saved successfully id=%s", review.id)
             except Exception as exc:
                 logger.exception("[AI] Review save failed: %s", exc)
     except Exception:
@@ -286,6 +334,13 @@ def _context_snapshot(
     trade_id: Optional[str],
     trade_number_today: int,
     session: str,
+    tradingview_market_data: dict[str, object],
+    tradingview_indicators: dict[str, object],
+    tradingview_trade_state: dict[str, object],
+    smartapi_market_data: dict[str, object],
+    market_sources: dict[str, str],
+    indicator_sources: dict[str, str],
+    trade_sources: dict[str, str],
 ) -> dict[str, object]:
     context_dict = getattr(context, "model_dump")()
     market = context_dict.get("market_data") or {}
@@ -305,6 +360,7 @@ def _context_snapshot(
             "option_price": context_dict.get("option_price"),
             "strike": market.get("strike"),
             "expiry": market.get("expiry"),
+            "option_type": market.get("option_type"),
             "premium": account.get("current_premium") or context_dict.get("option_price"),
             "atm_distance": market.get("atm_distance"),
             "previous_close": market.get("previous_close"),
@@ -319,6 +375,8 @@ def _context_snapshot(
             "rsi": indicators.get("rsi"),
             "atr": indicators.get("atr"),
             "adx": indicators.get("adx"),
+            "di_plus": indicators.get("di_plus"),
+            "di_minus": indicators.get("di_minus"),
             "supertrend": indicators.get("supertrend"),
             "orb_high": indicators.get("orb_high"),
             "orb_low": indicators.get("orb_low"),
@@ -345,6 +403,25 @@ def _context_snapshot(
             "holding_minutes": account.get("holding_minutes"),
             "position_state": account.get("position_state"),
         },
+        "tradingview": {
+            "indicators": tradingview_indicators,
+            "market_data": tradingview_market_data,
+            "trade_state": tradingview_trade_state,
+        },
+        "broker_data": smartapi_market_data,
+        "field_sources": {
+            **{f"market.{k}": v for k, v in market_sources.items()},
+            **{f"indicators.{k}": v for k, v in indicator_sources.items()},
+            **{f"trade_state.{k}": v for k, v in trade_sources.items()},
+        },
+        "source_breakdown": _source_breakdown(
+            market_sources=market_sources,
+            indicator_sources=indicator_sources,
+            trade_sources=trade_sources,
+            market=market,
+            indicators=indicators,
+            account=account,
+        ),
     }
 
 
@@ -358,7 +435,7 @@ def _is_present(value: object) -> bool:
     return True
 
 
-def _missing_context_fields(context_data: dict[str, object]) -> list[str]:
+def _missing_context_fields(context_data: dict[str, object]) -> tuple[list[str], int]:
     market = context_data.get("market") or {}
     indicators = context_data.get("indicators") or {}
     trend = context_data.get("trend") or {}
@@ -384,6 +461,8 @@ def _missing_context_fields(context_data: dict[str, object]) -> list[str]:
         "rsi": indicators.get("rsi"),
         "atr": indicators.get("atr"),
         "adx": indicators.get("adx"),
+        "di_plus": indicators.get("di_plus"),
+        "di_minus": indicators.get("di_minus"),
         "supertrend": indicators.get("supertrend"),
         "orb_high": indicators.get("orb_high"),
         "orb_low": indicators.get("orb_low"),
@@ -400,19 +479,73 @@ def _missing_context_fields(context_data: dict[str, object]) -> list[str]:
         "rr_ratio": risk.get("rr_ratio"),
         "running_pnl": risk.get("running_pnl"),
         "position": trade_state.get("position"),
+        "option_type": market.get("option_type"),
         "holding_minutes": trade_state.get("holding_minutes"),
         "position_state": trade_state.get("position_state"),
     }
-    return [name for name in _COMPLETENESS_FIELDS if not _is_present(field_map.get(name))]
+    expected = set(_REQUIRED_COMPLETENESS_FIELDS)
+    for name in _COMPLETENESS_FIELDS:
+        if name in expected:
+            continue
+        value = field_map.get(name)
+        if _is_present(value):
+            expected.add(name)
+    missing = [name for name in sorted(expected) if not _is_present(field_map.get(name))]
+    return missing, len(expected)
 
 
-def _merge_context_data(base: dict[str, object], override: Optional[dict[str, object]]) -> None:
+def _merge_context_data(
+    base: dict[str, object],
+    override: Optional[dict[str, object]],
+    source_map: Optional[dict[str, str]] = None,
+    source_name: str = "",
+) -> None:
     if not override:
         return
     for key, value in override.items():
+        if not _is_present(value):
+            continue
         if key == "filters" and isinstance(value, dict) and isinstance(base.get("filters"), dict):
             merged = dict(base["filters"])
             merged.update(value)
             base["filters"] = merged
+            if source_map is not None and source_name:
+                source_map["filters"] = source_name
             continue
         base[key] = value
+        if source_map is not None and source_name:
+            source_map[key] = source_name
+
+
+def _seed_sources(data: dict[str, object], source_name: str) -> dict[str, str]:
+    return {key: source_name for key, value in data.items() if _is_present(value)}
+
+
+def _source_breakdown(
+    *,
+    market_sources: dict[str, str],
+    indicator_sources: dict[str, str],
+    trade_sources: dict[str, str],
+    market: dict[str, object],
+    indicators: dict[str, object],
+    account: dict[str, object],
+) -> dict[str, int]:
+    sections = {
+        "market": (market, market_sources),
+        "indicators": (indicators, indicator_sources),
+        "trade_state": (account, trade_sources),
+    }
+    breakdown = {"tradingview": 0, "smartapi": 0, "database": 0, "not_supplied": 0}
+    for values, source_map in sections.values():
+        for key, value in values.items():
+            if not _is_present(value):
+                breakdown["not_supplied"] += 1
+                continue
+            source = source_map.get(key, "Database")
+            if source == "TradingView":
+                breakdown["tradingview"] += 1
+            elif source == "SmartAPI":
+                breakdown["smartapi"] += 1
+            else:
+                breakdown["database"] += 1
+    return breakdown

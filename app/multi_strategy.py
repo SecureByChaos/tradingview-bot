@@ -288,6 +288,7 @@ class MultiStrategyTradeManager:
             shadow_market_data["banknifty_price"] = round(self.smartapi.get_banknifty_spot(), 2)
         except Exception as exc:
             logger.info("[AI] Shadow market fetch skipped: BANKNIFTY spot unavailable (%s)", exc)
+        logger.info("[AI] Exit review triggered")
         run_shadow_review(
             trade.strategy_name,
             exit_signal_for_entry(trade.signal),

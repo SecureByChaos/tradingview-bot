@@ -26,15 +26,15 @@
 <h5 class="mt-4 mb-2">{{ group.date }}</h5>
 <div class="table-responsive responsive-table">
   <table class="table table-dark table-hover align-middle">
-    <thead><tr><th>Time</th><th>Strategy</th><th>Signal</th><th>Provider</th><th>Decision</th><th>Confidence</th><th>Trade Result</th><th>PnL</th><th></th></tr></thead>
+    <thead><tr><th>Time</th><th>Strategy</th><th>Signal</th><th>Review Type</th><th>Provider</th><th>Decision</th><th>Confidence</th><th>Trade Result</th><th>PnL</th><th></th></tr></thead>
     <tbody>
     {% for item in group.reviews %}{% set review = item.review %}
       <tr>
-        <td data-label="Time">{{ review.created_at | ist }}</td><td data-label="Strategy">{{ review.strategy }}</td><td data-label="Signal">{{ review.signal }}</td><td data-label="Provider">{{ review.provider }}</td>
+        <td data-label="Time">{{ review.created_at | ist }}</td><td data-label="Strategy">{{ review.strategy }}</td><td data-label="Signal">{{ review.signal }}</td><td data-label="Review Type">{{ "ENTRY" if review.signal.startswith("BUY") else "EXIT" }}</td><td data-label="Provider">{{ review.provider }}</td>
         <td data-label="Decision">{{ review.decision }}</td><td data-label="Confidence">{{ review.confidence }}%</td><td data-label="Trade Result">{{ review.actual_result or "-" }}</td><td data-label="PnL">{{ review.actual_pnl if review.actual_pnl is not none else "-" }}</td>
         <td data-label="Details"><button class="btn btn-sm btn-outline-light" type="button" data-bs-toggle="collapse" data-bs-target="#review-{{ review.id }}">Details</button></td>
       </tr>
-      <tr class="collapse detail-row" id="review-{{ review.id }}"><td colspan="9">
+      <tr class="collapse detail-row" id="review-{{ review.id }}"><td colspan="10">
         <div class="row g-3 py-2">
           <div class="col-md-6"><strong>Reason To Buy</strong><div>{{ item.reason_to_buy | join(", ") or "-" }}</div></div>
           <div class="col-md-6"><strong>Reason Not To Buy</strong><div>{{ item.reason_not_to_buy | join(", ") or "-" }}</div></div>

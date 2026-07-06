@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from sqlalchemy import Boolean, Date, DateTime, Float, Integer, String, Text, func
-from sqlalchemy.orm import Mapped, mapped_column
+\1\nfrom typing import Optional
 
 from app.database import Base
 
@@ -80,7 +80,7 @@ class AITradeReview(Base):
     __tablename__ = "ai_trade_reviews"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    trade_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    trade_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
     strategy: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     signal: Mapped[str] = mapped_column(String(16), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -97,7 +97,7 @@ class AITradeReview(Base):
     reason_not_to_buy: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
     summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
     latency_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-    actual_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    actual_result: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     actual_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
     ai_correct: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -112,7 +112,7 @@ class AIContextLog(Base):
     signal: Mapped[str] = mapped_column(String(16), nullable=False)
     event_type: Mapped[str] = mapped_column(String(16), nullable=False)
     paper_live: Mapped[str] = mapped_column(String(16), default="", nullable=False)
-    trade_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    trade_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
     trade_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     session: Mapped[str] = mapped_column(String(32), default="", nullable=False)
     context_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
@@ -200,15 +200,15 @@ class StrategyTrade(Base):
     stoploss: Mapped[float] = mapped_column(Float, nullable=False)
     target: Mapped[float] = mapped_column(Float, nullable=False)
     entry_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    exit_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     profit_loss: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     pnl_percent: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     result: Mapped[str] = mapped_column(String(16), default=TradeResult.OPEN, nullable=False)
     status: Mapped[str] = mapped_column(String(16), default=TradeStatus.OPEN, index=True, nullable=False)
     mode: Mapped[str] = mapped_column(String(16), default=TradingMode.PAPER, nullable=False)
-    exit_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    entry_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    exit_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    exit_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    entry_order_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    exit_order_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     highest_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     lowest_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     trailing_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -259,3 +259,4 @@ class LogEvent(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+from typing import Optional

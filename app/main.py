@@ -20,7 +20,7 @@ from app.multi_strategy import MultiStrategyTradeManager
 from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
 from app.platform import get_or_create_settings, get_or_create_state, get_or_create_strategy_stats, log_event, rebuild_daily_stats, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, today_ist, trading_allowed
-from sqlalchemy import select
+from sqlalchemy import func, select
 from app.risk import RiskProtectionService
 from app.scheduler import create_scheduler
 from app.smartapi_client import SmartAPIClient
@@ -118,12 +118,22 @@ def trades(db: Session = Depends(get_db)) -> list[dict[str, object]]:
     return [serialize_strategy_trade(trade) for trade in db.scalars(strategy_trades_query_for_filter("30d", None, None))]
 
 
+_TV_INDICATOR_FIELDS = (
+    "ema9", "ema21", "ema_gap", "vwap", "rsi", "atr", "adx", "di_plus", "di_minus",
+    "supertrend", "volume_ratio", "orb_high", "orb_low", "trend_direction", "breakout_status",
+    "strong_candle", "sideways_filter", "htf_confirmation", "filters", "rr_ratio",
+)
+
+
 def queue_shadow_review(
     background_tasks: BackgroundTasks,
     db: Session,
     strategy_name: str,
     signal: str,
     response: WebhookResponse,
+    market_data: dict[str, object] | None = None,
+    indicators: dict[str, object] | None = None,
+    trade_state: dict[str, object] | None = None,
 ) -> WebhookResponse:
     if not response.accepted:
         logger.info("[AI] Shadow skipped: webhook response not accepted")
@@ -131,7 +141,7 @@ def queue_shadow_review(
     if not signal.startswith("BUY"):
         logger.info("[AI] Shadow skipped: webhook signal is not BUY")
         return response
-    query = select(StrategyTrade).where(StrategyTrade.strategy_name == strategy_name)
+    query = select(StrategyTrade).where(func.lower(StrategyTrade.strategy_name) == strategy_name.lower())
     query = query.where(
         StrategyTrade.signal == signal,
         StrategyTrade.status == TradeStatus.OPEN,
@@ -140,14 +150,20 @@ def queue_shadow_review(
     if trade is None:
         logger.info("[AI] Shadow skipped: no matching BUY trade found")
         return response
-    market_data = _build_shadow_market_data(trade)
+    shadow_market_data = _build_shadow_market_data(trade)
+    if market_data:
+        shadow_market_data.update(market_data)
+    logger.info("[AI] Entry review triggered")
     background_tasks.add_task(
         run_shadow_review,
         strategy_name,
         signal,
         utc_now(),
         trade.trade_id if trade else None,
+        shadow_market_data,
         market_data,
+        indicators,
+        trade_state,
     )
     return response
 
@@ -157,10 +173,21 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
     try:
         reset_daily_risk_if_needed(db)
         strategy_name = (payload.strategy or settings.default_strategy_name).strip()
+        _log_tradingview_indicators(payload.indicators.model_dump(exclude_none=True) if payload.indicators else None)
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
+        payload_market_data = payload.market_data.model_dump(exclude_none=True) if payload.market_data else None
+        payload_indicators = payload.indicators.model_dump(exclude_none=True) if payload.indicators else None
+        payload_trade_state = payload.trade_state.model_dump(exclude_none=True) if payload.trade_state else None
         if strategy_name.upper() == "V7":
             return queue_shadow_review(
-                background_tasks, db, strategy_name, payload.signal.value, v7_manager.handle_signal(db, payload.signal)
+                background_tasks,
+                db,
+                strategy_name,
+                payload.signal.value,
+                v7_manager.handle_signal(db, payload.signal),
+                payload_market_data,
+                payload_indicators,
+                payload_trade_state,
             )
 
         strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == strategy_name))
@@ -208,7 +235,16 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
             telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
         else:
             log_event(db, "WEBHOOK", f"Signal ignored: {response.message}", "WARNING")
-        return queue_shadow_review(background_tasks, db, strategy_name, payload.signal.value, response)
+        return queue_shadow_review(
+            background_tasks,
+            db,
+            strategy_name,
+            payload.signal.value,
+            response,
+            payload_market_data,
+            payload_indicators,
+            payload_trade_state,
+        )
     except Exception as exc:
         logger.exception("Webhook processing failed")
         log_event(db, "ERROR", "Webhook processing failed", "ERROR", {"error": str(exc)})
@@ -220,6 +256,7 @@ def _build_shadow_market_data(trade: StrategyTrade) -> dict[str, object]:
     market_data: dict[str, object] = {
         "strike": trade.strike,
         "expiry": trade.expiry,
+        "option_type": trade.option_type,
         "option_price": trade.current_premium if trade.current_premium is not None else trade.entry_price,
     }
     try:
@@ -234,3 +271,24 @@ def _build_shadow_market_data(trade: StrategyTrade) -> dict[str, object]:
     except Exception as exc:
         logger.info("[AI] Shadow market fetch skipped: option premium unavailable (%s)", exc)
     return market_data
+
+
+def _log_tradingview_indicators(indicators: dict[str, object] | None) -> None:
+    if not indicators:
+        logger.info("[AI] TradingView indicators received: 0")
+        return
+    received = [name for name in _TV_INDICATOR_FIELDS if _is_present(indicators.get(name))]
+    missing = [name for name in _TV_INDICATOR_FIELDS if name not in received]
+    logger.info("[AI] TradingView indicators received: %s", len(received))
+    logger.info("[AI] TradingView indicators provided: %s", ", ".join(received) if received else "None")
+    logger.info("[AI] TradingView indicators missing: %s", ", ".join(missing) if missing else "None")
+
+
+def _is_present(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (dict, list)):
+        return bool(value)
+    return True

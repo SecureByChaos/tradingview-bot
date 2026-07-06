@@ -448,16 +448,45 @@ def ai_context_inspector_page(
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     context_log = get_latest_context_log(db)
+    context_json = _context_json(context_log.context_json) if context_log is not None else {}
+    tradingview = context_json.get("tradingview") if isinstance(context_json.get("tradingview"), dict) else {}
+    source_breakdown = context_json.get("source_breakdown") if isinstance(context_json.get("source_breakdown"), dict) else {}
     return templates.TemplateResponse(
         "ai_context_inspector.html",
         {
             "request": request,
             "context_log": context_log,
-            "context_json": _context_json(context_log.context_json) if context_log is not None else {},
+            "context_json": context_json,
             "request_json": _context_json(context_log.request_json) if context_log is not None else {},
             "missing_fields": _review_list(context_log.missing_fields) if context_log is not None else [],
             "reason_to_buy": _review_list(context_log.reason_to_buy) if context_log is not None else [],
             "reason_not_to_buy": _review_list(context_log.reason_not_to_buy) if context_log is not None else [],
+            "source_breakdown": source_breakdown,
+            "tradingview_indicators": _section_values(
+                tradingview.get("indicators") if isinstance(tradingview.get("indicators"), dict) else {},
+                (
+                    "ema9", "ema21", "ema_gap", "vwap", "rsi", "atr", "adx", "di_plus", "di_minus",
+                    "supertrend", "volume_ratio", "orb_high", "orb_low", "trend_direction", "breakout_status",
+                    "strong_candle", "sideways_filter", "htf_confirmation", "filters", "rr_ratio",
+                ),
+            ),
+            "tradingview_market_data": _section_values(
+                tradingview.get("market_data") if isinstance(tradingview.get("market_data"), dict) else {},
+                ("banknifty_price", "open", "high", "low", "close", "timeframe", "volume", "timestamp"),
+            ),
+            "trade_data": _section_values(
+                context_json.get("trade_data") if isinstance(context_json.get("trade_data"), dict) else {},
+                (
+                    "entry_price", "current_premium", "stop_loss", "target", "running_pnl", "holding_minutes",
+                    "position", "position_state", "trade_number", "signal", "strategy",
+                ),
+                empty_label="-",
+            ),
+            "broker_data": _section_values(
+                context_json.get("broker_data") if isinstance(context_json.get("broker_data"), dict) else {},
+                ("banknifty_price", "option_price", "strike", "expiry", "option_type"),
+                empty_label="-",
+            ),
         },
     )
 
@@ -476,6 +505,17 @@ def _context_json(value: str) -> dict[str, object]:
         return parsed if isinstance(parsed, dict) else {}
     except (TypeError, ValueError):
         return {}
+
+
+def _section_values(values: dict[str, object], fields: tuple[str, ...], empty_label: str = "NOT PROVIDED BY WEBHOOK") -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for field in fields:
+        value = values.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, (dict, list)) and not value):
+            rows.append({"field": field, "value": empty_label})
+        else:
+            rows.append({"field": field, "value": value})
+    return rows
 
 
 def apply_settings(

@@ -73,6 +73,8 @@ class SignalContextBuilder:
                 "ema_gap",
                 "supertrend",
                 "adx",
+                "di_plus",
+                "di_minus",
                 "atr",
                 "vwap",
                 "rsi",
