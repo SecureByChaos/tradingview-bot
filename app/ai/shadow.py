@@ -157,8 +157,10 @@ def run_shadow_review(
                 rr_ratio = round(reward / risk, 2) if risk > 0 else None
             holding_minutes = None
             if trade is not None and trade.entry_time is not None:
-                end_time = trade.exit_time or timestamp
-                holding_minutes = max(int((end_time - trade.entry_time).total_seconds() // 60), 0)
+                entry_time_ist = to_ist(trade.entry_time)
+                end_time_ist = to_ist(trade.exit_time or timestamp)
+                if entry_time_ist is not None and end_time_ist is not None:
+                    holding_minutes = max(int((end_time_ist - entry_time_ist).total_seconds() // 60), 0)
             market_data = {
                 "event_type": event_type,
                 "paper_live": (trade.mode if trade is not None else (strategy_cfg.mode if strategy_cfg is not None else "")),
