@@ -11,11 +11,11 @@ from sqlalchemy.orm import Session
 
 from app.auth import authenticate_admin, require_admin_page
 from app.ai.context_builder import SignalContextBuilder
-from app.ai.context_repository import get_context_log_for_review, get_latest_context_log
+from app.ai.context_repository import get_context_log_for_review
 from app.ai.factory import create_reviewer
 from app.ai.repository import create_settings as create_ai_settings, get_settings as get_ai_settings, update_settings as update_ai_settings
 from app.database import get_db
-from app.db_models import AITradeReview, BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
+from app.db_models import AIContextLog, AITradeReview, BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
 from app.platform import (
     get_dashboard_summary,
     get_or_create_strategy_stats,
@@ -445,9 +445,31 @@ def ai_reviews_page(
 def ai_context_inspector_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
+    review_date: str = "",
+    context_id: int | None = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    context_log = get_latest_context_log(db)
+    if not review_date:
+        review_date = datetime.now(IST).date().isoformat()
+    try:
+        day = date.fromisoformat(review_date)
+    except ValueError:
+        day = datetime.now(IST).date()
+        review_date = day.isoformat()
+    start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+    end = datetime.combine(day, time.max, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+    day_contexts = list(
+        db.scalars(
+            select(AIContextLog)
+            .where(AIContextLog.created_at.between(start, end))
+            .order_by(AIContextLog.created_at.desc())
+        )
+    )
+    context_log = None
+    if context_id is not None:
+        context_log = next((row for row in day_contexts if row.id == context_id), None)
+    if context_log is None and day_contexts:
+        context_log = day_contexts[0]
     context_json = _context_json(context_log.context_json) if context_log is not None else {}
     tradingview = context_json.get("tradingview") if isinstance(context_json.get("tradingview"), dict) else {}
     tradingview_indicators = tradingview.get("indicators") if isinstance(tradingview.get("indicators"), dict) else {}
@@ -496,6 +518,9 @@ def ai_context_inspector_page(
                 ("banknifty_price", "option_price", "strike", "expiry", "option_type"),
                 empty_label="-",
             ),
+            "review_date": review_date,
+            "context_id": context_log.id if context_log is not None else None,
+            "day_contexts": day_contexts,
         },
     )
 

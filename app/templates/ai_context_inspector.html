@@ -2,6 +2,30 @@
 {% from "components.html" import page_header, empty_state %}
 {% block content %}
 {{ page_header("AI Context Inspector") }}
+<div class="panel mb-4">
+  <form method="get" action="/ai-context-inspector" class="row g-3 align-items-end">
+    <div class="col-12 col-md-3">
+      <label class="field-label mb-1">Date</label>
+      <input type="date" class="form-control bg-dark text-light border-secondary" name="review_date" value="{{ review_date }}">
+    </div>
+    <div class="col-12 col-md-7">
+      <label class="field-label mb-1">Trade Selection (Day)</label>
+      <select class="form-select bg-dark text-light border-secondary" name="context_id">
+        {% if not day_contexts %}
+        <option value="">No context logs for selected date</option>
+        {% endif %}
+        {% for row in day_contexts %}
+        <option value="{{ row.id }}" {% if context_id == row.id %}selected{% endif %}>
+          {{ row.created_at | ist }} | {{ row.strategy }} | {{ row.signal }} | {{ row.event_type }} | {{ row.trade_id or "-" }}
+        </option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-12 col-md-2">
+      <button type="submit" class="btn btn-primary w-100">Load</button>
+    </div>
+  </form>
+</div>
 {% if context_log %}
 <div class="metric-grid compact mb-4">
   <div class="metric"><div class="label">Strategy</div><div class="value">{{ context_log.strategy }}</div></div>
