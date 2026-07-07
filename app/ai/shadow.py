@@ -43,6 +43,7 @@ _COMPLETENESS_FIELDS = (
     "expiry",
     "premium",
     "ema9",
+    "ema20",
     "ema21",
     "ema_gap",
     "vwap",
@@ -101,6 +102,8 @@ def run_shadow_review(
     smartapi_market_data: Optional[dict[str, object]] = None,
     tradingview_market_data: Optional[dict[str, object]] = None,
     tradingview_indicators: Optional[dict[str, object]] = None,
+    tradingview_trend: Optional[dict[str, object]] = None,
+    tradingview_strategy_filters: Optional[dict[str, object]] = None,
     tradingview_trade_state: Optional[dict[str, object]] = None,
 ) -> None:
     try:
@@ -182,6 +185,7 @@ def run_shadow_review(
             }
             indicators = {
                 "ema9": "",
+                "ema20": "",
                 "ema21": "",
                 "ema_gap": "",
                 "vwap": "",
@@ -222,8 +226,19 @@ def run_shadow_review(
             _merge_context_data(market_data, smartapi_market_data, market_sources, "SmartAPI")
             _merge_context_data(market_data, tradingview_market_data, market_sources, "TradingView")
             _merge_context_data(indicators, tradingview_indicators, indicator_sources, "TradingView")
+            _merge_trend_data(market_data, indicators, tradingview_trend, market_sources, indicator_sources, "TradingView")
+            _merge_filter_data(market_data, indicators, tradingview_strategy_filters, market_sources, indicator_sources, "TradingView")
             _merge_context_data(trade_state, tradingview_trade_state, trade_sources, "TradingView")
-            context = SignalContextBuilder().build(strategy, signal, timestamp, market_data, indicators, trade_state)
+            context = SignalContextBuilder().build(
+                strategy,
+                signal,
+                timestamp,
+                market_data,
+                indicators,
+                tradingview_trend,
+                tradingview_strategy_filters,
+                trade_state,
+            )
             logger.info("[AI] Context built")
             logger.info("[AI] Exit review" if event_type.startswith("CLOSE_") else "[AI] Entry review")
             prompt = PromptBuilder().build_signal_prompt(context, settings.system_prompt, PROMPT_VERSION)
@@ -234,6 +249,8 @@ def run_shadow_review(
                 session=session,
                 tradingview_market_data=tradingview_market_data or {},
                 tradingview_indicators=tradingview_indicators or {},
+                tradingview_trend=tradingview_trend or {},
+                tradingview_strategy_filters=tradingview_strategy_filters or {},
                 tradingview_trade_state=tradingview_trade_state or {},
                 smartapi_market_data=smartapi_market_data or {},
                 market_sources=market_sources,
@@ -336,6 +353,8 @@ def _context_snapshot(
     session: str,
     tradingview_market_data: dict[str, object],
     tradingview_indicators: dict[str, object],
+    tradingview_trend: dict[str, object],
+    tradingview_strategy_filters: dict[str, object],
     tradingview_trade_state: dict[str, object],
     smartapi_market_data: dict[str, object],
     market_sources: dict[str, str],
@@ -369,6 +388,7 @@ def _context_snapshot(
         },
         "indicators": {
             "ema9": indicators.get("ema9"),
+            "ema20": indicators.get("ema20"),
             "ema21": indicators.get("ema21"),
             "ema_gap": indicators.get("ema_gap"),
             "vwap": indicators.get("vwap"),
@@ -406,6 +426,8 @@ def _context_snapshot(
         "tradingview": {
             "indicators": tradingview_indicators,
             "market_data": tradingview_market_data,
+            "trend": tradingview_trend,
+            "strategy_filters": tradingview_strategy_filters,
             "trade_state": tradingview_trade_state,
         },
         "broker_data": smartapi_market_data,
@@ -455,6 +477,7 @@ def _missing_context_fields(context_data: dict[str, object]) -> tuple[list[str],
         "expiry": market.get("expiry"),
         "premium": market.get("premium"),
         "ema9": indicators.get("ema9"),
+        "ema20": indicators.get("ema20"),
         "ema21": indicators.get("ema21"),
         "ema_gap": indicators.get("ema_gap"),
         "vwap": indicators.get("vwap"),
@@ -549,3 +572,46 @@ def _source_breakdown(
             else:
                 breakdown["database"] += 1
     return breakdown
+
+
+def _merge_trend_data(
+    market_data: dict[str, object],
+    indicators: dict[str, object],
+    trend_data: Optional[dict[str, object]],
+    market_sources: dict[str, str],
+    indicator_sources: dict[str, str],
+    source_name: str,
+) -> None:
+    if not trend_data:
+        return
+    mapping = {
+        "trend_direction": "trend_direction",
+        "breakout": "breakout_status",
+        "strong_candle": "strong_candle",
+        "sideways_filter": "sideways_filter",
+        "htf_confirmation": "htf_confirmation",
+    }
+    for key, target in mapping.items():
+        value = trend_data.get(key)
+        if not _is_present(value):
+            continue
+        indicators[target] = value
+        market_data[target] = value
+        indicator_sources[target] = source_name
+        market_sources[target] = source_name
+
+
+def _merge_filter_data(
+    market_data: dict[str, object],
+    indicators: dict[str, object],
+    strategy_filters: Optional[dict[str, object]],
+    market_sources: dict[str, str],
+    indicator_sources: dict[str, str],
+    source_name: str,
+) -> None:
+    if not strategy_filters:
+        return
+    indicators["filters"] = strategy_filters
+    market_data["filters"] = strategy_filters
+    indicator_sources["filters"] = source_name
+    market_sources["filters"] = source_name

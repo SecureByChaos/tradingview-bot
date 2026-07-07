@@ -450,6 +450,9 @@ def ai_context_inspector_page(
     context_log = get_latest_context_log(db)
     context_json = _context_json(context_log.context_json) if context_log is not None else {}
     tradingview = context_json.get("tradingview") if isinstance(context_json.get("tradingview"), dict) else {}
+    tradingview_indicators = tradingview.get("indicators") if isinstance(tradingview.get("indicators"), dict) else {}
+    tradingview_trend = tradingview.get("trend") if isinstance(tradingview.get("trend"), dict) else {}
+    tradingview_strategy_filters = tradingview.get("strategy_filters") if isinstance(tradingview.get("strategy_filters"), dict) else {}
     source_breakdown = context_json.get("source_breakdown") if isinstance(context_json.get("source_breakdown"), dict) else {}
     return templates.TemplateResponse(
         "ai_context_inspector.html",
@@ -463,11 +466,17 @@ def ai_context_inspector_page(
             "reason_not_to_buy": _review_list(context_log.reason_not_to_buy) if context_log is not None else [],
             "source_breakdown": source_breakdown,
             "tradingview_indicators": _section_values(
-                tradingview.get("indicators") if isinstance(tradingview.get("indicators"), dict) else {},
+                {
+                    **tradingview_indicators,
+                    **{f"trend.{k}": v for k, v in tradingview_trend.items()},
+                    **{f"strategy_filters.{k}": v for k, v in tradingview_strategy_filters.items()},
+                },
                 (
-                    "ema9", "ema21", "ema_gap", "vwap", "rsi", "atr", "adx", "di_plus", "di_minus",
-                    "supertrend", "volume_ratio", "orb_high", "orb_low", "trend_direction", "breakout_status",
-                    "strong_candle", "sideways_filter", "htf_confirmation", "filters", "rr_ratio",
+                    "ema9", "ema20", "ema21", "ema_gap", "vwap", "rsi", "atr", "adx", "di_plus", "di_minus",
+                    "supertrend", "volume_ratio", "orb_high", "orb_low", "filters", "rr_ratio",
+                    "trend.trend_direction", "trend.breakout", "trend.strong_candle", "trend.sideways_filter", "trend.htf_confirmation",
+                    "strategy_filters.ema_filter", "strategy_filters.supertrend_filter", "strategy_filters.adx_filter",
+                    "strategy_filters.session_filter", "strategy_filters.trade_limit_filter",
                 ),
             ),
             "tradingview_market_data": _section_values(

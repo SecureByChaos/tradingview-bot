@@ -23,16 +23,20 @@ class ExitReason(str, Enum):
 
 class WebhookPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
+    context_version: str | None = None
     strategy: str | None = None
     signal: Signal
     market_data: "TradingViewMarketData | None" = None
     indicators: "TradingViewIndicators | None" = None
+    trend: "TradingViewTrend | None" = None
+    strategy_filters: "TradingViewStrategyFilters | None" = None
     trade_state: "TradingViewTradeState | None" = None
 
 
 class TradingViewIndicators(BaseModel):
     model_config = ConfigDict(extra="allow")
     ema9: float | None = None
+    ema20: float | None = None
     ema21: float | None = None
     ema_gap: float | None = None
     vwap: float | None = None
@@ -45,11 +49,6 @@ class TradingViewIndicators(BaseModel):
     volume_ratio: float | None = None
     orb_high: float | None = None
     orb_low: float | None = None
-    trend_direction: str | None = None
-    breakout_status: str | None = None
-    strong_candle: str | None = None
-    sideways_filter: str | None = None
-    htf_confirmation: str | None = None
     filters: dict[str, Any] | None = None
     rr_ratio: float | None = None
 
@@ -66,13 +65,32 @@ class TradingViewMarketData(BaseModel):
     timestamp: str | None = None
 
 
+class TradingViewTrend(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    trend_direction: str | None = None
+    breakout: bool | None = None
+    strong_candle: bool | None = None
+    sideways_filter: bool | None = None
+    htf_confirmation: bool | None = None
+
+
+class TradingViewStrategyFilters(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    ema_filter: bool | None = None
+    supertrend_filter: bool | None = None
+    adx_filter: bool | None = None
+    session_filter: bool | None = None
+    trade_limit_filter: bool | None = None
+
+
 class TradingViewTradeState(BaseModel):
     model_config = ConfigDict(extra="allow")
     trade_number: int | None = None
     daily_trade_count: int | None = None
-    position: str | None = None
+    position: int | None = None
     session: str | None = None
     market_condition: str | None = None
+    trailing_active: bool | None = None
 
 
 class OptionContract(BaseModel):

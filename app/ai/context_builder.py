@@ -21,10 +21,14 @@ class SignalContextBuilder:
         timestamp: datetime,
         market_data: Optional[Mapping[str, Any]] = None,
         indicators: Optional[Mapping[str, Any]] = None,
+        trend: Optional[Mapping[str, Any]] = None,
+        strategy_filters: Optional[Mapping[str, Any]] = None,
         trade_state: Optional[Mapping[str, Any]] = None,
     ) -> AIContext:
         market = market_data or {}
         indicator_data = indicators or {}
+        trend_data = trend or {}
+        filter_data = strategy_filters or {}
         state = trade_state or {}
 
         mapped_market: Dict[str, Any] = {
@@ -69,6 +73,7 @@ class SignalContextBuilder:
             for key in (
                 "ema",
                 "ema9",
+                "ema20",
                 "ema21",
                 "ema_gap",
                 "supertrend",
@@ -86,22 +91,36 @@ class SignalContextBuilder:
                 "trend_direction",
                 "strong_candle",
                 "sideways_filter",
-                "filters",
+                "rr_ratio",
             )
         }
+        if not mapped_indicators.get("trend_direction"):
+            mapped_indicators["trend_direction"] = trend_data.get("trend_direction")
+        if mapped_indicators.get("breakout_status") is None:
+            mapped_indicators["breakout_status"] = trend_data.get("breakout")
+        if mapped_indicators.get("strong_candle") is None:
+            mapped_indicators["strong_candle"] = trend_data.get("strong_candle")
+        if mapped_indicators.get("sideways_filter") is None:
+            mapped_indicators["sideways_filter"] = trend_data.get("sideways_filter")
+        if mapped_indicators.get("htf_confirmation") is None:
+            mapped_indicators["htf_confirmation"] = trend_data.get("htf_confirmation")
+        mapped_indicators["filters"] = indicator_data.get("filters") or dict(filter_data) or market.get("filters")
         mapped_state = {
             "paper_live": state.get("paper_live"),
-            "trade_number_today": state.get("trade_number_today"),
+            "trade_number_today": state.get("trade_number_today", state.get("daily_trade_count")),
             "position_state": state.get("position_state"),
             "current_position": state.get("position", state.get("current_position")),
             "trade_number": state.get("trade_number"),
             "entry_price": state.get("entry_price"),
             "stop_loss": state.get("stop_loss"),
             "target": state.get("target"),
-            "rr_ratio": state.get("rr_ratio"),
+            "rr_ratio": state.get("rr_ratio", indicator_data.get("rr_ratio")),
             "current_premium": state.get("current_premium"),
             "running_pnl": state.get("running_pnl"),
             "holding_minutes": state.get("holding_minutes"),
+            "session": state.get("session"),
+            "market_condition": state.get("market_condition"),
+            "trailing_active": state.get("trailing_active"),
         }
         signal_value = str(getattr(signal, "value", signal) or "")
         event_type = str(market.get("event_type") or self._EVENT_TYPE_MAP.get(signal_value, ""))

@@ -4,7 +4,11 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+import json
+
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -119,9 +123,8 @@ def trades(db: Session = Depends(get_db)) -> list[dict[str, object]]:
 
 
 _TV_INDICATOR_FIELDS = (
-    "ema9", "ema21", "ema_gap", "vwap", "rsi", "atr", "adx", "di_plus", "di_minus",
-    "supertrend", "volume_ratio", "orb_high", "orb_low", "trend_direction", "breakout_status",
-    "strong_candle", "sideways_filter", "htf_confirmation", "filters", "rr_ratio",
+    "ema9", "ema20", "ema21", "ema_gap", "vwap", "rsi", "atr", "adx", "di_plus", "di_minus",
+    "supertrend", "volume_ratio", "orb_high", "orb_low", "filters", "rr_ratio",
 )
 
 
@@ -133,6 +136,8 @@ def queue_shadow_review(
     response: WebhookResponse,
     market_data: dict[str, object] | None = None,
     indicators: dict[str, object] | None = None,
+    trend: dict[str, object] | None = None,
+    strategy_filters: dict[str, object] | None = None,
     trade_state: dict[str, object] | None = None,
 ) -> WebhookResponse:
     if not response.accepted:
@@ -163,6 +168,8 @@ def queue_shadow_review(
         shadow_market_data,
         market_data,
         indicators,
+        trend,
+        strategy_filters,
         trade_state,
     )
     return response
@@ -177,6 +184,8 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
         payload_market_data = payload.market_data.model_dump(exclude_none=True) if payload.market_data else None
         payload_indicators = payload.indicators.model_dump(exclude_none=True) if payload.indicators else None
+        payload_trend = payload.trend.model_dump(exclude_none=True) if payload.trend else None
+        payload_strategy_filters = payload.strategy_filters.model_dump(exclude_none=True) if payload.strategy_filters else None
         payload_trade_state = payload.trade_state.model_dump(exclude_none=True) if payload.trade_state else None
         if strategy_name.upper() == "V7":
             return queue_shadow_review(
@@ -187,6 +196,8 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
                 v7_manager.handle_signal(db, payload.signal),
                 payload_market_data,
                 payload_indicators,
+                payload_trend,
+                payload_strategy_filters,
                 payload_trade_state,
             )
 
@@ -243,6 +254,8 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
             response,
             payload_market_data,
             payload_indicators,
+            payload_trend,
+            payload_strategy_filters,
             payload_trade_state,
         )
     except Exception as exc:
@@ -292,3 +305,23 @@ def _is_present(value: object) -> bool:
     if isinstance(value, (dict, list)):
         return bool(value)
     return True
+
+
+@app.exception_handler(RequestValidationError)
+async def webhook_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    body_text = ""
+    try:
+        body = await request.body()
+        body_text = body.decode("utf-8", errors="replace")
+    except Exception:
+        body_text = "<unable to read request body>"
+    logger.error("========== WEBHOOK VALIDATION ERROR ==========")
+    logger.error("Validation Errors: %s", exc.errors())
+    logger.error("Complete JSON Request: %s", body_text)
+    with SessionLocal() as db:
+        try:
+            payload_obj = json.loads(body_text) if body_text and body_text.startswith("{") else {"raw_body": body_text}
+        except Exception:
+            payload_obj = {"raw_body": body_text}
+        log_event(db, "WEBHOOK", "Webhook validation failed", "ERROR", {"errors": exc.errors(), "request": payload_obj})
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
