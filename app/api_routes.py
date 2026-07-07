@@ -55,6 +55,10 @@ def multi_manager():
     return router.multi_strategy_manager  # type: ignore[attr-defined]
 
 
+def v7_manager():
+    return router.v7_manager  # type: ignore[attr-defined]
+
+
 def telegram() -> TelegramService:
     return router.telegram  # type: ignore[attr-defined]
 
@@ -320,12 +324,18 @@ def restart_bot(
 def kill_switch(
     db: Annotated[Session, Depends(get_db)],
     trade_manager: Annotated[TradeManager, Depends(manager)],
+    v7: Annotated[object, Depends(v7_manager)],
     notifier: Annotated[TelegramService, Depends(telegram)],
     _: Annotated[None, Depends(require_admin_api)] = None,
 ) -> dict[str, str]:
     active = trade_manager.get_active_trade()
     multi = router.multi_strategy_manager  # type: ignore[attr-defined]
     multi.square_off_all(db)
+    for option_type in ("CE", "PE"):
+        try:
+            v7.close_trade(db, option_type)
+        except Exception:
+            pass
     if active is not None:
         trade_manager.square_off_open_trade()
     set_bot_state(db, BotStatus.STOPPED, trading_allowed=False)

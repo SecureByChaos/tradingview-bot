@@ -92,6 +92,7 @@ health_manager.app = app
 
 api_routes.router.trade_manager = trade_manager  # type: ignore[attr-defined]
 api_routes.router.multi_strategy_manager = multi_strategy_manager  # type: ignore[attr-defined]
+api_routes.router.v7_manager = v7_manager  # type: ignore[attr-defined]
 api_routes.router.telegram = telegram  # type: ignore[attr-defined]
 api_routes.router.scheduler = scheduler  # type: ignore[attr-defined]
 api_routes.router.trade_logger = trade_logger  # type: ignore[attr-defined]
