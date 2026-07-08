@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+import json
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Signal(str, Enum):
@@ -31,6 +32,18 @@ class WebhookPayload(BaseModel):
     trend: "TradingViewTrend | None" = None
     strategy_filters: "TradingViewStrategyFilters | None" = None
     trade_state: "TradingViewTradeState | None" = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _unwrap_json_string(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            text = data.strip()
+            if text.startswith("{") and text.endswith("}"):
+                try:
+                    return json.loads(text)
+                except Exception:
+                    return data
+        return data
 
 
 class TradingViewIndicators(BaseModel):
@@ -62,7 +75,7 @@ class TradingViewMarketData(BaseModel):
     close: float | None = None
     timeframe: str | None = None
     volume: float | None = None
-    timestamp: str | None = None
+    timestamp: str | int | float | None = None
 
 
 class TradingViewTrend(BaseModel):
@@ -87,7 +100,7 @@ class TradingViewTradeState(BaseModel):
     model_config = ConfigDict(extra="allow")
     trade_number: int | None = None
     daily_trade_count: int | None = None
-    position: int | None = None
+    position: int | str | None = None
     session: str | None = None
     market_condition: str | None = None
     trailing_active: bool | None = None
