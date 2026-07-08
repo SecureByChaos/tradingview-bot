@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import shutil
 import time
 from datetime import datetime
@@ -54,6 +55,13 @@ class ServerHealth:
 
     @staticmethod
     def _cpu_percent() -> float:
+        if not hasattr(ctypes, "windll"):
+            try:
+                load1 = os.getloadavg()[0]
+                cpus = os.cpu_count() or 1
+                return round(min((load1 / cpus) * 100, 100.0), 2)
+            except Exception:
+                return 0.0
         idle1, kernel1, user1 = ServerHealth._system_times()
         time.sleep(0.1)
         idle2, kernel2, user2 = ServerHealth._system_times()
@@ -68,6 +76,22 @@ class ServerHealth:
 
     @staticmethod
     def _ram_percent() -> float:
+        if not hasattr(ctypes, "windll"):
+            try:
+                with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                    mem = dict(
+                        (line.split(":", 1)[0], float(line.split(":", 1)[1].strip().split()[0]))
+                        for line in f
+                        if ":" in line
+                    )
+                total = mem.get("MemTotal", 0.0)
+                available = mem.get("MemAvailable", 0.0)
+                if total <= 0:
+                    return 0.0
+                return round(((total - available) / total) * 100, 2)
+            except Exception:
+                return 0.0
+
         class MemoryStatus(ctypes.Structure):
             _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [(f"value{i}", ctypes.c_ulonglong) for i in range(7)]
 
@@ -75,4 +99,3 @@ class ServerHealth:
         status.length = ctypes.sizeof(status)
         ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
         return float(status.load)
-
