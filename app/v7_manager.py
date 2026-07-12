@@ -48,9 +48,19 @@ class V7Manager:
         if signal in {Signal.SELL_CE, Signal.SELL_PE}:
             option_type = "CE" if signal == Signal.SELL_CE else "PE"
             event = "CLOSE_CE" if option_type == "CE" else "CLOSE_PE"
-            if state not in {"LONG_CE", "LONG_PE"}:
-                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": f"No active {option_type} position"})
-            return self.record_exit_suggestion(db, signal)
+            expected_state = "LONG_CE" if option_type == "CE" else "LONG_PE"
+            observation_reason = ""
+            if state != expected_state:
+                if state == "FLAT":
+                    observation_reason = f"Ignored {event} because no active {option_type} position exists."
+                elif state == "LONG_CE":
+                    observation_reason = f"Ignored {event} because active CE position exists."
+                elif state == "LONG_PE":
+                    observation_reason = f"Ignored {event} because active PE position exists."
+                else:
+                    observation_reason = f"Ignored {event} due to invalid state {state}."
+                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": observation_reason})
+            return self.record_exit_suggestion(db, signal, observation_reason)
         return WebhookResponse(accepted=False, message=f"Rejected: unsupported V7 signal {signal.value}")
 
     def open_trade(self, db: Session, signal: Signal) -> WebhookResponse:
@@ -236,7 +246,7 @@ class V7Manager:
             closed.append(trade)
         return closed
 
-    def record_exit_suggestion(self, db: Session, signal: Signal) -> WebhookResponse:
+    def record_exit_suggestion(self, db: Session, signal: Signal, observation_reason: str = "") -> WebhookResponse:
         option_type = "CE" if signal == Signal.SELL_CE else "PE"
         trade = db.scalar(
             select(StrategyTrade)
@@ -273,6 +283,7 @@ class V7Manager:
             "unrealized_pnl": pnl_unrealized,
             "trailing_active": trailing_active,
             "current_trailing_sl": trailing_sl,
+            "observation_reason": observation_reason,
         }
         log_event(db, "TRADE", "TradingView Exit Suggestion", payload=payload)
         logger.debug(
@@ -284,7 +295,10 @@ class V7Manager:
             trailing_active,
             trailing_sl,
         )
-        return WebhookResponse(accepted=True, message="TradingView Exit Suggestion recorded")
+        message = "TradingView Exit Suggestion recorded"
+        if observation_reason:
+            message = f"{message}: {observation_reason}"
+        return WebhookResponse(accepted=True, message=message)
 
     def _close_trade(self, db: Session, trade: StrategyTrade, exit_price: float, reason: ExitReason) -> None:
         if trade.mode == TradingMode.LIVE:
@@ -374,24 +388,32 @@ class V7Manager:
         return TradeResult.BREAKEVEN
 
     def _trail_trigger(self, strategy: StrategyConfig | None) -> float:
-        value = os.getenv("V7_TRAIL_TRIGGER", os.getenv("TRAILING_ACTIVATION_PERCENT", "10"))
+        value = self._first_env("V7_TRAIL_TRIGGER", "TRAIL_TRIGGER", "trailTrigger", "TRAILING_ACTIVATION_PERCENT")
         try:
             return float(value)
         except Exception:
             return float(strategy.sl_percent) if strategy is not None else 10.0
 
     def _trail_offset(self, strategy: StrategyConfig | None) -> float:
-        value = os.getenv("V7_TRAIL_OFFSET", os.getenv("TRAILING_OFFSET_PERCENT", "5"))
+        value = self._first_env("V7_TRAIL_OFFSET", "TRAIL_OFFSET", "trailOffset", "TRAILING_OFFSET_PERCENT")
         try:
             return float(value)
         except Exception:
-            return (float(strategy.tp_percent) / 2) if strategy is not None else 5.0
+            return float(strategy.tp_percent) if strategy is not None else 5.0
 
     def _initial_sl(self, strategy: StrategyConfig | None) -> float:
-        value = os.getenv("V7_INITIAL_SL")
+        value = self._first_env("V7_INITIAL_SL", "INITIAL_SL", "initialSL")
         if value is not None and value.strip():
             try:
                 return float(value)
             except Exception:
                 pass
         return float(strategy.sl_percent) if strategy is not None else 10.0
+
+    @staticmethod
+    def _first_env(*keys: str) -> str | None:
+        for key in keys:
+            value = os.getenv(key)
+            if value is not None and value.strip():
+                return value
+        return None
