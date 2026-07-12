@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -14,7 +15,7 @@ from app.option_finder import OptionFinder
 from app.platform import log_event
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
-from app.time_utils import format_ist, utc_now
+from app.time_utils import IST, format_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +47,10 @@ class V7Manager:
             return self.open_trade(db, signal)
         if signal in {Signal.SELL_CE, Signal.SELL_PE}:
             option_type = "CE" if signal == Signal.SELL_CE else "PE"
-            expected_state = "LONG_CE" if option_type == "CE" else "LONG_PE"
             event = "CLOSE_CE" if option_type == "CE" else "CLOSE_PE"
-            if state != expected_state:
-                message = f"Ignored {event} because no active {option_type} position exists."
-                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": message})
-                return WebhookResponse(accepted=False, message=message)
-            log_event(db, "STATE", f"[STATE] {event} accepted")
-            return self.close_trade(db, option_type)
+            if state not in {"LONG_CE", "LONG_PE"}:
+                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": f"No active {option_type} position"})
+            return self.record_exit_suggestion(db, signal)
         return WebhookResponse(accepted=False, message=f"Rejected: unsupported V7 signal {signal.value}")
 
     def open_trade(self, db: Session, signal: Signal) -> WebhookResponse:
@@ -124,6 +121,7 @@ class V7Manager:
             highest_price=round(entry_price, 2),
             lowest_price=round(entry_price, 2),
             trailing_active=False,
+            trailing_stop=round(entry_price - self._initial_sl(strategy), 2) if signal == Signal.BUY_CE else round(entry_price + self._initial_sl(strategy), 2),
         )
         db.add(trade)
         db.commit()
@@ -135,9 +133,17 @@ class V7Manager:
             payload={"trade_id": trade.trade_id, "entry_time_ist": format_ist(trade.entry_time)},
         )
         self.telegram.send(db, f"Trade Opened\n[V7] {signal.value}\nEntry: {trade.entry_price}")
+        logger.debug(
+            "[V7] Entry Premium=%.2f Highest Premium=%.2f Lowest Premium=%.2f Trailing Active=%s Current Trailing SL=%.2f",
+            trade.entry_price,
+            trade.highest_price or trade.entry_price,
+            trade.lowest_price or trade.entry_price,
+            trade.trailing_active,
+            trade.trailing_stop or 0.0,
+        )
         return WebhookResponse(accepted=True, message=f"V7 {signal.value} opened")
 
-    def close_trade(self, db: Session, option_type: str) -> WebhookResponse:
+    def close_trade(self, db: Session, option_type: str, reason: ExitReason = ExitReason.TIME_EXIT) -> WebhookResponse:
         trade = db.scalar(
             select(StrategyTrade)
             .where(
@@ -152,8 +158,135 @@ class V7Manager:
             message = f"Ignored CLOSE_{option_type} because no active {option_type} position exists."
             log_event(db, "STATE", f"[STATE] CLOSE_{option_type} ignored", "WARNING", {"reason": message})
             return WebhookResponse(accepted=False, message=message)
+        self._close_trade(db, trade, self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken), reason)
+        return WebhookResponse(accepted=True, message=f"V7 {option_type} trade closed")
 
-        exit_price = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+    def monitor_open_trades(self, db: Session) -> list[StrategyTrade]:
+        closed: list[StrategyTrade] = []
+        strategy = self.get_strategy(db)
+        trail_trigger = self._trail_trigger(strategy)
+        trail_offset = self._trail_offset(strategy)
+        initial_sl = self._initial_sl(strategy)
+        now_ist = utc_now().astimezone(IST)
+        trades = list(
+            db.scalars(
+                select(StrategyTrade).where(
+                    StrategyTrade.strategy_name == self.strategy_name,
+                    StrategyTrade.status == TradeStatus.OPEN,
+                )
+            )
+        )
+        for trade in trades:
+            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+            trade.current_premium = round(premium, 2)
+            trade.pnl_percent = round(((premium - trade.entry_price) / trade.entry_price) * 100, 2)
+            trade.profit_loss = round((premium - trade.entry_price) * trade.quantity, 2)
+            reason: ExitReason | None = None
+
+            if trade.option_type == "CE":
+                trade.highest_price = premium if trade.highest_price is None else max(trade.highest_price, premium)
+                trade.lowest_price = premium if trade.lowest_price is None else min(trade.lowest_price, premium)
+                if not trade.trailing_active and (trade.highest_price - trade.entry_price) >= trail_trigger:
+                    trade.trailing_active = True
+                current_trailing_sl = (trade.highest_price - trail_offset) if trade.trailing_active else (trade.entry_price - initial_sl)
+                trade.trailing_stop = round(current_trailing_sl, 2)
+                if premium <= trade.trailing_stop:
+                    reason = ExitReason.STOPLOSS
+            else:
+                trade.lowest_price = premium if trade.lowest_price is None else min(trade.lowest_price, premium)
+                trade.highest_price = premium if trade.highest_price is None else max(trade.highest_price, premium)
+                if not trade.trailing_active and (trade.entry_price - trade.lowest_price) >= trail_trigger:
+                    trade.trailing_active = True
+                current_trailing_sl = (trade.lowest_price + trail_offset) if trade.trailing_active else (trade.entry_price + initial_sl)
+                trade.trailing_stop = round(current_trailing_sl, 2)
+                if premium >= trade.trailing_stop:
+                    reason = ExitReason.STOPLOSS
+
+            logger.debug(
+                "[V7] Current Premium=%.2f Highest Premium=%.2f Lowest Premium=%.2f Trailing Active=%s Current Trailing SL=%.2f",
+                premium,
+                trade.highest_price or premium,
+                trade.lowest_price or premium,
+                trade.trailing_active,
+                trade.trailing_stop or 0.0,
+            )
+            if reason is None and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 15)):
+                reason = ExitReason.TIME_EXIT
+            if reason is not None:
+                self._close_trade(db, trade, premium, reason)
+                closed.append(trade)
+                logger.debug("[V7] Actual Exit Reason=%s trade_id=%s", reason.value, trade.trade_id)
+        if trades:
+            db.commit()
+        return closed
+
+    def square_off_all(self, db: Session) -> list[StrategyTrade]:
+        closed: list[StrategyTrade] = []
+        trades = list(
+            db.scalars(
+                select(StrategyTrade).where(
+                    StrategyTrade.strategy_name == self.strategy_name,
+                    StrategyTrade.status == TradeStatus.OPEN,
+                )
+            )
+        )
+        for trade in trades:
+            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+            self._close_trade(db, trade, premium, ExitReason.TIME_EXIT)
+            closed.append(trade)
+        return closed
+
+    def record_exit_suggestion(self, db: Session, signal: Signal) -> WebhookResponse:
+        option_type = "CE" if signal == Signal.SELL_CE else "PE"
+        trade = db.scalar(
+            select(StrategyTrade)
+            .where(
+                StrategyTrade.strategy_name == self.strategy_name,
+                StrategyTrade.option_type == option_type,
+                StrategyTrade.status == TradeStatus.OPEN,
+            )
+            .order_by(StrategyTrade.entry_time.desc())
+            .limit(1)
+        )
+        spot = None
+        premium = None
+        pnl_unrealized = None
+        trailing_active = False
+        trailing_sl = None
+        trade_id = None
+        if trade is not None:
+            trade_id = trade.trade_id
+            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+            pnl_unrealized = round((premium - trade.entry_price) * trade.quantity, 2)
+            trailing_active = trade.trailing_active
+            trailing_sl = trade.trailing_stop
+        try:
+            spot = round(self.smartapi.get_banknifty_spot(), 2)
+        except Exception:
+            spot = None
+        payload = {
+            "timestamp": utc_now().isoformat(),
+            "trade_id": trade_id,
+            "signal": signal.value,
+            "banknifty_price": spot,
+            "option_premium": round(premium, 2) if premium is not None else None,
+            "unrealized_pnl": pnl_unrealized,
+            "trailing_active": trailing_active,
+            "current_trailing_sl": trailing_sl,
+        }
+        log_event(db, "TRADE", "TradingView Exit Suggestion", payload=payload)
+        logger.debug(
+            "[V7] TradingView Exit Suggestion signal=%s trade_id=%s premium=%s pnl=%s trailing_active=%s trailing_sl=%s",
+            signal.value,
+            trade_id,
+            payload["option_premium"],
+            pnl_unrealized,
+            trailing_active,
+            trailing_sl,
+        )
+        return WebhookResponse(accepted=True, message="TradingView Exit Suggestion recorded")
+
+    def _close_trade(self, db: Session, trade: StrategyTrade, exit_price: float, reason: ExitReason) -> None:
         if trade.mode == TradingMode.LIVE:
             contract = OptionContract(
                 exchange=trade.exchange,
@@ -173,16 +306,16 @@ class V7Manager:
         trade.pnl_percent = round(((exit_price - trade.entry_price) / trade.entry_price) * 100, 2)
         trade.result = self.result_for_pnl(trade.pnl_percent)
         trade.status = TradeStatus.CLOSED
-        trade.exit_reason = ExitReason.TV_EXIT.value
+        trade.exit_reason = reason.value
         db.commit()
         db.refresh(trade)
         log_event(
             db,
             "TRADE",
-            f"[V7] {option_type} closed by TradingView",
+            f"[V7] {trade.option_type} trade closed: {reason.value}",
             payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time)},
         )
-        self.telegram.send(db, f"Trade Closed\n[V7] {option_type} TV_EXIT\nP&L: {trade.pnl_percent:.2f}%")
+        self.telegram.send(db, f"Trade Closed\n[V7] {trade.option_type} {reason.value}\nP&L: {trade.pnl_percent:.2f}%")
         shadow_market_data = {
             "strike": trade.strike,
             "expiry": trade.expiry,
@@ -200,7 +333,7 @@ class V7Manager:
             trade.trade_id,
             shadow_market_data,
         )
-        return WebhookResponse(accepted=True, message=f"V7 {option_type} trade closed")
+        logger.debug("[V7] Actual Exit Reason=%s trade_id=%s", reason.value, trade.trade_id)
 
     def current_state(self, db: Session) -> str:
         trades = list(
@@ -239,3 +372,26 @@ class V7Manager:
         if pnl_percent < 0:
             return TradeResult.LOSS
         return TradeResult.BREAKEVEN
+
+    def _trail_trigger(self, strategy: StrategyConfig | None) -> float:
+        value = os.getenv("V7_TRAIL_TRIGGER", os.getenv("TRAILING_ACTIVATION_PERCENT", "10"))
+        try:
+            return float(value)
+        except Exception:
+            return float(strategy.sl_percent) if strategy is not None else 10.0
+
+    def _trail_offset(self, strategy: StrategyConfig | None) -> float:
+        value = os.getenv("V7_TRAIL_OFFSET", os.getenv("TRAILING_OFFSET_PERCENT", "5"))
+        try:
+            return float(value)
+        except Exception:
+            return (float(strategy.tp_percent) / 2) if strategy is not None else 5.0
+
+    def _initial_sl(self, strategy: StrategyConfig | None) -> float:
+        value = os.getenv("V7_INITIAL_SL")
+        if value is not None and value.strip():
+            try:
+                return float(value)
+            except Exception:
+                pass
+        return float(strategy.sl_percent) if strategy is not None else 10.0

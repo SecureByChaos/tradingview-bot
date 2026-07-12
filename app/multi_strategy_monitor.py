@@ -12,9 +12,10 @@ logger = logging.getLogger(__name__)
 
 
 class MultiStrategyMonitor:
-    def __init__(self, manager: MultiStrategyTradeManager, risk: RiskProtectionService) -> None:
+    def __init__(self, manager: MultiStrategyTradeManager, risk: RiskProtectionService, v7_manager: object | None = None) -> None:
         self.manager = manager
         self.risk = risk
+        self.v7_manager = v7_manager
 
     def tick(self) -> None:
         with SessionLocal() as db:
@@ -23,6 +24,8 @@ class MultiStrategyMonitor:
                 return
             try:
                 self.manager.monitor_open_trades(db)
+                if self.v7_manager is not None:
+                    self.v7_manager.monitor_open_trades(db)
                 self.risk.enforce_daily_loss_limit(db)
             except Exception as exc:
                 logger.exception("Multi-strategy monitor tick failed")
@@ -32,6 +35,8 @@ class MultiStrategyMonitor:
         with SessionLocal() as db:
             try:
                 closed = self.manager.square_off_all(db)
+                if self.v7_manager is not None:
+                    closed.extend(self.v7_manager.square_off_all(db))
                 if closed:
                     log_event(db, "TRADE", f"Scheduled square-off closed {len(closed)} open trade(s)")
             except Exception as exc:
