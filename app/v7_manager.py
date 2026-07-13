@@ -193,32 +193,40 @@ class V7Manager:
             trade.profit_loss = round((premium - trade.entry_price) * trade.quantity, 2)
             reason: ExitReason | None = None
 
-            if trade.option_type == "CE":
-                trade.highest_price = premium if trade.highest_price is None else max(trade.highest_price, premium)
-                trade.lowest_price = premium if trade.lowest_price is None else min(trade.lowest_price, premium)
-                if not trade.trailing_active and (trade.highest_price - trade.entry_price) >= trail_trigger:
-                    trade.trailing_active = True
-                current_trailing_sl = (trade.highest_price - trail_offset) if trade.trailing_active else (trade.entry_price - initial_sl)
-                trade.trailing_stop = round(current_trailing_sl, 2)
-                if premium <= trade.trailing_stop:
-                    reason = ExitReason.STOPLOSS
+            trail_activated_now = False
+            trade.highest_price = premium if trade.highest_price is None else max(trade.highest_price, premium)
+            if trade.lowest_price is None:
+                trade.lowest_price = premium
             else:
-                trade.lowest_price = premium if trade.lowest_price is None else min(trade.lowest_price, premium)
-                trade.highest_price = premium if trade.highest_price is None else max(trade.highest_price, premium)
-                if not trade.trailing_active and (trade.entry_price - trade.lowest_price) >= trail_trigger:
-                    trade.trailing_active = True
-                current_trailing_sl = (trade.lowest_price + trail_offset) if trade.trailing_active else (trade.entry_price + initial_sl)
-                trade.trailing_stop = round(current_trailing_sl, 2)
-                if premium >= trade.trailing_stop:
-                    reason = ExitReason.STOPLOSS
+                trade.lowest_price = min(trade.lowest_price, premium)
+
+            if not trade.trailing_active and premium >= (trade.entry_price * (1 + (trail_trigger / 100.0))):
+                trade.trailing_active = True
+                trail_activated_now = True
+
+            initial_stop = trade.entry_price * (1 - (initial_sl / 100.0))
+            if trade.trailing_active:
+                current_trailing_sl = trade.highest_price * (1 - (trail_offset / 100.0))
+            else:
+                current_trailing_sl = initial_stop
+
+            previous_trailing_stop = trade.trailing_stop
+            trade.trailing_stop = round(current_trailing_sl, 2)
+            if previous_trailing_stop is not None and trade.trailing_stop < previous_trailing_stop:
+                trade.trailing_stop = previous_trailing_stop
+
+            if premium <= trade.trailing_stop:
+                reason = ExitReason.STOPLOSS
 
             logger.debug(
-                "[V7] Current Premium=%.2f Highest Premium=%.2f Lowest Premium=%.2f Trailing Active=%s Current Trailing SL=%.2f",
+                "[V7] Entry Premium=%.2f Current Premium=%.2f Highest Premium=%.2f Initial Stop=%.2f Trailing Activated=%s Trailing Stop=%.2f Exit Reason=%s",
+                trade.entry_price,
                 premium,
                 trade.highest_price or premium,
-                trade.lowest_price or premium,
-                trade.trailing_active,
+                round(initial_stop, 2),
+                trade.trailing_active if not trail_activated_now else True,
                 trade.trailing_stop or 0.0,
+                reason.value if reason is not None else "",
             )
             if reason is None and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 15)):
                 reason = ExitReason.TIME_EXIT
