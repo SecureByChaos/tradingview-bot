@@ -442,6 +442,7 @@ def ai_reviews_page(
 
 
 @router.get("/ai-context-inspector", response_class=HTMLResponse)
+@router.get("/ai-context-inspector", response_class=HTMLResponse)
 def ai_context_inspector_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
@@ -449,7 +450,17 @@ def ai_context_inspector_page(
     context_id: str | None = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    normalized_review_date = review_date.strip() if review_date else ""`r`n    if normalized_review_date and "-" in normalized_review_date:`r`n        parts = normalized_review_date.split("-")`r`n        if len(parts) == 3 and len(parts[0]) != 4:`r`n            normalized_review_date = f"{parts[2]}-{parts[1]}-{parts[0]}"`r`n    try:`r`n        day = date.fromisoformat(normalized_review_date) if normalized_review_date else datetime.now(IST).date()`r`n    except ValueError:`r`n        day = datetime.now(IST).date()`r`n    review_date = day.isoformat()
+    normalized_review_date = review_date.strip() if review_date else ""
+    if normalized_review_date and "-" in normalized_review_date:
+        parts = normalized_review_date.split("-")
+        if len(parts) == 3 and len(parts[0]) != 4:
+            normalized_review_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
+    try:
+        day = date.fromisoformat(normalized_review_date) if normalized_review_date else datetime.now(IST).date()
+    except ValueError:
+        day = datetime.now(IST).date()
+    review_date = day.isoformat()
+
     start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
     end = datetime.combine(day, time.max, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
     day_contexts = list(
@@ -459,6 +470,7 @@ def ai_context_inspector_page(
             .order_by(AIContextLog.created_at.desc())
         )
     )
+
     parsed_context_seq: int | None = None
     if context_id is not None:
         candidate = context_id.strip()
@@ -467,7 +479,22 @@ def ai_context_inspector_page(
                 parsed_context_seq = int(candidate)
             except ValueError:
                 parsed_context_seq = None
-    day_contexts_by_time = sorted(day_contexts, key=lambda row: row.created_at)`r`n    context_log = None`r`n    if day_contexts_by_time:`r`n        if parsed_context_seq is None:`r`n            parsed_context_seq = 1`r`n        if parsed_context_seq > 0:`r`n            selected_index = parsed_context_seq - 1`r`n            if selected_index < len(day_contexts_by_time):`r`n                context_log = day_contexts_by_time[selected_index]`r`n        if context_log is None:`r`n            context_log = day_contexts_by_time[0]`r`n            parsed_context_seq = 1`r`n    else:`r`n        parsed_context_seq = 0
+
+    day_contexts_by_time = sorted(day_contexts, key=lambda row: row.created_at)
+    context_log = None
+    if day_contexts_by_time:
+        if parsed_context_seq is None:
+            parsed_context_seq = 1
+        if parsed_context_seq > 0:
+            selected_index = parsed_context_seq - 1
+            if selected_index < len(day_contexts_by_time):
+                context_log = day_contexts_by_time[selected_index]
+        if context_log is None:
+            context_log = day_contexts_by_time[0]
+            parsed_context_seq = 1
+    else:
+        parsed_context_seq = 0
+
     context_json = _context_json(context_log.context_json) if context_log is not None else {}
     tradingview = context_json.get("tradingview") if isinstance(context_json.get("tradingview"), dict) else {}
     tradingview_indicators = tradingview.get("indicators") if isinstance(tradingview.get("indicators"), dict) else {}
@@ -521,24 +548,6 @@ def ai_context_inspector_page(
             "day_contexts": day_contexts,
         },
     )
-
-
-def _review_list(value: str) -> list[str]:
-    try:
-        parsed = json.loads(value)
-        return parsed if isinstance(parsed, list) else [str(parsed)]
-    except (TypeError, ValueError):
-        return []
-
-
-def _context_json(value: str) -> dict[str, object]:
-    try:
-        parsed = json.loads(value)
-        return parsed if isinstance(parsed, dict) else {}
-    except (TypeError, ValueError):
-        return {}
-
-
 def _section_values(values: dict[str, object], fields: tuple[str, ...], empty_label: str = "NOT PROVIDED BY WEBHOOK") -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for field in fields:
