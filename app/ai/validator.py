@@ -8,13 +8,30 @@ from app.ai.models import ReviewResult
 
 class AIResponseValidator:
     _DECISIONS = {"APPROVE", "WATCH", "REJECT", "ERROR"}
+    _DECISION_ALIASES = {
+        "BUY": "APPROVE",
+        "TAKE": "APPROVE",
+        "GO": "APPROVE",
+        "ENTER": "APPROVE",
+        "YES": "APPROVE",
+        "HOLD": "WATCH",
+        "WAIT": "WATCH",
+        "NEUTRAL": "WATCH",
+        "OBSERVE": "WATCH",
+        "SKIP": "REJECT",
+        "NO": "REJECT",
+        "AVOID": "REJECT",
+        "PASS": "REJECT",
+        "DON'T BUY": "REJECT",
+        "DO_NOT_BUY": "REJECT",
+    }
 
     def validate(self, raw_json: Any) -> ReviewResult:
         try:
             data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
             if not isinstance(data, dict):
                 data = {}
-            decision = str(data.get("decision", "ERROR")).upper()
+            decision = self._normalize_decision(data.get("decision", "ERROR"))
             if decision not in self._DECISIONS:
                 decision = "ERROR"
             confidence = 0.0 if decision == "ERROR" else self._confidence(data.get("confidence", 0))
@@ -42,9 +59,22 @@ class AIResponseValidator:
     @staticmethod
     def _confidence(value: Any) -> float:
         try:
-            return min(100.0, max(0.0, float(value)))
+            if isinstance(value, str):
+                cleaned = value.strip().replace("%", "")
+                numeric = float(cleaned)
+            else:
+                numeric = float(value)
+            if numeric > 1.0:
+                numeric = numeric / 100.0
+            return min(1.0, max(0.0, numeric))
         except (TypeError, ValueError):
             return 0.0
+
+    @classmethod
+    def _normalize_decision(cls, value: Any) -> str:
+        decision = str(value or "ERROR").strip().upper()
+        decision = " ".join(decision.split())
+        return cls._DECISION_ALIASES.get(decision, decision)
 
     @classmethod
     def _optional_confidence(cls, value: Any) -> float | None:
