@@ -15,7 +15,7 @@
         <option value="">No context logs for selected date</option>
         {% endif %}
         {% for row in day_contexts %}
-        <option value="{{ row.id }}" {% if context_id == row.id %}selected{% endif %}>
+        <option value="{{ row.id }}" {% if context_id == row.id or (context_id is not none and context_id|string == row.id|string) %}selected{% endif %}>
           {{ row.created_at | ist }} | {{ row.strategy }} | {{ row.signal }} | {{ row.event_type }} | {{ row.trade_id or "-" }}
         </option>
         {% endfor %}
@@ -105,4 +105,5 @@
 {{ empty_state("No AI context logs available.") }}
 {% endif %}
 {% endblock %}
+
 

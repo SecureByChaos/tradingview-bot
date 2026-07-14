@@ -527,7 +527,7 @@ def ai_context_inspector_page(
                 empty_label="-",
             ),
             "review_date": review_date,
-            "context_id": context_log.id if context_log is not None else None,
+            "context_id": parsed_context_id,
             "day_contexts": day_contexts,
         },
     )
@@ -583,4 +583,5 @@ def apply_settings(
     settings.square_off_time = square_off_time
     settings.telegram_bot_token = telegram_bot_token
     settings.telegram_chat_id = telegram_chat_id
+
 
