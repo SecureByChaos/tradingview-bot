@@ -449,13 +449,7 @@ def ai_context_inspector_page(
     context_id: str | None = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    if not review_date:
-        review_date = datetime.now(IST).date().isoformat()
-    try:
-        day = date.fromisoformat(review_date)
-    except ValueError:
-        day = datetime.now(IST).date()
-        review_date = day.isoformat()
+    normalized_review_date = review_date.strip() if review_date else ""`r`n    if normalized_review_date and "-" in normalized_review_date:`r`n        parts = normalized_review_date.split("-")`r`n        if len(parts) == 3 and len(parts[0]) != 4:`r`n            normalized_review_date = f"{parts[2]}-{parts[1]}-{parts[0]}"`r`n    try:`r`n        day = date.fromisoformat(normalized_review_date) if normalized_review_date else datetime.now(IST).date()`r`n    except ValueError:`r`n        day = datetime.now(IST).date()`r`n    review_date = day.isoformat()
     start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
     end = datetime.combine(day, time.max, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
     day_contexts = list(
@@ -465,19 +459,15 @@ def ai_context_inspector_page(
             .order_by(AIContextLog.created_at.desc())
         )
     )
-    parsed_context_id: int | None = None
+    parsed_context_seq: int | None = None
     if context_id is not None:
         candidate = context_id.strip()
         if candidate:
             try:
-                parsed_context_id = int(candidate)
+                parsed_context_seq = int(candidate)
             except ValueError:
-                parsed_context_id = None
-    context_log = None
-    if parsed_context_id is not None:
-        context_log = next((row for row in day_contexts if row.id == parsed_context_id), None)
-    if context_log is None and day_contexts:
-        context_log = day_contexts[0]
+                parsed_context_seq = None
+    day_contexts_by_time = sorted(day_contexts, key=lambda row: row.created_at)`r`n    context_log = None`r`n    if day_contexts_by_time:`r`n        if parsed_context_seq is None:`r`n            parsed_context_seq = 1`r`n        if parsed_context_seq > 0:`r`n            selected_index = parsed_context_seq - 1`r`n            if selected_index < len(day_contexts_by_time):`r`n                context_log = day_contexts_by_time[selected_index]`r`n        if context_log is None:`r`n            context_log = day_contexts_by_time[0]`r`n            parsed_context_seq = 1`r`n    else:`r`n        parsed_context_seq = 0
     context_json = _context_json(context_log.context_json) if context_log is not None else {}
     tradingview = context_json.get("tradingview") if isinstance(context_json.get("tradingview"), dict) else {}
     tradingview_indicators = tradingview.get("indicators") if isinstance(tradingview.get("indicators"), dict) else {}
@@ -527,7 +517,7 @@ def ai_context_inspector_page(
                 empty_label="-",
             ),
             "review_date": review_date,
-            "context_id": parsed_context_id,
+            "context_id": parsed_context_seq,
             "day_contexts": day_contexts,
         },
     )
@@ -583,5 +573,7 @@ def apply_settings(
     settings.square_off_time = square_off_time
     settings.telegram_bot_token = telegram_bot_token
     settings.telegram_chat_id = telegram_chat_id
+
+
 
 

@@ -10,19 +10,19 @@
     </div>
     <div class="col-12 col-md-7">
       <label class="field-label mb-1">Trade Selection (Day)</label>
-      <select class="form-select bg-dark text-light border-secondary" name="context_id" {% if not day_contexts %}disabled{% endif %}>
+      <select class="form-select bg-dark text-light border-secondary" name="context_id">
         {% if not day_contexts %}
-        <option value="">No context logs for selected date</option>
+        <option value="0" selected>No context logs for selected date</option>
         {% endif %}
-        {% for row in day_contexts %}
-        <option value="{{ row.id }}" {% if context_id == row.id or (context_id is not none and context_id|string == row.id|string) %}selected{% endif %}>
+        {% for row in day_contexts|reverse %}
+        <option value="{{ loop.length - loop.index0 }}" {% if context_id == (loop.length - loop.index0) %}selected{% endif %}>
           {{ row.created_at | ist }} | {{ row.strategy }} | {{ row.signal }} | {{ row.event_type }} | {{ row.trade_id or "-" }}
         </option>
         {% endfor %}
       </select>
     </div>
     <div class="col-12 col-md-2">
-      <button type="submit" class="btn btn-primary w-100" {% if not day_contexts %}disabled{% endif %}>Load</button>
+      <button type="submit" class="btn btn-primary w-100">Load</button>
     </div>
   </form>
 </div>
@@ -105,5 +105,7 @@
 {{ empty_state("No AI context logs available.") }}
 {% endif %}
 {% endblock %}
+
+
 
 
