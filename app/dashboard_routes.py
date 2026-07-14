@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import date, datetime, time, timezone
 import json
@@ -446,7 +446,7 @@ def ai_context_inspector_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
     review_date: str = "",
-    context_id: int | None = None,
+    context_id: str | None = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     if not review_date:
@@ -465,9 +465,17 @@ def ai_context_inspector_page(
             .order_by(AIContextLog.created_at.desc())
         )
     )
-    context_log = None
+    parsed_context_id: int | None = None
     if context_id is not None:
-        context_log = next((row for row in day_contexts if row.id == context_id), None)
+        candidate = context_id.strip()
+        if candidate:
+            try:
+                parsed_context_id = int(candidate)
+            except ValueError:
+                parsed_context_id = None
+    context_log = None
+    if parsed_context_id is not None:
+        context_log = next((row for row in day_contexts if row.id == parsed_context_id), None)
     if context_log is None and day_contexts:
         context_log = day_contexts[0]
     context_json = _context_json(context_log.context_json) if context_log is not None else {}
@@ -575,3 +583,4 @@ def apply_settings(
     settings.square_off_time = square_off_time
     settings.telegram_bot_token = telegram_bot_token
     settings.telegram_chat_id = telegram_chat_id
+

@@ -1,4 +1,4 @@
-{% extends "base.html" %}
+﻿{% extends "base.html" %}
 {% from "components.html" import page_header, empty_state %}
 {% block content %}
 {{ page_header("AI Context Inspector") }}
@@ -10,7 +10,7 @@
     </div>
     <div class="col-12 col-md-7">
       <label class="field-label mb-1">Trade Selection (Day)</label>
-      <select class="form-select bg-dark text-light border-secondary" name="context_id">
+      <select class="form-select bg-dark text-light border-secondary" name="context_id" {% if not day_contexts %}disabled{% endif %}>
         {% if not day_contexts %}
         <option value="">No context logs for selected date</option>
         {% endif %}
@@ -22,7 +22,7 @@
       </select>
     </div>
     <div class="col-12 col-md-2">
-      <button type="submit" class="btn btn-primary w-100">Load</button>
+      <button type="submit" class="btn btn-primary w-100" {% if not day_contexts %}disabled{% endif %}>Load</button>
     </div>
   </form>
 </div>
@@ -105,3 +105,4 @@
 {{ empty_state("No AI context logs available.") }}
 {% endif %}
 {% endblock %}
+
