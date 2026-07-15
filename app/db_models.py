@@ -73,6 +73,11 @@ class AISettings(Base):
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     confidence_threshold: Mapped[int] = mapped_column(Integer, default=90, nullable=False)
     system_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    secondary_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    secondary_provider: Mapped[str] = mapped_column(String(32), default="claude", nullable=False)
+    secondary_model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    secondary_api_key: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    secondary_base_url: Mapped[str] = mapped_column(String(512), default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Optional
 
 from sqlalchemy import func, select
@@ -343,6 +344,83 @@ def run_shadow_review(
                 logger.info("[AI] Review saved successfully id=%s", review.id)
             except Exception as exc:
                 logger.exception("[AI] Review save failed: %s", exc)
+
+            if (
+                settings.secondary_enabled
+                and settings.secondary_provider
+                and settings.secondary_provider.strip().lower() != settings.provider.strip().lower()
+            ):
+                logger.info("[AI] Secondary review triggered (%s)", settings.secondary_provider)
+                secondary_settings = SimpleNamespace(
+                    provider=settings.secondary_provider,
+                    model=settings.secondary_model,
+                    api_key=settings.secondary_api_key,
+                    base_url=settings.secondary_base_url,
+                    temperature=settings.temperature,
+                    timeout_seconds=settings.timeout_seconds,
+                    system_prompt=settings.system_prompt,
+                )
+                secondary_request_data = {
+                    "provider": secondary_settings.provider,
+                    "model": secondary_settings.model,
+                    "prompt_version": prompt.get("version", PROMPT_VERSION),
+                    "messages": request_data["messages"],
+                }
+                try:
+                    secondary_context_log = create_context_log(
+                        db,
+                        timestamp=timestamp,
+                        strategy=strategy,
+                        signal=signal,
+                        event_type=event_type,
+                        paper_live=str(market_data.get("paper_live") or ""),
+                        trade_id=trade_id,
+                        trade_number=trade_number_today,
+                        session=session,
+                        context_data=context_data,
+                        request_data=secondary_request_data,
+                        payload_size=payload_size,
+                        context_version=CONTEXT_VERSION,
+                        prompt_version=prompt.get("version", PROMPT_VERSION),
+                        model=secondary_settings.model,
+                        completeness_percent=completeness,
+                        missing_fields=missing_fields,
+                    )
+                    logger.info("[AI] Calling %s", secondary_settings.provider)
+                    secondary_provider_result = create_reviewer(secondary_settings).analyze_signal(context)
+                    logger.info("[AI] %s response received", secondary_settings.provider)
+                    secondary_result = AIResponseValidator().validate(secondary_provider_result.model_dump()).model_copy(
+                        update={
+                            "provider": secondary_provider_result.provider,
+                            "model": secondary_provider_result.model,
+                            "latency_ms": secondary_provider_result.latency_ms,
+                        }
+                    )
+                    if secondary_result.decision == "ERROR":
+                        logger.error("AI secondary review failed: %s", secondary_result.summary)
+                    finalize_context_log(
+                        db,
+                        secondary_context_log.id,
+                        latency_ms=secondary_result.latency_ms,
+                        decision=secondary_result.decision,
+                        confidence=None if secondary_result.decision == "ERROR" else secondary_result.confidence,
+                        reason_to_buy=secondary_result.reason_to_buy,
+                        reason_not_to_buy=secondary_result.reason_not_to_buy,
+                        summary=secondary_result.summary,
+                    )
+                    secondary_review = save_review(
+                        db,
+                        trade_id,
+                        strategy,
+                        signal,
+                        secondary_result,
+                        PROMPT_VERSION,
+                        CONTEXT_VERSION,
+                        FRAMEWORK_VERSION,
+                    )
+                    logger.info("[AI] Secondary review saved successfully id=%s", secondary_review.id)
+                except Exception as exc:
+                    logger.exception("[AI] Secondary review save failed: %s", exc)
     except Exception:
         logger.exception("AI shadow review failed")
 

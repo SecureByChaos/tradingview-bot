@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Callable, Dict, Optional
 
 from app.ai.base import AIReviewer
+from app.ai.claude import ClaudeReviewer
 from app.ai.dummy import DummyReviewer
 from app.ai.openai import OpenAIReviewer
 from app.db_models import AISettings
@@ -11,6 +12,7 @@ ReviewerFactory = Callable[..., AIReviewer]
 _PROVIDERS: Dict[str, ReviewerFactory] = {
     "dummy": lambda **_: DummyReviewer(),
     "openai": OpenAIReviewer,
+    "claude": ClaudeReviewer,
 }
 
 

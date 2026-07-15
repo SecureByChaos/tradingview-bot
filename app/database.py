@@ -106,6 +106,19 @@ def _ensure_columns() -> None:
             for column, statement in trade_statements.items():
                 if column not in existing_trade_columns:
                     connection.execute(text(statement))
+    if "ai_settings" in table_names:
+        existing_ai_columns = {column["name"] for column in inspector.get_columns("ai_settings")}
+        ai_statements = {
+            "secondary_enabled": "ALTER TABLE ai_settings ADD COLUMN secondary_enabled BOOLEAN NOT NULL DEFAULT 0",
+            "secondary_provider": "ALTER TABLE ai_settings ADD COLUMN secondary_provider VARCHAR(32) NOT NULL DEFAULT 'claude'",
+            "secondary_model": "ALTER TABLE ai_settings ADD COLUMN secondary_model VARCHAR(128) NOT NULL DEFAULT ''",
+            "secondary_api_key": "ALTER TABLE ai_settings ADD COLUMN secondary_api_key VARCHAR(512) NOT NULL DEFAULT ''",
+            "secondary_base_url": "ALTER TABLE ai_settings ADD COLUMN secondary_base_url VARCHAR(512) NOT NULL DEFAULT ''",
+        }
+        with engine.begin() as connection:
+            for column, statement in ai_statements.items():
+                if column not in existing_ai_columns:
+                    connection.execute(text(statement))
 
 
 def _seed_default_strategy() -> None:

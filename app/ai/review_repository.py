@@ -25,6 +25,7 @@ def save_review(
             select(AITradeReview).where(
                 AITradeReview.trade_id == trade_id,
                 AITradeReview.signal == signal,
+                AITradeReview.provider == result.provider,
             )
         )
         if existing is not None:

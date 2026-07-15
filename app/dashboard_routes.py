@@ -310,11 +310,18 @@ def update_ai_settings_page(
     confidence_threshold: Annotated[int, Form()],
     system_prompt: Annotated[str, Form()],
     enabled: Annotated[str | None, Form()] = None,
+    secondary_enabled: Annotated[str | None, Form()] = None,
+    secondary_provider: Annotated[str, Form()] = "claude",
+    secondary_model: Annotated[str, Form()] = "",
+    secondary_api_key: Annotated[str, Form()] = "",
+    secondary_base_url: Annotated[str, Form()] = "",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> RedirectResponse:
+    valid_providers = {"dummy", "openai", "claude"}
     if (
         mode not in {"DISABLED", "SHADOW", "ADVISORY", "BLOCKING"}
-        or provider not in {"dummy", "openai"}
+        or provider not in valid_providers
+        or secondary_provider not in valid_providers
         or not 0 <= temperature <= 2
         or timeout_seconds < 1
         or not 0 <= confidence_threshold <= 100
@@ -331,9 +338,15 @@ def update_ai_settings_page(
         "timeout_seconds": timeout_seconds,
         "confidence_threshold": confidence_threshold,
         "system_prompt": system_prompt,
+        "secondary_enabled": secondary_enabled == "on",
+        "secondary_provider": secondary_provider,
+        "secondary_model": secondary_model.strip(),
+        "secondary_base_url": secondary_base_url.strip(),
     }
     if api_key:
         values["api_key"] = api_key
+    if secondary_api_key:
+        values["secondary_api_key"] = secondary_api_key
     update_ai_settings(db, settings, **values)
     return RedirectResponse("/ai-settings", status_code=303)
 
@@ -354,6 +367,38 @@ def test_ai_settings(
         "latency": result.latency_ms,
         "status": "ERROR" if result.decision == "ERROR" else "OK",
         "error": result.summary if result.decision == "ERROR" else "",
+    }
+    return templates.TemplateResponse("ai_settings.html", {"request": request, "settings": settings, "test_result": test_result})
+
+
+@router.post("/ai-settings/test-secondary", response_class=HTMLResponse)
+def test_secondary_ai_settings(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    from types import SimpleNamespace
+
+    settings = get_ai_settings(db) or create_ai_settings(db, id=1)
+    secondary_settings = SimpleNamespace(
+        provider=settings.secondary_provider,
+        model=settings.secondary_model,
+        api_key=settings.secondary_api_key,
+        base_url=settings.secondary_base_url,
+        temperature=settings.temperature,
+        timeout_seconds=settings.timeout_seconds,
+        system_prompt=settings.system_prompt,
+    )
+    result = create_reviewer(secondary_settings).analyze_signal(
+        SignalContextBuilder().build("CONNECTION_TEST", "TEST", datetime.now(timezone.utc))
+    )
+    test_result = {
+        "provider": secondary_settings.provider,
+        "model": secondary_settings.model,
+        "latency": result.latency_ms,
+        "status": "ERROR" if result.decision == "ERROR" else "OK",
+        "error": result.summary if result.decision == "ERROR" else "",
+        "secondary": True,
     }
     return templates.TemplateResponse("ai_settings.html", {"request": request, "settings": settings, "test_result": test_result})
 
