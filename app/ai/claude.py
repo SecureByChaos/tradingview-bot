@@ -50,6 +50,10 @@ class ClaudeReviewer(AIReviewer):
 
             endpoint = (self.settings.base_url or "https://api.anthropic.com/v1").rstrip("/") + "/messages"
             logger.info("[AI] Calling Claude")
+            # Anthropic's Messages API only accepts temperature in [0, 1], unlike OpenAI's [0, 2].
+            # The AI Settings form validates against OpenAI's wider range and this field is shared
+            # between providers, so clamp here rather than reject/misconfigure the shared setting.
+            claude_temperature = min(max(self.settings.temperature, 0.0), 1.0)
             response = self.client.send(
                 endpoint=endpoint,
                 headers={
@@ -60,7 +64,7 @@ class ClaudeReviewer(AIReviewer):
                 payload={
                     "model": self.settings.model,
                     "max_tokens": 1024,
-                    "temperature": self.settings.temperature,
+                    "temperature": claude_temperature,
                     "system": prompt["system_prompt"] + _JSON_ONLY_SUFFIX,
                     "messages": [
                         {"role": "user", "content": prompt["user_prompt"]},

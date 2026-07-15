@@ -31,7 +31,7 @@ class AIClient:
                     body = response.json()
                 except ValueError:
                     body = response.text
-                error = None if response.ok else "HTTP {}".format(response.status_code)
+                error = None if response.ok else self._build_error(response.status_code, body)
                 return AIClientResponse(response.status_code, body, self._latency(started), error)
             except requests.Timeout:
                 if attempt == 0:
@@ -46,3 +46,18 @@ class AIClient:
     @staticmethod
     def _latency(started: float) -> float:
         return round((perf_counter() - started) * 1000, 2)
+
+    @staticmethod
+    def _build_error(status_code: int, body: Any) -> str:
+        detail = ""
+        if isinstance(body, dict):
+            error_field = body.get("error")
+            if isinstance(error_field, dict):
+                detail = str(error_field.get("message") or error_field.get("type") or "")
+            elif isinstance(error_field, str):
+                detail = error_field
+            elif not detail:
+                detail = str(body.get("message") or "")
+        elif isinstance(body, str):
+            detail = body[:300]
+        return "HTTP {}{}".format(status_code, ": " + detail if detail else "")
