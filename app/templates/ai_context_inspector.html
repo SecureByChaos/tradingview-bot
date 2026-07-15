@@ -15,7 +15,7 @@
         <option value="0" selected>No context logs for selected date</option>
         {% endif %}
         {% for row in day_contexts|reverse %}
-        <option value="{{ loop.length - loop.index0 }}" {% if context_id == (loop.length - loop.index0) %}selected{% endif %}>
+        <option value="{{ loop.index0 + 1 }}" {% if context_id == (loop.index0 + 1) %}selected{% endif %}>
           {{ row.created_at | ist }} | {{ row.strategy }} | {{ row.signal }} | {{ row.event_type }} | {{ row.trade_id or "-" }}
         </option>
         {% endfor %}
