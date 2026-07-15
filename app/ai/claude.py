@@ -50,10 +50,20 @@ class ClaudeReviewer(AIReviewer):
 
             endpoint = (self.settings.base_url or "https://api.anthropic.com/v1").rstrip("/") + "/messages"
             logger.info("[AI] Calling Claude")
-            # Anthropic's Messages API only accepts temperature in [0, 1], unlike OpenAI's [0, 2].
-            # The AI Settings form validates against OpenAI's wider range and this field is shared
-            # between providers, so clamp here rather than reject/misconfigure the shared setting.
-            claude_temperature = min(max(self.settings.temperature, 0.0), 1.0)
+            # Newer Claude model families (e.g. Opus 4.7+, Sonnet 5) reject the `temperature`
+            # parameter outright -- "temperature is deprecated for this model" -- rather than
+            # just enforcing Anthropic's older [0, 1] range. Since this field is shared with the
+            # OpenAI config (validated against OpenAI's [0, 2] range) and whether a given Claude
+            # model still accepts it is model-dependent, the safe approach is to not send it at
+            # all and let the model use its own default.
+            payload = {
+                "model": self.settings.model,
+                "max_tokens": 1024,
+                "system": prompt["system_prompt"] + _JSON_ONLY_SUFFIX,
+                "messages": [
+                    {"role": "user", "content": prompt["user_prompt"]},
+                ],
+            }
             response = self.client.send(
                 endpoint=endpoint,
                 headers={
@@ -61,15 +71,7 @@ class ClaudeReviewer(AIReviewer):
                     "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json",
                 },
-                payload={
-                    "model": self.settings.model,
-                    "max_tokens": 1024,
-                    "temperature": claude_temperature,
-                    "system": prompt["system_prompt"] + _JSON_ONLY_SUFFIX,
-                    "messages": [
-                        {"role": "user", "content": prompt["user_prompt"]},
-                    ],
-                },
+                payload=payload,
                 timeout=self.settings.timeout_seconds,
             )
             logger.info("[AI] Claude response received")
