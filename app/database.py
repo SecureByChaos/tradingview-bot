@@ -1,24 +1,57 @@
 from __future__ import annotations
 
+import os
+
 from collections.abc import Generator
+from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
-
-from sqlalchemy import inspect, text
 
 from app.config import get_settings
 
 settings = get_settings()
-if settings.database_url.startswith("sqlite:///"):
-    sqlite_path = settings.database_url.replace("sqlite:///", "", 1)
-    if sqlite_path and sqlite_path != ":memory:":
-        from pathlib import Path
 
+
+def _resolve_database_url(raw_url: str) -> str:
+    if not raw_url.startswith("sqlite:///"):
+        return raw_url
+    sqlite_path = raw_url.replace("sqlite:///", "", 1)
+    if not sqlite_path or sqlite_path == ":memory:":
+        return raw_url
+    path = Path(sqlite_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.getenv("DATABASE_URL"):
+        return raw_url
+    if path.name != "platform.sqlite3":
+        return raw_url
+    fallback = path.parent / "banknifty_bot.db"
+    if not fallback.exists():
+        return raw_url
+    try:
+        probe_engine = create_engine(
+            raw_url,
+            connect_args={"check_same_thread": False},
+            future=True,
+        )
+        with probe_engine.connect() as connection:
+            count = connection.execute(text("SELECT COUNT(1) FROM ai_context_logs")).scalar_one()
+        probe_engine.dispose()
+        if int(count) > 0:
+            return raw_url
+    except Exception:
+        pass
+    return f"sqlite:///{fallback.as_posix()}"
+
+
+resolved_database_url = _resolve_database_url(settings.database_url)
+if resolved_database_url.startswith("sqlite:///"):
+    sqlite_path = resolved_database_url.replace("sqlite:///", "", 1)
+    if sqlite_path and sqlite_path != ":memory:":
         Path(sqlite_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
 engine = create_engine(
-    settings.database_url,
+    resolved_database_url,
     connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {},
     future=True,
 )

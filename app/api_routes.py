@@ -13,10 +13,12 @@ from sqlalchemy.orm import Session
 from app.auth import require_admin_api
 from app.ai.context_repository import get_latest_context_log
 from app.database import get_db
-from app.db_models import BotStatus, StrategyConfig, StrategyTrade, TradeStatus
+from app.db_models import BotStatus, LogEvent, StrategyConfig, StrategyTrade, TradeStatus
 from app.db_models import TradingMode
 from app.platform import (
+    ai_reviews_query_for_filter,
     api_status,
+    daily_stats_query_for_filter,
     get_or_create_strategy_stats,
     get_or_create_settings,
     get_or_create_state,
@@ -28,8 +30,10 @@ from app.platform import (
     strategy_metrics,
     strategy_trades_query_for_filter,
 )
+from app.reports import reports_query_for_filter
 from sqlalchemy import select
 from app.telegram_service import TelegramService
+from app.time_utils import format_ist
 from app.trade_manager import TradeManager
 
 router = APIRouter(prefix="/api")
@@ -160,6 +164,164 @@ def trades_export(
         iter([output.getvalue()]),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=strategy_trades_ist.csv"},
+    )
+
+
+@router.get("/logs/export")
+def logs_export(
+    db: Annotated[Session, Depends(get_db)],
+    limit: int = 1000,
+    event_type: str = "",
+    level: str = "",
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> StreamingResponse:
+    query = select(LogEvent).order_by(LogEvent.created_at.desc())
+    if event_type:
+        query = query.where(LogEvent.event_type == event_type)
+    if level:
+        query = query.where(LogEvent.level == level)
+    if limit:
+        query = query.limit(limit)
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=["Time (IST)", "Type", "Level", "Message", "Payload"])
+    writer.writeheader()
+    for log in db.scalars(query):
+        writer.writerow(
+            {
+                "Time (IST)": format_ist(log.created_at),
+                "Type": log.event_type,
+                "Level": log.level,
+                "Message": log.message,
+                "Payload": log.payload,
+            }
+        )
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=logs_ist.csv"},
+    )
+
+
+@router.get("/ai-reviews/export")
+def ai_reviews_export(
+    db: Annotated[Session, Depends(get_db)],
+    review_date: str = "",
+    strategy: str = "",
+    provider: str = "",
+    decision: str = "",
+    trade_result: str = "",
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> StreamingResponse:
+    query = ai_reviews_query_for_filter(review_date, strategy, provider, decision, trade_result)
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "Time (IST)",
+            "Strategy",
+            "Signal",
+            "Review Type",
+            "Provider",
+            "Model",
+            "Decision",
+            "Confidence",
+            "Trade Result",
+            "Actual P&L",
+            "AI Correct",
+            "Summary",
+        ],
+    )
+    writer.writeheader()
+    for review in db.scalars(query):
+        writer.writerow(
+            {
+                "Time (IST)": format_ist(review.created_at),
+                "Strategy": review.strategy,
+                "Signal": review.signal,
+                "Review Type": "ENTRY" if review.signal.startswith("BUY") else "EXIT",
+                "Provider": review.provider,
+                "Model": review.model,
+                "Decision": review.decision,
+                "Confidence": review.confidence,
+                "Trade Result": review.actual_result or "",
+                "Actual P&L": review.actual_pnl if review.actual_pnl is not None else "",
+                "AI Correct": "" if review.ai_correct is None else ("YES" if review.ai_correct else "NO"),
+                "Summary": review.summary,
+            }
+        )
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=ai_reviews_ist.csv"},
+    )
+
+
+@router.get("/daily-stats/export")
+def daily_stats_export(
+    db: Annotated[Session, Depends(get_db)],
+    filter: str = "30d",
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> StreamingResponse:
+    query = daily_stats_query_for_filter(filter, None, None)
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["Date", "Trade Count", "Wins", "Losses", "P&L %", "Consecutive Losses", "Risk Locked"],
+    )
+    writer.writeheader()
+    for stats in db.scalars(query):
+        writer.writerow(
+            {
+                "Date": stats.trade_date.isoformat(),
+                "Trade Count": stats.trade_count,
+                "Wins": stats.wins,
+                "Losses": stats.losses,
+                "P&L %": stats.pnl_percent,
+                "Consecutive Losses": stats.consecutive_losses,
+                "Risk Locked": "YES" if stats.risk_locked else "NO",
+            }
+        )
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=daily_stats.csv"},
+    )
+
+
+@router.get("/reports/export")
+def reports_export(
+    db: Annotated[Session, Depends(get_db)],
+    report_type: str = "",
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> StreamingResponse:
+    query = reports_query_for_filter(report_type)
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["Type", "Title", "Period Start", "Period End", "Generated At (IST)", "Provider", "Model", "Summary"],
+    )
+    writer.writeheader()
+    for report in db.scalars(query):
+        writer.writerow(
+            {
+                "Type": report.report_type,
+                "Title": report.title,
+                "Period Start": report.period_start.isoformat(),
+                "Period End": report.period_end.isoformat(),
+                "Generated At (IST)": format_ist(report.generated_at),
+                "Provider": report.provider,
+                "Model": report.model,
+                "Summary": report.summary_text,
+            }
+        )
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=ai_reports.csv"},
     )
 
 

@@ -3,12 +3,14 @@
 from datetime import date, datetime, time, timezone
 import json
 from typing import Annotated
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from app import reports
 from app.auth import authenticate_admin, require_admin_page
 from app.ai.context_builder import SignalContextBuilder
 from app.ai.context_repository import get_context_log_for_review
@@ -17,6 +19,7 @@ from app.ai.repository import create_settings as create_ai_settings, get_setting
 from app.database import get_db
 from app.db_models import AIContextLog, AITradeReview, BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
 from app.platform import (
+    ai_reviews_query_for_filter,
     get_dashboard_summary,
     get_or_create_strategy_stats,
     get_or_create_settings,
@@ -355,6 +358,66 @@ def test_ai_settings(
     return templates.TemplateResponse("ai_settings.html", {"request": request, "settings": settings, "test_result": test_result})
 
 
+@router.get("/reports", response_class=HTMLResponse)
+def reports_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    report_type: str = "",
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    report_rows = [
+        {"report": report, "stats": _context_json(report.stats_json)}
+        for report in reports.list_reports(db, report_type)
+    ]
+    return templates.TemplateResponse(
+        "reports.html",
+        {
+            "request": request,
+            "reports": report_rows,
+            "report_type": report_type,
+        },
+    )
+
+
+@router.post("/reports/daily/generate")
+def generate_daily_report_now(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    reports.generate_daily_summary(db)
+    return RedirectResponse("/reports?report_type=DAILY", status_code=303)
+
+
+@router.post("/reports/weekly/generate")
+def generate_weekly_report_now(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    reports.generate_weekly_report(db)
+    return RedirectResponse("/reports?report_type=WEEKLY", status_code=303)
+
+
+@router.post("/reports/monthly/generate")
+def generate_monthly_report_now(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    reports.generate_monthly_report(db)
+    return RedirectResponse("/reports?report_type=MONTHLY", status_code=303)
+
+
+@router.post("/reports/pattern/generate")
+def generate_pattern_report_now(
+    db: Annotated[Session, Depends(get_db)],
+    lookback_days: Annotated[str, Form()] = "90",
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    normalized = lookback_days.strip().lower()
+    days = None if normalized in {"", "all", "0"} else int(normalized)
+    reports.generate_pattern_discovery(db, days)
+    return RedirectResponse("/reports?report_type=PATTERN", status_code=303)
+
+
 @router.get("/logs", response_class=HTMLResponse)
 def logs_page(
     request: Request,
@@ -376,20 +439,7 @@ def ai_reviews_page(
     page: int = 1,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    query = select(AITradeReview)
-    if review_date:
-        day = date.fromisoformat(review_date)
-        start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
-        end = datetime.combine(day, time.max, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
-        query = query.where(AITradeReview.created_at.between(start, end))
-    if strategy:
-        query = query.where(AITradeReview.strategy == strategy)
-    if provider:
-        query = query.where(AITradeReview.provider == provider)
-    if decision:
-        query = query.where(AITradeReview.decision == decision)
-    if trade_result:
-        query = query.where(AITradeReview.actual_result == trade_result)
+    query = ai_reviews_query_for_filter(review_date, strategy, provider, decision, trade_result)
 
     filtered = query.subquery()
     summary = db.execute(
@@ -424,6 +474,8 @@ def ai_reviews_page(
             }
         )
     filters = {"review_date": review_date, "strategy": strategy, "provider": provider, "decision": decision, "trade_result": trade_result}
+    export_query = urlencode({key: value for key, value in filters.items() if value})
+    export_url = "/api/ai-reviews/export" + (f"?{export_query}" if export_query else "")
     return templates.TemplateResponse(
         "ai_reviews.html",
         {
@@ -433,6 +485,7 @@ def ai_reviews_page(
             "strategies": list(db.scalars(select(AITradeReview.strategy).distinct().order_by(AITradeReview.strategy))),
             "providers": list(db.scalars(select(AITradeReview.provider).distinct().order_by(AITradeReview.provider))),
             "filters": filters,
+            "export_url": export_url,
             "page": page,
             "pages": pages,
             "previous_url": str(request.url.include_query_params(page=page - 1)),
@@ -548,6 +601,24 @@ def ai_context_inspector_page(
             "day_contexts": day_contexts,
         },
     )
+def _review_list(value: str | None) -> list[str]:
+    try:
+        parsed = json.loads(value) if value else []
+    except Exception:
+        return []
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed]
+    return [str(parsed)] if parsed else []
+
+
+def _context_json(value: str | None) -> dict[str, object]:
+    try:
+        parsed = json.loads(value) if value else {}
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _section_values(values: dict[str, object], fields: tuple[str, ...], empty_label: str = "NOT PROVIDED BY WEBHOOK") -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for field in fields:

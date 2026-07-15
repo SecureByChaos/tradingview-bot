@@ -2,6 +2,7 @@
 {% from "components.html" import page_header, empty_state %}
 {% block content %}
 {{ page_header("System Logs") }}
+<div class="mb-3"><a class="btn btn-outline-light" href="/api/logs/export">Export CSV</a></div>
 {% if logs %}<div class="table-responsive responsive-table">
   <table class="table table-dark table-sm align-middle">
     <thead><tr><th>Time</th><th>Type</th><th>Level</th><th>Message</th><th>Payload</th></tr></thead>

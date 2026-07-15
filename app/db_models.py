@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 from sqlalchemy import Boolean, Date, DateTime, Float, Integer, String, Text, func
+from sqlalchemy.orm import Mapped, mapped_column
 from typing import Optional
 
 from app.database import Base
@@ -259,4 +260,25 @@ class LogEvent(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
-from typing import Optional
+
+
+class ReportType:
+    DAILY = "DAILY"
+    WEEKLY = "WEEKLY"
+    MONTHLY = "MONTHLY"
+    PATTERN = "PATTERN"
+
+
+class AIReport(Base):
+    __tablename__ = "ai_reports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    report_type: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, index=True, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    summary_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    stats_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True, nullable=False)

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import BotState, BotStatus, DailyStats, LogEvent, PlatformSettings, StrategyConfig, StrategyStats, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.db_models import AITradeReview, BotState, BotStatus, DailyStats, LogEvent, PlatformSettings, StrategyConfig, StrategyStats, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.time_utils import duration_label, format_ist, iso_utc, to_ist
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -277,6 +277,50 @@ def strategy_trades_query_for_filter(filter_name: str, start: date | None, end: 
     if end is not None:
         query = query.where(func.date(StrategyTrade.entry_time) <= end.isoformat())
     return query.order_by(StrategyTrade.entry_time.desc())
+
+
+def daily_stats_query_for_filter(filter_name: str, start: date | None, end: date | None) -> Select[tuple[DailyStats]]:
+    today = today_ist()
+    if filter_name == "7d":
+        start = today - timedelta(days=6)
+        end = today
+    elif filter_name == "30d":
+        start = today - timedelta(days=29)
+        end = today
+    elif filter_name == "today":
+        start = today
+        end = today
+
+    query = select(DailyStats)
+    if start is not None:
+        query = query.where(DailyStats.trade_date >= start)
+    if end is not None:
+        query = query.where(DailyStats.trade_date <= end)
+    return query.order_by(DailyStats.trade_date.desc())
+
+
+def ai_reviews_query_for_filter(
+    review_date: str = "",
+    strategy: str = "",
+    provider: str = "",
+    decision: str = "",
+    trade_result: str = "",
+) -> Select[tuple[AITradeReview]]:
+    query = select(AITradeReview)
+    if review_date:
+        day = date.fromisoformat(review_date)
+        start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+        end = datetime.combine(day, time.max, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
+        query = query.where(AITradeReview.created_at.between(start, end))
+    if strategy:
+        query = query.where(AITradeReview.strategy == strategy)
+    if provider:
+        query = query.where(AITradeReview.provider == provider)
+    if decision:
+        query = query.where(AITradeReview.decision == decision)
+    if trade_result:
+        query = query.where(AITradeReview.actual_result == trade_result)
+    return query.order_by(AITradeReview.created_at.desc())
 
 
 def strategy_metrics(db: Session) -> list[dict[str, Any]]:

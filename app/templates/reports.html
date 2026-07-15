@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% from "components.html" import page_header, empty_state %}
+{% block content %}
+{{ page_header("Reports") }}
+
+<div class="section-header"><h4 class="mb-0">Generate Now</h4></div>
+<div class="row g-3 mb-4">
+  <div class="col-md-3">
+    <form method="post" action="/reports/daily/generate">
+      <button class="btn btn-outline-info w-100" type="submit">Generate Daily Summary</button>
+    </form>
+  </div>
+  <div class="col-md-3">
+    <form method="post" action="/reports/weekly/generate">
+      <button class="btn btn-outline-info w-100" type="submit">Generate Weekly Report</button>
+    </form>
+  </div>
+  <div class="col-md-3">
+    <form method="post" action="/reports/monthly/generate">
+      <button class="btn btn-outline-info w-100" type="submit">Generate Monthly Report</button>
+    </form>
+  </div>
+  <div class="col-md-3">
+    <form method="post" action="/reports/pattern/generate" class="d-flex gap-2">
+      <select class="form-select" name="lookback_days">
+        <option value="30">Last 30 days</option>
+        <option value="90" selected>Last 90 days</option>
+        <option value="180">Last 180 days</option>
+        <option value="all">All time</option>
+      </select>
+      <button class="btn btn-outline-info text-nowrap" type="submit">Run Pattern Discovery</button>
+    </form>
+  </div>
+</div>
+
+<form class="filter-form filter-grid mb-3" method="get" action="/reports">
+  <div>
+    <select class="form-select" name="report_type">
+      <option value="" {% if report_type == "" %}selected{% endif %}>All Types</option>
+      <option value="DAILY" {% if report_type == "DAILY" %}selected{% endif %}>Daily Summary</option>
+      <option value="WEEKLY" {% if report_type == "WEEKLY" %}selected{% endif %}>Weekly Report</option>
+      <option value="MONTHLY" {% if report_type == "MONTHLY" %}selected{% endif %}>Monthly Report</option>
+      <option value="PATTERN" {% if report_type == "PATTERN" %}selected{% endif %}>Pattern Discovery</option>
+    </select>
+  </div>
+  <div><button class="btn btn-primary" type="submit">Filter</button></div>
+  <div><a class="btn btn-outline-light" href="/api/reports/export{% if report_type %}?report_type={{ report_type }}{% endif %}">Export CSV</a></div>
+</form>
+
+{% if reports %}
+{% for row in reports %}{% set report = row.report %}{% set stats = row.stats %}
+<div class="card bg-dark border-secondary mb-3">
+  <div class="card-body">
+    <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+      <div>
+        <span class="badge text-bg-secondary me-2">{{ report.report_type }}</span>
+        <strong>{{ report.title }}</strong>
+      </div>
+      <div class="small text-muted">
+        Generated {{ report.generated_at|ist }} &middot; Provider: {{ report.provider or "-" }}{% if report.model %} ({{ report.model }}){% endif %}
+      </div>
+    </div>
+    <p class="mt-3 mb-2" style="white-space: pre-wrap;">{{ report.summary_text }}</p>
+    <details>
+      <summary class="text-info" style="cursor:pointer;">View statistics</summary>
+      <pre class="mb-0 mt-2"><code>{{ stats | tojson(indent=2) }}</code></pre>
+    </details>
+  </div>
+</div>
+{% endfor %}
+{% else %}{{ empty_state("No reports generated yet.") }}{% endif %}
+{% endblock %}
