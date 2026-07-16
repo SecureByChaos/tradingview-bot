@@ -86,15 +86,12 @@ class V7Manager:
             )
             raise
         mode = self.resolve_mode(strategy)
-        required_capital = round(entry_price * contract.lot_size, 2)
-        available_capital = "N/A (no capital balance ledger)"
         quantity = self.calculate_quantity(strategy, entry_price, contract.lot_size)
-        if mode == TradingMode.PAPER and quantity <= 0 and strategy.capital_per_trade > 0:
-            quantity = contract.lot_size
-        reject_reason = "capital_per_trade is insufficient" if quantity <= 0 else ""
+        required_capital = round(entry_price * quantity, 2)
+        reject_reason = "lots_per_trade is invalid" if quantity <= 0 else ""
         logger.info(
-            "Mode: %s | Configured capital_per_trade: %.2f | Available capital: %s | Required capital: %.2f | Trade quantity: %s | Reject reason: %s",
-            mode, strategy.capital_per_trade, available_capital, required_capital, quantity, reject_reason,
+            "Mode: %s | Configured lots_per_trade: %s | Lot size: %s | Required capital: %.2f | Trade quantity: %s | Reject reason: %s",
+            mode, strategy.lots_per_trade, contract.lot_size, required_capital, quantity, reject_reason,
         )
         if quantity <= 0:
             log_event(
@@ -102,11 +99,11 @@ class V7Manager:
                 "STATE",
                 f"[STATE] FAILED_ENTRY {signal.value}",
                 "WARNING",
-                {"strategy": self.strategy_name, "reason": "capital_per_trade is insufficient"},
+                {"strategy": self.strategy_name, "reason": "lots_per_trade is invalid"},
             )
             return WebhookResponse(
                 accepted=False,
-                message=f"Rejected: capital_per_trade is insufficient for {contract.tradingsymbol}",
+                message=f"Rejected: lots_per_trade is invalid for {contract.tradingsymbol}",
             )
 
         order_id = None
@@ -396,10 +393,9 @@ class V7Manager:
         return db.scalar(select(StrategyConfig).where(func.upper(StrategyConfig.name) == self.strategy_name))
 
     def calculate_quantity(self, strategy: StrategyConfig, entry_price: float, lot_size: int) -> int:
-        if entry_price <= 0 or lot_size <= 0:
+        if lot_size <= 0 or strategy.lots_per_trade <= 0:
             return 0
-        lots = int(strategy.capital_per_trade // (entry_price * lot_size))
-        return lots * lot_size
+        return strategy.lots_per_trade * lot_size
 
     def resolve_mode(self, strategy: StrategyConfig) -> str:
         if strategy.mode == TradingMode.LIVE and strategy.live_trade and self.settings.live_trading:

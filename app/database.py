@@ -89,7 +89,7 @@ def _ensure_columns() -> None:
     statements = {
         "paper_trade": "ALTER TABLE strategy_configs ADD COLUMN paper_trade BOOLEAN NOT NULL DEFAULT 1",
         "live_trade": "ALTER TABLE strategy_configs ADD COLUMN live_trade BOOLEAN NOT NULL DEFAULT 0",
-        "capital_per_trade": "ALTER TABLE strategy_configs ADD COLUMN capital_per_trade FLOAT NOT NULL DEFAULT 20000.0",
+        "lots_per_trade": "ALTER TABLE strategy_configs ADD COLUMN lots_per_trade INTEGER NOT NULL DEFAULT 1",
         "sl_mode": "ALTER TABLE strategy_configs ADD COLUMN sl_mode VARCHAR(16) NOT NULL DEFAULT 'FIXED'",
         "trailing_activation_percent": "ALTER TABLE strategy_configs ADD COLUMN trailing_activation_percent FLOAT NOT NULL DEFAULT 10.0",
         "trailing_offset_percent": "ALTER TABLE strategy_configs ADD COLUMN trailing_offset_percent FLOAT NOT NULL DEFAULT 5.0",
@@ -150,7 +150,7 @@ def _seed_default_strategy() -> None:
             tp_percent=20.0,
             sl_percent=10.0,
             max_active_trades=1,
-            capital_per_trade=20000.0,
+            lots_per_trade=1,
             paper_trade=True,
             live_trade=False,
         )

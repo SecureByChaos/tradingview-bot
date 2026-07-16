@@ -171,7 +171,7 @@ def create_strategy(
     max_trades_per_day: Annotated[int, Form()],
     max_consecutive_losses: Annotated[int, Form()],
     daily_max_loss_percent: Annotated[float, Form()],
-    capital_per_trade: Annotated[float, Form()],
+    lots_per_trade: Annotated[int, Form()],
     enabled: Annotated[str | None, Form()] = None,
     paper_trade: Annotated[str | None, Form()] = None,
     live_trade: Annotated[str | None, Form()] = None,
@@ -183,6 +183,8 @@ def create_strategy(
         raise HTTPException(status_code=400, detail="Invalid SL mode")
     if db.scalar(select(IndexConfig).where(IndexConfig.symbol == index_symbol)) is None:
         raise HTTPException(status_code=400, detail="Invalid index symbol")
+    if lots_per_trade < 1:
+        raise HTTPException(status_code=400, detail="Lots per trade must be at least 1")
     strategy = StrategyConfig(
         name=name.strip(),
         enabled=enabled == "on",
@@ -197,7 +199,7 @@ def create_strategy(
         max_trades_per_day=max_trades_per_day,
         max_consecutive_losses=max_consecutive_losses,
         daily_max_loss_percent=daily_max_loss_percent,
-        capital_per_trade=capital_per_trade,
+        lots_per_trade=lots_per_trade,
         paper_trade=paper_trade == "on",
         live_trade=live_trade == "on",
     )
@@ -224,7 +226,7 @@ def update_strategy(
     max_trades_per_day: Annotated[int, Form()],
     max_consecutive_losses: Annotated[int, Form()],
     daily_max_loss_percent: Annotated[float, Form()],
-    capital_per_trade: Annotated[float, Form()],
+    lots_per_trade: Annotated[int, Form()],
     enabled: Annotated[str | None, Form()] = None,
     paper_trade: Annotated[str | None, Form()] = None,
     live_trade: Annotated[str | None, Form()] = None,
@@ -237,6 +239,8 @@ def update_strategy(
         raise HTTPException(status_code=400, detail="Invalid SL mode")
     if db.scalar(select(IndexConfig).where(IndexConfig.symbol == index_symbol)) is None:
         raise HTTPException(status_code=400, detail="Invalid index symbol")
+    if lots_per_trade < 1:
+        raise HTTPException(status_code=400, detail="Lots per trade must be at least 1")
     strategy.name = name.strip()
     strategy.enabled = enabled == "on"
     strategy.mode = mode
@@ -250,7 +254,7 @@ def update_strategy(
     strategy.max_trades_per_day = max_trades_per_day
     strategy.max_consecutive_losses = max_consecutive_losses
     strategy.daily_max_loss_percent = daily_max_loss_percent
-    strategy.capital_per_trade = capital_per_trade
+    strategy.lots_per_trade = lots_per_trade
     strategy.paper_trade = paper_trade == "on"
     strategy.live_trade = live_trade == "on"
     db.commit()

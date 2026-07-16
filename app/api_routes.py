@@ -344,7 +344,7 @@ def strategies(
             "max_trades_per_day": strategy.max_trades_per_day,
             "max_consecutive_losses": strategy.max_consecutive_losses,
             "daily_max_loss_percent": strategy.daily_max_loss_percent,
-            "capital_per_trade": strategy.capital_per_trade,
+            "lots_per_trade": strategy.lots_per_trade,
             "paper_trade": strategy.paper_trade,
             "live_trade": strategy.live_trade,
             "consecutive_losses": stats.consecutive_losses,
