@@ -1,4 +1,4 @@
-# banknifty-trading-bot
+# StrikeVault
 
 Production-ready FastAPI webhook bot for BankNifty option signals from TradingView, with Angel One SmartAPI execution, SQLite-backed multi-strategy trade state, scheduled monitoring, and dashboard controls.
 

@@ -17,13 +17,14 @@ from app.ai.context_repository import get_context_log_for_review
 from app.ai.factory import create_reviewer
 from app.ai.repository import create_settings as create_ai_settings, get_settings as get_ai_settings, update_settings as update_ai_settings
 from app.database import get_db
-from app.db_models import AIContextLog, AITradeReview, BotStatus, PlatformSettings, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
+from app.db_models import AIContextLog, AITradeReview, BotStatus, IndexConfig, PlatformSettings, SLMode, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
 from app.platform import (
     ai_reviews_query_for_filter,
     get_dashboard_summary,
     get_or_create_strategy_stats,
     get_or_create_settings,
     latest_logs,
+    list_index_configs,
     log_event,
     strategy_metrics,
     strategy_trades_query_for_filter,
@@ -151,17 +152,8 @@ def control_page(
 
 
 @router.get("/strategies", response_class=HTMLResponse)
-def strategies_page(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    _: Annotated[None, Depends(require_admin_page)] = None,
-) -> HTMLResponse:
-    strategies = list(db.scalars(select(StrategyConfig).order_by(StrategyConfig.name)))
-    metrics = strategy_metrics(db)
-    return templates.TemplateResponse(
-        "strategies.html",
-        {"request": request, "strategies": strategies, "metrics": metrics, "metrics_by_id": {item["strategy"].id: item for item in metrics}},
-    )
+def strategies_page() -> RedirectResponse:
+    return RedirectResponse("/settings?tab=strategies", status_code=307)
 
 
 @router.post("/strategies")
@@ -169,9 +161,16 @@ def create_strategy(
     db: Annotated[Session, Depends(get_db)],
     name: Annotated[str, Form()],
     mode: Annotated[str, Form()],
+    index_symbol: Annotated[str, Form()],
     tp_percent: Annotated[float, Form()],
     sl_percent: Annotated[float, Form()],
+    sl_mode: Annotated[str, Form()],
+    trailing_activation_percent: Annotated[float, Form()],
+    trailing_offset_percent: Annotated[float, Form()],
     max_active_trades: Annotated[int, Form()],
+    max_trades_per_day: Annotated[int, Form()],
+    max_consecutive_losses: Annotated[int, Form()],
+    daily_max_loss_percent: Annotated[float, Form()],
     capital_per_trade: Annotated[float, Form()],
     enabled: Annotated[str | None, Form()] = None,
     paper_trade: Annotated[str | None, Form()] = None,
@@ -180,13 +179,24 @@ def create_strategy(
 ) -> RedirectResponse:
     if mode not in {TradingMode.PAPER, TradingMode.LIVE}:
         raise HTTPException(status_code=400, detail="Invalid trading mode")
+    if sl_mode not in {SLMode.FIXED, SLMode.TRAILING}:
+        raise HTTPException(status_code=400, detail="Invalid SL mode")
+    if db.scalar(select(IndexConfig).where(IndexConfig.symbol == index_symbol)) is None:
+        raise HTTPException(status_code=400, detail="Invalid index symbol")
     strategy = StrategyConfig(
         name=name.strip(),
         enabled=enabled == "on",
         mode=mode,
+        index_symbol=index_symbol,
         tp_percent=tp_percent,
         sl_percent=sl_percent,
+        sl_mode=sl_mode,
+        trailing_activation_percent=trailing_activation_percent,
+        trailing_offset_percent=trailing_offset_percent,
         max_active_trades=max_active_trades,
+        max_trades_per_day=max_trades_per_day,
+        max_consecutive_losses=max_consecutive_losses,
+        daily_max_loss_percent=daily_max_loss_percent,
         capital_per_trade=capital_per_trade,
         paper_trade=paper_trade == "on",
         live_trade=live_trade == "on",
@@ -195,7 +205,7 @@ def create_strategy(
     db.commit()
     get_or_create_strategy_stats(db, strategy.name)
     log_event(db, "BOT", f"Strategy created: {strategy.name}")
-    return RedirectResponse("/strategies", status_code=303)
+    return RedirectResponse("/settings?tab=strategies", status_code=303)
 
 
 @router.post("/strategies/{strategy_id}")
@@ -204,9 +214,16 @@ def update_strategy(
     db: Annotated[Session, Depends(get_db)],
     name: Annotated[str, Form()],
     mode: Annotated[str, Form()],
+    index_symbol: Annotated[str, Form()],
     tp_percent: Annotated[float, Form()],
     sl_percent: Annotated[float, Form()],
+    sl_mode: Annotated[str, Form()],
+    trailing_activation_percent: Annotated[float, Form()],
+    trailing_offset_percent: Annotated[float, Form()],
     max_active_trades: Annotated[int, Form()],
+    max_trades_per_day: Annotated[int, Form()],
+    max_consecutive_losses: Annotated[int, Form()],
+    daily_max_loss_percent: Annotated[float, Form()],
     capital_per_trade: Annotated[float, Form()],
     enabled: Annotated[str | None, Form()] = None,
     paper_trade: Annotated[str | None, Form()] = None,
@@ -216,19 +233,64 @@ def update_strategy(
     strategy = db.get(StrategyConfig, strategy_id)
     if strategy is None:
         raise HTTPException(status_code=404, detail="Strategy not found")
+    if sl_mode not in {SLMode.FIXED, SLMode.TRAILING}:
+        raise HTTPException(status_code=400, detail="Invalid SL mode")
+    if db.scalar(select(IndexConfig).where(IndexConfig.symbol == index_symbol)) is None:
+        raise HTTPException(status_code=400, detail="Invalid index symbol")
     strategy.name = name.strip()
     strategy.enabled = enabled == "on"
     strategy.mode = mode
+    strategy.index_symbol = index_symbol
     strategy.tp_percent = tp_percent
     strategy.sl_percent = sl_percent
+    strategy.sl_mode = sl_mode
+    strategy.trailing_activation_percent = trailing_activation_percent
+    strategy.trailing_offset_percent = trailing_offset_percent
     strategy.max_active_trades = max_active_trades
+    strategy.max_trades_per_day = max_trades_per_day
+    strategy.max_consecutive_losses = max_consecutive_losses
+    strategy.daily_max_loss_percent = daily_max_loss_percent
     strategy.capital_per_trade = capital_per_trade
     strategy.paper_trade = paper_trade == "on"
     strategy.live_trade = live_trade == "on"
     db.commit()
     get_or_create_strategy_stats(db, strategy.name)
     log_event(db, "BOT", f"Strategy updated: {strategy.name}")
-    return RedirectResponse("/strategies", status_code=303)
+    return RedirectResponse("/settings?tab=strategies", status_code=303)
+
+
+@router.post("/instruments/{index_id}")
+def update_instrument(
+    index_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    display_name: Annotated[str, Form()],
+    exchange_segment: Annotated[str, Form()],
+    instrument_name: Annotated[str, Form()],
+    spot_exchange: Annotated[str, Form()],
+    spot_symbol: Annotated[str, Form()],
+    spot_token: Annotated[str, Form()],
+    lot_size: Annotated[int, Form()],
+    strike_interval: Annotated[int, Form()],
+    enabled: Annotated[str | None, Form()] = None,
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    index = db.get(IndexConfig, index_id)
+    if index is None:
+        raise HTTPException(status_code=404, detail="Index not found")
+    if enabled == "on" and not spot_token.strip():
+        raise HTTPException(status_code=400, detail="Cannot enable an index without a spot token")
+    index.display_name = display_name.strip()
+    index.exchange_segment = exchange_segment.strip().upper()
+    index.instrument_name = instrument_name.strip().upper()
+    index.spot_exchange = spot_exchange.strip().upper()
+    index.spot_symbol = spot_symbol.strip()
+    index.spot_token = spot_token.strip()
+    index.lot_size = lot_size
+    index.strike_interval = strike_interval
+    index.enabled = enabled == "on"
+    db.commit()
+    log_event(db, "BOT", f"Index config updated: {index.symbol}")
+    return RedirectResponse("/settings?tab=instruments", status_code=303)
 
 
 @router.post("/strategies/{strategy_id}/delete")
@@ -243,48 +305,54 @@ def delete_strategy(
     db.delete(strategy)
     db.commit()
     log_event(db, "BOT", f"Strategy deleted: {strategy.name}")
-    return RedirectResponse("/strategies", status_code=303)
+    return RedirectResponse("/settings?tab=strategies", status_code=303)
 
 
 @router.get("/settings", response_class=HTMLResponse)
 def settings_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
+    tab: str = "general",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    return templates.TemplateResponse("settings.html", {"request": request, "settings": get_or_create_settings(db)})
+    if tab not in {"general", "notifications", "strategies", "instruments"}:
+        tab = "general"
+    strategies = list(db.scalars(select(StrategyConfig).order_by(StrategyConfig.name)))
+    metrics = strategy_metrics(db)
+    return templates.TemplateResponse(
+        "settings.html",
+        {
+            "request": request,
+            "settings": get_or_create_settings(db),
+            "tab": tab,
+            "strategies": strategies,
+            "metrics_by_id": {item["strategy"].id: item for item in metrics},
+            "indexes": list_index_configs(db),
+        },
+    )
 
 
 @router.post("/settings")
 def update_settings_page(
     db: Annotated[Session, Depends(get_db)],
-    trading_mode: Annotated[str, Form()],
-    stop_loss_percent: Annotated[float, Form()],
-    target_percent: Annotated[float, Form()],
-    max_trades_per_day: Annotated[int, Form()],
-    max_consecutive_losses: Annotated[int, Form()],
-    daily_max_loss_percent: Annotated[float, Form()],
     square_off_time: Annotated[str, Form()],
     telegram_bot_token: Annotated[str, Form()] = "",
     telegram_chat_id: Annotated[str, Form()] = "",
+    active_tab: Annotated[str, Form()] = "general",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> RedirectResponse:
     settings = get_or_create_settings(db)
     apply_settings(
         settings,
-        trading_mode,
-        stop_loss_percent,
-        target_percent,
-        max_trades_per_day,
-        max_consecutive_losses,
-        daily_max_loss_percent,
         square_off_time,
         telegram_bot_token,
         telegram_chat_id,
     )
     db.commit()
     log_event(db, "BOT", "Settings updated from dashboard")
-    return RedirectResponse("/settings", status_code=303)
+    if active_tab not in {"general", "notifications"}:
+        active_tab = "general"
+    return RedirectResponse(f"/settings?tab={active_tab}", status_code=303)
 
 
 @router.get("/ai-settings", response_class=HTMLResponse)
@@ -677,24 +745,10 @@ def _section_values(values: dict[str, object], fields: tuple[str, ...], empty_la
 
 def apply_settings(
     settings: PlatformSettings,
-    trading_mode: str,
-    stop_loss_percent: float,
-    target_percent: float,
-    max_trades_per_day: int,
-    max_consecutive_losses: int,
-    daily_max_loss_percent: float,
     square_off_time: str,
     telegram_bot_token: str,
     telegram_chat_id: str,
 ) -> None:
-    if trading_mode not in {TradingMode.PAPER, TradingMode.LIVE}:
-        raise HTTPException(status_code=400, detail="Invalid trading mode")
-    settings.trading_mode = trading_mode
-    settings.stop_loss_percent = stop_loss_percent
-    settings.target_percent = target_percent
-    settings.max_trades_per_day = max_trades_per_day
-    settings.max_consecutive_losses = max_consecutive_losses
-    settings.daily_max_loss_percent = daily_max_loss_percent
     settings.square_off_time = square_off_time
     settings.telegram_bot_token = telegram_bot_token
     settings.telegram_chat_id = telegram_chat_id

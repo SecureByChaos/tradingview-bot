@@ -115,7 +115,7 @@ class HealthManager:
     @staticmethod
     def _notification(report: dict[str, object]) -> str:
         components = report["components"]
-        lines = ["BankNifty Trading Bot", "", "Pre-Market Health", ""]
+        lines = ["StrikeVault", "", "Pre-Market Health", ""]
         for name, result in components.items():
             lines.append(f"{name.title():15} {result['status']}")
         lines.extend(["", "Overall", str(report["overall_status"]), "", "Health Score", f"{report['health_score']}%"])

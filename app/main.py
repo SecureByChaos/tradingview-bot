@@ -23,7 +23,7 @@ from app.ai.shadow import run_shadow_review
 from app.multi_strategy import MultiStrategyTradeManager
 from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
-from app.platform import get_or_create_settings, get_or_create_state, get_or_create_strategy_stats, log_event, rebuild_daily_stats, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, today_ist, trading_allowed
+from app.platform import get_index_config, get_or_create_settings, get_or_create_strategy_stats, log_event, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, strategy_trading_allowed, trading_allowed
 from sqlalchemy import func, select
 from app.risk import RiskProtectionService
 from app.scheduler import create_scheduler
@@ -75,14 +75,14 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="BankNifty Trading Bot",
+    title="StrikeVault",
     version="1.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.session_secret_key,
-    session_cookie="banknifty_admin_session",
+    session_cookie="strikevault_admin_session",
     https_only=settings.secure_cookies,
     same_site="lax",
     max_age=60 * 60 * 8,
@@ -156,7 +156,7 @@ def queue_shadow_review(
     if trade is None:
         logger.info("[AI] Shadow skipped: no matching BUY trade found")
         return response
-    shadow_market_data = _build_shadow_market_data(trade)
+    shadow_market_data = _build_shadow_market_data(db, trade)
     if market_data:
         shadow_market_data.update(market_data)
     logger.info("[AI] Entry review triggered")
@@ -210,19 +210,16 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
 
         strategy_stats = get_or_create_strategy_stats(db, strategy.name)
         if strategy_stats.risk_locked:
-            message = f"Strategy {strategy.name} locked due to consecutive losses"
-            log_event(db, "WEBHOOK", message, "WARNING")
-            return WebhookResponse(accepted=False, message=message)
-
-        platform_settings = get_or_create_settings(db)
-        state = get_or_create_state(db)
-        today_stats = rebuild_daily_stats(db, today_ist())
-        if state.risk_locked or today_stats.risk_locked or today_stats.pnl_percent <= platform_settings.daily_max_loss_percent:
-            message = "Global risk lock active"
+            message = f"Strategy {strategy.name} locked due to consecutive losses or daily loss limit"
             log_event(db, "WEBHOOK", message, "WARNING")
             return WebhookResponse(accepted=False, message=message)
 
         allowed, message = trading_allowed(db)
+        if not allowed:
+            log_event(db, "WEBHOOK", f"Webhook ignored: {message}", "WARNING")
+            return WebhookResponse(accepted=False, message=message)
+
+        allowed, message = strategy_trading_allowed(db, strategy)
         if not allowed:
             log_event(db, "WEBHOOK", f"Webhook ignored: {message}", "WARNING")
             return WebhookResponse(accepted=False, message=message)
@@ -266,7 +263,7 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-def _build_shadow_market_data(trade: StrategyTrade) -> dict[str, object]:
+def _build_shadow_market_data(db: Session, trade: StrategyTrade) -> dict[str, object]:
     market_data: dict[str, object] = {
         "strike": trade.strike,
         "expiry": trade.expiry,
@@ -274,9 +271,14 @@ def _build_shadow_market_data(trade: StrategyTrade) -> dict[str, object]:
         "option_price": trade.current_premium if trade.current_premium is not None else trade.entry_price,
     }
     try:
-        market_data["banknifty_price"] = round(smartapi.get_banknifty_spot(), 2)
+        index = get_index_config(db, trade.index_symbol)
+        spot = round(smartapi.get_index_spot(index) if index is not None else smartapi.get_banknifty_spot(), 2)
+        market_data["index_price"] = spot
+        market_data["index_symbol"] = trade.index_symbol
+        if trade.index_symbol == "BANKNIFTY":
+            market_data["banknifty_price"] = spot
     except Exception as exc:
-        logger.info("[AI] Shadow market fetch skipped: BANKNIFTY spot unavailable (%s)", exc)
+        logger.info("[AI] Shadow market fetch skipped: %s spot unavailable (%s)", trade.index_symbol, exc)
     try:
         market_data["option_price"] = round(
             smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken),

@@ -7,14 +7,13 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.auth import require_admin_api
 from app.ai.context_repository import get_latest_context_log
 from app.database import get_db
 from app.db_models import BotStatus, LogEvent, StrategyConfig, StrategyTrade, TradeStatus
-from app.db_models import TradingMode
 from app.platform import (
     ai_reviews_query_for_filter,
     api_status,
@@ -22,6 +21,7 @@ from app.platform import (
     get_or_create_strategy_stats,
     get_or_create_settings,
     get_or_create_state,
+    list_index_configs,
     log_event,
     rebuild_daily_stats,
     set_bot_state,
@@ -40,12 +40,6 @@ router = APIRouter(prefix="/api")
 
 
 class SettingsPayload(BaseModel):
-    trading_mode: str
-    stop_loss_percent: float = Field(gt=0)
-    target_percent: float = Field(gt=0)
-    max_trades_per_day: int = Field(gt=0)
-    max_consecutive_losses: int = Field(gt=0)
-    daily_max_loss_percent: float
     square_off_time: str
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -124,6 +118,7 @@ def trades_export(
         fieldnames=[
             "Trade ID",
             "Strategy",
+            "Index",
             "Signal",
             "Date (IST)",
             "Entry Time (IST)",
@@ -145,6 +140,7 @@ def trades_export(
             {
                 "Trade ID": row["trade_id"],
                 "Strategy": row["strategy_name"],
+                "Index": row["index_symbol"],
                 "Signal": row["signal"],
                 "Date (IST)": row["entry_time_ist"].split(" ", 1)[0] if row["entry_time_ist"] else "",
                 "Entry Time (IST)": row["entry_time_ist"],
@@ -338,9 +334,16 @@ def strategies(
             "name": strategy.name,
             "enabled": strategy.enabled,
             "mode": strategy.mode,
+            "index_symbol": strategy.index_symbol,
             "tp_percent": strategy.tp_percent,
             "sl_percent": strategy.sl_percent,
+            "sl_mode": strategy.sl_mode,
+            "trailing_activation_percent": strategy.trailing_activation_percent,
+            "trailing_offset_percent": strategy.trailing_offset_percent,
             "max_active_trades": strategy.max_active_trades,
+            "max_trades_per_day": strategy.max_trades_per_day,
+            "max_consecutive_losses": strategy.max_consecutive_losses,
+            "daily_max_loss_percent": strategy.daily_max_loss_percent,
             "capital_per_trade": strategy.capital_per_trade,
             "paper_trade": strategy.paper_trade,
             "live_trade": strategy.live_trade,
@@ -348,6 +351,29 @@ def strategies(
             "risk_locked": stats.risk_locked,
         })
     return payload
+
+
+@router.get("/instruments")
+def instruments(
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": index.id,
+            "symbol": index.symbol,
+            "display_name": index.display_name,
+            "exchange_segment": index.exchange_segment,
+            "instrument_name": index.instrument_name,
+            "spot_exchange": index.spot_exchange,
+            "spot_symbol": index.spot_symbol,
+            "spot_token": index.spot_token,
+            "lot_size": index.lot_size,
+            "strike_interval": index.strike_interval,
+            "enabled": index.enabled,
+        }
+        for index in list_index_configs(db)
+    ]
 
 
 @router.get("/strategy-stats")
@@ -410,12 +436,6 @@ def get_settings_api(
     return {
         column: getattr(settings, column)
         for column in [
-            "trading_mode",
-            "stop_loss_percent",
-            "target_percent",
-            "max_trades_per_day",
-            "max_consecutive_losses",
-            "daily_max_loss_percent",
             "square_off_time",
             "telegram_bot_token",
             "telegram_chat_id",
@@ -429,8 +449,6 @@ def update_settings_api(
     db: Annotated[Session, Depends(get_db)],
     _: Annotated[None, Depends(require_admin_api)] = None,
 ) -> dict[str, str]:
-    if payload.trading_mode not in {TradingMode.PAPER, TradingMode.LIVE}:
-        raise HTTPException(status_code=400, detail="Invalid trading mode")
     settings = get_or_create_settings(db)
     for key, value in payload.model_dump().items():
         setattr(settings, key, value)

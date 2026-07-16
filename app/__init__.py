@@ -1,1 +1,1 @@
-"""BankNifty Trading Bot application package."""
+"""StrikeVault application package."""

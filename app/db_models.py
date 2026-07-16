@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Float, Integer, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, Float, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 from typing import Optional
 
@@ -33,6 +33,17 @@ class TradeResult:
     BREAKEVEN = "BREAKEVEN"
 
 
+class SLMode:
+    FIXED = "FIXED"
+    TRAILING = "TRAILING"
+
+
+class IndexSymbol:
+    BANKNIFTY = "BANKNIFTY"
+    NIFTY = "NIFTY"
+    SENSEX = "SENSEX"
+
+
 class BotState(Base):
     __tablename__ = "bot_status"
 
@@ -47,12 +58,6 @@ class PlatformSettings(Base):
     __tablename__ = "settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
-    trading_mode: Mapped[str] = mapped_column(String(16), default=TradingMode.PAPER, nullable=False)
-    stop_loss_percent: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
-    target_percent: Mapped[float] = mapped_column(Float, default=20.0, nullable=False)
-    max_trades_per_day: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
-    max_consecutive_losses: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
-    daily_max_loss_percent: Mapped[float] = mapped_column(Float, default=-20.0, nullable=False)
     square_off_time: Mapped[str] = mapped_column(String(8), default="15:15", nullable=False)
     telegram_bot_token: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     telegram_chat_id: Mapped[str] = mapped_column(String(128), default="", nullable=False)
@@ -159,6 +164,24 @@ class SystemHealthLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class IndexConfig(Base):
+    __tablename__ = "index_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    exchange_segment: Mapped[str] = mapped_column(String(8), default="NFO", nullable=False)
+    instrument_name: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    spot_exchange: Mapped[str] = mapped_column(String(8), default="NSE", nullable=False)
+    spot_symbol: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    spot_token: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    lot_size: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    strike_interval: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class StrategyConfig(Base):
     __tablename__ = "strategy_configs"
 
@@ -166,14 +189,36 @@ class StrategyConfig(Base):
     name: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     mode: Mapped[str] = mapped_column(String(16), default=TradingMode.PAPER, nullable=False)
+    index_symbol: Mapped[str] = mapped_column(String(32), default=IndexSymbol.BANKNIFTY, nullable=False)
     tp_percent: Mapped[float] = mapped_column(Float, default=20.0, nullable=False)
     sl_percent: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
+    sl_mode: Mapped[str] = mapped_column(String(16), default=SLMode.FIXED, nullable=False)
+    trailing_activation_percent: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
+    trailing_offset_percent: Mapped[float] = mapped_column(Float, default=5.0, nullable=False)
     max_active_trades: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    max_trades_per_day: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    max_consecutive_losses: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    daily_max_loss_percent: Mapped[float] = mapped_column(Float, default=-20.0, nullable=False)
     capital_per_trade: Mapped[float] = mapped_column(Float, default=20000.0, nullable=False)
     paper_trade: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     live_trade: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class StrategyDailyStats(Base):
+    __tablename__ = "strategy_daily_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_name: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    trade_date: Mapped[date] = mapped_column(Date, index=True, nullable=False)
+    trade_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    wins: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    losses: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    pnl_percent: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    __table_args__ = (UniqueConstraint("strategy_name", "trade_date", name="uq_strategy_daily_stats_name_date"),)
 
 
 class StrategyStats(Base):
@@ -193,6 +238,7 @@ class StrategyTrade(Base):
     trade_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     strategy_name: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
     signal: Mapped[str] = mapped_column(String(16), nullable=False)
+    index_symbol: Mapped[str] = mapped_column(String(32), default=IndexSymbol.BANKNIFTY, nullable=False)
     exchange: Mapped[str] = mapped_column(String(16), default="NFO", nullable=False)
     tradingsymbol: Mapped[str] = mapped_column(String(128), nullable=False)
     symboltoken: Mapped[str] = mapped_column(String(64), nullable=False)

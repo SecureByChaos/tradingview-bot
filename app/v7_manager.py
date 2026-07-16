@@ -12,7 +12,7 @@ from app.ai.shadow import exit_signal_for_entry, run_shadow_review
 from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, OptionContract, Signal, WebhookResponse
 from app.option_finder import OptionFinder
-from app.platform import log_event
+from app.platform import get_index_config, log_event
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
 from app.time_utils import IST, format_ist, utc_now
@@ -68,8 +68,13 @@ class V7Manager:
         if strategy is None:
             return WebhookResponse(accepted=False, message="Rejected: strategy 'V7' does not exist")
 
+        index = get_index_config(db, strategy.index_symbol)
+        if index is None or not index.enabled:
+            message = f"Rejected: index '{strategy.index_symbol}' is not configured/enabled. Configure it in Settings > Instruments."
+            log_event(db, "STATE", f"[STATE] FAILED_ENTRY {signal.value}", "WARNING", {"strategy": self.strategy_name, "reason": message})
+            return WebhookResponse(accepted=False, message=message)
         try:
-            contract = self.option_finder.find_atm_contract(signal)
+            contract = self.option_finder.find_atm_contract(signal, index)
             entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
         except Exception as exc:
             log_event(
@@ -112,6 +117,7 @@ class V7Manager:
             trade_id=uuid4().hex,
             strategy_name=self.strategy_name,
             signal=signal.value,
+            index_symbol=strategy.index_symbol,
             exchange=contract.exchange,
             tradingsymbol=contract.tradingsymbol,
             symboltoken=contract.symboltoken,
@@ -278,15 +284,22 @@ class V7Manager:
             pnl_unrealized = round((premium - trade.entry_price) * trade.quantity, 2)
             trailing_active = trade.trailing_active
             trailing_sl = trade.trailing_stop
+        index_symbol = trade.index_symbol if trade is not None else None
+        if index_symbol is None:
+            strategy = self.get_strategy(db)
+            index_symbol = strategy.index_symbol if strategy is not None else "BANKNIFTY"
         try:
-            spot = round(self.smartapi.get_banknifty_spot(), 2)
+            index = get_index_config(db, index_symbol)
+            spot = round(self.smartapi.get_index_spot(index) if index is not None else self.smartapi.get_banknifty_spot(), 2)
         except Exception:
             spot = None
         payload = {
             "timestamp": utc_now().isoformat(),
             "trade_id": trade_id,
             "signal": signal.value,
-            "banknifty_price": spot,
+            "index_symbol": index_symbol,
+            "index_price": spot,
+            "banknifty_price": spot if index_symbol == "BANKNIFTY" else None,
             "option_premium": round(premium, 2) if premium is not None else None,
             "unrealized_pnl": pnl_unrealized,
             "trailing_active": trailing_active,
@@ -344,9 +357,14 @@ class V7Manager:
             "option_price": round(exit_price, 2),
         }
         try:
-            shadow_market_data["banknifty_price"] = round(self.smartapi.get_banknifty_spot(), 2)
+            trade_index = get_index_config(db, trade.index_symbol)
+            spot = round(self.smartapi.get_index_spot(trade_index) if trade_index is not None else self.smartapi.get_banknifty_spot(), 2)
+            shadow_market_data["index_price"] = spot
+            shadow_market_data["index_symbol"] = trade.index_symbol
+            if trade.index_symbol == "BANKNIFTY":
+                shadow_market_data["banknifty_price"] = spot
         except Exception as exc:
-            logger.info("[AI] Shadow market fetch skipped: BANKNIFTY spot unavailable (%s)", exc)
+            logger.info("[AI] Shadow market fetch skipped: %s spot unavailable (%s)", trade.index_symbol, exc)
         logger.info("[AI] Exit review triggered")
         run_shadow_review(
             trade.strategy_name,

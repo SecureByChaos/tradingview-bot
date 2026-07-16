@@ -162,10 +162,16 @@ def run_shadow_review(
                 end_time_ist = to_ist(trade.exit_time or timestamp)
                 if entry_time_ist is not None and end_time_ist is not None:
                     holding_minutes = max(int((end_time_ist - entry_time_ist).total_seconds() // 60), 0)
+            index_symbol = (
+                trade.index_symbol if trade is not None
+                else (strategy_cfg.index_symbol if strategy_cfg is not None else "BANKNIFTY")
+            )
             market_data = {
                 "event_type": event_type,
                 "paper_live": (trade.mode if trade is not None else (strategy_cfg.mode if strategy_cfg is not None else "")),
                 "session": session,
+                "index_symbol": index_symbol,
+                "index_price": "",
                 "banknifty_price": "",
                 "option_price": (trade.current_premium if trade is not None else None),
                 "strike": (trade.strike if trade is not None else None),

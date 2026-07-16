@@ -8,7 +8,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import AITradeReview, BotState, BotStatus, DailyStats, LogEvent, PlatformSettings, StrategyConfig, StrategyStats, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.db_models import AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.time_utils import duration_label, format_ist, iso_utc, to_ist
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -78,11 +78,12 @@ def reset_daily_risk_if_needed(db: Session) -> None:
 
 
 def update_strategy_stats_after_close(db: Session, strategy_name: str, result: str) -> StrategyStats:
-    settings = get_or_create_settings(db)
+    strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == strategy_name))
+    max_consecutive_losses = strategy.max_consecutive_losses if strategy is not None else 2
     stats = get_or_create_strategy_stats(db, strategy_name)
     if result == TradeResult.LOSS:
         stats.consecutive_losses += 1
-        stats.risk_locked = stats.consecutive_losses >= settings.max_consecutive_losses
+        stats.risk_locked = stats.consecutive_losses >= max_consecutive_losses
     elif result == TradeResult.WIN:
         stats.consecutive_losses = 0
         stats.risk_locked = False
@@ -121,20 +122,70 @@ def set_bot_state(db: Session, status: str, trading_allowed: bool, risk_locked: 
 
 
 def trading_allowed(db: Session) -> tuple[bool, str]:
+    """Admin-level gate only (bot on/off, manual kill-switch). Per-strategy trade-count and
+    daily-loss limits are enforced separately by strategy_trading_allowed()."""
     state = get_or_create_state(db)
-    settings = get_or_create_settings(db)
-    stats = rebuild_daily_stats(db)
     if state.risk_locked:
         return False, "Trading disabled: daily risk lock is active"
     if state.status != BotStatus.RUNNING:
         return False, f"Trading disabled: bot status is {state.status}"
     if not state.trading_allowed:
         return False, "Trading disabled by admin"
-    if stats.trade_count >= settings.max_trades_per_day:
-        return False, "Trading disabled: maximum trades per day reached"
-    if stats.pnl_percent <= settings.daily_max_loss_percent:
-        return False, "Trading disabled: daily max loss reached"
     return True, "Trading allowed"
+
+
+def get_or_create_strategy_daily_stats(db: Session, strategy_name: str, trade_date: date | None = None) -> StrategyDailyStats:
+    day = trade_date or today_ist()
+    stats = db.scalar(
+        select(StrategyDailyStats).where(
+            StrategyDailyStats.strategy_name == strategy_name,
+            StrategyDailyStats.trade_date == day,
+        )
+    )
+    if stats is None:
+        stats = StrategyDailyStats(strategy_name=strategy_name, trade_date=day)
+        db.add(stats)
+        db.commit()
+        db.refresh(stats)
+    return stats
+
+
+def rebuild_strategy_daily_stats(db: Session, strategy_name: str, trade_date: date | None = None) -> StrategyDailyStats:
+    day = trade_date or today_ist()
+    records = list(
+        db.scalars(
+            select(StrategyTrade).where(
+                StrategyTrade.strategy_name == strategy_name,
+                func.date(StrategyTrade.exit_time) == day.isoformat(),
+                StrategyTrade.status == TradeStatus.CLOSED,
+            )
+        )
+    )
+    stats = get_or_create_strategy_daily_stats(db, strategy_name, day)
+    stats.trade_count = len(records)
+    stats.pnl_percent = round(sum(record.pnl_percent for record in records), 2)
+    stats.wins = sum(1 for record in records if record.result == TradeResult.WIN)
+    stats.losses = sum(1 for record in records if record.result == TradeResult.LOSS)
+    db.commit()
+    db.refresh(stats)
+    return stats
+
+
+def strategy_trading_allowed(db: Session, strategy: StrategyConfig) -> tuple[bool, str]:
+    stats = rebuild_strategy_daily_stats(db, strategy.name)
+    if stats.trade_count >= strategy.max_trades_per_day:
+        return False, f"Trading disabled for {strategy.name}: maximum trades per day reached"
+    if stats.pnl_percent <= strategy.daily_max_loss_percent:
+        return False, f"Trading disabled for {strategy.name}: daily max loss reached"
+    return True, "Trading allowed"
+
+
+def get_index_config(db: Session, symbol: str) -> IndexConfig | None:
+    return db.scalar(select(IndexConfig).where(IndexConfig.symbol == (symbol or IndexSymbol.BANKNIFTY).upper()))
+
+
+def list_index_configs(db: Session) -> list[IndexConfig]:
+    return list(db.scalars(select(IndexConfig).order_by(IndexConfig.symbol)))
 
 
 def sync_trade_row(db: Session, row: dict[str, str], trading_mode: str) -> TradeRecord | None:
@@ -201,7 +252,6 @@ def rebuild_daily_stats(db: Session, trade_date: date | None = None) -> DailySta
 
 def get_dashboard_summary(db: Session, active_trade: Any | None) -> dict[str, Any]:
     state = get_or_create_state(db)
-    settings = get_or_create_settings(db)
     stats = rebuild_daily_stats(db)
     open_count = int(db.scalar(select(func.count()).select_from(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN)) or 0)
     open_option_types = list(
@@ -224,7 +274,6 @@ def get_dashboard_summary(db: Session, active_trade: Any | None) -> dict[str, An
         current_state = "FAILED_ENTRY"
     return {
         "bot_status": state.status,
-        "trading_mode": settings.trading_mode,
         "active_trade": active_trade,
         "open_trades": open_count,
         "trade_count": stats.trade_count,
@@ -353,6 +402,7 @@ def serialize_strategy_trade(trade: StrategyTrade) -> dict[str, Any]:
         "trade_id": trade.trade_id,
         "strategy_name": trade.strategy_name,
         "signal": trade.signal,
+        "index_symbol": trade.index_symbol,
         "strike": trade.strike,
         "entry_price": trade.entry_price,
         "exit_price": trade.exit_price,

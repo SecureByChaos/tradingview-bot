@@ -331,6 +331,14 @@ class SmartAPIClient:
             self.settings.banknifty_spot_token,
         )
 
+    def get_index_spot(self, index: Any) -> float:
+        """Generalized spot-price fetch for any configured index (BankNifty/Nifty/Sensex/...)."""
+        if not index.spot_token:
+            raise SmartAPIError(
+                f"{index.symbol} spot token is not configured. Set it in Settings > Instruments before trading this index."
+            )
+        return self.get_ltp(index.spot_exchange, index.spot_symbol, index.spot_token)
+
     def place_market_order(
         self,
         contract: OptionContract,

@@ -9,7 +9,13 @@
     <div><label class="form-label">Mode</label><select class="form-select" name="mode"><option>PAPER</option><option>LIVE</option></select></div>
     <div><label class="form-label">TP %</label><input class="form-control" type="number" step="0.01" name="tp_percent" value="20"></div>
     <div><label class="form-label">SL %</label><input class="form-control" type="number" step="0.01" name="sl_percent" value="10"></div>
+    <div><label class="form-label">SL Mode</label><select class="form-select" name="sl_mode"><option value="FIXED">FIXED (fixed SL + target)</option><option value="TRAILING">TRAILING (base SL, no fixed target)</option></select></div>
+    <div><label class="form-label">Trailing Activation %</label><input class="form-control" type="number" step="0.01" name="trailing_activation_percent" value="10"></div>
+    <div><label class="form-label">Trailing Offset %</label><input class="form-control" type="number" step="0.01" name="trailing_offset_percent" value="5"></div>
     <div><label class="form-label">Max Open</label><input class="form-control" type="number" name="max_active_trades" value="1"></div>
+    <div><label class="form-label">Max Trades/Day</label><input class="form-control" type="number" name="max_trades_per_day" value="2"></div>
+    <div><label class="form-label">Max Consecutive Losses</label><input class="form-control" type="number" name="max_consecutive_losses" value="2"></div>
+    <div><label class="form-label">Daily Max Loss %</label><input class="form-control" type="number" step="0.01" name="daily_max_loss_percent" value="-20"></div>
     <div><label class="form-label">Capital Per Trade</label><input class="form-control" type="number" step="0.01" name="capital_per_trade" value="20000"></div>
     <div class="full d-flex flex-wrap gap-4"><label class="form-check"><input class="form-check-input" type="checkbox" name="enabled" checked> Enabled</label><label class="form-check"><input class="form-check-input" type="checkbox" name="paper_trade" checked> Paper</label><label class="form-check"><input class="form-check-input" type="checkbox" name="live_trade"> Live</label></div>
     <div class="full"><button class="btn btn-primary" type="submit">Add Strategy</button></div>
@@ -17,7 +23,7 @@
 </div>
 {% if strategies %}<div class="table-responsive responsive-table">
   <table class="table table-dark table-sm align-middle">
-    <thead><tr><th>Name</th><th>Mode</th><th>TP %</th><th>SL %</th><th>Max Open</th><th>Capital</th><th>Flags</th><th>Metrics</th><th>Actions</th></tr></thead>
+    <thead><tr><th>Name</th><th>Mode</th><th>TP %</th><th>SL %</th><th>SL Mode</th><th>Trailing Act% / Off%</th><th>Max Open</th><th>Max/Day</th><th>Max Losses</th><th>Daily Loss %</th><th>Capital</th><th>Flags</th><th>Metrics</th><th>Actions</th></tr></thead>
     <tbody>
     {% for strategy in strategies %}
       {% set metric = metrics_by_id.get(strategy.id) %}
@@ -27,7 +33,12 @@
           <td data-label="Mode"><select class="form-select form-select-sm" name="mode"><option {% if strategy.mode == "PAPER" %}selected{% endif %}>PAPER</option><option {% if strategy.mode == "LIVE" %}selected{% endif %}>LIVE</option></select></td>
           <td data-label="TP %"><input class="form-control form-control-sm" type="number" step="0.01" name="tp_percent" value="{{ strategy.tp_percent }}"></td>
           <td data-label="SL %"><input class="form-control form-control-sm" type="number" step="0.01" name="sl_percent" value="{{ strategy.sl_percent }}"></td>
+          <td data-label="SL Mode"><select class="form-select form-select-sm" name="sl_mode"><option value="FIXED" {% if strategy.sl_mode == "FIXED" %}selected{% endif %}>FIXED</option><option value="TRAILING" {% if strategy.sl_mode == "TRAILING" %}selected{% endif %}>TRAILING</option></select></td>
+          <td data-label="Trailing Act% / Off%"><div class="d-flex gap-1"><input class="form-control form-control-sm" type="number" step="0.01" name="trailing_activation_percent" value="{{ strategy.trailing_activation_percent }}" title="Activation %"><input class="form-control form-control-sm" type="number" step="0.01" name="trailing_offset_percent" value="{{ strategy.trailing_offset_percent }}" title="Offset %"></div></td>
           <td data-label="Max Open"><input class="form-control form-control-sm" type="number" name="max_active_trades" value="{{ strategy.max_active_trades }}"></td>
+          <td data-label="Max/Day"><input class="form-control form-control-sm" type="number" name="max_trades_per_day" value="{{ strategy.max_trades_per_day }}"></td>
+          <td data-label="Max Losses"><input class="form-control form-control-sm" type="number" name="max_consecutive_losses" value="{{ strategy.max_consecutive_losses }}"></td>
+          <td data-label="Daily Loss %"><input class="form-control form-control-sm" type="number" step="0.01" name="daily_max_loss_percent" value="{{ strategy.daily_max_loss_percent }}"></td>
           <td data-label="Capital"><input class="form-control form-control-sm" type="number" step="0.01" name="capital_per_trade" value="{{ strategy.capital_per_trade }}"></td>
           <td data-label="Flags">
             <label><input type="checkbox" name="enabled" {% if strategy.enabled %}checked{% endif %}> Enabled</label><br>

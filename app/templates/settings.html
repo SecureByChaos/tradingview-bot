@@ -1,29 +1,162 @@
 {% extends "base.html" %}
-{% from "components.html" import page_header %}
+{% from "components.html" import page_header, empty_state %}
 {% block content %}
 {{ page_header("Settings") }}
-<form class="metric" method="post" action="/settings">
-  <h5>Trading Mode</h5>
-  <div class="mb-3">
-    <select class="form-select" name="trading_mode">
-      <option value="PAPER" {% if settings.trading_mode == "PAPER" %}selected{% endif %}>PAPER</option>
-      <option value="LIVE" {% if settings.trading_mode == "LIVE" %}selected{% endif %}>LIVE</option>
-    </select>
+
+<ul class="nav nav-tabs mb-3" id="settingsTabs" role="tablist">
+  <li class="nav-item" role="presentation">
+    <button class="nav-link {% if tab == 'general' %}active{% endif %}" id="general-tab" data-bs-toggle="tab" data-bs-target="#general-pane" type="button" role="tab">General</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link {% if tab == 'notifications' %}active{% endif %}" id="notifications-tab" data-bs-toggle="tab" data-bs-target="#notifications-pane" type="button" role="tab">Notifications</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link {% if tab == 'strategies' %}active{% endif %}" id="strategies-tab" data-bs-toggle="tab" data-bs-target="#strategies-pane" type="button" role="tab">Strategies</button>
+  </li>
+  <li class="nav-item" role="presentation">
+    <button class="nav-link {% if tab == 'instruments' %}active{% endif %}" id="instruments-tab" data-bs-toggle="tab" data-bs-target="#instruments-pane" type="button" role="tab">Instruments</button>
+  </li>
+</ul>
+
+<div class="tab-content">
+  <form class="metric" id="general-settings-form" method="post" action="/settings">
+    <input type="hidden" name="active_tab" id="active_tab_input" value="{{ tab if tab in ('general', 'notifications') else 'general' }}">
+
+    <div class="tab-pane fade {% if tab == 'general' %}show active{% endif %}" id="general-pane" role="tabpanel">
+      <h5>General</h5>
+      <div class="form-grid">
+        <div><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"></div>
+      </div>
+    </div>
+
+    <div class="tab-pane fade {% if tab == 'notifications' %}show active{% endif %}" id="notifications-pane" role="tabpanel">
+      <h5>Telegram Notifications</h5>
+      <div class="form-grid">
+        <div><label class="form-label">Telegram Bot Token</label><input class="form-control" name="telegram_bot_token" value="{{ settings.telegram_bot_token }}"></div>
+        <div><label class="form-label">Telegram Chat ID</label><input class="form-control" name="telegram_chat_id" value="{{ settings.telegram_chat_id }}"></div>
+      </div>
+    </div>
+
+    <button class="btn btn-primary mt-4" id="general-settings-save" type="submit" {% if tab not in ('general', 'notifications') %}style="display:none"{% endif %}>Save Settings</button>
+  </form>
+
+  <div class="tab-pane fade {% if tab == 'strategies' %}show active{% endif %}" id="strategies-pane" role="tabpanel">
+    <div class="alert alert-info">Stoploss/target mode and risk limits (max trades/day, max consecutive losses, daily max loss %) are configured per strategy below. The traded index (BankNifty/Nifty/Sensex) is also chosen per strategy — configure the index itself on the <a href="/settings?tab=instruments" class="alert-link">Instruments</a> tab first.</div>
+    <div class="metric mb-4">
+      <h5>Add Strategy</h5>
+      <form class="form-grid" method="post" action="/strategies">
+        <div><label class="form-label">Name</label><input class="form-control" name="name" required></div>
+        <div><label class="form-label">Mode</label><select class="form-select" name="mode"><option>PAPER</option><option>LIVE</option></select></div>
+        <div><label class="form-label">Index</label><select class="form-select" name="index_symbol">
+          {% for index in indexes %}<option value="{{ index.symbol }}" {% if index.symbol == "BANKNIFTY" %}selected{% endif %}>{{ index.display_name or index.symbol }}{% if not index.enabled %} (disabled){% endif %}</option>{% endfor %}
+        </select></div>
+        <div><label class="form-label">TP %</label><input class="form-control" type="number" step="0.01" name="tp_percent" value="20"></div>
+        <div><label class="form-label">SL %</label><input class="form-control" type="number" step="0.01" name="sl_percent" value="10"></div>
+        <div><label class="form-label">SL Mode</label><select class="form-select" name="sl_mode"><option value="FIXED">FIXED (fixed SL + target)</option><option value="TRAILING">TRAILING (base SL, no fixed target)</option></select></div>
+        <div><label class="form-label">Trailing Activation %</label><input class="form-control" type="number" step="0.01" name="trailing_activation_percent" value="10"></div>
+        <div><label class="form-label">Trailing Offset %</label><input class="form-control" type="number" step="0.01" name="trailing_offset_percent" value="5"></div>
+        <div><label class="form-label">Max Open</label><input class="form-control" type="number" name="max_active_trades" value="1"></div>
+        <div><label class="form-label">Max Trades/Day</label><input class="form-control" type="number" name="max_trades_per_day" value="2"></div>
+        <div><label class="form-label">Max Consecutive Losses</label><input class="form-control" type="number" name="max_consecutive_losses" value="2"></div>
+        <div><label class="form-label">Daily Max Loss %</label><input class="form-control" type="number" step="0.01" name="daily_max_loss_percent" value="-20"></div>
+        <div><label class="form-label">Capital Per Trade</label><input class="form-control" type="number" step="0.01" name="capital_per_trade" value="20000"></div>
+        <div class="full d-flex flex-wrap gap-4"><label class="form-check"><input class="form-check-input" type="checkbox" name="enabled" checked> Enabled</label><label class="form-check"><input class="form-check-input" type="checkbox" name="paper_trade" checked> Paper</label><label class="form-check"><input class="form-check-input" type="checkbox" name="live_trade"> Live</label></div>
+        <div class="full"><button class="btn btn-primary" type="submit">Add Strategy</button></div>
+      </form>
+    </div>
+    {% if strategies %}<div class="table-responsive responsive-table">
+      <table class="table table-dark table-sm align-middle">
+        <thead><tr><th>Name</th><th>Mode</th><th>Index</th><th>TP %</th><th>SL %</th><th>SL Mode</th><th>Trailing Act% / Off%</th><th>Max Open</th><th>Max/Day</th><th>Max Losses</th><th>Daily Loss %</th><th>Capital</th><th>Flags</th><th>Metrics</th><th>Actions</th></tr></thead>
+        <tbody>
+        {% for strategy in strategies %}
+          {% set metric = metrics_by_id.get(strategy.id) %}
+          <tr>
+            <form method="post" action="/strategies/{{ strategy.id }}">
+              <td data-label="Name"><input class="form-control form-control-sm" name="name" value="{{ strategy.name }}"></td>
+              <td data-label="Mode"><select class="form-select form-select-sm" name="mode"><option {% if strategy.mode == "PAPER" %}selected{% endif %}>PAPER</option><option {% if strategy.mode == "LIVE" %}selected{% endif %}>LIVE</option></select></td>
+              <td data-label="Index"><select class="form-select form-select-sm" name="index_symbol">
+                {% for index in indexes %}<option value="{{ index.symbol }}" {% if index.symbol == strategy.index_symbol %}selected{% endif %}>{{ index.display_name or index.symbol }}{% if not index.enabled %} (disabled){% endif %}</option>{% endfor %}
+              </select></td>
+              <td data-label="TP %"><input class="form-control form-control-sm" type="number" step="0.01" name="tp_percent" value="{{ strategy.tp_percent }}"></td>
+              <td data-label="SL %"><input class="form-control form-control-sm" type="number" step="0.01" name="sl_percent" value="{{ strategy.sl_percent }}"></td>
+              <td data-label="SL Mode"><select class="form-select form-select-sm" name="sl_mode"><option value="FIXED" {% if strategy.sl_mode == "FIXED" %}selected{% endif %}>FIXED</option><option value="TRAILING" {% if strategy.sl_mode == "TRAILING" %}selected{% endif %}>TRAILING</option></select></td>
+              <td data-label="Trailing Act% / Off%"><div class="d-flex gap-1"><input class="form-control form-control-sm" type="number" step="0.01" name="trailing_activation_percent" value="{{ strategy.trailing_activation_percent }}" title="Activation %"><input class="form-control form-control-sm" type="number" step="0.01" name="trailing_offset_percent" value="{{ strategy.trailing_offset_percent }}" title="Offset %"></div></td>
+              <td data-label="Max Open"><input class="form-control form-control-sm" type="number" name="max_active_trades" value="{{ strategy.max_active_trades }}"></td>
+              <td data-label="Max/Day"><input class="form-control form-control-sm" type="number" name="max_trades_per_day" value="{{ strategy.max_trades_per_day }}"></td>
+              <td data-label="Max Losses"><input class="form-control form-control-sm" type="number" name="max_consecutive_losses" value="{{ strategy.max_consecutive_losses }}"></td>
+              <td data-label="Daily Loss %"><input class="form-control form-control-sm" type="number" step="0.01" name="daily_max_loss_percent" value="{{ strategy.daily_max_loss_percent }}"></td>
+              <td data-label="Capital"><input class="form-control form-control-sm" type="number" step="0.01" name="capital_per_trade" value="{{ strategy.capital_per_trade }}"></td>
+              <td data-label="Flags">
+                <label><input type="checkbox" name="enabled" {% if strategy.enabled %}checked{% endif %}> Enabled</label><br>
+                <label><input type="checkbox" name="paper_trade" {% if strategy.paper_trade %}checked{% endif %}> Paper</label><br>
+                <label><input type="checkbox" name="live_trade" {% if strategy.live_trade %}checked{% endif %}> Live</label>
+              </td>
+              <td data-label="Metrics">Open {{ metric.open_trades if metric else 0 }} · Win {{ "%.2f"|format(metric.win_rate if metric else 0) }}% · P&L {{ "%.2f"|format(metric.net_pnl if metric else 0) }}</td>
+              <td data-label="Actions"><button class="btn btn-sm btn-success" type="submit">Save</button></td>
+            </form>
+            <td data-label="Delete">
+              <form method="post" action="/strategies/{{ strategy.id }}/delete" onsubmit="return confirm('Delete this strategy?')">
+                <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}{{ empty_state("No strategies configured.") }}{% endif %}
   </div>
-  <h5>Risk Settings</h5>
-  <div class="form-grid">
-    <div><label class="form-label">Stop Loss %</label><input class="form-control" type="number" step="0.01" name="stop_loss_percent" value="{{ settings.stop_loss_percent }}"></div>
-    <div><label class="form-label">Target %</label><input class="form-control" type="number" step="0.01" name="target_percent" value="{{ settings.target_percent }}"></div>
-    <div><label class="form-label">Max Trades Per Day</label><input class="form-control" type="number" name="max_trades_per_day" value="{{ settings.max_trades_per_day }}"></div>
-    <div><label class="form-label">Max Consecutive Losses</label><input class="form-control" type="number" name="max_consecutive_losses" value="{{ settings.max_consecutive_losses }}"></div>
-    <div><label class="form-label">Daily Max Loss %</label><input class="form-control" type="number" step="0.01" name="daily_max_loss_percent" value="{{ settings.daily_max_loss_percent }}"></div>
-    <div><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"></div>
+
+  <div class="tab-pane fade {% if tab == 'instruments' %}show active{% endif %}" id="instruments-pane" role="tabpanel">
+    <div class="alert alert-info">Bank Nifty ships pre-configured. Nifty and Sensex are disabled by default with placeholder spot tokens — verify the exchange segment, spot token, lot size, and strike interval against your broker's instrument master before enabling them for live or paper trading.</div>
+    {% if indexes %}<div class="table-responsive responsive-table">
+      <table class="table table-dark table-sm align-middle">
+        <thead><tr><th>Symbol</th><th>Display Name</th><th>Option Segment</th><th>Instrument Name</th><th>Spot Exchange</th><th>Spot Symbol</th><th>Spot Token</th><th>Lot Size</th><th>Strike Interval</th><th>Enabled</th><th>Actions</th></tr></thead>
+        <tbody>
+        {% for index in indexes %}
+          <tr>
+            <form method="post" action="/instruments/{{ index.id }}">
+              <td data-label="Symbol"><strong>{{ index.symbol }}</strong></td>
+              <td data-label="Display Name"><input class="form-control form-control-sm" name="display_name" value="{{ index.display_name }}"></td>
+              <td data-label="Option Segment"><select class="form-select form-select-sm" name="exchange_segment"><option value="NFO" {% if index.exchange_segment == "NFO" %}selected{% endif %}>NFO</option><option value="BFO" {% if index.exchange_segment == "BFO" %}selected{% endif %}>BFO</option></select></td>
+              <td data-label="Instrument Name"><input class="form-control form-control-sm" name="instrument_name" value="{{ index.instrument_name }}"></td>
+              <td data-label="Spot Exchange"><select class="form-select form-select-sm" name="spot_exchange"><option value="NSE" {% if index.spot_exchange == "NSE" %}selected{% endif %}>NSE</option><option value="BSE" {% if index.spot_exchange == "BSE" %}selected{% endif %}>BSE</option></select></td>
+              <td data-label="Spot Symbol"><input class="form-control form-control-sm" name="spot_symbol" value="{{ index.spot_symbol }}"></td>
+              <td data-label="Spot Token"><input class="form-control form-control-sm" name="spot_token" value="{{ index.spot_token }}" placeholder="verify before enabling"></td>
+              <td data-label="Lot Size"><input class="form-control form-control-sm" type="number" name="lot_size" value="{{ index.lot_size }}"></td>
+              <td data-label="Strike Interval"><input class="form-control form-control-sm" type="number" name="strike_interval" value="{{ index.strike_interval }}"></td>
+              <td data-label="Enabled"><input type="checkbox" name="enabled" {% if index.enabled %}checked{% endif %}></td>
+              <td data-label="Actions"><button class="btn btn-sm btn-success" type="submit">Save</button></td>
+            </form>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}{{ empty_state("No instruments configured.") }}{% endif %}
   </div>
-  <h5 class="mt-4">Telegram Settings</h5>
-  <div class="form-grid">
-    <div><label class="form-label">Telegram Bot Token</label><input class="form-control" name="telegram_bot_token" value="{{ settings.telegram_bot_token }}"></div>
-    <div><label class="form-label">Telegram Chat ID</label><input class="form-control" name="telegram_chat_id" value="{{ settings.telegram_chat_id }}"></div>
-  </div>
-  <button class="btn btn-primary mt-4" type="submit">Save Settings</button>
-</form>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function () {
+  var activeTabInput = document.getElementById('active_tab_input');
+  var saveButton = document.getElementById('general-settings-save');
+  var tabButtons = document.querySelectorAll('#settingsTabs button[data-bs-toggle="tab"]');
+  tabButtons.forEach(function (button) {
+    button.addEventListener('shown.bs.tab', function (event) {
+      var targetId = event.target.getAttribute('data-bs-target');
+      if (targetId === '#notifications-pane') {
+        saveButton.style.display = '';
+        activeTabInput.value = 'notifications';
+      } else if (targetId === '#general-pane') {
+        saveButton.style.display = '';
+        activeTabInput.value = 'general';
+      } else {
+        saveButton.style.display = 'none';
+      }
+    });
+  });
+});
+</script>
 {% endblock %}

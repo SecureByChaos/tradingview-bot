@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime
 from uuid import uuid4
 
@@ -10,10 +9,10 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.ai.shadow import exit_signal_for_entry, run_shadow_review
-from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.db_models import SLMode, StrategyConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, Signal, WebhookResponse
 from app.option_finder import OptionFinder
-from app.platform import log_event, update_strategy_stats_after_close
+from app.platform import get_index_config, log_event, update_strategy_stats_after_close
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
 from app.time_utils import IST, format_ist, utc_now
@@ -79,8 +78,13 @@ class MultiStrategyTradeManager:
                 accepted=False,
                 message=f"Rejected: strategy '{strategy.name}' active trade limit reached",
             )
+        index = get_index_config(db, strategy.index_symbol)
+        if index is None or not index.enabled:
+            message = f"Rejected: index '{strategy.index_symbol}' is not configured/enabled. Configure it in Settings > Instruments."
+            log_event(db, "STATE", f"[STATE] FAILED_ENTRY {signal.value}", "WARNING", {"strategy": strategy.name, "reason": message})
+            return WebhookResponse(accepted=False, message=message)
         try:
-            contract = self.option_finder.find_atm_contract(signal)
+            contract = self.option_finder.find_atm_contract(signal, index)
             entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
         except Exception as exc:
             log_event(
@@ -127,6 +131,7 @@ class MultiStrategyTradeManager:
             trade_id=uuid4().hex,
             strategy_name=strategy.name,
             signal=signal.value,
+            index_symbol=strategy.index_symbol,
             exchange=contract.exchange,
             tradingsymbol=contract.tradingsymbol,
             symboltoken=contract.symboltoken,
@@ -189,41 +194,61 @@ class MultiStrategyTradeManager:
                 )
             )
         )
+        if not trades:
+            return closed
+        strategy_names = {trade.strategy_name for trade in trades}
+        strategies_by_name = {
+            strategy.name: strategy
+            for strategy in db.scalars(select(StrategyConfig).where(StrategyConfig.name.in_(strategy_names)))
+        }
         now_ist = datetime.now(IST)
         for trade in trades:
             try:
+                strategy = strategies_by_name.get(trade.strategy_name)
+                sl_mode = strategy.sl_mode if strategy is not None else SLMode.FIXED
+                activation_percent = strategy.trailing_activation_percent if strategy is not None else 10.0
+                offset_percent = strategy.trailing_offset_percent if strategy is not None else 5.0
+
                 premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
                 trade.current_premium = round(premium, 2)
                 trade.pnl_percent = round(((premium - trade.entry_price) / trade.entry_price) * 100, 2)
                 is_short = trade.signal.startswith("SELL")
-                activation_threshold = round(trade.entry_price * (float(os.getenv("TRAILING_ACTIVATION_PERCENT", "10")) / 100), 2)
-                trailing_offset = round(trade.entry_price * (float(os.getenv("TRAILING_OFFSET_PERCENT", "5")) / 100), 2)
+                activation_threshold = round(trade.entry_price * (activation_percent / 100), 2)
+                trailing_offset = round(trade.entry_price * (offset_percent / 100), 2)
                 reason: ExitReason | None = None
 
                 if is_short:
                     trade.lowest_price = premium if trade.lowest_price is None else min(trade.lowest_price, premium)
-                    if not trade.trailing_active and premium <= trade.entry_price - activation_threshold:
-                        trade.trailing_active = True
-                    if trade.trailing_active:
-                        trade.trailing_stop = round(trade.lowest_price + trailing_offset, 2)
-                    if trade.trailing_active and trade.trailing_stop is not None and premium >= trade.trailing_stop:
-                        reason = ExitReason.STOPLOSS
-                    elif premium >= trade.stoploss:
-                        reason = ExitReason.STOPLOSS
-                    elif premium <= trade.target:
-                        reason = ExitReason.TARGET
+                    if sl_mode == SLMode.TRAILING:
+                        if not trade.trailing_active and premium <= trade.entry_price - activation_threshold:
+                            trade.trailing_active = True
+                        if trade.trailing_active:
+                            trade.trailing_stop = round(trade.lowest_price + trailing_offset, 2)
+                        if trade.trailing_active and trade.trailing_stop is not None and premium >= trade.trailing_stop:
+                            reason = ExitReason.STOPLOSS
+                        elif not trade.trailing_active and premium >= trade.stoploss:
+                            reason = ExitReason.STOPLOSS
+                    else:
+                        if premium >= trade.stoploss:
+                            reason = ExitReason.STOPLOSS
+                        elif premium <= trade.target:
+                            reason = ExitReason.TARGET
                 else:
                     trade.highest_price = premium if trade.highest_price is None else max(trade.highest_price, premium)
-                    if not trade.trailing_active and premium >= trade.entry_price + activation_threshold:
-                        trade.trailing_active = True
-                    if trade.trailing_active:
-                        trade.trailing_stop = round(trade.highest_price - trailing_offset, 2)
-                    if trade.trailing_active and trade.trailing_stop is not None and premium <= trade.trailing_stop:
-                        reason = ExitReason.STOPLOSS
-                    elif premium <= trade.stoploss:
-                        reason = ExitReason.STOPLOSS
-                    elif premium >= trade.target:
-                        reason = ExitReason.TARGET
+                    if sl_mode == SLMode.TRAILING:
+                        if not trade.trailing_active and premium >= trade.entry_price + activation_threshold:
+                            trade.trailing_active = True
+                        if trade.trailing_active:
+                            trade.trailing_stop = round(trade.highest_price - trailing_offset, 2)
+                        if trade.trailing_active and trade.trailing_stop is not None and premium <= trade.trailing_stop:
+                            reason = ExitReason.STOPLOSS
+                        elif not trade.trailing_active and premium <= trade.stoploss:
+                            reason = ExitReason.STOPLOSS
+                    else:
+                        if premium <= trade.stoploss:
+                            reason = ExitReason.STOPLOSS
+                        elif premium >= trade.target:
+                            reason = ExitReason.TARGET
 
                 if reason is None and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 15)):
                     reason = ExitReason.TIME_EXIT
@@ -285,9 +310,14 @@ class MultiStrategyTradeManager:
             "option_price": round(exit_price, 2),
         }
         try:
-            shadow_market_data["banknifty_price"] = round(self.smartapi.get_banknifty_spot(), 2)
+            trade_index = get_index_config(db, trade.index_symbol)
+            spot = round(self.smartapi.get_index_spot(trade_index) if trade_index is not None else self.smartapi.get_banknifty_spot(), 2)
+            shadow_market_data["index_price"] = spot
+            shadow_market_data["index_symbol"] = trade.index_symbol
+            if trade.index_symbol == "BANKNIFTY":
+                shadow_market_data["banknifty_price"] = spot
         except Exception as exc:
-            logger.info("[AI] Shadow market fetch skipped: BANKNIFTY spot unavailable (%s)", exc)
+            logger.info("[AI] Shadow market fetch skipped: %s spot unavailable (%s)", trade.index_symbol, exc)
         logger.info("[AI] Exit review triggered")
         run_shadow_review(
             trade.strategy_name,

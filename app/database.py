@@ -77,6 +77,7 @@ def init_db() -> None:
     _ensure_columns()
     _seed_default_strategy()
     _seed_default_ai_settings()
+    _seed_default_indexes()
 
 
 def _ensure_columns() -> None:
@@ -89,6 +90,13 @@ def _ensure_columns() -> None:
         "paper_trade": "ALTER TABLE strategy_configs ADD COLUMN paper_trade BOOLEAN NOT NULL DEFAULT 1",
         "live_trade": "ALTER TABLE strategy_configs ADD COLUMN live_trade BOOLEAN NOT NULL DEFAULT 0",
         "capital_per_trade": "ALTER TABLE strategy_configs ADD COLUMN capital_per_trade FLOAT NOT NULL DEFAULT 20000.0",
+        "sl_mode": "ALTER TABLE strategy_configs ADD COLUMN sl_mode VARCHAR(16) NOT NULL DEFAULT 'FIXED'",
+        "trailing_activation_percent": "ALTER TABLE strategy_configs ADD COLUMN trailing_activation_percent FLOAT NOT NULL DEFAULT 10.0",
+        "trailing_offset_percent": "ALTER TABLE strategy_configs ADD COLUMN trailing_offset_percent FLOAT NOT NULL DEFAULT 5.0",
+        "max_trades_per_day": "ALTER TABLE strategy_configs ADD COLUMN max_trades_per_day INTEGER NOT NULL DEFAULT 2",
+        "max_consecutive_losses": "ALTER TABLE strategy_configs ADD COLUMN max_consecutive_losses INTEGER NOT NULL DEFAULT 2",
+        "daily_max_loss_percent": "ALTER TABLE strategy_configs ADD COLUMN daily_max_loss_percent FLOAT NOT NULL DEFAULT -20.0",
+        "index_symbol": "ALTER TABLE strategy_configs ADD COLUMN index_symbol VARCHAR(32) NOT NULL DEFAULT 'BANKNIFTY'",
     }
     with engine.begin() as connection:
         for column, statement in statements.items():
@@ -101,6 +109,7 @@ def _ensure_columns() -> None:
             "lowest_price": "ALTER TABLE strategy_trades ADD COLUMN lowest_price FLOAT",
             "trailing_active": "ALTER TABLE strategy_trades ADD COLUMN trailing_active BOOLEAN NOT NULL DEFAULT 0",
             "trailing_stop": "ALTER TABLE strategy_trades ADD COLUMN trailing_stop FLOAT",
+            "index_symbol": "ALTER TABLE strategy_trades ADD COLUMN index_symbol VARCHAR(32) NOT NULL DEFAULT 'BANKNIFTY'",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():
@@ -160,3 +169,54 @@ def _seed_default_ai_settings() -> None:
         if settings_row is None:
             db.add(AISettings(id=1))
             db.commit()
+
+
+def _seed_default_indexes() -> None:
+    from sqlalchemy import select
+
+    from app.db_models import IndexConfig, IndexSymbol
+
+    defaults = [
+        dict(
+            symbol=IndexSymbol.BANKNIFTY,
+            display_name="Bank Nifty",
+            exchange_segment="NFO",
+            instrument_name="BANKNIFTY",
+            spot_exchange=settings.banknifty_spot_exchange,
+            spot_symbol=settings.banknifty_spot_symbol,
+            spot_token=settings.banknifty_spot_token,
+            lot_size=settings.banknifty_lot_size,
+            strike_interval=100,
+            enabled=True,
+        ),
+        dict(
+            symbol=IndexSymbol.NIFTY,
+            display_name="Nifty 50",
+            exchange_segment="NFO",
+            instrument_name="NIFTY",
+            spot_exchange="NSE",
+            spot_symbol="Nifty 50",
+            spot_token="",
+            lot_size=75,
+            strike_interval=50,
+            enabled=False,
+        ),
+        dict(
+            symbol=IndexSymbol.SENSEX,
+            display_name="Sensex",
+            exchange_segment="BFO",
+            instrument_name="SENSEX",
+            spot_exchange="BSE",
+            spot_symbol="SENSEX",
+            spot_token="",
+            lot_size=20,
+            strike_interval=100,
+            enabled=False,
+        ),
+    ]
+    with SessionLocal() as db:
+        for row in defaults:
+            existing = db.scalar(select(IndexConfig).where(IndexConfig.symbol == row["symbol"]))
+            if existing is None:
+                db.add(IndexConfig(**row))
+        db.commit()

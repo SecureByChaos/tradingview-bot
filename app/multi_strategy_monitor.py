@@ -26,7 +26,7 @@ class MultiStrategyMonitor:
                 self.manager.monitor_open_trades(db)
                 if self.v7_manager is not None:
                     self.v7_manager.monitor_open_trades(db)
-                self.risk.enforce_daily_loss_limit(db)
+                self.risk.enforce_daily_loss_limits(db)
             except Exception as exc:
                 logger.exception("Multi-strategy monitor tick failed")
                 log_event(db, "ERROR", "Multi-strategy monitor tick failed", "ERROR", {"error": str(exc)})

@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
@@ -77,35 +78,52 @@ class OptionFinder:
         self.settings = settings
         self.smartapi = smartapi
 
-    def find_atm_contract(self, signal: Signal) -> OptionContract:
-        spot_price = self.smartapi.get_banknifty_spot()
-        atm_strike = int(round(spot_price / 100) * 100)
+    def find_atm_contract(self, signal: Signal, index: Any = None) -> OptionContract:
+        index = index or self._default_index()
+        spot_price = self.smartapi.get_index_spot(index)
+        strike_interval = index.strike_interval or 100
+        atm_strike = int(round(spot_price / strike_interval) * strike_interval)
         option_type = "CE" if signal.value.endswith("CE") else "PE"
         instruments = self._load_instruments()
-        matches = self._filter_banknifty_options(instruments, option_type)
+        matches = self._filter_index_options(instruments, index, option_type)
         if matches.empty:
-            raise ValueError(f"No BankNifty {option_type} contracts found in instrument master")
+            raise ValueError(f"No {index.symbol} {option_type} contracts found in instrument master")
 
         matches = matches.assign(strike_diff=(matches["strike_normalized"] - atm_strike).abs())
         nearest_expiry = matches["expiry_dt"].min()
         expiry_contracts = matches[matches["expiry_dt"] == nearest_expiry]
         selected = expiry_contracts.sort_values(["strike_diff", "strike_normalized"]).iloc[0]
         logger.info(
-            "Selected %s at spot %.2f: %s strike=%s expiry=%s",
+            "Selected %s (%s) at spot %.2f: %s strike=%s expiry=%s",
             signal,
+            index.symbol,
             spot_price,
             selected["symbol"],
             int(selected["strike_normalized"]),
             selected["expiry"],
         )
         return OptionContract(
-            exchange=selected.get("exch_seg", "NFO"),
+            exchange=selected.get("exch_seg", index.exchange_segment),
             tradingsymbol=selected["symbol"],
             symboltoken=str(selected["token"]),
             strike=int(selected["strike_normalized"]),
             expiry=str(selected["expiry"]),
             option_type=option_type,
-            lot_size=int(float(selected.get("lotsize") or self.settings.banknifty_lot_size)),
+            lot_size=int(float(selected.get("lotsize") or index.lot_size)),
+        )
+
+    def _default_index(self) -> Any:
+        """Fallback used only by legacy/unreachable call sites that predate multi-index
+        support (find_atm_contract without an explicit index argument)."""
+        return SimpleNamespace(
+            symbol="BANKNIFTY",
+            exchange_segment="NFO",
+            instrument_name="BANKNIFTY",
+            spot_exchange=self.settings.banknifty_spot_exchange,
+            spot_symbol=self.settings.banknifty_spot_symbol,
+            spot_token=self.settings.banknifty_spot_token,
+            lot_size=self.settings.banknifty_lot_size,
+            strike_interval=100,
         )
 
     def _load_instruments(self) -> pd.DataFrame:
@@ -127,16 +145,16 @@ class OptionFinder:
         modified = datetime.fromtimestamp(path.stat().st_mtime, tz=IST)
         return datetime.now(IST) - modified < timedelta(hours=12)
 
-    def _filter_banknifty_options(self, instruments: pd.DataFrame, option_type: str) -> pd.DataFrame:
+    def _filter_index_options(self, instruments: pd.DataFrame, index: Any, option_type: str) -> pd.DataFrame:
         required = {"exch_seg", "instrumenttype", "name", "symbol", "expiry", "strike", "token"}
         missing = required - set(instruments.columns)
         if missing:
             raise ValueError(f"Instrument master missing columns: {', '.join(sorted(missing))}")
 
         frame = instruments[
-            (instruments["exch_seg"] == "NFO")
+            (instruments["exch_seg"] == index.exchange_segment)
             & (instruments["instrumenttype"].isin(["OPTIDX", "OPTSTK"]))
-            & (instruments["name"].astype(str).str.upper() == "BANKNIFTY")
+            & (instruments["name"].astype(str).str.upper() == index.instrument_name.upper())
             & (instruments["symbol"].astype(str).str.upper().str.endswith(option_type))
         ].copy()
         frame["expiry_dt"] = pd.to_datetime(frame["expiry"], format="%d%b%Y", errors="coerce").dt.date

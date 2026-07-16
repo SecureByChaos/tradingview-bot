@@ -1,7 +1,7 @@
 services:
-  banknifty-trading-bot:
+  strikevault:
     build: .
-    container_name: banknifty-trading-bot
+    container_name: strikevault
     restart: unless-stopped
     env_file:
       - .env

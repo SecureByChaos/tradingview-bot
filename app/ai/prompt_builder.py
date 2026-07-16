@@ -17,6 +17,8 @@ class PromptBuilder:
         market = context.market_data or {}
         indicators = context.indicators or {}
         account = context.account_state or {}
+        _index_labels = {"BANKNIFTY": "BankNifty", "NIFTY": "Nifty", "SENSEX": "Sensex"}
+        index_label = _index_labels.get(str(market.get("index_symbol") or "").upper(), "BankNifty")
 
         values = (
             ("Strategy", context.strategy_name),
@@ -27,7 +29,7 @@ class PromptBuilder:
             ("Trade Number Today", account.get("trade_number_today")),
             ("Session", market.get("session")),
             ("Position State", account.get("position_state")),
-            ("BankNifty price", context.spot_price if context.spot_price is not None else market.get("banknifty_price")),
+            (f"{index_label} price", context.spot_price if context.spot_price is not None else market.get("index_price", market.get("banknifty_price"))),
             ("Option Premium", context.option_price if context.option_price is not None else market.get("option_price")),
             ("Strike", market.get("strike")),
             ("Expiry", market.get("expiry")),
