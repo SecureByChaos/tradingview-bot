@@ -56,6 +56,11 @@ h1, h2, h3, h4, h5 { letter-spacing: 0; }
 .warn { color: var(--warning) !important; }
 .table-responsive { border: 1px solid var(--border); border-radius: 8px; }
 .table { margin: 0; font-size: .9rem; --bs-table-bg: var(--surface); --bs-table-border-color: var(--border); }
+.table-strategies { min-width: 1700px; }
+.table-instruments { min-width: 1300px; }
+@media (max-width: 767.98px) {
+  .table-strategies, .table-instruments { min-width: 0; }
+}
 .table thead th { position: sticky; top: 0; z-index: 2; color: #dce5f2; background: #182436; white-space: nowrap; }
 .table tbody tr:nth-child(even) > * { --bs-table-bg-type: rgba(255, 255, 255, .018); }
 .table td { vertical-align: middle; overflow-wrap: anywhere; }
