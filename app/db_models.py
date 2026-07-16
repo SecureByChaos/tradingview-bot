@@ -200,6 +200,9 @@ class StrategyConfig(Base):
     max_consecutive_losses: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     daily_max_loss_percent: Mapped[float] = mapped_column(Float, default=-20.0, nullable=False)
     lots_per_trade: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # Deprecated/unused: retained only so inserts satisfy the legacy NOT NULL column still
+    # present in older production databases from before position sizing switched to lots.
+    capital_per_trade: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     paper_trade: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     live_trade: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
