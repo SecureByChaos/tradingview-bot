@@ -19,30 +19,31 @@
 </ul>
 
 <div class="tab-content">
-  <form id="general-settings-form" method="post" action="/settings">
-    <input type="hidden" name="active_tab" id="active_tab_input" value="{{ tab if tab in ('general', 'notifications') else 'general' }}">
-
-    <div class="tab-pane fade {% if tab == 'general' %}show active{% endif %}" id="general-pane" role="tabpanel">
-      <div class="metric">
-        <h5>General</h5>
-        <div class="form-grid">
-          <div><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"></div>
-        </div>
+  <div class="tab-pane fade {% if tab == 'general' %}show active{% endif %}" id="general-pane" role="tabpanel">
+    <form class="metric" method="post" action="/settings">
+      <input type="hidden" name="telegram_bot_token" value="{{ settings.telegram_bot_token }}">
+      <input type="hidden" name="telegram_chat_id" value="{{ settings.telegram_chat_id }}">
+      <input type="hidden" name="active_tab" value="general">
+      <h5>General</h5>
+      <div class="form-grid">
+        <div><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"></div>
       </div>
-    </div>
+      <button class="btn btn-primary mt-4" type="submit">Save Settings</button>
+    </form>
+  </div>
 
-    <div class="tab-pane fade {% if tab == 'notifications' %}show active{% endif %}" id="notifications-pane" role="tabpanel">
-      <div class="metric">
-        <h5>Telegram Notifications</h5>
-        <div class="form-grid">
-          <div><label class="form-label">Telegram Bot Token</label><input class="form-control" name="telegram_bot_token" value="{{ settings.telegram_bot_token }}"></div>
-          <div><label class="form-label">Telegram Chat ID</label><input class="form-control" name="telegram_chat_id" value="{{ settings.telegram_chat_id }}"></div>
-        </div>
+  <div class="tab-pane fade {% if tab == 'notifications' %}show active{% endif %}" id="notifications-pane" role="tabpanel">
+    <form class="metric" method="post" action="/settings">
+      <input type="hidden" name="square_off_time" value="{{ settings.square_off_time }}">
+      <input type="hidden" name="active_tab" value="notifications">
+      <h5>Telegram Notifications</h5>
+      <div class="form-grid">
+        <div><label class="form-label">Telegram Bot Token</label><input class="form-control" name="telegram_bot_token" value="{{ settings.telegram_bot_token }}"></div>
+        <div><label class="form-label">Telegram Chat ID</label><input class="form-control" name="telegram_chat_id" value="{{ settings.telegram_chat_id }}"></div>
       </div>
-    </div>
-
-    <button class="btn btn-primary mt-4" id="general-settings-save" type="submit" {% if tab not in ('general', 'notifications') %}style="display:none"{% endif %}>Save Settings</button>
-  </form>
+      <button class="btn btn-primary mt-4" type="submit">Save Settings</button>
+    </form>
+  </div>
 
   <div class="tab-pane fade {% if tab == 'strategies' %}show active{% endif %}" id="strategies-pane" role="tabpanel">
     <div class="alert alert-info">Stoploss/target mode and risk limits (max trades/day, max consecutive losses, daily max loss %) are configured per strategy below. The traded index (BankNifty/Nifty/Sensex) is also chosen per strategy — configure the index itself on the <a href="/settings?tab=instruments" class="alert-link">Instruments</a> tab first.</div>
@@ -140,27 +141,4 @@
     {% else %}{{ empty_state("No instruments configured.") }}{% endif %}
   </div>
 </div>
-{% endblock %}
-{% block scripts %}
-<script>
-document.addEventListener('DOMContentLoaded', function () {
-  var activeTabInput = document.getElementById('active_tab_input');
-  var saveButton = document.getElementById('general-settings-save');
-  var tabButtons = document.querySelectorAll('#settingsTabs button[data-bs-toggle="tab"]');
-  tabButtons.forEach(function (button) {
-    button.addEventListener('shown.bs.tab', function (event) {
-      var targetId = event.target.getAttribute('data-bs-target');
-      if (targetId === '#notifications-pane') {
-        saveButton.style.display = '';
-        activeTabInput.value = 'notifications';
-      } else if (targetId === '#general-pane') {
-        saveButton.style.display = '';
-        activeTabInput.value = 'general';
-      } else {
-        saveButton.style.display = 'none';
-      }
-    });
-  });
-});
-</script>
 {% endblock %}
