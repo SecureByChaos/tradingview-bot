@@ -18,6 +18,7 @@
       <nav class="sidebar-nav">
       {% set path = request.url.path %}
       <a class="{% if path == '/' %}active{% endif %}" href="/">Dashboard</a>
+      <a class="{% if path == '/ops' %}active{% endif %}" href="/ops">Ops Summary</a>
       <a class="{% if path == '/v7' %}active{% endif %}" href="/v7">V7 Portal</a>
       <a class="{% if path == '/active-trade-page' %}active{% endif %}" href="/active-trade-page">Active Trade</a>
       <a class="{% if path == '/history' %}active{% endif %}" href="/history">Trade History</a>

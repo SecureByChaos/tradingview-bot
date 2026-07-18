@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.ai.shadow import exit_signal_for_entry, run_shadow_review
-from app.db_models import SLMode, StrategyConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.db_models import SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, Signal, WebhookResponse
 from app.option_finder import OptionFinder
 from app.platform import get_index_config, log_event, update_strategy_stats_after_close
@@ -209,6 +209,7 @@ class MultiStrategyTradeManager:
                 premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
                 trade.current_premium = round(premium, 2)
                 trade.pnl_percent = round(((premium - trade.entry_price) / trade.entry_price) * 100, 2)
+                db.add(StrategyTradeTick(trade_id=trade.trade_id, premium=trade.current_premium))
                 is_short = trade.signal.startswith("SELL")
                 activation_threshold = round(trade.entry_price * (activation_percent / 100), 2)
                 trailing_offset = round(trade.entry_price * (offset_percent / 100), 2)

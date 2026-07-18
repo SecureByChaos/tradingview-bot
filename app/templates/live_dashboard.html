@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% from "components.html" import empty_state %}
+{% block content %}
+<div class="page-header"><h2>Live market</h2><span class="badge text-bg-secondary" id="last-updated-badge">Updated just now</span></div>
+<div class="metric-grid mb-4" id="index-cards">
+</div>
+
+<div class="section-header">
+  <h4 class="mb-0">Active trades</h4>
+  <span class="badge text-bg-secondary" id="trade-count">0</span>
+</div>
+<div class="trade-card-grid mb-4" id="trade-cards"></div>
+<div id="trade-empty-state" style="display:none;">{{ empty_state("Monitoring markets, no active trade.") }}</div>
+
+<div class="section-header"><h4 class="mb-0">Today's activity</h4></div>
+<div class="panel">
+  <div class="activity-feed" id="activity-feed"></div>
+  <div id="activity-empty-state" style="display:none;">{{ empty_state("No activity yet today.") }}</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const initialData = {
+  indices: {{ indices | tojson }},
+  trades: {{ trades | tojson }},
+  activity: {{ activity | tojson }}
+};
+const tradeCharts = {};
+
+function renderIndices(indices) {
+  const container = document.getElementById('index-cards');
+  container.innerHTML = indices.map(function (idx) {
+    if (idx.price === null) {
+      return '<div class="metric"><div class="label">' + idx.display_name + '</div><div class="value warn">Unavailable</div></div>';
+    }
+    const cls = (idx.change_abs || 0) >= 0 ? 'profit' : 'loss';
+    const sign = (idx.change_abs || 0) >= 0 ? '+' : '';
+    return '<div class="metric">' +
+      '<div class="label">' + idx.display_name + '</div>' +
+      '<div class="value">' + idx.price.toLocaleString() + '</div>' +
+      '<div class="' + cls + '" style="font-size:.85rem; margin-top:.2rem;">' + sign + idx.change_abs + ' (' + sign + idx.change_percent + '%)</div>' +
+      '</div>';
+  }).join('');
+}
+
+function renderTrades(trades) {
+  document.getElementById('trade-count').textContent = trades.length;
+  const grid = document.getElementById('trade-cards');
+  const empty = document.getElementById('trade-empty-state');
+  Object.keys(tradeCharts).forEach(function (id) { tradeCharts[id].destroy(); delete tradeCharts[id]; });
+  if (!trades.length) {
+    grid.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  grid.innerHTML = trades.map(function (trade) {
+    const cls = (trade.pnl_percent || 0) >= 0 ? 'profit' : 'loss';
+    const sign = (trade.pnl_percent || 0) >= 0 ? '+' : '';
+    return '<div class="trade-card">' +
+      '<div class="trade-card-header"><strong>' + trade.index_display_name + ' · ' + trade.position_label + '</strong>' +
+      '<span class="badge text-bg-success">Open</span></div>' +
+      '<div class="trade-card-strategy">Strategy: ' + trade.strategy_name + '</div>' +
+      '<div class="trade-card-figures">' +
+      '<div><div class="label">Entry</div><div class="value">' + trade.entry_price + '</div></div>' +
+      '<div><div class="label">Current</div><div class="value">' + trade.current_premium + '</div></div>' +
+      '<div><div class="label">Live P&amp;L</div><div class="value ' + cls + '">' + sign + trade.pnl_percent + '%</div></div>' +
+      '</div>' +
+      '<div class="trade-chart-wrap"><canvas id="chart-' + trade.trade_id + '" role="img" aria-label="Premium chart for ' + trade.index_display_name + ' ' + trade.position_label + '"></canvas></div>' +
+      '</div>';
+  }).join('');
+  trades.forEach(function (trade) {
+    const rising = trade.history[trade.history.length - 1] >= trade.history[0];
+    const color = rising ? '#45d68a' : '#ff6577';
+    const ctx = document.getElementById('chart-' + trade.trade_id);
+    tradeCharts[trade.trade_id] = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: trade.history.map(function (_, i) { return i; }),
+        datasets: [{ data: trade.history, borderColor: color, backgroundColor: color + '22', fill: true, borderWidth: 2, pointRadius: 0, tension: 0.3 }]
+      },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: false } } }
+    });
+  });
+}
+
+function renderActivity(activity) {
+  const container = document.getElementById('activity-feed');
+  const empty = document.getElementById('activity-empty-state');
+  if (!activity.length) {
+    container.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+  container.innerHTML = activity.map(function (event) {
+    return '<div><span class="time">' + event.time_label + '</span>' + event.message + '</div>';
+  }).join('');
+}
+
+let lastUpdatedAt = Date.now();
+
+function renderAll(data) {
+  renderIndices(data.indices);
+  renderTrades(data.trades);
+  renderActivity(data.activity);
+  lastUpdatedAt = Date.now();
+}
+
+renderAll(initialData);
+
+setInterval(function () {
+  fetch('/api/live-dashboard')
+    .then(function (response) { return response.ok ? response.json() : null; })
+    .then(function (data) { if (data) { renderAll(data); } })
+    .catch(function () {});
+}, 10000);
+
+setInterval(function () {
+  const seconds = Math.round((Date.now() - lastUpdatedAt) / 1000);
+  document.getElementById('last-updated-badge').textContent = seconds < 5 ? 'Updated just now' : 'Updated ' + seconds + 's ago';
+}, 1000);
+</script>
+{% endblock %}

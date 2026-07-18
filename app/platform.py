@@ -8,8 +8,8 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, TradeRecord, TradeResult, TradeStatus, TradingMode
-from app.time_utils import duration_label, format_ist, iso_utc, to_ist
+from app.db_models import AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.time_utils import duration_label, format_ist, iso_utc, to_ist, utc_now
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -389,6 +389,170 @@ def origin_comparison_metrics(db: Session, filter_name: str, start: date | None,
             }
         )
     return metrics
+
+
+_INDEX_TICK_THROTTLE_SECONDS = 25
+_INDEX_DISPLAY_NAMES = {"BANKNIFTY": "Bank Nifty", "NIFTY": "Nifty", "SENSEX": "Sensex"}
+
+
+def _index_display_name(symbol: str | None) -> str:
+    return _INDEX_DISPLAY_NAMES.get((symbol or "").upper(), (symbol or "").title())
+
+
+def get_index_live_figures(db: Session, smartapi: Any) -> list[dict[str, Any]]:
+    """Live index figures (Nifty/Sensex/Bank Nifty) for the live dashboards --
+    figures only, no per-index chart by design. Change and day range are
+    computed from our own recorded ticks, using today's first tick as the
+    reference point, rather than a broker "previous close" field -- the
+    current SmartAPI client wrapper only exposes LTP, not a reliable
+    previous-close, so inventing one would be dishonest."""
+    figures: list[dict[str, Any]] = []
+    indexes = list(db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)))
+    today = today_ist().isoformat()
+    for index in indexes:
+        entry: dict[str, Any] = {
+            "symbol": index.symbol,
+            "display_name": index.display_name or index.symbol,
+            "price": None,
+            "change_abs": None,
+            "change_percent": None,
+            "day_low": None,
+            "day_high": None,
+        }
+        try:
+            price = round(smartapi.get_index_spot(index), 2)
+        except Exception as exc:
+            entry["error"] = str(exc)
+            figures.append(entry)
+            continue
+
+        latest_tick = db.scalar(
+            select(IndexPriceTick)
+            .where(IndexPriceTick.index_symbol == index.symbol)
+            .order_by(IndexPriceTick.recorded_at.desc())
+            .limit(1)
+        )
+        latest_ist = to_ist(latest_tick.recorded_at) if latest_tick is not None else None
+        now_ist = to_ist(utc_now())
+        if latest_ist is None or (now_ist - latest_ist).total_seconds() >= _INDEX_TICK_THROTTLE_SECONDS:
+            db.add(IndexPriceTick(index_symbol=index.symbol, price=price))
+            db.commit()
+
+        todays_ticks = list(
+            db.scalars(
+                select(IndexPriceTick)
+                .where(
+                    IndexPriceTick.index_symbol == index.symbol,
+                    func.date(IndexPriceTick.recorded_at) == today,
+                )
+                .order_by(IndexPriceTick.recorded_at)
+            )
+        )
+        entry["price"] = price
+        if todays_ticks:
+            reference = todays_ticks[0].price
+            all_prices = [tick.price for tick in todays_ticks] + [price]
+            entry["change_abs"] = round(price - reference, 2)
+            entry["change_percent"] = round(((price - reference) / reference) * 100, 2) if reference else 0.0
+            entry["day_low"] = round(min(all_prices), 2)
+            entry["day_high"] = round(max(all_prices), 2)
+        figures.append(entry)
+    return figures
+
+
+def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[str, Any]]:
+    """Real (origin == SIGNAL) open trades for the live dashboards, each with
+    its recent premium history for a sparkline and the strategy that took
+    it. Never includes AI_ALT_* evaluation trades."""
+    trades = list(
+        db.scalars(
+            select(StrategyTrade)
+            .where(StrategyTrade.status == TradeStatus.OPEN, StrategyTrade.origin == "SIGNAL")
+            .order_by(StrategyTrade.entry_time.desc())
+        )
+    )
+    result: list[dict[str, Any]] = []
+    for trade in trades:
+        ticks = list(
+            db.scalars(
+                select(StrategyTradeTick)
+                .where(StrategyTradeTick.trade_id == trade.trade_id)
+                .order_by(StrategyTradeTick.recorded_at.desc())
+                .limit(tick_limit)
+            )
+        )
+        ticks.reverse()
+        history = [tick.premium for tick in ticks] or [trade.entry_price]
+        if history[-1] != trade.current_premium and trade.current_premium is not None:
+            history.append(trade.current_premium)
+        result.append(
+            {
+                "trade_id": trade.trade_id,
+                "strategy_name": trade.strategy_name,
+                "index_symbol": trade.index_symbol,
+                "option_type": trade.option_type,
+                "index_display_name": _index_display_name(trade.index_symbol),
+                "position_label": "Long call" if trade.option_type == "CE" else "Long put",
+                "entry_price": trade.entry_price,
+                "current_premium": trade.current_premium,
+                "pnl_percent": trade.pnl_percent,
+                "entry_time_ist": format_ist(trade.entry_time),
+                "history": history,
+            }
+        )
+    return result
+
+
+def get_today_activity(db: Session, limit: int = 20) -> list[dict[str, Any]]:
+    """Plain-language, strategy-attributed activity feed for the live
+    dashboards, derived directly from real (origin == SIGNAL) trade
+    entry/exit times rather than parsing internal log-event strings."""
+    today = today_ist().isoformat()
+    trades = list(
+        db.scalars(
+            select(StrategyTrade).where(
+                StrategyTrade.origin == "SIGNAL",
+                func.date(StrategyTrade.entry_time) == today,
+            )
+        )
+    )
+    closed_today = list(
+        db.scalars(
+            select(StrategyTrade).where(
+                StrategyTrade.origin == "SIGNAL",
+                StrategyTrade.exit_time.is_not(None),
+                func.date(StrategyTrade.exit_time) == today,
+            )
+        )
+    )
+    events: list[dict[str, Any]] = []
+    for trade in trades:
+        position = "long call" if trade.option_type == "CE" else "long put"
+        events.append(
+            {
+                "timestamp": trade.entry_time,
+                "time_label": to_ist(trade.entry_time).strftime("%I:%M %p") if to_ist(trade.entry_time) else "",
+                "message": f"[{trade.strategy_name}] Entered {_index_display_name(trade.index_symbol)} {position}",
+            }
+        )
+    for trade in closed_today:
+        position = "long call" if trade.option_type == "CE" else "long put"
+        sign = "+" if (trade.pnl_percent or 0) >= 0 else ""
+        events.append(
+            {
+                "timestamp": trade.exit_time,
+                "time_label": to_ist(trade.exit_time).strftime("%I:%M %p") if to_ist(trade.exit_time) else "",
+                "message": f"[{trade.strategy_name}] Closed {_index_display_name(trade.index_symbol)} {position}, {sign}{trade.pnl_percent:.1f}%",
+            }
+        )
+    events.sort(key=lambda event: event["timestamp"], reverse=True)
+    # Drop the raw datetime before returning -- only used for sorting above.
+    # Jinja's `tojson` filter (used to seed the initial page render) can't
+    # serialize a datetime object, and only time_label/message are ever
+    # displayed.
+    for event in events:
+        del event["timestamp"]
+    return events[:limit]
 
 
 def daily_stats_query_for_filter(filter_name: str, start: date | None, end: date | None) -> Select[tuple[DailyStats]]:

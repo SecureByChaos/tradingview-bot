@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.ai.shadow import exit_signal_for_entry, run_shadow_review
-from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.db_models import StrategyConfig, StrategyTrade, StrategyTradeTick, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, OptionContract, Signal, WebhookResponse
 from app.option_finder import OptionFinder
 from app.platform import get_index_config, log_event
@@ -197,6 +197,7 @@ class V7Manager:
             trade.current_premium = round(premium, 2)
             trade.pnl_percent = round(((premium - trade.entry_price) / trade.entry_price) * 100, 2)
             trade.profit_loss = round((premium - trade.entry_price) * trade.quantity, 2)
+            db.add(StrategyTradeTick(trade_id=trade.trade_id, premium=trade.current_premium))
             reason: ExitReason | None = None
 
             trail_activated_now = False

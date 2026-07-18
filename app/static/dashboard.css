@@ -71,6 +71,17 @@ h1, h2, h3, h4, h5 { letter-spacing: 0; }
 .filter-grid { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)) auto; align-items: end; gap: .75rem; }
 .login-shell { min-height: calc(100vh - 3rem); display: grid; place-items: center; padding: 1rem 0; }
 .login-panel { width: min(100%, 420px); }
+.trade-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1rem; }
+.trade-card { padding: 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.trade-card-header { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin-bottom: .25rem; }
+.trade-card-strategy { color: var(--muted); font-size: .78rem; margin-bottom: .6rem; }
+.trade-card-figures { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .5rem; margin-bottom: .6rem; }
+.trade-card-figures .label { color: var(--muted); font-size: .72rem; }
+.trade-card-figures .value { font-size: .95rem; font-weight: 600; }
+.trade-chart-wrap { position: relative; width: 100%; height: 100px; }
+.activity-feed { display: flex; flex-direction: column; gap: .6rem; font-size: .88rem; }
+.activity-feed .time { color: var(--muted); min-width: 66px; display: inline-block; }
+.activity-strategy { color: #7fb7ff; }
 
 @media (max-width: 1399.98px) {
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }

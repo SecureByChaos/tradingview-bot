@@ -287,6 +287,34 @@ class StrategyTrade(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class StrategyTradeTick(Base):
+    """Periodic premium samples for an open StrategyTrade, recorded on the
+    existing 30s monitor tick. Powers the live per-trade sparkline on the
+    owner/client live dashboards -- without this there is no real history to
+    chart, only the single current_premium point."""
+
+    __tablename__ = "strategy_trade_ticks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    premium: Mapped[float] = mapped_column(Float, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True, nullable=False)
+
+
+class IndexPriceTick(Base):
+    """Periodic spot-price samples per index, recorded (throttled) whenever
+    the live dashboard polls for fresh figures. Used to compute today's
+    change and day range without assuming the broker API exposes a reliable
+    previous-close field."""
+
+    __tablename__ = "index_price_ticks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    index_symbol: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    price: Mapped[float] = mapped_column(Float, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True, nullable=False)
+
+
 class TradeRecord(Base):
     __tablename__ = "trades"
 

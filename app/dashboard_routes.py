@@ -11,7 +11,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app import reports
-from app.auth import authenticate_admin, require_admin_page
+from app.auth import authenticate_admin, require_admin_api, require_admin_page
 from app.ai.context_builder import SignalContextBuilder
 from app.ai.context_repository import get_context_log_for_review
 from app.ai.factory import create_reviewer
@@ -21,8 +21,11 @@ from app.db_models import AIContextLog, AITradeReview, BotStatus, IndexConfig, P
 from app.platform import (
     ai_reviews_query_for_filter,
     get_dashboard_summary,
+    get_index_live_figures,
+    get_open_trades_with_ticks,
     get_or_create_strategy_stats,
     get_or_create_settings,
+    get_today_activity,
     latest_logs,
     list_index_configs,
     log_event,
@@ -90,7 +93,7 @@ def logout(request: Request) -> RedirectResponse:
     return RedirectResponse("/login", status_code=303)
 
 
-@router.get("/", response_class=HTMLResponse)
+@router.get("/ops", response_class=HTMLResponse)
 def dashboard(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
@@ -105,13 +108,44 @@ def dashboard(
     )
 
 
+def _live_dashboard_data(db: Session, smartapi: object) -> dict[str, object]:
+    return {
+        "indices": get_index_live_figures(db, smartapi),
+        "trades": get_open_trades_with_ticks(db),
+        "activity": get_today_activity(db),
+    }
+
+
+@router.get("/", response_class=HTMLResponse)
+def live_dashboard(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    smartapi: Annotated[object, Depends(get_smartapi)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    data = _live_dashboard_data(db, smartapi)
+    return templates.TemplateResponse(
+        "live_dashboard.html",
+        {"request": request, **data},
+    )
+
+
+@router.get("/api/live-dashboard")
+def live_dashboard_api(
+    db: Annotated[Session, Depends(get_db)],
+    smartapi: Annotated[object, Depends(get_smartapi)],
+    _: Annotated[None, Depends(require_admin_api)] = None,
+) -> dict[str, object]:
+    return _live_dashboard_data(db, smartapi)
+
+
 @router.post("/health-check")
 def run_health_check(
     health_manager: Annotated[object, Depends(get_health_manager)],
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> RedirectResponse:
     health_manager.run(notify=False)
-    return RedirectResponse("/", status_code=303)
+    return RedirectResponse("/ops", status_code=303)
 
 
 @router.get("/active-trade-page", response_class=HTMLResponse)
