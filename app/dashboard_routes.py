@@ -162,6 +162,7 @@ def create_strategy(
     name: Annotated[str, Form()],
     mode: Annotated[str, Form()],
     index_symbol: Annotated[str, Form()],
+    expiry_itm_strikes: Annotated[int, Form()],
     tp_percent: Annotated[float, Form()],
     sl_percent: Annotated[float, Form()],
     sl_mode: Annotated[str, Form()],
@@ -185,11 +186,14 @@ def create_strategy(
         raise HTTPException(status_code=400, detail="Invalid index symbol")
     if lots_per_trade < 1:
         raise HTTPException(status_code=400, detail="Lots per trade must be at least 1")
+    if expiry_itm_strikes < 0:
+        raise HTTPException(status_code=400, detail="Expiry ITM strikes cannot be negative")
     strategy = StrategyConfig(
         name=name.strip(),
         enabled=enabled == "on",
         mode=mode,
         index_symbol=index_symbol,
+        expiry_itm_strikes=expiry_itm_strikes,
         tp_percent=tp_percent,
         sl_percent=sl_percent,
         sl_mode=sl_mode,
@@ -217,6 +221,7 @@ def update_strategy(
     name: Annotated[str, Form()],
     mode: Annotated[str, Form()],
     index_symbol: Annotated[str, Form()],
+    expiry_itm_strikes: Annotated[int, Form()],
     tp_percent: Annotated[float, Form()],
     sl_percent: Annotated[float, Form()],
     sl_mode: Annotated[str, Form()],
@@ -241,10 +246,13 @@ def update_strategy(
         raise HTTPException(status_code=400, detail="Invalid index symbol")
     if lots_per_trade < 1:
         raise HTTPException(status_code=400, detail="Lots per trade must be at least 1")
+    if expiry_itm_strikes < 0:
+        raise HTTPException(status_code=400, detail="Expiry ITM strikes cannot be negative")
     strategy.name = name.strip()
     strategy.enabled = enabled == "on"
     strategy.mode = mode
     strategy.index_symbol = index_symbol
+    strategy.expiry_itm_strikes = expiry_itm_strikes
     strategy.tp_percent = tp_percent
     strategy.sl_percent = sl_percent
     strategy.sl_mode = sl_mode

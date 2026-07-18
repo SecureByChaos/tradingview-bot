@@ -190,6 +190,7 @@ class StrategyConfig(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     mode: Mapped[str] = mapped_column(String(16), default=TradingMode.PAPER, nullable=False)
     index_symbol: Mapped[str] = mapped_column(String(32), default=IndexSymbol.BANKNIFTY, nullable=False)
+    expiry_itm_strikes: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     tp_percent: Mapped[float] = mapped_column(Float, default=20.0, nullable=False)
     sl_percent: Mapped[float] = mapped_column(Float, default=10.0, nullable=False)
     sl_mode: Mapped[str] = mapped_column(String(16), default=SLMode.FIXED, nullable=False)

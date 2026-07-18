@@ -335,6 +335,7 @@ def strategies(
             "enabled": strategy.enabled,
             "mode": strategy.mode,
             "index_symbol": strategy.index_symbol,
+            "expiry_itm_strikes": strategy.expiry_itm_strikes,
             "tp_percent": strategy.tp_percent,
             "sl_percent": strategy.sl_percent,
             "sl_mode": strategy.sl_mode,

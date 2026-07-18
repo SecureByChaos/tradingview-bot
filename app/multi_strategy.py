@@ -84,7 +84,7 @@ class MultiStrategyTradeManager:
             log_event(db, "STATE", f"[STATE] FAILED_ENTRY {signal.value}", "WARNING", {"strategy": strategy.name, "reason": message})
             return WebhookResponse(accepted=False, message=message)
         try:
-            contract = self.option_finder.find_atm_contract(signal, index)
+            contract = self.option_finder.find_atm_contract(signal, index, strategy.expiry_itm_strikes)
             entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
         except Exception as exc:
             log_event(

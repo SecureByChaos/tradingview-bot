@@ -78,7 +78,7 @@ class OptionFinder:
         self.settings = settings
         self.smartapi = smartapi
 
-    def find_atm_contract(self, signal: Signal, index: Any = None) -> OptionContract:
+    def find_atm_contract(self, signal: Signal, index: Any = None, expiry_itm_strikes: int = 0) -> OptionContract:
         index = index or self._default_index()
         spot_price = self.smartapi.get_index_spot(index)
         strike_interval = index.strike_interval or 100
@@ -89,18 +89,27 @@ class OptionFinder:
         if matches.empty:
             raise ValueError(f"No {index.symbol} {option_type} contracts found in instrument master")
 
-        matches = matches.assign(strike_diff=(matches["strike_normalized"] - atm_strike).abs())
         nearest_expiry = matches["expiry_dt"].min()
-        expiry_contracts = matches[matches["expiry_dt"] == nearest_expiry]
+        is_expiry_day = nearest_expiry == datetime.now(IST).date()
+
+        target_strike = atm_strike
+        if is_expiry_day and expiry_itm_strikes > 0:
+            itm_shift = strike_interval * expiry_itm_strikes
+            # ITM for a call is a lower strike; ITM for a put is a higher strike. Never OTM.
+            target_strike = atm_strike - itm_shift if option_type == "CE" else atm_strike + itm_shift
+
+        expiry_contracts = matches[matches["expiry_dt"] == nearest_expiry].copy()
+        expiry_contracts = expiry_contracts.assign(strike_diff=(expiry_contracts["strike_normalized"] - target_strike).abs())
         selected = expiry_contracts.sort_values(["strike_diff", "strike_normalized"]).iloc[0]
         logger.info(
-            "Selected %s (%s) at spot %.2f: %s strike=%s expiry=%s",
+            "Selected %s (%s) at spot %.2f: %s strike=%s expiry=%s%s",
             signal,
             index.symbol,
             spot_price,
             selected["symbol"],
             int(selected["strike_normalized"]),
             selected["expiry"],
+            f" [expiry-day, {expiry_itm_strikes} strike(s) ITM targeted]" if is_expiry_day and expiry_itm_strikes > 0 else "",
         )
         return OptionContract(
             exchange=selected.get("exch_seg", index.exchange_segment),

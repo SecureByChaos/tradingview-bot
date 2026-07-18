@@ -98,6 +98,7 @@ def _ensure_columns() -> None:
         "max_consecutive_losses": "ALTER TABLE strategy_configs ADD COLUMN max_consecutive_losses INTEGER NOT NULL DEFAULT 2",
         "daily_max_loss_percent": "ALTER TABLE strategy_configs ADD COLUMN daily_max_loss_percent FLOAT NOT NULL DEFAULT -20.0",
         "index_symbol": "ALTER TABLE strategy_configs ADD COLUMN index_symbol VARCHAR(32) NOT NULL DEFAULT 'BANKNIFTY'",
+        "expiry_itm_strikes": "ALTER TABLE strategy_configs ADD COLUMN expiry_itm_strikes INTEGER NOT NULL DEFAULT 1",
     }
     with engine.begin() as connection:
         for column, statement in statements.items():
