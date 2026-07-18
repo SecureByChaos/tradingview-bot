@@ -186,8 +186,8 @@ def create_strategy(
         raise HTTPException(status_code=400, detail="Invalid index symbol")
     if lots_per_trade < 1:
         raise HTTPException(status_code=400, detail="Lots per trade must be at least 1")
-    if expiry_itm_strikes < 0:
-        raise HTTPException(status_code=400, detail="Expiry ITM strikes cannot be negative")
+    if expiry_itm_strikes not in (0, 1):
+        raise HTTPException(status_code=400, detail="Expiry ITM strikes must be 0 or 1")
     strategy = StrategyConfig(
         name=name.strip(),
         enabled=enabled == "on",
@@ -246,8 +246,8 @@ def update_strategy(
         raise HTTPException(status_code=400, detail="Invalid index symbol")
     if lots_per_trade < 1:
         raise HTTPException(status_code=400, detail="Lots per trade must be at least 1")
-    if expiry_itm_strikes < 0:
-        raise HTTPException(status_code=400, detail="Expiry ITM strikes cannot be negative")
+    if expiry_itm_strikes not in (0, 1):
+        raise HTTPException(status_code=400, detail="Expiry ITM strikes must be 0 or 1")
     strategy.name = name.strip()
     strategy.enabled = enabled == "on"
     strategy.mode = mode

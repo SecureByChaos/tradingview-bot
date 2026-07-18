@@ -55,7 +55,7 @@
         <div><label class="form-label">Index</label><select class="form-select" name="index_symbol">
           {% for index in indexes %}<option value="{{ index.symbol }}" {% if index.symbol == "BANKNIFTY" %}selected{% endif %}>{{ index.display_name or index.symbol }}{% if not index.enabled %} (disabled){% endif %}</option>{% endfor %}
         </select></div>
-        <div><label class="form-label" title="Strikes ITM to shift toward on expiry day only. 0 = always ATM.">Expiry ITM Strikes</label><input class="form-control" type="number" step="1" min="0" name="expiry_itm_strikes" value="1"></div>
+        <div><label class="form-label" title="Shift 1 strike ITM on expiry day only. 0 = always ATM.">Expiry ITM Strikes</label><select class="form-select" name="expiry_itm_strikes"><option value="0">0 (always ATM)</option><option value="1" selected>1 (ITM on expiry day)</option></select></div>
         <div><label class="form-label">TP %</label><input class="form-control" type="number" step="0.01" name="tp_percent" value="20"></div>
         <div><label class="form-label">SL %</label><input class="form-control" type="number" step="0.01" name="sl_percent" value="10"></div>
         <div><label class="form-label">SL Mode</label><select class="form-select" name="sl_mode"><option value="FIXED">FIXED (fixed SL + target)</option><option value="TRAILING">TRAILING (base SL, no fixed target)</option></select></div>
@@ -83,7 +83,7 @@
               <td data-label="Index"><select class="form-select form-select-sm" name="index_symbol">
                 {% for index in indexes %}<option value="{{ index.symbol }}" {% if index.symbol == strategy.index_symbol %}selected{% endif %}>{{ index.display_name or index.symbol }}{% if not index.enabled %} (disabled){% endif %}</option>{% endfor %}
               </select></td>
-              <td data-label="Expiry ITM"><input class="form-control form-control-sm" type="number" step="1" min="0" name="expiry_itm_strikes" value="{{ strategy.expiry_itm_strikes }}"></td>
+              <td data-label="Expiry ITM"><select class="form-select form-select-sm" name="expiry_itm_strikes"><option value="0" {% if strategy.expiry_itm_strikes == 0 %}selected{% endif %}>0</option><option value="1" {% if strategy.expiry_itm_strikes != 0 %}selected{% endif %}>1</option></select></td>
               <td data-label="TP %"><input class="form-control form-control-sm" type="number" step="0.01" name="tp_percent" value="{{ strategy.tp_percent }}"></td>
               <td data-label="SL %"><input class="form-control form-control-sm" type="number" step="0.01" name="sl_percent" value="{{ strategy.sl_percent }}"></td>
               <td data-label="SL Mode"><select class="form-select form-select-sm" name="sl_mode"><option value="FIXED" {% if strategy.sl_mode == "FIXED" %}selected{% endif %}>FIXED</option><option value="TRAILING" {% if strategy.sl_mode == "TRAILING" %}selected{% endif %}>TRAILING</option></select></td>

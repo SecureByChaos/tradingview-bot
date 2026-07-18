@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -152,7 +152,12 @@ class OptionFinder:
         if not path.exists():
             return False
         modified = datetime.fromtimestamp(path.stat().st_mtime, tz=IST)
-        return datetime.now(IST) - modified < timedelta(hours=12)
+        # Refresh once per calendar day (IST) rather than a rolling window, so the
+        # first request each trading day always pulls the latest instrument master.
+        # This matters specifically for expiry-day detection: if NSE shifts an
+        # expiry date for a holiday, we want that reflected before market open,
+        # not up to ~12h stale from a rolling window.
+        return modified.date() == datetime.now(IST).date()
 
     def _filter_index_options(self, instruments: pd.DataFrame, index: Any, option_type: str) -> pd.DataFrame:
         required = {"exch_seg", "instrumenttype", "name", "symbol", "expiry", "strike", "token"}
