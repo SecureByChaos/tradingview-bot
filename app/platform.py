@@ -260,10 +260,25 @@ def rebuild_daily_stats(db: Session, trade_date: date | None = None) -> DailySta
 def get_dashboard_summary(db: Session, active_trade: Any | None) -> dict[str, Any]:
     state = get_or_create_state(db)
     stats = rebuild_daily_stats(db)
-    open_count = int(db.scalar(select(func.count()).select_from(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN)) or 0)
+    # origin == "SIGNAL" only -- these feed the homepage's Open Trades count and
+    # Current State tile, which must reflect real trading only. An open
+    # AI_ALT_* evaluation trade must not inflate the count or make the state
+    # tile show a position that isn't actually there.
+    open_count = int(
+        db.scalar(
+            select(func.count()).select_from(StrategyTrade).where(
+                StrategyTrade.status == TradeStatus.OPEN,
+                StrategyTrade.origin == "SIGNAL",
+            )
+        )
+        or 0
+    )
     open_option_types = list(
         db.scalars(
-            select(StrategyTrade.option_type).where(StrategyTrade.status == TradeStatus.OPEN)
+            select(StrategyTrade.option_type).where(
+                StrategyTrade.status == TradeStatus.OPEN,
+                StrategyTrade.origin == "SIGNAL",
+            )
         )
     )
     current_state = "FLAT"
@@ -315,7 +330,9 @@ def trades_query_for_filter(filter_name: str, start: date | None, end: date | No
     return query.order_by(TradeRecord.exit_time.desc())
 
 
-def strategy_trades_query_for_filter(filter_name: str, start: date | None, end: date | None) -> Select[tuple[StrategyTrade]]:
+def strategy_trades_query_for_filter(
+    filter_name: str, start: date | None, end: date | None, origin: str | None = None
+) -> Select[tuple[StrategyTrade]]:
     today = today_ist()
     if filter_name == "7d":
         start = today - timedelta(days=6)
@@ -332,7 +349,46 @@ def strategy_trades_query_for_filter(filter_name: str, start: date | None, end: 
         query = query.where(func.date(StrategyTrade.entry_time) >= start.isoformat())
     if end is not None:
         query = query.where(func.date(StrategyTrade.entry_time) <= end.isoformat())
+    if origin == "signal":
+        query = query.where(StrategyTrade.origin == "SIGNAL")
+    elif origin == "ai_alt":
+        query = query.where(StrategyTrade.origin != "SIGNAL")
     return query.order_by(StrategyTrade.entry_time.desc())
+
+
+def origin_comparison_metrics(db: Session, filter_name: str, start: date | None, end: date | None) -> list[dict[str, Any]]:
+    """Side-by-side evaluation view: for each origin (SIGNAL, AI_ALT_OPENAI,
+    AI_ALT_CLAUDE, ...) seen in the selected date range, closed-trade win
+    rate and net P&L, so the AI alternative-call evaluation can actually be
+    judged against the real signal instead of guessed at."""
+    trades = list(db.scalars(strategy_trades_query_for_filter(filter_name, start, end)))
+    closed_by_origin: dict[str, list[StrategyTrade]] = {}
+    for trade in trades:
+        if trade.status != TradeStatus.CLOSED:
+            continue
+        closed_by_origin.setdefault(trade.origin, []).append(trade)
+
+    def sort_key(name: str) -> tuple[int, str]:
+        return (0, "") if name == "SIGNAL" else (1, name)
+
+    metrics: list[dict[str, Any]] = []
+    for origin_name in sorted(closed_by_origin, key=sort_key):
+        rows = closed_by_origin[origin_name]
+        wins = sum(1 for row in rows if row.result == TradeResult.WIN)
+        losses = sum(1 for row in rows if row.result == TradeResult.LOSS)
+        total = len(rows)
+        metrics.append(
+            {
+                "origin": origin_name,
+                "trade_count": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+                "net_pnl": round(sum(row.profit_loss for row in rows), 2),
+                "avg_pnl_percent": round(sum(row.pnl_percent for row in rows) / total, 2) if total else 0.0,
+            }
+        )
+    return metrics
 
 
 def daily_stats_query_for_filter(filter_name: str, start: date | None, end: date | None) -> Select[tuple[DailyStats]]:
@@ -438,6 +494,9 @@ def serialize_strategy_trade(trade: StrategyTrade) -> dict[str, Any]:
         "current_premium": trade.current_premium,
         "origin": trade.origin,
         "source_trade_id": trade.source_trade_id,
+        "ai_action": trade.ai_action,
+        "ai_confidence": trade.ai_confidence,
+        "ai_reasoning": trade.ai_reasoning,
     }
 
 

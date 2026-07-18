@@ -26,6 +26,7 @@ from app.platform import (
     latest_logs,
     list_index_configs,
     log_event,
+    origin_comparison_metrics,
     strategy_metrics,
     strategy_trades_query_for_filter,
 )
@@ -34,9 +35,19 @@ from app.smartapi_client import SmartAPIError
 from app.time_utils import IST, duration_label, format_ist, to_ist
 from app.trade_manager import TradeManager
 
+def origin_label(origin: str | None) -> str:
+    if not origin or origin == "SIGNAL":
+        return "Signal"
+    if origin.startswith("AI_ALT_"):
+        provider = origin[len("AI_ALT_"):].title()
+        return f"AI Alt · {provider}"
+    return origin
+
+
 templates = Jinja2Templates(directory="app/templates")
 templates.env.filters["ist"] = format_ist
 templates.env.filters["duration"] = duration_label
+templates.env.filters["origin_label"] = origin_label
 router = APIRouter()
 
 
@@ -132,12 +143,40 @@ def history(
     filter: str = "today",
     start: str | None = None,
     end: str | None = None,
+    origin: str = "all",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end))))
+    origin_filter = origin if origin in ("signal", "ai_alt") else None
+    trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter)))
     return templates.TemplateResponse(
         "history.html",
-        {"request": request, "trades": trades, "filter": filter, "start": start or "", "end": end or ""},
+        {"request": request, "trades": trades, "filter": filter, "start": start or "", "end": end or "", "origin": origin},
+    )
+
+
+@router.get("/ai-alternatives", response_class=HTMLResponse)
+def ai_alternatives_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    filter: str = "30d",
+    start: str | None = None,
+    end: str | None = None,
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    comparison = origin_comparison_metrics(db, filter, parse_date(start), parse_date(end))
+    alt_trades = list(
+        db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), "ai_alt"))
+    )
+    return templates.TemplateResponse(
+        "ai_alternatives.html",
+        {
+            "request": request,
+            "comparison": comparison,
+            "alt_trades": alt_trades,
+            "filter": filter,
+            "start": start or "",
+            "end": end or "",
+        },
     )
 
 

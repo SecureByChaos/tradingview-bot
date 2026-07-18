@@ -114,6 +114,9 @@ def _ensure_columns() -> None:
             "index_symbol": "ALTER TABLE strategy_trades ADD COLUMN index_symbol VARCHAR(32) NOT NULL DEFAULT 'BANKNIFTY'",
             "origin": "ALTER TABLE strategy_trades ADD COLUMN origin VARCHAR(32) NOT NULL DEFAULT 'SIGNAL'",
             "source_trade_id": "ALTER TABLE strategy_trades ADD COLUMN source_trade_id VARCHAR(64)",
+            "ai_action": "ALTER TABLE strategy_trades ADD COLUMN ai_action VARCHAR(16)",
+            "ai_confidence": "ALTER TABLE strategy_trades ADD COLUMN ai_confidence FLOAT",
+            "ai_reasoning": "ALTER TABLE strategy_trades ADD COLUMN ai_reasoning TEXT",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():

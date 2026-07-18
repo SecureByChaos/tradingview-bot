@@ -116,6 +116,9 @@ def maybe_open_alternative_trade(
         trailing_active=False,
         origin=origin,
         source_trade_id=original_trade.trade_id,
+        ai_action=alternative.action,
+        ai_confidence=alternative.confidence,
+        ai_reasoning=alternative.reasoning,
     )
     db.add(trade)
     db.commit()

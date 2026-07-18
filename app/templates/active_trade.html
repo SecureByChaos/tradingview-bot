@@ -6,7 +6,9 @@
 {% if trades %}
 {% for trade in trades %}
 <div class="metric mb-3">
-  <h5>{{ trade.strategy_name }} · {{ trade.signal }}</h5>
+  <h5>{{ trade.strategy_name }} · {{ trade.signal }}
+    <span class="badge {% if trade.origin == 'SIGNAL' %}text-bg-secondary{% else %}text-bg-info{% endif %}">{{ trade.origin|origin_label }}</span>
+  </h5>
   <div class="detail-grid">
     <div><div class="label">Strike</div><div class="value">{{ trade.strike }}</div></div>
     <div><div class="label">Entry Price</div><div class="value">{{ trade.entry_price }}</div></div>
@@ -18,6 +20,9 @@
     <div><div class="label">Mode</div><div class="value">{{ trade.mode }}</div></div>
     <div><div class="label">Entry Time</div><div class="value fs-6">{{ trade.entry_time|ist }}</div></div>
   </div>
+  {% if trade.origin != 'SIGNAL' and trade.ai_reasoning %}
+  <p class="mb-0 mt-3"><strong>AI reasoning ({{ trade.ai_action }}, confidence {{ "%.0f"|format((trade.ai_confidence or 0) * 100) }}%):</strong> {{ trade.ai_reasoning }}</p>
+  {% endif %}
   <p class="mb-0 mt-3">
   {% if trade.trailing_active %}
   Trailing stop active: exit when premium crosses {{ trade.trailing_stop }}, or current time >= 15:15 IST.

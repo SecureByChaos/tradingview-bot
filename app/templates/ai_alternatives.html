@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% from "components.html" import page_header, empty_state %}
+{% block content %}
+{{ page_header("AI Alternatives") }}
+<p class="text-secondary">Evaluation-only comparison: when an AI reviewer rejects a signal, its proposed alternative is paper-executed alongside the original signal trade. This page compares outcomes side by side so a direction (which model, which alternative type, if any) can be chosen from data rather than guessed.</p>
+<form class="filter-form filter-grid mb-3" method="get">
+  <div>
+    <select class="form-select" name="filter">
+      <option value="today" {% if filter == "today" %}selected{% endif %}>Today</option>
+      <option value="7d" {% if filter == "7d" %}selected{% endif %}>Last 7 Days</option>
+      <option value="30d" {% if filter == "30d" %}selected{% endif %}>Last 30 Days</option>
+      <option value="custom" {% if filter == "custom" %}selected{% endif %}>Custom</option>
+    </select>
+  </div>
+  <div><input class="form-control" type="date" name="start" value="{{ start }}"></div>
+  <div><input class="form-control" type="date" name="end" value="{{ end }}"></div>
+  <div><button class="btn btn-primary" type="submit">Filter</button></div>
+</form>
+
+<div class="section-header"><h4>Outcome Comparison (closed trades)</h4></div>
+{% if comparison %}
+<div class="table-responsive responsive-table mb-4">
+  <table class="table table-dark table-hover align-middle">
+    <thead><tr><th>Origin</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win Rate</th><th>Net P&L</th><th>Avg P&L %</th></tr></thead>
+    <tbody>
+    {% for row in comparison %}
+      <tr>
+        <td data-label="Origin"><span class="badge {% if row.origin == 'SIGNAL' %}text-bg-secondary{% else %}text-bg-info{% endif %}">{{ row.origin|origin_label }}</span></td>
+        <td data-label="Trades">{{ row.trade_count }}</td>
+        <td data-label="Wins" class="profit">{{ row.wins }}</td>
+        <td data-label="Losses" class="loss">{{ row.losses }}</td>
+        <td data-label="Win Rate">{{ "%.2f"|format(row.win_rate) }}%</td>
+        <td data-label="Net P&amp;L" class="{% if row.net_pnl >= 0 %}profit{% else %}loss{% endif %}">{{ row.net_pnl }}</td>
+        <td data-label="Avg P&amp;L %" class="{% if row.avg_pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(row.avg_pnl_percent) }}%</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("No closed trades in this range yet.") }}
+{% endif %}
+
+<div class="section-header"><h4>AI Alternative Trades (this range)</h4></div>
+{% if alt_trades %}
+<div class="table-responsive responsive-table">
+  <table class="table table-dark table-hover align-middle">
+    <thead><tr><th>Strategy</th><th>Model</th><th>Action</th><th>Confidence</th><th>Signal</th><th>Status</th><th>P&L %</th><th>Reasoning</th></tr></thead>
+    <tbody>
+    {% for trade in alt_trades %}
+      <tr>
+        <td data-label="Strategy">{{ trade.strategy_name }}</td>
+        <td data-label="Model"><span class="badge text-bg-info">{{ trade.origin|origin_label }}</span></td>
+        <td data-label="Action">{{ trade.ai_action or "" }}</td>
+        <td data-label="Confidence">{{ "%.0f"|format((trade.ai_confidence or 0) * 100) }}%</td>
+        <td data-label="Signal">{{ trade.signal }}</td>
+        <td data-label="Status">{{ trade.status }}</td>
+        <td data-label="P&amp;L %" class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
+        <td data-label="Reasoning">{{ trade.ai_reasoning or "" }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("No AI alternative trades in this range yet.") }}
+{% endif %}
+{% endblock %}

@@ -277,6 +277,12 @@ class StrategyTrade(Base):
     # the original trade it was proposed alongside.
     origin: Mapped[str] = mapped_column(String(32), default="SIGNAL", nullable=False)
     source_trade_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    # Structured record of the AI's rationale for an AI_ALT_* trade (null for
+    # normal SIGNAL trades) so it can be displayed directly instead of only
+    # existing inside a LogEvent JSON payload.
+    ai_action: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    ai_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ai_reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
