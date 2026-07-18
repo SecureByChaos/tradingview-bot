@@ -138,11 +138,18 @@ def _seed_default_strategy() -> None:
     from app.db_models import StrategyConfig, StrategyStats, TradingMode
 
     with SessionLocal() as db:
-        strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == settings.default_strategy_name))
-        if strategy is not None:
-            stats = db.scalar(select(StrategyStats).where(StrategyStats.strategy_name == strategy.name))
-            if stats is None:
-                db.add(StrategyStats(strategy_name=strategy.name))
+        strategies = db.scalars(select(StrategyConfig)).all()
+        if strategies:
+            # At least one strategy already exists (possibly renamed by the user via
+            # the settings UI), so never attempt to create another "default" one.
+            # Just make sure every existing strategy has a matching stats row.
+            existing_stat_names = {row.strategy_name for row in db.scalars(select(StrategyStats)).all()}
+            added = False
+            for strategy in strategies:
+                if strategy.name not in existing_stat_names:
+                    db.add(StrategyStats(strategy_name=strategy.name))
+                    added = True
+            if added:
                 db.commit()
             return
         strategy = StrategyConfig(
