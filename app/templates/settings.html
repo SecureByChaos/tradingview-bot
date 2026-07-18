@@ -72,7 +72,7 @@
     </div>
     {% if strategies %}<div class="table-responsive responsive-table">
       <table class="table table-dark table-sm align-middle table-strategies">
-        <thead><tr><th>Name</th><th>Mode</th><th>Index</th><th title="Strikes ITM to shift toward on expiry day only. 0 = always ATM.">Expiry ITM</th><th>TP %</th><th>SL %</th><th>SL Mode</th><th>Trailing Act% / Off%</th><th>Max Open</th><th>Max/Day</th><th>Max Losses</th><th>Daily Loss %</th><th>Lots</th><th>Flags</th><th>Metrics</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Name</th><th>Mode</th><th>Index</th><th title="Strikes ITM to shift toward on expiry day only. 0 = always ATM.">Expiry ITM</th><th>TP %</th><th>SL %</th><th>SL Mode</th><th>Trailing Act% / Off%</th><th>Max Open</th><th>Max/Day</th><th>Max Losses</th><th>Daily Loss %</th><th>Lots</th><th>Flags</th><th>Metrics</th><th>Actions</th><th>Delete</th></tr></thead>
         <tbody>
         {% for strategy in strategies %}
           {% set metric = metrics_by_id.get(strategy.id) %}
@@ -99,11 +99,11 @@
                 <label><input type="checkbox" name="live_trade" {% if strategy.live_trade %}checked{% endif %}> Live</label>
               </td>
               <td data-label="Metrics">Open {{ metric.open_trades if metric else 0 }} · Win {{ "%.2f"|format(metric.win_rate if metric else 0) }}% · P&L {{ "%.2f"|format(metric.net_pnl if metric else 0) }}</td>
-              <td data-label="Actions"><button class="btn btn-sm btn-success" type="submit">Save</button></td>
+              <td data-label="Actions"><button class="btn btn-sm btn-success text-nowrap" type="submit">Save</button></td>
             </form>
             <td data-label="Delete">
               <form method="post" action="/strategies/{{ strategy.id }}/delete" onsubmit="return confirm('Delete this strategy?')">
-                <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+                <button class="btn btn-sm btn-outline-danger text-nowrap" type="submit">Delete</button>
               </form>
             </td>
           </tr>

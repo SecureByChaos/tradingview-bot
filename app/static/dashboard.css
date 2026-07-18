@@ -56,7 +56,7 @@ h1, h2, h3, h4, h5 { letter-spacing: 0; }
 .warn { color: var(--warning) !important; }
 .table-responsive { border: 1px solid var(--border); border-radius: 8px; }
 .table { margin: 0; font-size: .9rem; --bs-table-bg: var(--surface); --bs-table-border-color: var(--border); }
-.table-strategies { min-width: 1850px; }
+.table-strategies { min-width: 1950px; }
 .table-instruments { min-width: 1300px; }
 @media (max-width: 767.98px) {
   .table-strategies, .table-instruments { min-width: 0; }
