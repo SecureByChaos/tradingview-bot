@@ -82,12 +82,30 @@ class PromptBuilder:
             if event_type.startswith("CLOSE_")
             else "This is an ENTRY review. Evaluate whether this entry should be taken."
         )
+        is_entry_review = not event_type.startswith("CLOSE_")
+        alternative_instruction = (
+            "\nIf decision is REJECT and this is an ENTRY review, also populate an "
+            "\"alternative\" object using the same indicators above: "
+            "{\"action\": \"ADJUST\"|\"FLIP\"|\"NONE\", \"option_type\": \"CE\"|\"PE\", "
+            "\"sl_percent\": number, \"target_percent\": number, \"confidence\": 0-1, "
+            "\"reasoning\": string}. Use \"ADJUST\" to keep the same side (CE/PE) as the "
+            "original signal but propose different stop-loss/target percentages for a "
+            "better risk-reward. Use \"FLIP\" to propose the opposite side entirely if the "
+            "data suggests the original signal is wrong-footed. Use \"NONE\" only if there "
+            "is genuinely no better alternative to propose. Base this purely on the "
+            "indicators and market data already provided -- do not invent data. If decision "
+            "is not REJECT, or this is an EXIT review, set alternative to "
+            "{\"action\": \"NONE\"}."
+            if is_entry_review
+            else "\nSet alternative to {\"action\": \"NONE\"} for EXIT reviews."
+        )
         user_prompt += (
             "\n\nReview Type: " + ("EXIT" if event_type.startswith("CLOSE_") else "ENTRY") +
             "\n" + review_instruction +
+            alternative_instruction +
             "\nReturn ONLY valid JSON with these keys: decision, confidence, market_type, "
             "risk, entry_quality, reason_to_buy, reason_not_to_buy, summary, expected_probability, "
-            "received_fields, missing_fields, context_quality. "
+            "received_fields, missing_fields, context_quality, alternative. "
             "Do not include markdown, code fences, or additional text."
         )
         return {

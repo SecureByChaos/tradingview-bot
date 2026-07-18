@@ -152,12 +152,16 @@ def get_or_create_strategy_daily_stats(db: Session, strategy_name: str, trade_da
 
 def rebuild_strategy_daily_stats(db: Session, strategy_name: str, trade_date: date | None = None) -> StrategyDailyStats:
     day = trade_date or today_ist()
+    # origin == "SIGNAL" only: this feeds strategy_trading_allowed()'s daily
+    # trade-count and max-loss gates, which must reflect real signal trades
+    # only -- AI_ALT_* evaluation trades must never trip these limits.
     records = list(
         db.scalars(
             select(StrategyTrade).where(
                 StrategyTrade.strategy_name == strategy_name,
                 func.date(StrategyTrade.exit_time) == day.isoformat(),
                 StrategyTrade.status == TradeStatus.CLOSED,
+                StrategyTrade.origin == "SIGNAL",
             )
         )
     )
@@ -225,11 +229,14 @@ def sync_trade_row(db: Session, row: dict[str, str], trading_mode: str) -> Trade
 
 def rebuild_daily_stats(db: Session, trade_date: date | None = None) -> DailyStats:
     day = trade_date or today_ist()
+    # origin == "SIGNAL" only, so platform-wide daily stats reflect real trading
+    # only and aren't skewed by AI_ALT_* evaluation trades.
     records = list(
         db.scalars(
             select(StrategyTrade).where(
                 func.date(StrategyTrade.exit_time) == day.isoformat(),
                 StrategyTrade.status == TradeStatus.CLOSED,
+                StrategyTrade.origin == "SIGNAL",
             ).order_by(StrategyTrade.exit_time)
         )
     )
@@ -376,7 +383,16 @@ def strategy_metrics(db: Session) -> list[dict[str, Any]]:
     strategies = list(db.scalars(select(StrategyConfig).order_by(StrategyConfig.name)))
     metrics: list[dict[str, Any]] = []
     for strategy in strategies:
-        trades = list(db.scalars(select(StrategyTrade).where(StrategyTrade.strategy_name == strategy.name)))
+        # origin == "SIGNAL" only: dashboard performance metrics should reflect
+        # real trading only, not AI_ALT_* evaluation trades.
+        trades = list(
+            db.scalars(
+                select(StrategyTrade).where(
+                    StrategyTrade.strategy_name == strategy.name,
+                    StrategyTrade.origin == "SIGNAL",
+                )
+            )
+        )
         closed = [trade for trade in trades if trade.status == TradeStatus.CLOSED]
         wins = sum(1 for trade in closed if trade.result == TradeResult.WIN)
         losses = sum(1 for trade in closed if trade.result == TradeResult.LOSS)
@@ -420,6 +436,8 @@ def serialize_strategy_trade(trade: StrategyTrade) -> dict[str, Any]:
         "mode": trade.mode,
         "exit_reason": trade.exit_reason,
         "current_premium": trade.current_premium,
+        "origin": trade.origin,
+        "source_trade_id": trade.source_trade_id,
     }
 
 

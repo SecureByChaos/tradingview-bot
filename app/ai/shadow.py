@@ -8,6 +8,7 @@ from typing import Optional
 
 from sqlalchemy import func, select
 
+from app.ai.alternative_trader import maybe_open_alternative_trade
 from app.ai.context_repository import create_context_log, finalize_context_log
 from app.ai.context_builder import SignalContextBuilder
 from app.ai.factory import create_reviewer
@@ -106,6 +107,8 @@ def run_shadow_review(
     tradingview_trend: Optional[dict[str, object]] = None,
     tradingview_strategy_filters: Optional[dict[str, object]] = None,
     tradingview_trade_state: Optional[dict[str, object]] = None,
+    smartapi_client: Optional[object] = None,
+    option_finder: Optional[object] = None,
 ) -> None:
     try:
         with SessionLocal() as db:
@@ -351,6 +354,19 @@ def run_shadow_review(
             except Exception as exc:
                 logger.exception("[AI] Review save failed: %s", exc)
 
+            if result.decision == "REJECT" and event_type.startswith("OPEN_"):
+                try:
+                    maybe_open_alternative_trade(
+                        db,
+                        trade,
+                        result.provider or settings.provider,
+                        result.alternative,
+                        smartapi_client,
+                        option_finder,
+                    )
+                except Exception as exc:
+                    logger.exception("[AI][ALT] Primary alternative-trade generation failed: %s", exc)
+
             if (
                 settings.secondary_enabled
                 and settings.secondary_provider
@@ -425,6 +441,18 @@ def run_shadow_review(
                         FRAMEWORK_VERSION,
                     )
                     logger.info("[AI] Secondary review saved successfully id=%s", secondary_review.id)
+                    if secondary_result.decision == "REJECT" and event_type.startswith("OPEN_"):
+                        try:
+                            maybe_open_alternative_trade(
+                                db,
+                                trade,
+                                secondary_result.provider or secondary_settings.provider,
+                                secondary_result.alternative,
+                                smartapi_client,
+                                option_finder,
+                            )
+                        except Exception as exc:
+                            logger.exception("[AI][ALT] Secondary alternative-trade generation failed: %s", exc)
                 except Exception as exc:
                     logger.exception("[AI] Secondary review save failed: %s", exc)
     except Exception:

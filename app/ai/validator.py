@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, List
 
-from app.ai.models import ReviewResult
+from app.ai.models import AlternativeCall, ReviewResult
 
 
 class AIResponseValidator:
@@ -24,6 +24,19 @@ class AIResponseValidator:
         "PASS": "REJECT",
         "DON'T BUY": "REJECT",
         "DO_NOT_BUY": "REJECT",
+    }
+    _ALT_ACTIONS = {"NONE", "ADJUST", "FLIP"}
+    _ALT_ACTION_ALIASES = {
+        "ADJUST_TERMS": "ADJUST",
+        "SAME_SIDE": "ADJUST",
+        "KEEP_SIDE": "ADJUST",
+        "MODIFY": "ADJUST",
+        "REVERSE": "FLIP",
+        "FLIP_SIDE": "FLIP",
+        "OPPOSITE": "FLIP",
+        "SWITCH": "FLIP",
+        "NO_ALTERNATIVE": "NONE",
+        "NO_CHANGE": "NONE",
     }
 
     def validate(self, raw_json: Any) -> ReviewResult:
@@ -51,10 +64,43 @@ class AIResponseValidator:
                 received_fields=self._list(data.get("received_fields")),
                 missing_fields=self._list(data.get("missing_fields")),
                 context_quality=str(data.get("context_quality") or ""),
+                alternative=self._alternative(data.get("alternative")),
                 provider="",
             )
         except Exception:
             return ReviewResult(decision="ERROR", confidence=0, summary="Invalid AI response.", provider="")
+
+    @classmethod
+    def _alternative(cls, value: Any) -> AlternativeCall | None:
+        if not isinstance(value, dict):
+            return None
+        action = str(value.get("action") or "NONE").strip().upper().replace(" ", "_")
+        action = cls._ALT_ACTION_ALIASES.get(action, action)
+        if action not in cls._ALT_ACTIONS:
+            action = "NONE"
+        option_type = value.get("option_type")
+        option_type = str(option_type).strip().upper() if option_type else None
+        if option_type not in ("CE", "PE"):
+            option_type = None
+        return AlternativeCall(
+            action=action,
+            option_type=option_type,
+            sl_percent=cls._optional_percent(value.get("sl_percent")),
+            target_percent=cls._optional_percent(value.get("target_percent")),
+            confidence=cls._confidence(value.get("confidence", 0)),
+            reasoning=str(value.get("reasoning") or ""),
+        )
+
+    @staticmethod
+    def _optional_percent(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            if isinstance(value, str):
+                return float(value.strip().replace("%", ""))
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _confidence(value: Any) -> float:

@@ -288,15 +288,24 @@ class MultiStrategyTradeManager:
         trade.result = self.result_for_pnl(trade.pnl_percent)
         trade.status = TradeStatus.CLOSED
         trade.exit_reason = reason.value
-        stats = update_strategy_stats_after_close(db, trade.strategy_name, trade.result)
+        # AI_ALT_* trades are evaluation-only side-by-side comparisons against the
+        # real signal trade -- they must never affect the real strategy's risk
+        # state (consecutive losses / risk lock), send Telegram notifications, or
+        # trigger further AI review. Their own P&L stays on the trade row itself
+        # for later comparison.
+        is_ai_alternative = trade.origin != "SIGNAL"
+        if not is_ai_alternative:
+            stats = update_strategy_stats_after_close(db, trade.strategy_name, trade.result)
         db.commit()
         db.refresh(trade)
         log_event(
             db,
             "TRADE",
             f"[{trade.strategy_name}] trade closed: {reason.value}",
-            payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time)},
+            payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time), "origin": trade.origin},
         )
+        if is_ai_alternative:
+            return trade
         if stats.risk_locked:
             log_event(db, "RISK", f"Strategy {trade.strategy_name} locked due to consecutive losses", "WARNING")
             self.telegram.send(db, f"Strategy Risk Lock\n[{trade.strategy_name}] consecutive losses: {stats.consecutive_losses}")
@@ -326,11 +335,14 @@ class MultiStrategyTradeManager:
         return trade
 
     def current_state(self, db: Session, strategy_name: str) -> str:
+        # origin == "SIGNAL" only: AI_ALT_* paper trades are evaluation-only side
+        # trades and must never influence the real signal's state machine.
         trades = list(
             db.scalars(
                 select(StrategyTrade).where(
                     StrategyTrade.strategy_name == strategy_name,
                     StrategyTrade.status == TradeStatus.OPEN,
+                    StrategyTrade.origin == "SIGNAL",
                 )
             )
         )
@@ -343,12 +355,16 @@ class MultiStrategyTradeManager:
         return "FLAT"
 
     def latest_open_trade_for_option(self, db: Session, strategy_name: str, option_type: str) -> StrategyTrade | None:
+        # origin == "SIGNAL" only -- a TradingView exit signal must always act on
+        # the real trade, never an AI_ALT_* evaluation side trade that happens to
+        # share the same option type.
         return db.scalar(
             select(StrategyTrade)
             .where(
                 StrategyTrade.strategy_name == strategy_name,
                 StrategyTrade.status == TradeStatus.OPEN,
                 StrategyTrade.option_type == option_type,
+                StrategyTrade.origin == "SIGNAL",
             )
             .order_by(StrategyTrade.entry_time.desc())
             .limit(1)
@@ -388,11 +404,14 @@ class MultiStrategyTradeManager:
         return db.scalar(select(StrategyConfig).where(func.lower(StrategyConfig.name) == name.lower()))
 
     def active_trade_count(self, db: Session, strategy_name: str) -> int:
+        # origin == "SIGNAL" only -- AI_ALT_* evaluation trades must not count
+        # against the strategy's real max_active_trades limit.
         return int(
             db.scalar(
                 select(func.count()).select_from(StrategyTrade).where(
                     StrategyTrade.strategy_name == strategy_name,
                     StrategyTrade.status == TradeStatus.OPEN,
+                    StrategyTrade.origin == "SIGNAL",
                 )
             )
             or 0

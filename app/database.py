@@ -112,6 +112,8 @@ def _ensure_columns() -> None:
             "trailing_active": "ALTER TABLE strategy_trades ADD COLUMN trailing_active BOOLEAN NOT NULL DEFAULT 0",
             "trailing_stop": "ALTER TABLE strategy_trades ADD COLUMN trailing_stop FLOAT",
             "index_symbol": "ALTER TABLE strategy_trades ADD COLUMN index_symbol VARCHAR(32) NOT NULL DEFAULT 'BANKNIFTY'",
+            "origin": "ALTER TABLE strategy_trades ADD COLUMN origin VARCHAR(32) NOT NULL DEFAULT 'SIGNAL'",
+            "source_trade_id": "ALTER TABLE strategy_trades ADD COLUMN source_trade_id VARCHAR(64)",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():

@@ -147,10 +147,13 @@ def queue_shadow_review(
     if not signal.startswith("BUY"):
         logger.info("[AI] Shadow skipped: webhook signal is not BUY")
         return response
+    # origin == "SIGNAL" only: the review subject must always be the real
+    # trade, never an AI_ALT_* evaluation side trade that happens to match.
     query = select(StrategyTrade).where(func.lower(StrategyTrade.strategy_name) == strategy_name.lower())
     query = query.where(
         StrategyTrade.signal == signal,
         StrategyTrade.status == TradeStatus.OPEN,
+        StrategyTrade.origin == "SIGNAL",
     ).order_by(StrategyTrade.created_at.desc())
     trade = db.scalar(query.limit(1))
     if trade is None:
@@ -172,6 +175,8 @@ def queue_shadow_review(
         trend,
         strategy_filters,
         trade_state,
+        smartapi_client=smartapi,
+        option_finder=option_finder,
     )
     return response
 
@@ -224,6 +229,8 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
             log_event(db, "WEBHOOK", f"Webhook ignored: {message}", "WARNING")
             return WebhookResponse(accepted=False, message=message)
 
+        # origin == "SIGNAL" only -- a losing AI_ALT_* evaluation trade must
+        # never trigger the real strategy's cooldown-after-loss.
         recent_loss = db.scalar(
             select(StrategyTrade.id)
             .where(
@@ -231,6 +238,7 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
                 StrategyTrade.result == TradeResult.LOSS,
                 StrategyTrade.exit_time.is_not(None),
                 StrategyTrade.exit_time >= utc_now() - timedelta(minutes=30),
+                StrategyTrade.origin == "SIGNAL",
             )
             .limit(1)
         )

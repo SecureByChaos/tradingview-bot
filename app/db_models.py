@@ -269,6 +269,14 @@ class StrategyTrade(Base):
     lowest_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     trailing_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     trailing_stop: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # origin distinguishes the original TradingView signal ("SIGNAL") from a paper
+    # trade opened because an AI reviewer proposed an alternative call after
+    # rejecting the original signal ("AI_ALT_OPENAI", "AI_ALT_CLAUDE", etc). Lets
+    # the evaluation phase compare outcomes side by side without touching the
+    # normal signal-trading path. source_trade_id links an AI_ALT_* trade back to
+    # the original trade it was proposed alongside.
+    origin: Mapped[str] = mapped_column(String(32), default="SIGNAL", nullable=False)
+    source_trade_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

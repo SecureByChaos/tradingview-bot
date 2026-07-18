@@ -57,6 +57,8 @@ def _month_bounds(reference: date) -> tuple[date, date]:
 # ---------------------------------------------------------------------------
 
 def _closed_trades_between(db: Session, start: date, end: date) -> list[StrategyTrade]:
+    # origin == "SIGNAL" only: periodic AI performance reports should summarize
+    # real trading only, not AI_ALT_* evaluation trades.
     return list(
         db.scalars(
             select(StrategyTrade)
@@ -64,6 +66,7 @@ def _closed_trades_between(db: Session, start: date, end: date) -> list[Strategy
                 StrategyTrade.status == TradeStatus.CLOSED,
                 func.date(StrategyTrade.exit_time) >= start.isoformat(),
                 func.date(StrategyTrade.exit_time) <= end.isoformat(),
+                StrategyTrade.origin == "SIGNAL",
             )
             .order_by(StrategyTrade.exit_time)
         )

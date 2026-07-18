@@ -157,12 +157,15 @@ class V7Manager:
         return WebhookResponse(accepted=True, message=f"V7 {signal.value} opened")
 
     def close_trade(self, db: Session, option_type: str, reason: ExitReason = ExitReason.TIME_EXIT) -> WebhookResponse:
+        # origin == "SIGNAL" only -- a TradingView exit must always act on the
+        # real trade, never an AI_ALT_* evaluation side trade.
         trade = db.scalar(
             select(StrategyTrade)
             .where(
                 StrategyTrade.strategy_name == self.strategy_name,
                 StrategyTrade.option_type == option_type,
                 StrategyTrade.status == TradeStatus.OPEN,
+                StrategyTrade.origin == "SIGNAL",
             )
             .order_by(StrategyTrade.entry_time.desc())
             .limit(1)
@@ -259,12 +262,14 @@ class V7Manager:
 
     def record_exit_suggestion(self, db: Session, signal: Signal, observation_reason: str = "") -> WebhookResponse:
         option_type = "CE" if signal == Signal.SELL_CE else "PE"
+        # origin == "SIGNAL" only -- this reports on the real position's state.
         trade = db.scalar(
             select(StrategyTrade)
             .where(
                 StrategyTrade.strategy_name == self.strategy_name,
                 StrategyTrade.option_type == option_type,
                 StrategyTrade.status == TradeStatus.OPEN,
+                StrategyTrade.origin == "SIGNAL",
             )
             .order_by(StrategyTrade.entry_time.desc())
             .limit(1)
@@ -345,8 +350,12 @@ class V7Manager:
             db,
             "TRADE",
             f"[V7] {trade.option_type} trade closed: {reason.value}",
-            payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time)},
+            payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time), "origin": trade.origin},
         )
+        # AI_ALT_* trades are evaluation-only side-by-side comparisons -- no
+        # Telegram noise and no further AI review of their own exits.
+        if trade.origin != "SIGNAL":
+            return
         self.telegram.send(db, f"Trade Closed\n[V7] {trade.option_type} {reason.value}\nP&L: {trade.pnl_percent:.2f}%")
         shadow_market_data = {
             "strike": trade.strike,
@@ -373,11 +382,14 @@ class V7Manager:
         logger.debug("[V7] Actual Exit Reason=%s trade_id=%s", reason.value, trade.trade_id)
 
     def current_state(self, db: Session) -> str:
+        # origin == "SIGNAL" only: AI_ALT_* paper trades are evaluation-only side
+        # trades and must never influence the real signal's state machine.
         trades = list(
             db.scalars(
                 select(StrategyTrade).where(
                     StrategyTrade.strategy_name == self.strategy_name,
                     StrategyTrade.status == TradeStatus.OPEN,
+                    StrategyTrade.origin == "SIGNAL",
                 )
             )
         )
