@@ -157,7 +157,7 @@ def active_trade_page(
     smartapi: Annotated[object, Depends(get_smartapi)],
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    open_trades = list(db.scalars(select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN).order_by(StrategyTrade.entry_time.desc())))
+    open_trades = list(db.scalars(select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN, StrategyTrade.origin == "SIGNAL").order_by(StrategyTrade.entry_time.desc())))
     for trade in open_trades:
         try:
             current_premium = smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
