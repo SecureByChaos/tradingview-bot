@@ -8,7 +8,6 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import Settings
-from app.ai.shadow import exit_signal_for_entry, run_shadow_review
 from app.db_models import SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, Signal, WebhookResponse
 from app.option_finder import OptionFinder
@@ -311,28 +310,11 @@ class MultiStrategyTradeManager:
             log_event(db, "RISK", f"Strategy {trade.strategy_name} locked due to consecutive losses", "WARNING")
             self.telegram.send(db, f"Strategy Risk Lock\n[{trade.strategy_name}] consecutive losses: {stats.consecutive_losses}")
         self.telegram.send(db, f"Trade Closed\n[{trade.strategy_name}] {reason.value}\nP&L: {trade.pnl_percent:.2f}%")
-        shadow_market_data = {
-            "strike": trade.strike,
-            "expiry": trade.expiry,
-            "option_price": round(exit_price, 2),
-        }
-        try:
-            trade_index = get_index_config(db, trade.index_symbol)
-            spot = round(self.smartapi.get_index_spot(trade_index) if trade_index is not None else self.smartapi.get_banknifty_spot(), 2)
-            shadow_market_data["index_price"] = spot
-            shadow_market_data["index_symbol"] = trade.index_symbol
-            if trade.index_symbol == "BANKNIFTY":
-                shadow_market_data["banknifty_price"] = spot
-        except Exception as exc:
-            logger.info("[AI] Shadow market fetch skipped: %s spot unavailable (%s)", trade.index_symbol, exc)
-        logger.info("[AI] Exit review triggered")
-        run_shadow_review(
-            trade.strategy_name,
-            exit_signal_for_entry(trade.signal),
-            utc_now(),
-            trade.trade_id,
-            shadow_market_data,
-        )
+        # Exit shadow review removed: it never had real market/indicator context
+        # (TradingView only sends that on entry signals) and never affected
+        # anything -- no alternative trade, no risk-state impact -- so it was
+        # pure token spend for a note that just restated numbers already on
+        # the trade row. Entry reviews (main.py) are unaffected.
         return trade
 
     def current_state(self, db: Session, strategy_name: str) -> str:
