@@ -114,6 +114,29 @@ class AITradeReview(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class AIExitCall(Base):
+    """Independent, read-only AI exit-call tracking for the AI Exit Calls page.
+    Never written to or read by the real trading logic -- app/ai/exit_shadow.py
+    is the only writer, and it never touches StrategyTrade/risk/stats/telegram.
+    Each row is one periodic check; a trade stops being re-checked once a row
+    with decision == 'EXIT' exists for it (see exit_shadow.py)."""
+
+    __tablename__ = "ai_exit_calls"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    strategy_name: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reasoning: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    premium_at_check: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pnl_percent_at_check: Mapped[float | None] = mapped_column(Float, nullable=True)
+    holding_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class AIContextLog(Base):
     __tablename__ = "ai_context_logs"
 

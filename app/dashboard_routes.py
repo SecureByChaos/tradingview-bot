@@ -23,6 +23,7 @@ from app.db_models import AIContextLog, AITradeReview, BotStatus, IndexConfig, P
 from app.platform import (
     ai_reviews_query_for_filter,
     get_dashboard_summary,
+    get_exit_shadow_summary,
     get_index_live_figures,
     get_open_trades_with_ticks,
     get_or_create_strategy_stats,
@@ -254,6 +255,16 @@ def performance_page(
         "performance.html",
         {"request": request, **summary, "filter": filter, "start": start or "", "end": end or ""},
     )
+
+
+@router.get("/ai-exit-calls", response_class=HTMLResponse)
+def ai_exit_calls_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    summary = get_exit_shadow_summary(db)
+    return templates.TemplateResponse("ai_exit_calls.html", {"request": request, **summary})
 
 
 @router.get("/ai-alternatives", response_class=HTMLResponse)

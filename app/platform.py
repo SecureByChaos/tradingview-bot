@@ -8,7 +8,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.db_models import AIExitCall, AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.time_utils import duration_label, format_ist, iso_utc, to_ist, utc_now
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -574,6 +574,99 @@ def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[s
             }
         )
     return result
+
+
+def get_exit_shadow_summary(db: Session) -> dict[str, Any]:
+    """Data for the AI Exit Calls page -- a read-only view over app/ai/exit_shadow.py's
+    output. Never influences the real trade; this only ever reads AIExitCall +
+    StrategyTrade rows for display."""
+    open_trades = list(
+        db.scalars(
+            select(StrategyTrade).where(
+                StrategyTrade.status == TradeStatus.OPEN,
+                StrategyTrade.origin == "SIGNAL",
+            ).order_by(StrategyTrade.entry_time.desc())
+        )
+    )
+    live: list[dict[str, Any]] = []
+    for trade in open_trades:
+        calls = list(
+            db.scalars(
+                select(AIExitCall)
+                .where(AIExitCall.trade_id == trade.trade_id)
+                .order_by(AIExitCall.checked_at.desc())
+            )
+        )
+        latest_by_provider: dict[str, AIExitCall] = {}
+        for call in calls:
+            latest_by_provider.setdefault(call.provider, call)
+        holding_minutes = None
+        if trade.entry_time is not None:
+            entry_ist = to_ist(trade.entry_time)
+            now_ist = to_ist(utc_now())
+            if entry_ist is not None and now_ist is not None:
+                holding_minutes = max(int((now_ist - entry_ist).total_seconds() // 60), 0)
+        live.append({
+            "trade_id": trade.trade_id,
+            "strategy_name": trade.strategy_name,
+            "index_display_name": _index_display_name(trade.index_symbol),
+            "position_label": "Long call" if trade.option_type == "CE" else "Long put",
+            "entry_price": trade.entry_price,
+            "current_premium": trade.current_premium,
+            "pnl_percent": trade.pnl_percent,
+            "holding_minutes": holding_minutes,
+            "calls": [
+                {
+                    "provider": call.provider,
+                    "decision": call.decision,
+                    "confidence": call.confidence,
+                    "reasoning": call.reasoning,
+                    "checked_at": format_ist(call.checked_at),
+                }
+                for call in latest_by_provider.values()
+            ],
+            "checks_run": len(calls),
+        })
+
+    exit_trade_ids = list(
+        db.scalars(select(AIExitCall.trade_id).where(AIExitCall.decision == "EXIT").distinct())
+    )
+    comparisons_with_time: list[tuple[datetime, dict[str, Any]]] = []
+    if exit_trade_ids:
+        trades_by_id = {
+            trade.trade_id: trade
+            for trade in db.scalars(select(StrategyTrade).where(StrategyTrade.trade_id.in_(exit_trade_ids)))
+        }
+        for trade_id in exit_trade_ids:
+            trade = trades_by_id.get(trade_id)
+            if trade is None:
+                continue
+            exit_call = db.scalar(
+                select(AIExitCall)
+                .where(AIExitCall.trade_id == trade_id, AIExitCall.decision == "EXIT")
+                .order_by(AIExitCall.checked_at.asc())
+                .limit(1)
+            )
+            if exit_call is None:
+                continue
+            shadow_pnl = exit_call.pnl_percent_at_check
+            comparisons_with_time.append((exit_call.checked_at, {
+                "trade_id": trade_id,
+                "strategy_name": trade.strategy_name,
+                "index_display_name": _index_display_name(trade.index_symbol),
+                "position_label": "Long call" if trade.option_type == "CE" else "Long put",
+                "ai_called_at": format_ist(exit_call.checked_at),
+                "ai_provider": exit_call.provider,
+                "ai_reasoning": exit_call.reasoning,
+                "shadow_pnl_percent": shadow_pnl,
+                "real_status": trade.status,
+                "real_pnl_percent": trade.pnl_percent if trade.status == TradeStatus.CLOSED else None,
+                "real_exit_reason": trade.exit_reason if trade.status == TradeStatus.CLOSED else None,
+            }))
+        comparisons_with_time.sort(key=lambda item: item[0], reverse=True)
+    comparisons = [row for _, row in comparisons_with_time]
+
+    return {"live": live, "comparisons": comparisons}
 
 
 def get_today_activity(db: Session, limit: int = 20) -> list[dict[str, Any]]:
