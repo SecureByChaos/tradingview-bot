@@ -26,6 +26,7 @@ from app.option_finder import OptionFinder
 from app.platform import get_index_config, get_or_create_settings, get_or_create_strategy_stats, log_event, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, strategy_trading_allowed, trading_allowed
 from sqlalchemy import func, select
 from app.risk import RiskProtectionService
+from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
 from app.scheduler import create_scheduler
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
@@ -191,13 +192,14 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
         payload_trend = payload.trend.model_dump(exclude_none=True) if payload.trend else None
         payload_strategy_filters = payload.strategy_filters.model_dump(exclude_none=True) if payload.strategy_filters else None
         payload_trade_state = payload.trade_state.model_dump(exclude_none=True) if payload.trade_state else None
+        _run_integrity_checks(db, strategy_name, payload.signal.value, payload_market_data)
         if strategy_name.upper() == "V7":
             return queue_shadow_review(
                 background_tasks,
                 db,
                 strategy_name,
                 payload.signal.value,
-                v7_manager.handle_signal(db, payload.signal),
+                v7_manager.handle_signal(db, payload.signal, payload_market_data),
                 payload_market_data,
                 payload_indicators,
                 payload_trend,
@@ -245,7 +247,7 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
             log_event(db, "WEBHOOK", message, "WARNING")
             return WebhookResponse(accepted=False, message=message)
 
-        response = multi_strategy_manager.handle_signal(db, strategy_name, payload.signal)
+        response = multi_strategy_manager.handle_signal(db, strategy_name, payload.signal, payload_market_data)
         if response.accepted and not payload.signal.value.startswith("SELL"):
             telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
         else:
@@ -293,6 +295,26 @@ def _build_shadow_market_data(db: Session, trade: StrategyTrade) -> dict[str, ob
     except Exception as exc:
         logger.info("[AI] Shadow market fetch skipped: option premium unavailable (%s)", exc)
     return market_data
+
+
+def _run_integrity_checks(
+    db: Session,
+    strategy_name: str,
+    signal: str,
+    market_data: dict[str, object] | None,
+) -> None:
+    """Log-only signal-integrity checks -- freshness, market hours, and replay
+    detection. None of these block the webhook; they exist purely to surface
+    a data-trust flag on the logs/dashboard when something looks off. See
+    app/signal_validation.py."""
+    received_at = utc_now()
+    for warning in (
+        check_market_hours(received_at),
+        check_webhook_staleness(market_data, received_at),
+        check_duplicate_signal(strategy_name, signal, market_data, received_at),
+    ):
+        if warning:
+            log_event(db, "VALIDATION", warning, "WARNING", {"strategy": strategy_name, "signal": signal})
 
 
 def _log_tradingview_indicators(indicators: dict[str, object] | None) -> None:

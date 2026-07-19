@@ -12,6 +12,7 @@ from app.db_models import SLMode, StrategyConfig, StrategyTrade, StrategyTradeTi
 from app.models import ExitReason, Signal, WebhookResponse
 from app.option_finder import OptionFinder
 from app.platform import get_index_config, log_event, update_strategy_stats_after_close
+from app.signal_validation import check_premium_sanity, check_spot_price_deviation
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
 from app.time_utils import IST, format_ist, utc_now
@@ -32,7 +33,13 @@ class MultiStrategyTradeManager:
         self.option_finder = option_finder
         self.telegram = telegram
 
-    def handle_signal(self, db: Session, strategy_name: str | None, signal: Signal) -> WebhookResponse:
+    def handle_signal(
+        self,
+        db: Session,
+        strategy_name: str | None,
+        signal: Signal,
+        market_data: dict[str, object] | None = None,
+    ) -> WebhookResponse:
         resolved_name = (strategy_name or self.settings.default_strategy_name).strip()
         strategy = self.get_strategy(db, resolved_name)
         if strategy is None:
@@ -94,6 +101,16 @@ class MultiStrategyTradeManager:
                 {"strategy": strategy.name, "error": str(exc)},
             )
             raise
+        # Reuse the spot price OptionFinder already fetched while picking the
+        # ATM strike -- no extra SmartAPI call, avoids tripping the 1 req/sec
+        # /quote rate limit.
+        claimed_price = (market_data or {}).get("banknifty_price") or (market_data or {}).get("index_price")
+        for warning in (
+            check_spot_price_deviation(claimed_price, contract.spot_price),
+            check_premium_sanity(entry_price),
+        ):
+            if warning:
+                log_event(db, "VALIDATION", warning, "WARNING", {"strategy": strategy.name, "signal": signal.value})
         mode = self.resolve_mode(strategy)
         quantity = self.calculate_quantity(strategy, entry_price, contract.lot_size)
         required_capital = round(entry_price * quantity, 2)

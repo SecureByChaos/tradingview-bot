@@ -114,6 +114,11 @@ class OptionContract(BaseModel):
     expiry: str
     option_type: str
     lot_size: int
+    # Spot price OptionFinder already fetched from SmartAPI while picking the
+    # ATM strike -- carried here so callers can reuse it (e.g. for the
+    # spot-price cross-check) instead of firing a second, redundant ltpData
+    # call against Angel One's 1 req/sec /quote rate limit.
+    spot_price: float | None = None
 
 
 class ActiveTrade(BaseModel):

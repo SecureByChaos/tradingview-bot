@@ -119,6 +119,7 @@ class OptionFinder:
             expiry=str(selected["expiry"]),
             option_type=option_type,
             lot_size=int(float(selected.get("lotsize") or index.lot_size)),
+            spot_price=round(spot_price, 2),
         )
 
     def _default_index(self) -> Any:

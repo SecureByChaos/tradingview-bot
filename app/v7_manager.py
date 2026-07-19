@@ -12,6 +12,7 @@ from app.db_models import StrategyConfig, StrategyTrade, StrategyTradeTick, Trad
 from app.models import ExitReason, OptionContract, Signal, WebhookResponse
 from app.option_finder import OptionFinder
 from app.platform import get_index_config, log_event
+from app.signal_validation import check_premium_sanity, check_spot_price_deviation
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
 from app.time_utils import IST, format_ist, utc_now
@@ -34,7 +35,12 @@ class V7Manager:
         self.option_finder = option_finder
         self.telegram = telegram
 
-    def handle_signal(self, db: Session, signal: Signal) -> WebhookResponse:
+    def handle_signal(
+        self,
+        db: Session,
+        signal: Signal,
+        market_data: dict[str, object] | None = None,
+    ) -> WebhookResponse:
         state = self.current_state(db)
         if signal in {Signal.BUY_CE, Signal.BUY_PE}:
             if state != "FLAT":
@@ -43,7 +49,7 @@ class V7Manager:
                 log_event(db, "STATE", message, "WARNING")
                 return WebhookResponse(accepted=False, message=message)
             log_event(db, "STATE", "[STATE] OPEN_CE accepted" if signal == Signal.BUY_CE else "[STATE] OPEN_PE accepted")
-            return self.open_trade(db, signal)
+            return self.open_trade(db, signal, market_data)
         if signal in {Signal.SELL_CE, Signal.SELL_PE}:
             option_type = "CE" if signal == Signal.SELL_CE else "PE"
             event = "CLOSE_CE" if option_type == "CE" else "CLOSE_PE"
@@ -62,7 +68,12 @@ class V7Manager:
             return self.record_exit_suggestion(db, signal, observation_reason)
         return WebhookResponse(accepted=False, message=f"Rejected: unsupported V7 signal {signal.value}")
 
-    def open_trade(self, db: Session, signal: Signal) -> WebhookResponse:
+    def open_trade(
+        self,
+        db: Session,
+        signal: Signal,
+        market_data: dict[str, object] | None = None,
+    ) -> WebhookResponse:
         strategy = self.get_strategy(db)
         if strategy is None:
             return WebhookResponse(accepted=False, message="Rejected: strategy 'V7' does not exist")
@@ -84,6 +95,16 @@ class V7Manager:
                 {"strategy": self.strategy_name, "error": str(exc)},
             )
             raise
+        # Reuse the spot price OptionFinder already fetched while picking the
+        # ATM strike -- no extra SmartAPI call, avoids tripping the 1 req/sec
+        # /quote rate limit.
+        claimed_price = (market_data or {}).get("banknifty_price") or (market_data or {}).get("index_price")
+        for warning in (
+            check_spot_price_deviation(claimed_price, contract.spot_price),
+            check_premium_sanity(entry_price),
+        ):
+            if warning:
+                log_event(db, "VALIDATION", warning, "WARNING", {"strategy": self.strategy_name, "signal": signal.value})
         mode = self.resolve_mode(strategy)
         quantity = self.calculate_quantity(strategy, entry_price, contract.lot_size)
         required_capital = round(entry_price * quantity, 2)
