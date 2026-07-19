@@ -20,7 +20,10 @@
       <option value="ai_alt" {% if origin == "ai_alt" %}selected{% endif %}>AI Alternatives Only</option>
     </select>
   </div>
-  <div ><button class="btn btn-primary" type="submit">Filter</button></div>
+  <div class="d-flex flex-column flex-md-row gap-2">
+    <button class="btn btn-primary" type="submit">Filter</button>
+    <a class="btn btn-outline-light" href="/history/export?filter={{ filter }}&start={{ start }}&end={{ end }}&origin={{ origin }}">Export CSV</a>
+  </div>
 </form>
 {% if trades %}<div class="table-responsive responsive-table">
   <table class="table table-dark table-hover align-middle">

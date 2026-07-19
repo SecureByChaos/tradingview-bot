@@ -1,12 +1,14 @@
 ﻿from __future__ import annotations
 
+import csv
+import io
 from datetime import date, datetime, time, timezone
 import json
 from typing import Annotated
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
@@ -186,6 +188,54 @@ def history(
     return templates.TemplateResponse(
         "history.html",
         {"request": request, "trades": trades, "filter": filter, "start": start or "", "end": end or "", "origin": origin},
+    )
+
+
+@router.get("/history/export")
+def history_export(
+    db: Annotated[Session, Depends(get_db)],
+    filter: str = "today",
+    start: str | None = None,
+    end: str | None = None,
+    origin: str = "all",
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> StreamingResponse:
+    """CSV export of the Trade History table, honoring whatever filter/date-range/
+    origin is currently applied on the page -- same query as the HTML view, just
+    written out as a file instead of rendered."""
+    origin_filter = origin if origin in ("signal", "ai_alt") else None
+    trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter)))
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "Strategy", "Origin", "Entry Time (IST)", "Exit Time (IST)", "Duration",
+        "Signal", "Strike", "Entry", "Exit", "P&L %", "Result", "Status", "Mode",
+    ])
+    for trade in trades:
+        writer.writerow([
+            trade.strategy_name,
+            origin_label(trade.origin),
+            format_ist(trade.entry_time),
+            format_ist(trade.exit_time),
+            duration_label(trade.entry_time, trade.exit_time),
+            trade.signal,
+            trade.strike,
+            trade.entry_price,
+            trade.exit_price or "",
+            f"{trade.pnl_percent:.2f}" if trade.pnl_percent is not None else "",
+            trade.result,
+            trade.status,
+            trade.mode,
+        ])
+    buffer.seek(0)
+
+    today_label = datetime.now(IST).strftime("%Y-%m-%d")
+    filename = f"strikevault_trade_history_{filter}_{today_label}.csv"
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
