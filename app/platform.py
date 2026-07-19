@@ -399,6 +399,79 @@ def _index_display_name(symbol: str | None) -> str:
     return _INDEX_DISPLAY_NAMES.get((symbol or "").upper(), (symbol or "").title())
 
 
+def get_performance_summary(
+    db: Session,
+    filter_name: str,
+    start: date | None,
+    end: date | None,
+    strategy_name: str | None = None,
+) -> dict[str, Any]:
+    """Owner-variant of the client reporting portal
+    (docs/client-reporting-portal-design.md): same KPI / equity-curve /
+    daily-P&L / win-loss shape, with strategy attribution added -- a
+    strategy filter and a Strategy column on recent trades, neither of
+    which the eventual client-facing version will have. origin == SIGNAL
+    trades only, same rule as everywhere else."""
+    trades = list(db.scalars(strategy_trades_query_for_filter(filter_name, start, end, "signal")))
+    closed = [
+        trade for trade in trades
+        if trade.status == TradeStatus.CLOSED and (strategy_name is None or trade.strategy_name == strategy_name)
+    ]
+    closed.sort(key=lambda trade: trade.exit_time or trade.entry_time)
+
+    daily_totals: dict[str, float] = {}
+    for trade in closed:
+        exit_ist = to_ist(trade.exit_time)
+        if exit_ist is None:
+            continue
+        day = exit_ist.date().isoformat()
+        daily_totals[day] = daily_totals.get(day, 0.0) + trade.pnl_percent
+    daily_pnl = [{"date": day, "pnl_percent": round(daily_totals[day], 2)} for day in sorted(daily_totals)]
+
+    equity_curve: list[dict[str, Any]] = []
+    running = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for point in daily_pnl:
+        running += point["pnl_percent"]
+        peak = max(peak, running)
+        max_drawdown = max(max_drawdown, peak - running)
+        equity_curve.append({"date": point["date"], "cumulative_percent": round(running, 2)})
+
+    wins = sum(1 for trade in closed if trade.result == TradeResult.WIN)
+    losses = sum(1 for trade in closed if trade.result == TradeResult.LOSS)
+    total = len(closed)
+
+    recent_trades = [
+        {
+            "date": to_ist(trade.exit_time).strftime("%d %b") if to_ist(trade.exit_time) else "",
+            "strategy_name": trade.strategy_name,
+            "index_display_name": _index_display_name(trade.index_symbol),
+            "position_label": "Long call" if trade.option_type == "CE" else "Long put",
+            "result": trade.result,
+            "pnl_percent": trade.pnl_percent,
+        }
+        for trade in reversed(closed[-20:])
+    ]
+
+    strategies = sorted(set(db.scalars(select(StrategyTrade.strategy_name).where(StrategyTrade.origin == "SIGNAL").distinct())))
+
+    return {
+        "kpis": {
+            "net_return_percent": round(running, 2),
+            "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+            "total_trades": total,
+            "max_drawdown_percent": round(-max_drawdown, 2),
+        },
+        "daily_pnl": daily_pnl,
+        "equity_curve": equity_curve,
+        "win_loss": {"wins": wins, "losses": losses},
+        "recent_trades": recent_trades,
+        "strategies": strategies,
+        "selected_strategy": strategy_name or "",
+    }
+
+
 def get_index_live_figures(db: Session, smartapi: Any) -> list[dict[str, Any]]:
     """Live index figures (Nifty/Sensex/Bank Nifty) for the live dashboards --
     figures only, no per-index chart by design. Change and day range are

@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% from "components.html" import page_header, empty_state %}
+{% block content %}
+{{ page_header("Performance") }}
+<form class="filter-form filter-grid mb-3" method="get">
+  <div>
+    <select class="form-select" name="filter">
+      <option value="today" {% if filter == "today" %}selected{% endif %}>Today</option>
+      <option value="7d" {% if filter == "7d" %}selected{% endif %}>Last 7 Days</option>
+      <option value="30d" {% if filter == "30d" %}selected{% endif %}>Last 30 Days</option>
+      <option value="custom" {% if filter == "custom" %}selected{% endif %}>Custom</option>
+    </select>
+  </div>
+  <div><input class="form-control" type="date" name="start" value="{{ start }}"></div>
+  <div><input class="form-control" type="date" name="end" value="{{ end }}"></div>
+  <div>
+    <select class="form-select" name="strategy">
+      <option value="" {% if not selected_strategy %}selected{% endif %}>All strategies</option>
+      {% for name in strategies %}
+      <option value="{{ name }}" {% if selected_strategy == name %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div><button class="btn btn-primary" type="submit">Filter</button></div>
+</form>
+
+<div class="metric-grid mb-4">
+  <div class="metric"><div class="label">Net return</div><div class="value {% if kpis.net_return_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(kpis.net_return_percent) }}%</div></div>
+  <div class="metric"><div class="label">Win rate</div><div class="value">{{ "%.0f"|format(kpis.win_rate) }}%</div></div>
+  <div class="metric"><div class="label">Total trades</div><div class="value">{{ kpis.total_trades }}</div></div>
+  <div class="metric"><div class="label">Max drawdown</div><div class="value loss">{{ "%.2f"|format(kpis.max_drawdown_percent) }}%</div></div>
+</div>
+
+{% if equity_curve %}
+<div class="panel mb-4">
+  <div class="label mb-2">Cumulative return</div>
+  <div class="trade-chart-wrap" style="height:240px;">
+    <canvas id="equityChart" role="img" aria-label="Line chart of cumulative return over the selected period"></canvas>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-lg-6">
+    <div class="panel h-100">
+      <div class="label mb-2">Daily P&amp;L</div>
+      <div class="trade-chart-wrap" style="height:200px;">
+        <canvas id="dailyChart" role="img" aria-label="Bar chart of daily profit and loss percent"></canvas>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="panel h-100">
+      <div class="label mb-2">Win / loss split</div>
+      <div class="trade-chart-wrap" style="height:200px;">
+        <canvas id="winChart" role="img" aria-label="Donut chart of win versus loss count"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+{% else %}
+{{ empty_state("No closed trades in this range yet.") }}
+{% endif %}
+
+<div class="section-header"><h4 class="mb-0">Recent trades</h4></div>
+{% if recent_trades %}
+<div class="table-responsive responsive-table">
+  <table class="table table-dark table-hover align-middle">
+    <thead><tr><th>Date</th><th>Strategy</th><th>Position</th><th>Result</th><th>Return</th></tr></thead>
+    <tbody>
+    {% for trade in recent_trades %}
+      <tr>
+        <td data-label="Date">{{ trade.date }}</td>
+        <td data-label="Strategy">{{ trade.strategy_name }}</td>
+        <td data-label="Position">{{ trade.index_display_name }} · {{ trade.position_label }}</td>
+        <td data-label="Result">{% if trade.result == "WIN" %}<span class="badge text-bg-success">Win</span>{% elif trade.result == "LOSS" %}<span class="badge text-bg-danger">Loss</span>{% else %}<span class="badge text-bg-secondary">{{ trade.result|title }}</span>{% endif %}</td>
+        <td data-label="Return" class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("No trades to show for this filter.") }}
+{% endif %}
+
+{% if equity_curve %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const equityLabels = {{ equity_curve | map(attribute="date") | list | tojson }};
+const equityValues = {{ equity_curve | map(attribute="cumulative_percent") | list | tojson }};
+const dailyLabels = {{ daily_pnl | map(attribute="date") | list | tojson }};
+const dailyValues = {{ daily_pnl | map(attribute="pnl_percent") | list | tojson }};
+const wins = {{ win_loss.wins }};
+const losses = {{ win_loss.losses }};
+
+new Chart(document.getElementById('equityChart'), {
+  type: 'line',
+  data: { labels: equityLabels, datasets: [{ data: equityValues, borderColor: '#378ADD', backgroundColor: 'rgba(55,138,221,0.12)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0.25 }] },
+  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+    scales: { x: { grid: { display: false } }, y: { ticks: { callback: v => v + '%' } } } }
+});
+new Chart(document.getElementById('dailyChart'), {
+  type: 'bar',
+  data: { labels: dailyLabels, datasets: [{ data: dailyValues, backgroundColor: dailyValues.map(v => v >= 0 ? '#45d68a' : '#ff6577'), borderRadius: 4 }] },
+  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+    scales: { x: { display: false }, y: { ticks: { callback: v => v + '%' } } } }
+});
+new Chart(document.getElementById('winChart'), {
+  type: 'doughnut',
+  data: { labels: ['Wins', 'Losses'], datasets: [{ data: [wins, losses], backgroundColor: ['#45d68a', '#ff6577'], borderWidth: 0 }] },
+  options: { responsive: true, maintainAspectRatio: false, cutout: '70%', plugins: { legend: { display: false } } }
+});
+</script>
+{% endif %}
+{% endblock %}

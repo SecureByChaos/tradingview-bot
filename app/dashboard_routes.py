@@ -25,6 +25,7 @@ from app.platform import (
     get_open_trades_with_ticks,
     get_or_create_strategy_stats,
     get_or_create_settings,
+    get_performance_summary,
     get_today_activity,
     latest_logs,
     list_index_configs,
@@ -185,6 +186,23 @@ def history(
     return templates.TemplateResponse(
         "history.html",
         {"request": request, "trades": trades, "filter": filter, "start": start or "", "end": end or "", "origin": origin},
+    )
+
+
+@router.get("/performance", response_class=HTMLResponse)
+def performance_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    filter: str = "30d",
+    start: str | None = None,
+    end: str | None = None,
+    strategy: str = "",
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    summary = get_performance_summary(db, filter, parse_date(start), parse_date(end), strategy or None)
+    return templates.TemplateResponse(
+        "performance.html",
+        {"request": request, **summary, "filter": filter, "start": start or "", "end": end or ""},
     )
 
 

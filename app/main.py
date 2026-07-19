@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app import api_routes, dashboard_routes, v7_router
+from app import api_routes, dashboard_routes
 from app.config import get_settings
 from app.database import SessionLocal, engine, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
@@ -100,11 +100,9 @@ dashboard_routes.router.trade_manager = trade_manager  # type: ignore[attr-defin
 dashboard_routes.router.multi_strategy_manager = multi_strategy_manager  # type: ignore[attr-defined]
 dashboard_routes.router.smartapi = smartapi  # type: ignore[attr-defined]
 dashboard_routes.router.health_manager = health_manager  # type: ignore[attr-defined]
-v7_router.router.v7_manager = v7_manager  # type: ignore[attr-defined]
 
 app.include_router(dashboard_routes.router)
 app.include_router(api_routes.router)
-app.include_router(v7_router.router)
 
 
 @app.get("/health")
