@@ -25,6 +25,7 @@ from app.platform import (
     get_dashboard_summary,
     get_exit_shadow_summary,
     get_index_live_figures,
+    get_origination_summary,
     get_open_trades_with_ticks,
     get_or_create_strategy_stats,
     get_or_create_settings,
@@ -48,6 +49,9 @@ def origin_label(origin: str | None) -> str:
     if origin.startswith("AI_ALT_"):
         provider = origin[len("AI_ALT_"):].title()
         return f"AI Alt · {provider}"
+    if origin.startswith("AI_ORIGIN_"):
+        provider = origin[len("AI_ORIGIN_"):].title()
+        return f"AI Origin · {provider}"
     return origin
 
 
@@ -265,6 +269,16 @@ def ai_exit_calls_page(
 ) -> HTMLResponse:
     summary = get_exit_shadow_summary(db)
     return templates.TemplateResponse("ai_exit_calls.html", {"request": request, **summary})
+
+
+@router.get("/ai-origination", response_class=HTMLResponse)
+def ai_origination_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    summary = get_origination_summary(db)
+    return templates.TemplateResponse("ai_origination.html", {"request": request, **summary})
 
 
 @router.get("/ai-alternatives", response_class=HTMLResponse)

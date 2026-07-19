@@ -472,6 +472,24 @@ def get_performance_summary(
     }
 
 
+def record_index_tick_if_stale(db: Session, index_symbol: str, price: float) -> None:
+    """Throttled IndexPriceTick recorder, shared by the live-dashboard figure
+    fetch and app/ai/originator.py's momentum check -- both need real spot-price
+    history, and originator.py runs on a schedule independent of whether anyone
+    has the dashboard open, so tick recording can't stay dashboard-only."""
+    latest_tick = db.scalar(
+        select(IndexPriceTick)
+        .where(IndexPriceTick.index_symbol == index_symbol)
+        .order_by(IndexPriceTick.recorded_at.desc())
+        .limit(1)
+    )
+    latest_ist = to_ist(latest_tick.recorded_at) if latest_tick is not None else None
+    now_ist = to_ist(utc_now())
+    if latest_ist is None or (now_ist - latest_ist).total_seconds() >= _INDEX_TICK_THROTTLE_SECONDS:
+        db.add(IndexPriceTick(index_symbol=index_symbol, price=price))
+        db.commit()
+
+
 def get_index_live_figures(db: Session, smartapi: Any) -> list[dict[str, Any]]:
     """Live index figures (Nifty/Sensex/Bank Nifty) for the live dashboards --
     figures only, no per-index chart by design. Change and day range are
@@ -499,17 +517,7 @@ def get_index_live_figures(db: Session, smartapi: Any) -> list[dict[str, Any]]:
             figures.append(entry)
             continue
 
-        latest_tick = db.scalar(
-            select(IndexPriceTick)
-            .where(IndexPriceTick.index_symbol == index.symbol)
-            .order_by(IndexPriceTick.recorded_at.desc())
-            .limit(1)
-        )
-        latest_ist = to_ist(latest_tick.recorded_at) if latest_tick is not None else None
-        now_ist = to_ist(utc_now())
-        if latest_ist is None or (now_ist - latest_ist).total_seconds() >= _INDEX_TICK_THROTTLE_SECONDS:
-            db.add(IndexPriceTick(index_symbol=index.symbol, price=price))
-            db.commit()
+        record_index_tick_if_stale(db, index.symbol, price)
 
         todays_ticks = list(
             db.scalars(
@@ -667,6 +675,61 @@ def get_exit_shadow_summary(db: Session) -> dict[str, Any]:
     comparisons = [row for _, row in comparisons_with_time]
 
     return {"live": live, "comparisons": comparisons}
+
+
+def get_origination_summary(db: Session, limit: int = 30) -> dict[str, Any]:
+    """Data for the AI Origination page -- read-only view over app/ai/originator.py's
+    output. These are trades the AI opened entirely on its own (no TradingView
+    signal involved), tagged origin AI_ORIGIN_*, isolated from real trading logic
+    exactly like AI_ALT_* trades."""
+    open_trades = list(
+        db.scalars(
+            select(StrategyTrade)
+            .where(StrategyTrade.status == TradeStatus.OPEN, StrategyTrade.origin.like("AI_ORIGIN_%"))
+            .order_by(StrategyTrade.entry_time.desc())
+        )
+    )
+    closed_trades = list(
+        db.scalars(
+            select(StrategyTrade)
+            .where(StrategyTrade.status == TradeStatus.CLOSED, StrategyTrade.origin.like("AI_ORIGIN_%"))
+            .order_by(StrategyTrade.exit_time.desc())
+            .limit(limit)
+        )
+    )
+
+    def _row(trade: StrategyTrade, closed: bool) -> dict[str, Any]:
+        return {
+            "trade_id": trade.trade_id,
+            "provider": trade.origin[len("AI_ORIGIN_"):].title() if trade.origin else "",
+            "index_display_name": _index_display_name(trade.index_symbol),
+            "position_label": "Long call" if trade.option_type == "CE" else "Long put",
+            "entry_price": trade.entry_price,
+            "current_premium": trade.current_premium,
+            "exit_price": trade.exit_price if closed else None,
+            "pnl_percent": trade.pnl_percent,
+            "result": trade.result if closed else None,
+            "confidence": trade.ai_confidence,
+            "reasoning": trade.ai_reasoning,
+            "entry_time": format_ist(trade.entry_time),
+            "exit_time": format_ist(trade.exit_time) if closed else None,
+        }
+
+    live = [_row(trade, closed=False) for trade in open_trades]
+    history = [_row(trade, closed=True) for trade in closed_trades]
+
+    wins = sum(1 for trade in closed_trades if trade.result == TradeResult.WIN)
+    losses = sum(1 for trade in closed_trades if trade.result == TradeResult.LOSS)
+    total_closed = len(closed_trades)
+    kpis = {
+        "total_originated": len(open_trades) + len(closed_trades),
+        "open_count": len(open_trades),
+        "closed_count": total_closed,
+        "win_rate": round((wins / total_closed) * 100, 2) if total_closed else 0.0,
+        "net_pnl_percent": round(sum(trade.pnl_percent or 0 for trade in closed_trades), 2),
+    }
+
+    return {"live": live, "history": history, "kpis": kpis}
 
 
 def get_today_activity(db: Session, limit: int = 20) -> list[dict[str, Any]]:

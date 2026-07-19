@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -12,7 +14,11 @@ from app.monitor import TradeMonitor
 IST = ZoneInfo("Asia/Kolkata")
 
 
-def create_scheduler(monitor: TradeMonitor, health_manager: object | None = None) -> BackgroundScheduler:
+def create_scheduler(
+    monitor: TradeMonitor,
+    health_manager: object | None = None,
+    originator_job: Callable[[], None] | None = None,
+) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(
         monitor.tick,
@@ -30,6 +36,15 @@ def create_scheduler(monitor: TradeMonitor, health_manager: object | None = None
         max_instances=1,
         coalesce=True,
     )
+    if originator_job is not None:
+        scheduler.add_job(
+            originator_job,
+            trigger=IntervalTrigger(minutes=5),
+            id="ai-origination-check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     scheduler.add_job(
         monitor.square_off,
         trigger=CronTrigger(hour=15, minute=15, timezone=IST),

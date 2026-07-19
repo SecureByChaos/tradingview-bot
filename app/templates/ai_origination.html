@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% from "components.html" import page_header, empty_state %}
+{% block content %}
+{{ page_header("AI Origination", "Paper only -- AI-initiated, no TradingView signal", "text-bg-secondary") }}
+
+<div class="metric-grid mb-4">
+  <div class="metric"><div class="label">Total originated</div><div class="value">{{ kpis.total_originated }}</div></div>
+  <div class="metric"><div class="label">Currently open</div><div class="value">{{ kpis.open_count }}</div></div>
+  <div class="metric"><div class="label">Win rate (closed)</div><div class="value">{{ "%.0f"|format(kpis.win_rate) }}%</div></div>
+  <div class="metric"><div class="label">Net P&amp;L (closed)</div><div class="value {% if kpis.net_pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(kpis.net_pnl_percent) }}%</div></div>
+</div>
+
+<div class="section-header"><h4 class="mb-0">Currently open</h4></div>
+{% if live %}
+<div class="table-responsive responsive-table mb-4">
+  <table class="table table-dark table-hover align-middle">
+    <thead><tr><th>Provider</th><th>Position</th><th>Entry</th><th>Current</th><th>P&amp;L %</th><th>Confidence</th><th>Reasoning</th><th>Opened</th></tr></thead>
+    <tbody>
+    {% for row in live %}
+      <tr>
+        <td data-label="Provider"><span class="badge text-bg-info">{{ row.provider }}</span></td>
+        <td data-label="Position">{{ row.index_display_name }} · {{ row.position_label }}</td>
+        <td data-label="Entry">{{ row.entry_price }}</td>
+        <td data-label="Current">{{ row.current_premium if row.current_premium is not none else "Unavailable" }}</td>
+        <td data-label="P&amp;L %" class="{% if (row.pnl_percent or 0) >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(row.pnl_percent or 0) }}%</td>
+        <td data-label="Confidence">{% if row.confidence is not none %}{{ "%.0f"|format(row.confidence * 100) }}%{% endif %}</td>
+        <td data-label="Reasoning" style="max-width:280px;">{{ row.reasoning }}</td>
+        <td data-label="Opened">{{ row.entry_time }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("No AI-originated trades open right now.") }}
+{% endif %}
+
+<div class="section-header"><h4 class="mb-0">History</h4></div>
+{% if history %}
+<div class="table-responsive responsive-table">
+  <table class="table table-dark table-hover align-middle">
+    <thead><tr><th>Provider</th><th>Position</th><th>Entry</th><th>Exit</th><th>P&amp;L %</th><th>Result</th><th>Confidence</th><th>Closed</th></tr></thead>
+    <tbody>
+    {% for row in history %}
+      <tr>
+        <td data-label="Provider"><span class="badge text-bg-info">{{ row.provider }}</span></td>
+        <td data-label="Position">{{ row.index_display_name }} · {{ row.position_label }}</td>
+        <td data-label="Entry">{{ row.entry_price }}</td>
+        <td data-label="Exit">{{ row.exit_price or "" }}</td>
+        <td data-label="P&amp;L %" class="{% if (row.pnl_percent or 0) >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(row.pnl_percent or 0) }}%</td>
+        <td data-label="Result">
+          {% if row.result == "WIN" %}<span class="badge text-bg-success">Win</span>
+          {% elif row.result == "LOSS" %}<span class="badge text-bg-danger">Loss</span>
+          {% else %}<span class="badge text-bg-secondary">{{ row.result }}</span>{% endif %}
+        </td>
+        <td data-label="Confidence">{% if row.confidence is not none %}{{ "%.0f"|format(row.confidence * 100) }}%{% endif %}</td>
+        <td data-label="Closed">{{ row.exit_time }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("No AI-originated trades have closed yet.") }}
+{% endif %}
+{% endblock %}

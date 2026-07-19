@@ -23,6 +23,14 @@ BROKER_CONNECTED = "CONNECTED"
 BROKER_RECONNECTING = "RECONNECTING"
 BROKER_FAILED = "FAILED"
 
+# Angel One's /quote (ltpData) endpoint is rate-limited to 1 request/second.
+# This app now has several independent callers that can all want a quote in
+# the same moment -- the 30s trade monitor (once per open trade, including
+# AI_ALT_*/AI_ORIGIN_* shadow trades), the 5-min AI origination check (once
+# per enabled index), webhook-triggered entries/exits, and manual dashboard
+# actions. A small margin above 1.0s avoids edge-of-window rejections.
+_MIN_QUOTE_INTERVAL_SECONDS = 1.05
+
 
 class SmartAPIClient:
     def __init__(self, settings: Settings) -> None:
@@ -32,6 +40,8 @@ class SmartAPIClient:
         self._refresh_token: Optional[str] = None
         self._feed_token: Optional[str] = None
         self._auth_lock = threading.RLock()
+        self._quote_rate_lock = threading.Lock()
+        self._last_quote_call_monotonic: float = 0.0
         self._status = BROKER_RECONNECTING
         self._last_login: Optional[datetime] = None
         self._last_refresh: Optional[datetime] = None
@@ -300,7 +310,19 @@ class SmartAPIClient:
             raise SmartAPIError(f"Broker in FAILED state: {self._last_error}")
         return self._client
 
+    def _throttle_quote_call(self) -> None:
+        """Serializes every ltpData call (from any thread) to at least
+        _MIN_QUOTE_INTERVAL_SECONDS apart, process-wide -- see the constant's
+        comment for why this matters now that several independent loops share
+        this one rate-limited endpoint."""
+        with self._quote_rate_lock:
+            wait = _MIN_QUOTE_INTERVAL_SECONDS - (time.monotonic() - self._last_quote_call_monotonic)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_quote_call_monotonic = time.monotonic()
+
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
+        self._throttle_quote_call()
         started = time.perf_counter()
         if self._client is None:
             self.authenticate()

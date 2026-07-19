@@ -27,6 +27,7 @@ from app.platform import get_index_config, get_or_create_settings, get_or_create
 from sqlalchemy import func, select
 from app.risk import RiskProtectionService
 from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
+from app.ai.originator import run_origination_checks
 from app.scheduler import create_scheduler
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
@@ -50,7 +51,11 @@ v7_manager = V7Manager(settings, smartapi, option_finder, telegram)
 risk_service = RiskProtectionService(multi_strategy_manager, telegram)
 monitor = MultiStrategyMonitor(multi_strategy_manager, risk_service, v7_manager)
 health_manager = HealthManager(smartapi, engine, telegram)
-scheduler = create_scheduler(monitor, health_manager)
+scheduler = create_scheduler(
+    monitor,
+    health_manager,
+    originator_job=lambda: run_origination_checks(smartapi, option_finder),
+)
 health_manager.scheduler = scheduler
 
 
