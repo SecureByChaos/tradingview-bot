@@ -388,12 +388,17 @@ def run_origination_checks(
             try:
                 if _has_open_origination(session, index.symbol):
                     continue
-                if _in_reopen_cooldown(session, index.symbol):
-                    logger.info(
-                        "[AI][ORIGIN] %s: in %s-min post-close cooldown, skipping",
-                        index.symbol, _REOPEN_COOLDOWN_MINUTES,
-                    )
-                    continue
+                # Cooldown disabled for now, on purpose -- observing raw
+                # AI Origination trade volume with no throttle to see where the
+                # daily count actually lands before deciding whether the
+                # cooldown is needed. _in_reopen_cooldown/_REOPEN_COOLDOWN_MINUTES
+                # are left in place; uncomment below to re-enable.
+                # if _in_reopen_cooldown(session, index.symbol):
+                #     logger.info(
+                #         "[AI][ORIGIN] %s: in %s-min post-close cooldown, skipping",
+                #         index.symbol, _REOPEN_COOLDOWN_MINUTES,
+                #     )
+                #     continue
                 price = round(smartapi.get_index_spot(index), 2)
                 record_index_tick_if_stale(session, index.symbol, price)
                 cutoff = utc_now() - timedelta(minutes=_LOOKBACK_MINUTES)
