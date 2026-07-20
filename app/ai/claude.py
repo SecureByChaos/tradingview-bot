@@ -58,7 +58,15 @@ class ClaudeReviewer(AIReviewer):
             # all and let the model use its own default.
             payload = {
                 "model": self.settings.model,
-                "max_tokens": 1024,
+                # The real signal-review schema (prompt_builder.py) asks for 12
+                # keys, including two reasoning arrays and a nested alternative
+                # object -- 1024 was tight enough to risk the response getting
+                # cut off mid-JSON on a fuller answer (unlike OpenAIReviewer,
+                # which doesn't cap tokens at all). A truncated response isn't
+                # a formatting problem extract_json_object() can recover from;
+                # it's genuinely incomplete JSON, so the fix is headroom, not
+                # smarter parsing.
+                "max_tokens": 2048,
                 "system": prompt["system_prompt"] + _JSON_ONLY_SUFFIX,
                 "messages": [
                     {"role": "user", "content": prompt["user_prompt"]},
