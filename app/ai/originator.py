@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.ai.client import AIClient
 from app.ai.repository import get_settings
 from app.database import SessionLocal
-from app.db_models import AISettings, IndexConfig, IndexPriceTick, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.db_models import AISettings, IndexConfig, IndexPriceTick, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.models import Signal
 from app.option_finder import OptionFinder
 from app.platform import list_index_configs, log_event, record_index_tick_if_stale
@@ -24,8 +24,6 @@ logger = logging.getLogger(__name__)
 
 _LOOKBACK_MINUTES = 45
 _MIN_TICKS_REQUIRED = 3
-_DEFAULT_SL_PERCENT = 10.0
-_DEFAULT_TARGET_PERCENT = 20.0
 # Higher than the 0.3 floor used for alternative-call trades: those are
 # adjusting a setup TradingView/the AI already flagged, this is fabricating a
 # brand-new position from momentum data alone, with nothing else to anchor
@@ -42,10 +40,37 @@ SYSTEM_PROMPT = (
     "whether the data is too thin/ambiguous to justify one -- in which case "
     "choose NONE. Do not invent data you were not given, and do not feel "
     "pressured to pick a side; NONE is the correct answer most of the time. "
+    "sl_percent and target_percent are PERCENTAGE POINTS on the option premium, "
+    "e.g. 10 means a 10% stop-loss, NOT a 0-1 fraction -- unlike confidence, "
+    "which IS 0-1. A typical sl_percent is 8-15 and target_percent is 15-30; "
+    "keep both between 5 and 50 -- options premiums move several percent on "
+    "ordinary noise, so anything below 5 will just close instantly on nothing, "
+    "and anything above 50 is barely a risk control at all. If you can't "
+    "propose a sane value in that range, this trade will automatically fall "
+    "back to trailing-stop management instead of your fixed band. "
     "Respond with a single valid JSON object only, no markdown, code fences, or "
     "extra text: {\"decision\": \"BUY_CE\"|\"BUY_PE\"|\"NONE\", \"confidence\": 0-1, "
     "\"sl_percent\": number, \"target_percent\": number, \"reasoning\": \"one or two sentences\"}."
 )
+
+# Defensive bounds independent of the prompt wording above -- LLMs aren't 100%
+# reliable at following stated scales/units, and a too-tight SL/target band on
+# a naturally noisy option premium means the position closes almost instantly
+# on ordinary noise, not on the AI actually being wrong (too-wide is the
+# opposite failure -- an unreasonably large band that's barely a risk control
+# at all, often a sign the model misread the units). AI Origin trades run
+# entirely on the AI's own risk judgment where it gives a sane one -- when it
+# doesn't (missing, or outside these bounds), the trade still opens, but on
+# trailing-stop methodology instead of a fixed number we picked ourselves.
+_MIN_SL_TARGET_PERCENT = 5.0
+_MAX_SL_TARGET_PERCENT = 50.0
+# Trailing fallback's own parameters -- these aren't "correcting" the AI's
+# entry/exit judgment, they're the same trailing-engine knobs every other
+# trailing-mode strategy in this app already uses (StrategyConfig.trailing_*),
+# applied here because AI Origin trades have no StrategyConfig row of their
+# own to source them from.
+_TRAILING_INITIAL_SL_PERCENT = 10.0
+_TRAILING_FALLBACK_TARGET_PERCENT = 20.0
 
 
 @dataclass(frozen=True)
@@ -207,6 +232,23 @@ def _open_paper_trade(
     smartapi: SmartAPIClient,
     option_finder: OptionFinder,
 ) -> Optional[StrategyTrade]:
+    def _is_sane(value: float | None) -> bool:
+        return value is not None and _MIN_SL_TARGET_PERCENT <= value <= _MAX_SL_TARGET_PERCENT
+
+    # AI Origin trades run entirely on the AI's own risk judgment where it
+    # gives a sane one. When it doesn't -- missing, too tight (closes on pure
+    # noise), or too wide (barely a risk control) -- we don't substitute a
+    # fixed number of our own and pretend it's still the AI's call. Instead
+    # the trade uses trailing-stop methodology, the same mechanism every other
+    # trailing strategy in this app already relies on.
+    use_trailing = not (_is_sane(decision.sl_percent) and _is_sane(decision.target_percent))
+    if use_trailing:
+        logger.info(
+            "[AI][ORIGIN] %s sl_percent=%s target_percent=%s outside %.0f-%.0f%% sane range -- "
+            "opening on trailing-stop methodology instead of a fixed AI-proposed band",
+            index.symbol, decision.sl_percent, decision.target_percent, _MIN_SL_TARGET_PERCENT, _MAX_SL_TARGET_PERCENT,
+        )
+
     option_type = "CE" if decision.action == "BUY_CE" else "PE"
     signal = Signal.BUY_CE if option_type == "CE" else Signal.BUY_PE
     try:
@@ -216,8 +258,8 @@ def _open_paper_trade(
         logger.info("[AI][ORIGIN] Skipped: could not resolve contract/price for %s (%s)", index.symbol, exc)
         return None
 
-    sl_percent = decision.sl_percent if decision.sl_percent and decision.sl_percent > 0 else _DEFAULT_SL_PERCENT
-    target_percent = decision.target_percent if decision.target_percent and decision.target_percent > 0 else _DEFAULT_TARGET_PERCENT
+    sl_percent = _TRAILING_INITIAL_SL_PERCENT if use_trailing else decision.sl_percent
+    target_percent = _TRAILING_FALLBACK_TARGET_PERCENT if use_trailing else decision.target_percent
     stoploss = round(entry_price * (1 - sl_percent / 100), 2)
     target = round(entry_price * (1 + target_percent / 100), 2)
     origin = f"AI_ORIGIN_{provider.strip().upper()}"
@@ -247,6 +289,7 @@ def _open_paper_trade(
         highest_price=round(entry_price, 2),
         lowest_price=round(entry_price, 2),
         trailing_active=False,
+        sl_mode=SLMode.TRAILING if use_trailing else SLMode.FIXED,
         origin=origin,
         ai_action=decision.action,
         ai_confidence=decision.confidence,
@@ -356,8 +399,21 @@ def run_origination_checks(
                             and (secondary_decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT
                         ):
                             _open_paper_trade(session, index, settings.secondary_provider, secondary_decision, smartapi, option_finder)
-            except Exception:
+            except Exception as exc:
                 logger.exception("[AI][ORIGIN] Check failed for index %s", index.symbol)
+                # Previously silent beyond the server log file (not reachable from the
+                # UI) -- this made it impossible to tell "AI never wants to trade this
+                # index" apart from "this index is silently broken" (e.g. a bad spot
+                # token) without SSH access. Surface it on the activity log instead.
+                try:
+                    log_event(
+                        session,
+                        "AI_ORIGIN",
+                        f"[{index.display_name or index.symbol}] Origination check failed: {exc}",
+                        level="WARNING",
+                    )
+                except Exception:
+                    logger.exception("[AI][ORIGIN] Also failed to log the above failure for %s", index.symbol)
     except Exception:
         logger.exception("[AI][ORIGIN] run_origination_checks failed")
     finally:

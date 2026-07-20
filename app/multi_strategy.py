@@ -55,22 +55,28 @@ class MultiStrategyTradeManager:
                 return WebhookResponse(accepted=False, message=message)
             log_event(db, "STATE", "[STATE] OPEN_CE accepted" if signal == Signal.BUY_CE else "[STATE] OPEN_PE accepted")
         elif signal in {Signal.SELL_CE, Signal.SELL_PE}:
+            # TradingView SELL_CE/SELL_PE signals are observational only -- the
+            # real trade is never closed off this signal. Exits are decided
+            # exclusively by monitor_open_trades' own SL/target/trailing logic.
+            # Mirrors V7Manager.record_exit_suggestion, which already worked
+            # this way; this path (used by BNV6/BNV7/etc, i.e. every non-V7
+            # strategy) previously still closed on TV_EXIT -- that's the gap
+            # being fixed here.
             option_type = "CE" if signal == Signal.SELL_CE else "PE"
             event = "CLOSE_CE" if option_type == "CE" else "CLOSE_PE"
             expected_state = "LONG_CE" if option_type == "CE" else "LONG_PE"
+            observation_reason = ""
             if state != expected_state:
-                message = f"Ignored {event} because no active {option_type} position exists."
-                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": message})
-                return WebhookResponse(accepted=False, message=message)
-            trade = self.latest_open_trade_for_option(db, strategy.name, option_type)
-            if trade is None:
-                message = f"Ignored {event} because no active {option_type} position exists."
-                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": message})
-                return WebhookResponse(accepted=False, message=message)
-            log_event(db, "STATE", f"[STATE] {event} accepted")
-            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
-            self.close_trade(db, trade, premium, ExitReason.TV_EXIT)
-            return WebhookResponse(accepted=True, message=f"Closed active {option_type} trade")
+                if state == "FLAT":
+                    observation_reason = f"Ignored {event} because no active {option_type} position exists."
+                elif state == "LONG_CE":
+                    observation_reason = f"Ignored {event} because active CE position exists."
+                elif state == "LONG_PE":
+                    observation_reason = f"Ignored {event} because active PE position exists."
+                else:
+                    observation_reason = f"Ignored {event} due to invalid state {state}."
+                log_event(db, "STATE", f"[STATE] {event} ignored", "WARNING", {"reason": observation_reason})
+            return self.record_exit_suggestion(db, strategy.name, signal, observation_reason)
         if not strategy.enabled:
             return WebhookResponse(accepted=False, message=f"Rejected: strategy '{strategy.name}' is disabled")
         if strategy.mode == TradingMode.PAPER and not strategy.paper_trade:
@@ -177,6 +183,65 @@ class MultiStrategyTradeManager:
         self.telegram.send(db, f"Trade Opened\n[{strategy.name}] {signal.value}\nEntry: {trade.entry_price}")
         return WebhookResponse(accepted=True, message="Trade opened")
 
+    def record_exit_suggestion(
+        self, db: Session, strategy_name: str, signal: Signal, observation_reason: str = ""
+    ) -> WebhookResponse:
+        """Logs a TradingView SELL_CE/SELL_PE signal for visibility without acting
+        on it -- the real trade is never closed here. Mirrors
+        V7Manager.record_exit_suggestion (kept as a separate copy rather than a
+        shared helper since the two managers' StrategyTrade lookups and default
+        index fallback differ slightly)."""
+        option_type = "CE" if signal == Signal.SELL_CE else "PE"
+        trade = db.scalar(
+            select(StrategyTrade)
+            .where(
+                StrategyTrade.strategy_name == strategy_name,
+                StrategyTrade.option_type == option_type,
+                StrategyTrade.status == TradeStatus.OPEN,
+                StrategyTrade.origin == "SIGNAL",
+            )
+            .order_by(StrategyTrade.entry_time.desc())
+            .limit(1)
+        )
+        spot = None
+        premium = None
+        pnl_unrealized = None
+        trailing_active = False
+        trailing_sl = None
+        trade_id = None
+        if trade is not None:
+            trade_id = trade.trade_id
+            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+            pnl_unrealized = round((premium - trade.entry_price) * trade.quantity, 2)
+            trailing_active = trade.trailing_active
+            trailing_sl = trade.trailing_stop
+        index_symbol = trade.index_symbol if trade is not None else None
+        if index_symbol is None:
+            strategy = self.get_strategy(db, strategy_name)
+            index_symbol = strategy.index_symbol if strategy is not None else "BANKNIFTY"
+        try:
+            index = get_index_config(db, index_symbol)
+            spot = round(self.smartapi.get_index_spot(index) if index is not None else self.smartapi.get_banknifty_spot(), 2)
+        except Exception:
+            spot = None
+        payload = {
+            "timestamp": utc_now().isoformat(),
+            "trade_id": trade_id,
+            "signal": signal.value,
+            "index_symbol": index_symbol,
+            "index_price": spot,
+            "option_premium": round(premium, 2) if premium is not None else None,
+            "unrealized_pnl": pnl_unrealized,
+            "trailing_active": trailing_active,
+            "current_trailing_sl": trailing_sl,
+            "observation_reason": observation_reason,
+        }
+        log_event(db, "TRADE", f"[{strategy_name}] TradingView Exit Suggestion", payload=payload)
+        message = "TradingView Exit Suggestion recorded"
+        if observation_reason:
+            message = f"{message}: {observation_reason}"
+        return WebhookResponse(accepted=True, message=message)
+
     def handle_v7_tv_exit(self, db: Session, strategy_name: str, signal: Signal) -> WebhookResponse:
         option_type = "CE" if signal == Signal.SELL_CE else "PE"
         log_event(db, "WEBHOOK", f"[V7] TradingView exit signal received: {signal.value}")
@@ -218,7 +283,10 @@ class MultiStrategyTradeManager:
         for trade in trades:
             try:
                 strategy = strategies_by_name.get(trade.strategy_name)
-                sl_mode = strategy.sl_mode if strategy is not None else SLMode.FIXED
+                # Per-trade sl_mode wins when set (AI Origin trades use this --
+                # see StrategyTrade.sl_mode's docstring); otherwise fall back to
+                # the strategy-level setting as before.
+                sl_mode = trade.sl_mode or (strategy.sl_mode if strategy is not None else SLMode.FIXED)
                 activation_percent = strategy.trailing_activation_percent if strategy is not None else 10.0
                 offset_percent = strategy.trailing_offset_percent if strategy is not None else 5.0
 
@@ -381,8 +449,16 @@ class MultiStrategyTradeManager:
             )
         )
         for trade in trades:
-            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
-            closed.append(self.close_trade(db, trade, premium, ExitReason.TIME_EXIT))
+            try:
+                premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+                closed.append(self.close_trade(db, trade, premium, ExitReason.TIME_EXIT))
+            except Exception as exc:
+                # One bad/stale contract token must never stop every other open
+                # trade from being squared off -- this is the last line of
+                # defense before market close, so it needs to be as resilient
+                # as monitor_open_trades already is per-trade.
+                logger.exception("Square-off failed for trade %s", trade.trade_id)
+                log_event(db, "ERROR", f"[{trade.strategy_name}] square-off failed", "ERROR", {"trade_id": trade.trade_id, "error": str(exc)})
         return closed
 
     def square_off_strategy(self, db: Session, strategy_name: str) -> list[StrategyTrade]:
@@ -396,8 +472,16 @@ class MultiStrategyTradeManager:
             )
         )
         for trade in trades:
-            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
-            closed.append(self.close_trade(db, trade, premium, ExitReason.TIME_EXIT))
+            try:
+                premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+                closed.append(self.close_trade(db, trade, premium, ExitReason.TIME_EXIT))
+            except Exception as exc:
+                # One bad/stale contract token must never stop every other open
+                # trade from being squared off -- this is the last line of
+                # defense before market close, so it needs to be as resilient
+                # as monitor_open_trades already is per-trade.
+                logger.exception("Square-off failed for trade %s", trade.trade_id)
+                log_event(db, "ERROR", f"[{trade.strategy_name}] square-off failed", "ERROR", {"trade_id": trade.trade_id, "error": str(exc)})
         return closed
 
     def get_strategy(self, db: Session, name: str) -> StrategyConfig | None:

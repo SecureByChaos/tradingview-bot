@@ -292,6 +292,14 @@ class StrategyTrade(Base):
     lowest_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     trailing_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     trailing_stop: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Per-trade SL-mode override. Null for almost every trade -- sl_mode is
+    # normally a strategy-level setting (StrategyConfig.sl_mode), looked up by
+    # strategy_name in monitor_open_trades. AI Origin trades have no matching
+    # StrategyConfig row (synthetic strategy_name) and need this decided per
+    # trade instead: when the AI's own sl_percent/target_percent proposal is
+    # invalid or unreasonably wide, that specific trade falls back to trailing
+    # instead of a number we picked -- see app/ai/originator.py.
+    sl_mode: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     # origin distinguishes the original TradingView signal ("SIGNAL") from a paper
     # trade opened because an AI reviewer proposed an alternative call after
     # rejecting the original signal ("AI_ALT_OPENAI", "AI_ALT_CLAUDE", etc). Lets

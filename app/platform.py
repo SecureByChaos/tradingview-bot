@@ -352,7 +352,12 @@ def strategy_trades_query_for_filter(
     if origin == "signal":
         query = query.where(StrategyTrade.origin == "SIGNAL")
     elif origin == "ai_alt":
-        query = query.where(StrategyTrade.origin != "SIGNAL")
+        # Must match AI_ALT_* specifically, not just "anything but SIGNAL" --
+        # that broader check also pulled in AI_ORIGIN_* trades (fully
+        # independent, self-originated AI trades) onto the AI Alternatives
+        # page, making it look like alternatives were being generated for
+        # AI Origin trades when none actually were.
+        query = query.where(StrategyTrade.origin.like("AI_ALT_%"))
     return query.order_by(StrategyTrade.entry_time.desc())
 
 

@@ -22,6 +22,13 @@ _DEFAULT_TARGET_PERCENT = 20.0
 # alternative the model itself isn't confident about isn't useful evaluation
 # data, it's just noise in the comparison.
 _MIN_CONFIDENCE_TO_ACT = 0.3
+# Defensive floor on the AI-proposed sl_percent/target_percent themselves --
+# the prompt (app/ai/prompt_builder.py) states these are percentage points,
+# not a 0-1 fraction, but LLMs aren't 100% reliable about following a stated
+# scale. A too-tight band closes almost instantly on ordinary option-premium
+# noise, not on the AI actually being wrong. Below this floor the proposed
+# value is discarded and the _DEFAULT_* constants above are used instead.
+_MIN_SL_TARGET_PERCENT = 5.0
 
 
 def maybe_open_alternative_trade(
@@ -47,6 +54,18 @@ def maybe_open_alternative_trade(
         return None
     if original_trade is None:
         logger.info("[AI][ALT] Skipped: no original trade to attach an alternative to")
+        return None
+    if original_trade.origin != "SIGNAL":
+        # Explicit guard, not just relying on the caller (shadow.py's entry-review
+        # trade lookup) to always filter correctly -- an alternative must only ever
+        # be generated for a real signal trade, never for another AI_ALT_* or
+        # AI_ORIGIN_* trade. This should already be unreachable given how the
+        # caller looks trades up, but this isolation guarantee is too important
+        # to depend on that alone.
+        logger.info(
+            "[AI][ALT] Skipped: original trade %s has origin %s, not SIGNAL -- refusing to generate an alternative for a non-signal trade",
+            original_trade.trade_id, original_trade.origin,
+        )
         return None
     if original_trade.mode != TradingMode.PAPER:
         logger.info(
@@ -82,9 +101,15 @@ def maybe_open_alternative_trade(
         logger.info("[AI][ALT] Skipped: could not resolve contract/price for %s alternative (%s)", provider, exc)
         return None
 
-    sl_percent = alternative.sl_percent if alternative.sl_percent and alternative.sl_percent > 0 else _DEFAULT_SL_PERCENT
+    sl_percent = (
+        alternative.sl_percent
+        if alternative.sl_percent and alternative.sl_percent >= _MIN_SL_TARGET_PERCENT
+        else _DEFAULT_SL_PERCENT
+    )
     target_percent = (
-        alternative.target_percent if alternative.target_percent and alternative.target_percent > 0 else _DEFAULT_TARGET_PERCENT
+        alternative.target_percent
+        if alternative.target_percent and alternative.target_percent >= _MIN_SL_TARGET_PERCENT
+        else _DEFAULT_TARGET_PERCENT
     )
     stoploss = round(entry_price * (1 - sl_percent / 100), 2)
     target = round(entry_price * (1 + target_percent / 100), 2)

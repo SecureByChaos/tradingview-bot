@@ -276,9 +276,13 @@ class V7Manager:
             )
         )
         for trade in trades:
-            premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
-            self._close_trade(db, trade, premium, ExitReason.TIME_EXIT)
-            closed.append(trade)
+            try:
+                premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+                self._close_trade(db, trade, premium, ExitReason.TIME_EXIT)
+                closed.append(trade)
+            except Exception as exc:
+                logger.exception("[V7] Square-off failed for trade %s", trade.trade_id)
+                log_event(db, "ERROR", "[V7] square-off failed", "ERROR", {"trade_id": trade.trade_id, "error": str(exc)})
         return closed
 
     def record_exit_suggestion(self, db: Session, signal: Signal, observation_reason: str = "") -> WebhookResponse:

@@ -253,8 +253,13 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
             return WebhookResponse(accepted=False, message=message)
 
         response = multi_strategy_manager.handle_signal(db, strategy_name, payload.signal, payload_market_data)
-        if response.accepted and not payload.signal.value.startswith("SELL"):
-            telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
+        if response.accepted:
+            # SELL_CE/SELL_PE are now observation-only (see
+            # MultiStrategyTradeManager.record_exit_suggestion) and are already
+            # logged via their own STATE/TRADE events inside handle_signal --
+            # don't also mislabel an accepted signal as "ignored" here.
+            if not payload.signal.value.startswith("SELL"):
+                telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
         else:
             log_event(db, "WEBHOOK", f"Signal ignored: {response.message}", "WARNING")
         return queue_shadow_review(

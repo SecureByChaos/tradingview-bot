@@ -117,6 +117,7 @@ def _ensure_columns() -> None:
             "ai_action": "ALTER TABLE strategy_trades ADD COLUMN ai_action VARCHAR(16)",
             "ai_confidence": "ALTER TABLE strategy_trades ADD COLUMN ai_confidence FLOAT",
             "ai_reasoning": "ALTER TABLE strategy_trades ADD COLUMN ai_reasoning TEXT",
+            "sl_mode": "ALTER TABLE strategy_trades ADD COLUMN sl_mode VARCHAR(16)",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():

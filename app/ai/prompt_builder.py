@@ -93,7 +93,12 @@ class PromptBuilder:
             "better risk-reward. Use \"FLIP\" to propose the opposite side entirely if the "
             "data suggests the original signal is wrong-footed. Use \"NONE\" only if there "
             "is genuinely no better alternative to propose. Base this purely on the "
-            "indicators and market data already provided -- do not invent data. If decision "
+            "indicators and market data already provided -- do not invent data. "
+            "sl_percent and target_percent are PERCENTAGE POINTS on the option premium "
+            "(e.g. 10 means a 10% stop-loss), NOT a 0-1 fraction like confidence -- a "
+            "typical sl_percent is 8-15 and target_percent is 15-30; do not propose "
+            "anything below 5, option premiums move several percent on ordinary noise. "
+            "If decision "
             "is not REJECT, or this is an EXIT review, set alternative to "
             "{\"action\": \"NONE\"}."
             if is_entry_review
