@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.client import AIClient
+from app.ai.json_utils import extract_json_object
 from app.ai.repository import get_settings
 from app.database import SessionLocal
 from app.db_models import AIExitCall, AISettings, StrategyTrade, TradeStatus
@@ -64,7 +65,7 @@ def _build_user_prompt(trade: StrategyTrade) -> str:
 
 def _parse_response(text: str) -> tuple[str, float | None, str]:
     try:
-        data = json.loads(text) if isinstance(text, str) else text
+        data = json.loads(extract_json_object(text)) if isinstance(text, str) else text
         if not isinstance(data, dict):
             return "ERROR", None, "Invalid AI response (not a JSON object)."
         decision = str(data.get("decision") or "").strip().upper()

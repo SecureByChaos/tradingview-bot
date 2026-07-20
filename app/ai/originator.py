@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.ai.client import AIClient
+from app.ai.json_utils import extract_json_object
 from app.ai.repository import get_settings
 from app.database import SessionLocal
 from app.db_models import AISettings, IndexConfig, IndexPriceTick, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
@@ -32,8 +33,9 @@ _MIN_CONFIDENCE_TO_ACT = 0.55
 
 SYSTEM_PROMPT = (
     "You are an options entry-timing assistant running an independent, "
-    "paper-trading-only experiment. You are given nothing but recent spot-price "
-    "history for one index -- no volume, no options chain data, no technical "
+    "paper-trading-only experiment. You are given recent spot-price history for "
+    "one index, and when available, today's real exchange-reported session "
+    "open/high/low -- but no volume, no options chain data, no technical "
     "indicators, no support/resistance, nothing else. This is deliberately "
     "limited data. Decide whether there is a genuinely clear momentum case for "
     "opening a fresh CE (bullish) or PE (bearish) position right now, or "
@@ -71,6 +73,11 @@ _MAX_SL_TARGET_PERCENT = 50.0
 # own to source them from.
 _TRAILING_INITIAL_SL_PERCENT = 10.0
 _TRAILING_FALLBACK_TARGET_PERCENT = 20.0
+# Flat pause after ANY AI Origination close (win or loss) before that same
+# index can originate again -- matches the 30-min post-loss cooldown real
+# SIGNAL trades already get, applied here regardless of result since the
+# problem is reopen velocity, not just losing streaks.
+_REOPEN_COOLDOWN_MINUTES = 30
 
 
 @dataclass(frozen=True)
@@ -82,7 +89,9 @@ class _ProviderView:
     timeout_seconds: int
 
 
-def _build_user_prompt(index: IndexConfig, current_price: float, ticks: list[IndexPriceTick]) -> str:
+def _build_user_prompt(
+    index: IndexConfig, current_price: float, ticks: list[IndexPriceTick], day_ohlc: dict[str, float] | None = None
+) -> str:
     prices = [tick.price for tick in ticks] + [current_price]
     earliest = prices[0]
     change_percent = round(((current_price - earliest) / earliest) * 100, 3) if earliest else 0.0
@@ -98,6 +107,16 @@ def _build_user_prompt(index: IndexConfig, current_price: float, ticks: list[Ind
         f"Window low: {round(min(prices), 2)}",
         f"Up moves: {up_moves}, Down moves: {down_moves} (sample-to-sample)",
     ]
+    if day_ohlc is not None:
+        # Exchange-reported full-session range, independent of our own
+        # tick-sampling gaps -- gives real context for where "current price"
+        # sits within today's actual range, not just within our lookback
+        # window. Not always available (see SmartAPIClient.get_index_ohlc);
+        # omitted entirely rather than guessed at when missing.
+        lines.append(
+            f"Today's session range so far: open {day_ohlc['open']}, high {day_ohlc['high']}, "
+            f"low {day_ohlc['low']}, previous close {day_ohlc['close']}"
+        )
     return "\n".join(lines) + "\n\nDecide: BUY_CE, BUY_PE, or NONE?"
 
 
@@ -112,7 +131,7 @@ class _Decision:
 
 def _parse_response(text: str) -> _Decision:
     try:
-        data = json.loads(text) if isinstance(text, str) else text
+        data = json.loads(extract_json_object(text)) if isinstance(text, str) else text
         if not isinstance(data, dict):
             return _Decision("ERROR", None, None, None, "Invalid AI response (not a JSON object).")
         decision = str(data.get("decision") or "").strip().upper()
@@ -218,6 +237,28 @@ def _has_open_origination(db: Session, index_symbol: str) -> bool:
                 StrategyTrade.index_symbol == index_symbol,
                 StrategyTrade.status == TradeStatus.OPEN,
                 StrategyTrade.origin.like("AI_ORIGIN_%"),
+            ).limit(1)
+        )
+        is not None
+    )
+
+
+def _in_reopen_cooldown(db: Session, index_symbol: str) -> bool:
+    """Without this, an index sits idle only while a trade is OPEN -- the moment
+    one closes (often within minutes, win or loss), the very next 5-min
+    scheduler tick is free to open another. On a fast-moving index that
+    produces a reopen-immediately-after-close loop all session (e.g. 16
+    Bank Nifty originations in one day). This adds a flat post-close pause,
+    independent of win/loss, before the same index can originate again."""
+    cutoff = utc_now() - timedelta(minutes=_REOPEN_COOLDOWN_MINUTES)
+    return (
+        db.scalar(
+            select(StrategyTrade.id).where(
+                StrategyTrade.index_symbol == index_symbol,
+                StrategyTrade.origin.like("AI_ORIGIN_%"),
+                StrategyTrade.status == TradeStatus.CLOSED,
+                StrategyTrade.exit_time.is_not(None),
+                StrategyTrade.exit_time >= cutoff,
             ).limit(1)
         )
         is not None
@@ -347,6 +388,12 @@ def run_origination_checks(
             try:
                 if _has_open_origination(session, index.symbol):
                     continue
+                if _in_reopen_cooldown(session, index.symbol):
+                    logger.info(
+                        "[AI][ORIGIN] %s: in %s-min post-close cooldown, skipping",
+                        index.symbol, _REOPEN_COOLDOWN_MINUTES,
+                    )
+                    continue
                 price = round(smartapi.get_index_spot(index), 2)
                 record_index_tick_if_stale(session, index.symbol, price)
                 cutoff = utc_now() - timedelta(minutes=_LOOKBACK_MINUTES)
@@ -361,7 +408,14 @@ def run_origination_checks(
                     logger.info("[AI][ORIGIN] %s: not enough tick history yet (%s samples)", index.symbol, len(ticks))
                     continue
 
-                user_prompt = _build_user_prompt(index, price, ticks)
+                # Best-effort real day OHLC on top of our own tick sampling --
+                # never blocks the check if it fails or comes back unusable.
+                try:
+                    day_ohlc = smartapi.get_index_ohlc(index)
+                except Exception as exc:
+                    logger.info("[AI][ORIGIN] %s: get_index_ohlc failed (%s)", index.symbol, exc)
+                    day_ohlc = None
+                user_prompt = _build_user_prompt(index, price, ticks, day_ohlc)
                 primary_view = _ProviderView(
                     provider=settings.provider,
                     model=settings.model,

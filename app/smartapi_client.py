@@ -361,6 +361,52 @@ class SmartAPIClient:
             )
         return self.get_ltp(index.spot_exchange, index.spot_symbol, index.spot_token)
 
+    def get_index_ohlc(self, index: Any) -> dict[str, float] | None:
+        """Real exchange-reported day open/high/low/close for an index, via
+        getMarketData's OHLC mode -- same /quote rate-limit family as get_ltp,
+        so it shares the same throttle. Angel One's index feed has been
+        reported (SmartAPI forum, NIFTY OHLC request) to sometimes return 0 for
+        open/high/low on pure index instruments even when close/ltp are
+        populated -- so this returns None rather than zeros when that happens,
+        letting the caller fall back to its own data instead of trusting a
+        broken reading. Best-effort only: any failure here should never block
+        a caller that has other data to fall back on."""
+        if not index.spot_token:
+            return None
+        self._throttle_quote_call()
+        try:
+            response = self._call_with_reauth(
+                self.client.getMarketData,
+                "OHLC",
+                {index.spot_exchange: [index.spot_token]},
+            )
+        except Exception as exc:
+            logger.info("SmartAPI getMarketData(OHLC) failed for %s: %s", index.symbol, exc)
+            return None
+        if not response or response.get("status") is False:
+            return None
+        try:
+            fetched = response["data"]["fetched"]
+            if not fetched:
+                return None
+            row = fetched[0]
+            values = {
+                "open": float(row.get("open") or 0),
+                "high": float(row.get("high") or 0),
+                "low": float(row.get("low") or 0),
+                "close": float(row.get("close") or 0),
+            }
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            logger.info("Unexpected getMarketData(OHLC) response for %s: %s (%s)", index.symbol, response, exc)
+            return None
+        # Angel's index feed sometimes reports open/high/low as 0 while close
+        # is populated -- treat that as "not really available" rather than
+        # real zeros a trading decision could act on.
+        if values["open"] <= 0 or values["high"] <= 0 or values["low"] <= 0:
+            logger.info("SmartAPI getMarketData(OHLC) returned incomplete data for %s: %s", index.symbol, values)
+            return None
+        return values
+
     def place_market_order(
         self,
         contract: OptionContract,

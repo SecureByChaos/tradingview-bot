@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, List
 
+from app.ai.json_utils import extract_json_object
 from app.ai.models import AlternativeCall, ReviewResult
 
 
@@ -41,7 +42,7 @@ class AIResponseValidator:
 
     def validate(self, raw_json: Any) -> ReviewResult:
         try:
-            data = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+            data = json.loads(extract_json_object(raw_json)) if isinstance(raw_json, str) else raw_json
             if not isinstance(data, dict):
                 data = {}
             decision = self._normalize_decision(data.get("decision", "ERROR"))
