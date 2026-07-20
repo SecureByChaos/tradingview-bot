@@ -243,6 +243,7 @@ def rebuild_daily_stats(db: Session, trade_date: date | None = None) -> DailySta
     stats = get_or_create_daily_stats(db, day)
     stats.trade_count = len(records)
     stats.pnl_percent = round(sum(record.pnl_percent for record in records), 2)
+    stats.pnl_amount = round(sum(record.profit_loss for record in records), 2)
     stats.wins = sum(1 for record in records if record.result == TradeResult.WIN)
     stats.losses = sum(1 for record in records if record.result == TradeResult.LOSS)
     consecutive = 0
@@ -302,6 +303,7 @@ def get_dashboard_summary(db: Session, active_trade: Any | None) -> dict[str, An
         "wins": stats.wins,
         "losses": stats.losses,
         "pnl_percent": stats.pnl_percent,
+        "pnl_amount": stats.pnl_amount,
         "consecutive_losses": stats.consecutive_losses,
         "trading_allowed": state.trading_allowed and state.status == BotStatus.RUNNING and not state.risk_locked,
         "daily_risk_status": "LOCKED" if state.risk_locked else "OK",
@@ -425,27 +427,39 @@ def get_performance_summary(
     closed.sort(key=lambda trade: trade.exit_time or trade.entry_time)
 
     daily_totals: dict[str, float] = {}
+    daily_amounts: dict[str, float] = {}
     for trade in closed:
         exit_ist = to_ist(trade.exit_time)
         if exit_ist is None:
             continue
         day = exit_ist.date().isoformat()
         daily_totals[day] = daily_totals.get(day, 0.0) + trade.pnl_percent
-    daily_pnl = [{"date": day, "pnl_percent": round(daily_totals[day], 2)} for day in sorted(daily_totals)]
+        daily_amounts[day] = daily_amounts.get(day, 0.0) + trade.profit_loss
+    daily_pnl = [
+        {"date": day, "pnl_percent": round(daily_totals[day], 2), "pnl_amount": round(daily_amounts[day], 2)}
+        for day in sorted(daily_totals)
+    ]
 
     equity_curve: list[dict[str, Any]] = []
     running = 0.0
+    running_amount = 0.0
     peak = 0.0
     max_drawdown = 0.0
     for point in daily_pnl:
         running += point["pnl_percent"]
+        running_amount += point["pnl_amount"]
         peak = max(peak, running)
         max_drawdown = max(max_drawdown, peak - running)
-        equity_curve.append({"date": point["date"], "cumulative_percent": round(running, 2)})
+        equity_curve.append({
+            "date": point["date"],
+            "cumulative_percent": round(running, 2),
+            "cumulative_amount": round(running_amount, 2),
+        })
 
     wins = sum(1 for trade in closed if trade.result == TradeResult.WIN)
     losses = sum(1 for trade in closed if trade.result == TradeResult.LOSS)
     total = len(closed)
+    net_pnl_amount = round(sum(trade.profit_loss for trade in closed), 2)
 
     recent_trades = [
         {
@@ -455,6 +469,7 @@ def get_performance_summary(
             "position_label": "Long call" if trade.option_type == "CE" else "Long put",
             "result": trade.result,
             "pnl_percent": trade.pnl_percent,
+            "profit_loss": trade.profit_loss,
         }
         for trade in reversed(closed[-20:])
     ]
@@ -464,6 +479,7 @@ def get_performance_summary(
     return {
         "kpis": {
             "net_return_percent": round(running, 2),
+            "net_pnl_amount": net_pnl_amount,
             "win_rate": round((wins / total) * 100, 2) if total else 0.0,
             "total_trades": total,
             "max_drawdown_percent": round(-max_drawdown, 2),

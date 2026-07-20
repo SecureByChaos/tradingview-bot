@@ -123,6 +123,15 @@ def _ensure_columns() -> None:
             for column, statement in trade_statements.items():
                 if column not in existing_trade_columns:
                     connection.execute(text(statement))
+    if "daily_stats" in table_names:
+        existing_daily_stats_columns = {column["name"] for column in inspector.get_columns("daily_stats")}
+        daily_stats_statements = {
+            "pnl_amount": "ALTER TABLE daily_stats ADD COLUMN pnl_amount FLOAT NOT NULL DEFAULT 0.0",
+        }
+        with engine.begin() as connection:
+            for column, statement in daily_stats_statements.items():
+                if column not in existing_daily_stats_columns:
+                    connection.execute(text(statement))
     if "ai_settings" in table_names:
         existing_ai_columns = {column["name"] for column in inspector.get_columns("ai_settings")}
         ai_statements = {

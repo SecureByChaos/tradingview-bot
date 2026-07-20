@@ -26,6 +26,7 @@
 
 <div class="metric-grid mb-4">
   <div class="metric"><div class="label">Net return</div><div class="value {% if kpis.net_return_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(kpis.net_return_percent) }}%</div></div>
+  <div class="metric"><div class="label">Net P&amp;L</div><div class="value {% if kpis.net_pnl_amount >= 0 %}profit{% else %}loss{% endif %}">₹{{ "%.2f"|format(kpis.net_pnl_amount) }}</div></div>
   <div class="metric"><div class="label">Win rate</div><div class="value">{{ "%.0f"|format(kpis.win_rate) }}%</div></div>
   <div class="metric"><div class="label">Total trades</div><div class="value">{{ kpis.total_trades }}</div></div>
   <div class="metric"><div class="label">Max drawdown</div><div class="value loss">{{ "%.2f"|format(kpis.max_drawdown_percent) }}%</div></div>
@@ -65,7 +66,7 @@
 {% if recent_trades %}
 <div class="table-responsive responsive-table">
   <table class="table table-dark table-hover align-middle">
-    <thead><tr><th>Date</th><th>Strategy</th><th>Position</th><th>Result</th><th>Return</th></tr></thead>
+    <thead><tr><th>Date</th><th>Strategy</th><th>Position</th><th>Result</th><th>Return</th><th>P&amp;L (₹)</th></tr></thead>
     <tbody>
     {% for trade in recent_trades %}
       <tr>
@@ -74,6 +75,7 @@
         <td data-label="Position">{{ trade.index_display_name }} · {{ trade.position_label }}</td>
         <td data-label="Result">{% if trade.result == "WIN" %}<span class="badge text-bg-success">Win</span>{% elif trade.result == "LOSS" %}<span class="badge text-bg-danger">Loss</span>{% else %}<span class="badge text-bg-secondary">{{ trade.result|title }}</span>{% endif %}</td>
         <td data-label="Return" class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
+        <td data-label="P&amp;L (₹)" class="{% if trade.profit_loss >= 0 %}profit{% else %}loss{% endif %}">₹{{ "%.2f"|format(trade.profit_loss) }}</td>
       </tr>
     {% endfor %}
     </tbody>
@@ -88,21 +90,25 @@
 <script>
 const equityLabels = {{ equity_curve | map(attribute="date") | list | tojson }};
 const equityValues = {{ equity_curve | map(attribute="cumulative_percent") | list | tojson }};
+const equityAmounts = {{ equity_curve | map(attribute="cumulative_amount") | list | tojson }};
 const dailyLabels = {{ daily_pnl | map(attribute="date") | list | tojson }};
 const dailyValues = {{ daily_pnl | map(attribute="pnl_percent") | list | tojson }};
+const dailyAmounts = {{ daily_pnl | map(attribute="pnl_amount") | list | tojson }};
 const wins = {{ win_loss.wins }};
 const losses = {{ win_loss.losses }};
 
 new Chart(document.getElementById('equityChart'), {
   type: 'line',
   data: { labels: equityLabels, datasets: [{ data: equityValues, borderColor: '#378ADD', backgroundColor: 'rgba(55,138,221,0.12)', fill: true, borderWidth: 2, pointRadius: 0, tension: 0.25 }] },
-  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false },
+      tooltip: { callbacks: { label: ctx => `${ctx.parsed.y}%  (₹${equityAmounts[ctx.dataIndex].toFixed(2)})` } } },
     scales: { x: { grid: { display: false } }, y: { ticks: { callback: v => v + '%' } } } }
 });
 new Chart(document.getElementById('dailyChart'), {
   type: 'bar',
   data: { labels: dailyLabels, datasets: [{ data: dailyValues, backgroundColor: dailyValues.map(v => v >= 0 ? '#45d68a' : '#ff6577'), borderRadius: 4 }] },
-  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+  options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false },
+      tooltip: { callbacks: { label: ctx => `${ctx.parsed.y}%  (₹${dailyAmounts[ctx.dataIndex].toFixed(2)})` } } },
     scales: { x: { display: false }, y: { ticks: { callback: v => v + '%' } } } }
 });
 new Chart(document.getElementById('winChart'), {

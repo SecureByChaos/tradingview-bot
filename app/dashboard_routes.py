@@ -215,7 +215,7 @@ def history_export(
     writer = csv.writer(buffer)
     writer.writerow([
         "Strategy", "Origin", "Entry Time (IST)", "Exit Time (IST)", "Duration",
-        "Signal", "Strike", "Entry", "Exit", "P&L %", "Result", "Status", "Mode",
+        "Signal", "Strike", "Entry", "Exit", "P&L %", "P&L (Rs)", "Result", "Status", "Mode",
     ])
     for trade in trades:
         writer.writerow([
@@ -229,6 +229,7 @@ def history_export(
             trade.entry_price,
             trade.exit_price or "",
             f"{trade.pnl_percent:.2f}" if trade.pnl_percent is not None else "",
+            f"{trade.profit_loss:.2f}" if trade.status == "CLOSED" else "",
             trade.result,
             trade.status,
             trade.mode,

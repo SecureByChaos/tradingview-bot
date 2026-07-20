@@ -371,6 +371,7 @@ class DailyStats(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trade_date: Mapped[date] = mapped_column(Date, unique=True, index=True, nullable=False)
     pnl_percent: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    pnl_amount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     trade_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     wins: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     losses: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
