@@ -19,7 +19,7 @@ from app.models import Signal
 from app.option_finder import OptionFinder
 from app.platform import list_index_configs, log_event, record_index_tick_if_stale
 from app.smartapi_client import SmartAPIClient
-from app.time_utils import format_ist, utc_now
+from app.time_utils import format_ist, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,17 @@ _MIN_TICKS_REQUIRED = 3
 # brand-new position from momentum data alone, with nothing else to anchor
 # it -- a materially bigger claim, so it should clear a materially higher bar.
 _MIN_CONFIDENCE_TO_ACT = 0.55
+# Applies to every index (Bank Nifty, Nifty, and Sensex whenever it's added) --
+# the first 15 minutes after the 9:15 open are the noisiest, whippiest part of
+# the session. Origination keeps recording price ticks during this window so
+# there's already real momentum history by the time trading is allowed, it
+# just doesn't call the AI or act on anything until the window closes.
+_TRADING_START_HOUR = 9
+_TRADING_START_MINUTE = 30
+
+
+def _still_observing(now_ist) -> bool:
+    return (now_ist.hour, now_ist.minute) < (_TRADING_START_HOUR, _TRADING_START_MINUTE)
 
 SYSTEM_PROMPT = (
     "You are an options entry-timing assistant running an independent, "
@@ -401,6 +412,12 @@ def run_origination_checks(
                 #     continue
                 price = round(smartapi.get_index_spot(index), 2)
                 record_index_tick_if_stale(session, index.symbol, price)
+                if _still_observing(to_ist(utc_now())):
+                    logger.info(
+                        "[AI][ORIGIN] %s: still observing (market open until %02d:%02d IST), recording ticks only",
+                        index.symbol, _TRADING_START_HOUR, _TRADING_START_MINUTE,
+                    )
+                    continue
                 cutoff = utc_now() - timedelta(minutes=_LOOKBACK_MINUTES)
                 ticks = list(
                     session.scalars(
