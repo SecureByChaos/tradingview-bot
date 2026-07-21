@@ -68,9 +68,20 @@ own data.
 11. **(Further out) Expiry/max-pain awareness.** OI-by-strike near weekly expiry,
     so behavior can adapt when OI-pinning dynamics dominate over pure momentum.
 
-## Known issue: primary/secondary ordering bias
+## Known issue: primary/secondary ordering bias — FIXED 2026-07-21
 
-Discovered 2026-07-21, not yet fixed. `run_origination_checks` gives the primary
+Discovered 2026-07-21, fixed same day via `_build_provider_order()` in
+`app/ai/originator.py`: which provider attempts first now alternates every
+5-minute cycle (`cycle_toggle = int(utc_now().timestamp() // 300) % 2`),
+computed once per `run_origination_checks` call and applied to every index
+that cycle. Chosen over the consensus/agreement option deliberately -- this
+fixes the fairness problem without reducing how often trades happen, whereas
+requiring both providers to agree would cut trade volume, which wasn't wanted
+right now. Splitting indices between providers was the other option not taken,
+since alternating first-mover was simpler and doesn't permanently tie a
+provider to one index.
+
+Original problem, for reference: `run_origination_checks` gives the primary
 provider (currently OpenAI) the first attempt on every enabled index, every
 cycle. The secondary provider (currently Claude) only gets called for a given
 index if the primary either returns NONE or its confidence falls below the

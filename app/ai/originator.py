@@ -241,6 +241,44 @@ def _call_provider(provider: str, view: _ProviderView, user_prompt: str) -> Opti
     return None
 
 
+def _build_provider_order(settings: AISettings, cycle_toggle: int) -> list[tuple[str, str, _ProviderView]]:
+    """Builds the (label, provider_name, view) attempt order for this cycle.
+    cycle_toggle alternates 0/1 every 5 minutes (see caller) -- when it's 1 and
+    both providers are actually configured, secondary attempts first instead
+    of primary, so first-mover advantage doesn't structurally favor whichever
+    provider happens to sit in the "primary" slot in AI Settings."""
+    order: list[tuple[str, str, _ProviderView]] = [(
+        "primary",
+        settings.provider,
+        _ProviderView(
+            provider=settings.provider,
+            model=settings.model,
+            api_key=settings.api_key,
+            base_url=settings.base_url,
+            timeout_seconds=settings.timeout_seconds,
+        ),
+    )]
+    if (
+        settings.secondary_enabled
+        and settings.secondary_provider
+        and settings.secondary_provider.strip().lower() != settings.provider.strip().lower()
+    ):
+        order.append((
+            "secondary",
+            settings.secondary_provider,
+            _ProviderView(
+                provider=settings.secondary_provider,
+                model=settings.secondary_model,
+                api_key=settings.secondary_api_key,
+                base_url=settings.secondary_base_url,
+                timeout_seconds=settings.timeout_seconds,
+            ),
+        ))
+    if cycle_toggle == 1 and len(order) == 2:
+        order = [order[1], order[0]]
+    return order
+
+
 def _has_open_origination(db: Session, index_symbol: str) -> bool:
     return (
         db.scalar(
@@ -393,6 +431,16 @@ def run_origination_checks(
             logger.info("[AI][ORIGIN] Skipped: no real provider configured (provider=%s)", settings.provider)
             return
 
+        # Which provider gets the first attempt each index's single trade slot
+        # flips every 5-min cycle -- without this, primary always went first and
+        # always got first crack at every index, so it structurally accumulated
+        # more trades than secondary regardless of which model actually judges
+        # setups better. This doesn't reduce how often trades happen (that was
+        # an explicit ask) -- it only changes which provider gets first refusal
+        # on a given cycle, so both get a fair share of first attempts over a
+        # full day instead of one always winning by default.
+        provider_order = _build_provider_order(settings, cycle_toggle=int(utc_now().timestamp() // 300) % 2)
+
         for index in list_index_configs(session):
             if not index.enabled:
                 continue
@@ -438,43 +486,19 @@ def run_origination_checks(
                     logger.info("[AI][ORIGIN] %s: get_index_ohlc failed (%s)", index.symbol, exc)
                     day_ohlc = None
                 user_prompt = _build_user_prompt(index, price, ticks, day_ohlc)
-                primary_view = _ProviderView(
-                    provider=settings.provider,
-                    model=settings.model,
-                    api_key=settings.api_key,
-                    base_url=settings.base_url,
-                    timeout_seconds=settings.timeout_seconds,
-                )
-                decision = _call_provider(settings.provider, primary_view, user_prompt)
-                if decision is not None:
-                    logger.info("[AI][ORIGIN] %s -> %s (%s)", index.symbol, decision.action, settings.provider)
+                for turn, provider_name, view in provider_order:
+                    # Whichever provider goes first this cycle can fill the
+                    # index's one trade slot; if it does, the other one is
+                    # skipped for this index this cycle, same as before -- the
+                    # only change is who gets first refusal isn't fixed.
+                    if _has_open_origination(session, index.symbol):
+                        break
+                    decision = _call_provider(provider_name, view, user_prompt)
+                    if decision is None:
+                        continue
+                    logger.info("[AI][ORIGIN] %s -> %s (%s, %s)", index.symbol, decision.action, provider_name, turn)
                     if decision.action in ("BUY_CE", "BUY_PE") and (decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT:
-                        _open_paper_trade(session, index, settings.provider, decision, smartapi, option_finder)
-
-                if (
-                    settings.secondary_enabled
-                    and settings.secondary_provider
-                    and settings.secondary_provider.strip().lower() != settings.provider.strip().lower()
-                    and not _has_open_origination(session, index.symbol)
-                ):
-                    secondary_view = _ProviderView(
-                        provider=settings.secondary_provider,
-                        model=settings.secondary_model,
-                        api_key=settings.secondary_api_key,
-                        base_url=settings.secondary_base_url,
-                        timeout_seconds=settings.timeout_seconds,
-                    )
-                    secondary_decision = _call_provider(settings.secondary_provider, secondary_view, user_prompt)
-                    if secondary_decision is not None:
-                        logger.info(
-                            "[AI][ORIGIN] %s -> %s (secondary %s)",
-                            index.symbol, secondary_decision.action, settings.secondary_provider,
-                        )
-                        if (
-                            secondary_decision.action in ("BUY_CE", "BUY_PE")
-                            and (secondary_decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT
-                        ):
-                            _open_paper_trade(session, index, settings.secondary_provider, secondary_decision, smartapi, option_finder)
+                        _open_paper_trade(session, index, provider_name, decision, smartapi, option_finder)
             except Exception as exc:
                 logger.exception("[AI][ORIGIN] Check failed for index %s", index.symbol)
                 # Previously silent beyond the server log file (not reachable from the
