@@ -19,6 +19,18 @@ from app.time_utils import IST, format_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
+# AI Origination only (see the origin check below) -- these trades get no
+# further AI judgment after entry, unlike real signal trades which at least
+# get a shadow exit review. Real intraday options traders commonly use a
+# 30-60 min time stop specifically because theta decay makes a stalled,
+# near-breakeven position a slow bleed regardless of direction; a momentum
+# thesis that hasn't shown anything after an hour has effectively already
+# been disproven. Deliberately separate from the existing 15:15 TIME_EXIT
+# check below -- that's the end-of-day catch-all for every trade, this is an
+# earlier, AI-Origination-specific "this isn't developing" exit.
+_STALL_WINDOW_MINUTES = 60
+_STALL_BAND_PERCENT = 5.0
+
 
 class MultiStrategyTradeManager:
     def __init__(
@@ -331,6 +343,11 @@ class MultiStrategyTradeManager:
                             reason = ExitReason.STOPLOSS
                         elif premium >= trade.target:
                             reason = ExitReason.TARGET
+
+                if reason is None and trade.origin.startswith("AI_ORIGIN_"):
+                    elapsed_minutes = (utc_now() - trade.entry_time).total_seconds() / 60
+                    if elapsed_minutes >= _STALL_WINDOW_MINUTES and abs(trade.pnl_percent) <= _STALL_BAND_PERCENT:
+                        reason = ExitReason.STALL_EXIT
 
                 if reason is None and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 15)):
                     reason = ExitReason.TIME_EXIT

@@ -20,6 +20,11 @@ class ExitReason(str, Enum):
     STOPLOSS = "STOPLOSS"
     TIME_EXIT = "TIME_EXIT"
     TV_EXIT = "TV_EXIT"
+    # AI Origination only -- distinct from TIME_EXIT (end-of-day square-off) so
+    # reporting can tell "this thesis never developed" apart from "market
+    # closed while it was still open." See monitor_open_trades in
+    # multi_strategy.py for the stall-window/stall-band check that uses this.
+    STALL_EXIT = "STALL_EXIT"
 
 
 class WebhookPayload(BaseModel):
