@@ -8,6 +8,7 @@
   <div class="metric"><div class="label">Currently open</div><div class="value">{{ kpis.open_count }}</div></div>
   <div class="metric"><div class="label">Win rate (closed)</div><div class="value">{{ "%.0f"|format(kpis.win_rate) }}%</div></div>
   <div class="metric"><div class="label">Net P&amp;L (closed)</div><div class="value {% if kpis.net_pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(kpis.net_pnl_percent) }}%</div></div>
+  <div class="metric"><div class="label">Net P&amp;L ₹ (closed)</div><div class="value {% if kpis.net_pnl_amount >= 0 %}profit{% else %}loss{% endif %}">₹{{ "%.2f"|format(kpis.net_pnl_amount) }}</div></div>
 </div>
 
 <div class="section-header"><h4 class="mb-0">Currently open</h4></div>
@@ -39,7 +40,7 @@
 {% if history %}
 <div class="table-responsive responsive-table">
   <table class="table table-dark table-hover align-middle">
-    <thead><tr><th>Provider</th><th>Position</th><th>Entry</th><th>Exit</th><th>P&amp;L %</th><th>Result</th><th>Confidence</th><th>Closed</th></tr></thead>
+    <thead><tr><th>Provider</th><th>Position</th><th>Entry</th><th>Exit</th><th>P&amp;L %</th><th>P&amp;L (₹)</th><th>Result</th><th>Confidence</th><th>Closed</th></tr></thead>
     <tbody>
     {% for row in history %}
       <tr>
@@ -48,6 +49,7 @@
         <td data-label="Entry">{{ row.entry_price }}</td>
         <td data-label="Exit">{{ row.exit_price or "" }}</td>
         <td data-label="P&amp;L %" class="{% if (row.pnl_percent or 0) >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(row.pnl_percent or 0) }}%</td>
+        <td data-label="P&amp;L (₹)" class="{% if (row.profit_loss or 0) >= 0 %}profit{% else %}loss{% endif %}">₹{{ "%.2f"|format(row.profit_loss or 0) }}</td>
         <td data-label="Result">
           {% if row.result == "WIN" %}<span class="badge text-bg-success">Win</span>
           {% elif row.result == "LOSS" %}<span class="badge text-bg-danger">Loss</span>

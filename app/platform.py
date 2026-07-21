@@ -729,6 +729,7 @@ def get_origination_summary(db: Session, limit: int = 30) -> dict[str, Any]:
             "current_premium": trade.current_premium,
             "exit_price": trade.exit_price if closed else None,
             "pnl_percent": trade.pnl_percent,
+            "profit_loss": trade.profit_loss if closed else None,
             "result": trade.result if closed else None,
             "confidence": trade.ai_confidence,
             "reasoning": trade.ai_reasoning,
@@ -748,6 +749,7 @@ def get_origination_summary(db: Session, limit: int = 30) -> dict[str, Any]:
         "closed_count": total_closed,
         "win_rate": round((wins / total_closed) * 100, 2) if total_closed else 0.0,
         "net_pnl_percent": round(sum(trade.pnl_percent or 0 for trade in closed_trades), 2),
+        "net_pnl_amount": round(sum(trade.profit_loss or 0 for trade in closed_trades), 2),
     }
 
     return {"live": live, "history": history, "kpis": kpis}

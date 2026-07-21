@@ -190,9 +190,24 @@ def history(
 ) -> HTMLResponse:
     origin_filter = origin if origin in ("signal", "ai_alt") else None
     trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter)))
+    # Net P&L in rupees across whatever filter/date-range/origin is currently
+    # applied -- only closed trades have a real profit_loss (open trades default
+    # to 0.0, which would understate nothing but also isn't a real realized
+    # number yet, so they're excluded from this total on purpose).
+    closed_trades = [trade for trade in trades if trade.status == TradeStatus.CLOSED]
+    net_pnl_amount = round(sum(trade.profit_loss for trade in closed_trades), 2)
     return templates.TemplateResponse(
         "history.html",
-        {"request": request, "trades": trades, "filter": filter, "start": start or "", "end": end or "", "origin": origin},
+        {
+            "request": request,
+            "trades": trades,
+            "filter": filter,
+            "start": start or "",
+            "end": end or "",
+            "origin": origin,
+            "net_pnl_amount": net_pnl_amount,
+            "closed_count": len(closed_trades),
+        },
     )
 
 
