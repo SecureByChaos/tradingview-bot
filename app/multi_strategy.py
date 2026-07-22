@@ -15,7 +15,7 @@ from app.platform import get_index_config, log_event, update_strategy_stats_afte
 from app.signal_validation import check_premium_sanity, check_spot_price_deviation
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
-from app.time_utils import IST, format_ist, utc_now
+from app.time_utils import IST, format_ist, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +345,15 @@ class MultiStrategyTradeManager:
                             reason = ExitReason.TARGET
 
                 if reason is None and trade.origin.startswith("AI_ORIGIN_"):
-                    elapsed_minutes = (utc_now() - trade.entry_time).total_seconds() / 60
+                    # SQLite doesn't reliably round-trip tzinfo even on a
+                    # DateTime(timezone=True) column -- trade.entry_time can
+                    # come back offset-naive, which breaks a raw subtraction
+                    # against an offset-aware now(). to_ist() already exists
+                    # specifically to normalize that (see its docstring-less
+                    # but consistent use everywhere else in this codebase);
+                    # reuse it here instead of subtracting the raw values.
+                    entry_time_ist = to_ist(trade.entry_time)
+                    elapsed_minutes = (now_ist - entry_time_ist).total_seconds() / 60 if entry_time_ist else 0
                     if elapsed_minutes >= _STALL_WINDOW_MINUTES and abs(trade.pnl_percent) <= _STALL_BAND_PERCENT:
                         reason = ExitReason.STALL_EXIT
 
