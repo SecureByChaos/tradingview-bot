@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% from "components.html" import page_header, empty_state %}
 {% block content %}
-{{ page_header("AI Origination", "Paper only -- AI-initiated, no TradingView signal", "text-bg-secondary") }}
+{{ page_header("AI Origination", "AI-initiated, no TradingView signal -- paper by default, live only where enabled per index in Settings > Instruments", "text-bg-secondary") }}
 
 <div class="metric-grid mb-4">
   <div class="metric"><div class="label">Total originated</div><div class="value">{{ kpis.total_originated }}</div></div>
@@ -15,13 +15,15 @@
 {% if live %}
 <div class="table-responsive responsive-table mb-4">
   <table class="table table-dark table-hover align-middle">
-    <thead><tr><th>Provider</th><th>Position</th><th>Entry</th><th>Current</th><th>P&amp;L %</th><th>Confidence</th><th>Reasoning</th><th>Opened</th></tr></thead>
+    <thead><tr><th>Provider</th><th>Position</th><th>Mode</th><th>Entry</th><th>Capital (₹)</th><th>Current</th><th>P&amp;L %</th><th>Confidence</th><th>Reasoning</th><th>Opened</th></tr></thead>
     <tbody>
     {% for row in live %}
       <tr>
         <td data-label="Provider"><span class="badge text-bg-info">{{ row.provider }}</span></td>
         <td data-label="Position">{{ row.index_display_name }} · {{ row.position_label }}</td>
+        <td data-label="Mode"><span class="badge {% if row.mode == 'LIVE' %}text-bg-danger{% else %}text-bg-secondary{% endif %}">{{ row.mode }}</span></td>
         <td data-label="Entry">{{ row.entry_price }}</td>
+        <td data-label="Capital (₹)">₹{{ "%.2f"|format(row.investment_amount or 0) }}</td>
         <td data-label="Current">{{ row.current_premium if row.current_premium is not none else "Unavailable" }}</td>
         <td data-label="P&amp;L %" class="{% if (row.pnl_percent or 0) >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(row.pnl_percent or 0) }}%</td>
         <td data-label="Confidence">{% if row.confidence is not none %}{{ "%.0f"|format(row.confidence * 100) }}%{% endif %}</td>
@@ -40,13 +42,15 @@
 {% if history %}
 <div class="table-responsive responsive-table">
   <table class="table table-dark table-hover align-middle">
-    <thead><tr><th>Provider</th><th>Position</th><th>Entry</th><th>Exit</th><th>P&amp;L %</th><th>P&amp;L (₹)</th><th>Result</th><th>Confidence</th><th>Closed</th></tr></thead>
+    <thead><tr><th>Provider</th><th>Position</th><th>Mode</th><th>Entry</th><th>Capital (₹)</th><th>Exit</th><th>P&amp;L %</th><th>P&amp;L (₹)</th><th>Result</th><th>Confidence</th><th>Closed</th></tr></thead>
     <tbody>
     {% for row in history %}
       <tr>
         <td data-label="Provider"><span class="badge text-bg-info">{{ row.provider }}</span></td>
         <td data-label="Position">{{ row.index_display_name }} · {{ row.position_label }}</td>
+        <td data-label="Mode"><span class="badge {% if row.mode == 'LIVE' %}text-bg-danger{% else %}text-bg-secondary{% endif %}">{{ row.mode }}</span></td>
         <td data-label="Entry">{{ row.entry_price }}</td>
+        <td data-label="Capital (₹)">₹{{ "%.2f"|format(row.investment_amount or 0) }}</td>
         <td data-label="Exit">{{ row.exit_price or "" }}</td>
         <td data-label="P&amp;L %" class="{% if (row.pnl_percent or 0) >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(row.pnl_percent or 0) }}%</td>
         <td data-label="P&amp;L (₹)" class="{% if (row.profit_loss or 0) >= 0 %}profit{% else %}loss{% endif %}">₹{{ "%.2f"|format(row.profit_loss or 0) }}</td>

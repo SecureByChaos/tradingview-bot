@@ -12,6 +12,7 @@
   <div class="detail-grid">
     <div><div class="label">Strike</div><div class="value">{{ trade.strike }}</div></div>
     <div><div class="label">Entry Price</div><div class="value">{{ trade.entry_price }}</div></div>
+    <div><div class="label">Capital Invested</div><div class="value">₹{{ "%.2f"|format(trade.investment_amount or 0) }}</div></div>
     <div><div class="label">Current Premium</div><div class="value">{{ trade.current_premium if trade.current_premium is not none else "Unavailable" }}</div></div>
     <div><div class="label">Stop Loss</div><div class="value loss">{{ trade.stoploss }}</div></div>
     <div><div class="label">Target</div><div class="value profit">{{ trade.target }}</div></div>

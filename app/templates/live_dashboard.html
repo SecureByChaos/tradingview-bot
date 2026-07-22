@@ -63,6 +63,7 @@ function renderTrades(trades) {
       '<div class="trade-card-strategy">Strategy: ' + trade.strategy_name + '</div>' +
       '<div class="trade-card-figures">' +
       '<div><div class="label">Entry</div><div class="value">' + trade.entry_price + '</div></div>' +
+      '<div><div class="label">Capital (₹)</div><div class="value">₹' + (trade.investment_amount || 0).toFixed(2) + '</div></div>' +
       '<div><div class="label">Current</div><div class="value">' + trade.current_premium + '</div></div>' +
       '<div><div class="label">Live P&amp;L</div><div class="value ' + cls + '">' + sign + trade.pnl_percent + '%</div></div>' +
       '</div>' +

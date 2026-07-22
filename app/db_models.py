@@ -201,6 +201,14 @@ class IndexConfig(Base):
     lot_size: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     strike_interval: Mapped[int] = mapped_column(Integer, default=100, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Separate opt-in from StrategyConfig.live_trade -- AI Origination has no
+    # StrategyConfig row of its own (synthetic strategy_name), so its live/paper
+    # choice is made per index here instead. Defaults to False (paper) on every
+    # index; even when True, app/smartapi_client.py's place_market_order() still
+    # only fires a real order if the server-side SMARTAPI_LIVE_TRADING env var
+    # (Settings.live_trading) is also on -- this is the per-index half of that
+    # same two-key safety pattern every other live-capable strategy already uses.
+    ai_origination_live_trade: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -273,6 +281,13 @@ class StrategyTrade(Base):
     expiry: Mapped[str] = mapped_column(String(32), nullable=False)
     option_type: Mapped[str] = mapped_column(String(8), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Actual capital committed at entry -- entry_price * quantity, i.e. total
+    # premium paid for the whole position (quantity is already lots *
+    # lot_size, not a lot count). Stored rather than computed on read so it's
+    # available directly in exports/CSV and stays correct even if entry_price
+    # display rounding ever changes; set once at trade-open time across every
+    # strategy path (SIGNAL, AI_ALT_*, AI_ORIGIN_*).
+    investment_amount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     entry_price: Mapped[float] = mapped_column(Float, nullable=False)
     exit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     current_premium: Mapped[float | None] = mapped_column(Float, nullable=True)

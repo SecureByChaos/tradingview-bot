@@ -127,6 +127,7 @@ def maybe_open_alternative_trade(
         expiry=contract.expiry,
         option_type=contract.option_type,
         quantity=original_trade.quantity,
+        investment_amount=round(entry_price * original_trade.quantity, 2),
         entry_price=round(entry_price, 2),
         current_premium=round(entry_price, 2),
         stoploss=stoploss,

@@ -170,6 +170,7 @@ class MultiStrategyTradeManager:
             expiry=contract.expiry,
             option_type=contract.option_type,
             quantity=quantity,
+            investment_amount=required_capital,
             entry_price=round(entry_price, 2),
             current_premium=round(entry_price, 2),
             stoploss=stoploss,

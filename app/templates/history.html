@@ -32,14 +32,14 @@
 </div>
 <div class="table-responsive responsive-table">
   <table class="table table-dark table-hover align-middle">
-    <thead><tr><th>Strategy</th><th>Origin</th><th>Entry Time (IST)</th><th>Exit Time (IST)</th><th>Duration</th><th>Signal</th><th>Strike</th><th>Entry</th><th>Exit</th><th>P&L %</th><th>P&L (₹)</th><th>Result</th><th>Status</th><th>Mode</th></tr></thead>
+    <thead><tr><th>Strategy</th><th>Origin</th><th>Entry Time (IST)</th><th>Exit Time (IST)</th><th>Duration</th><th>Signal</th><th>Strike</th><th>Entry</th><th>Capital (₹)</th><th>Exit</th><th>P&L %</th><th>P&L (₹)</th><th>Result</th><th>Status</th><th>Mode</th></tr></thead>
     <tbody>
     {% for trade in trades %}
       <tr>
         <td data-label="Strategy">{{ trade.strategy_name }}</td>
         <td data-label="Origin"><span class="badge {% if trade.origin == 'SIGNAL' %}text-bg-secondary{% else %}text-bg-info{% endif %}">{{ trade.origin|origin_label }}</span></td>
         <td data-label="Entry Time">{{ trade.entry_time|ist }}</td><td data-label="Exit Time">{{ trade.exit_time|ist }}</td><td data-label="Duration">{{ trade.entry_time|duration(trade.exit_time) }}</td><td data-label="Signal">{{ trade.signal }}</td><td data-label="Strike">{{ trade.strike }}</td>
-        <td data-label="Entry">{{ trade.entry_price }}</td><td data-label="Exit">{{ trade.exit_price or "" }}</td>
+        <td data-label="Entry">{{ trade.entry_price }}</td><td data-label="Capital (₹)">₹{{ "%.2f"|format(trade.investment_amount or 0) }}</td><td data-label="Exit">{{ trade.exit_price or "" }}</td>
         <td data-label="P&amp;L %" class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
         <td data-label="P&amp;L (₹)" class="{% if trade.status == 'CLOSED' %}{% if trade.profit_loss >= 0 %}profit{% else %}loss{% endif %}{% endif %}">{% if trade.status == 'CLOSED' %}₹{{ "%.2f"|format(trade.profit_loss) }}{% else %}—{% endif %}</td>
         <td data-label="Result">{{ trade.result }}</td><td data-label="Status">{{ trade.status }}</td><td data-label="Mode">{{ trade.mode }}</td>

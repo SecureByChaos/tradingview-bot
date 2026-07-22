@@ -118,10 +118,32 @@ def _ensure_columns() -> None:
             "ai_confidence": "ALTER TABLE strategy_trades ADD COLUMN ai_confidence FLOAT",
             "ai_reasoning": "ALTER TABLE strategy_trades ADD COLUMN ai_reasoning TEXT",
             "sl_mode": "ALTER TABLE strategy_trades ADD COLUMN sl_mode VARCHAR(16)",
+            "investment_amount": "ALTER TABLE strategy_trades ADD COLUMN investment_amount FLOAT NOT NULL DEFAULT 0.0",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():
                 if column not in existing_trade_columns:
+                    connection.execute(text(statement))
+            # Backfill: existing rows get investment_amount=0.0 from the ALTER
+            # above, but it's directly derivable from columns that already
+            # exist on every row (entry_price * quantity) -- compute it once
+            # for any row still sitting at the default so historical trades
+            # aren't stuck showing zero capital invested.
+            if "investment_amount" not in existing_trade_columns:
+                connection.execute(
+                    text(
+                        "UPDATE strategy_trades SET investment_amount = ROUND(entry_price * quantity, 2) "
+                        "WHERE investment_amount = 0.0"
+                    )
+                )
+    if "index_configs" in table_names:
+        existing_index_columns = {column["name"] for column in inspector.get_columns("index_configs")}
+        index_statements = {
+            "ai_origination_live_trade": "ALTER TABLE index_configs ADD COLUMN ai_origination_live_trade BOOLEAN NOT NULL DEFAULT 0",
+        }
+        with engine.begin() as connection:
+            for column, statement in index_statements.items():
+                if column not in existing_index_columns:
                     connection.execute(text(statement))
     if "daily_stats" in table_names:
         existing_daily_stats_columns = {column["name"] for column in inspector.get_columns("daily_stats")}

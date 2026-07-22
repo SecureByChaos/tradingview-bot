@@ -230,7 +230,7 @@ def history_export(
     writer = csv.writer(buffer)
     writer.writerow([
         "Strategy", "Origin", "Entry Time (IST)", "Exit Time (IST)", "Duration",
-        "Signal", "Strike", "Entry", "Exit", "P&L %", "P&L (Rs)", "Result", "Status", "Mode",
+        "Signal", "Strike", "Entry", "Capital Invested (Rs)", "Exit", "P&L %", "P&L (Rs)", "Result", "Status", "Mode",
     ])
     for trade in trades:
         writer.writerow([
@@ -242,6 +242,7 @@ def history_export(
             trade.signal,
             trade.strike,
             trade.entry_price,
+            f"{trade.investment_amount:.2f}" if trade.investment_amount is not None else "",
             trade.exit_price or "",
             f"{trade.pnl_percent:.2f}" if trade.pnl_percent is not None else "",
             f"{trade.profit_loss:.2f}" if trade.status == "CLOSED" else "",
@@ -466,6 +467,7 @@ def update_instrument(
     lot_size: Annotated[int, Form()],
     strike_interval: Annotated[int, Form()],
     enabled: Annotated[str | None, Form()] = None,
+    ai_origination_live_trade: Annotated[str | None, Form()] = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> RedirectResponse:
     index = db.get(IndexConfig, index_id)
@@ -482,6 +484,7 @@ def update_instrument(
     index.lot_size = lot_size
     index.strike_interval = strike_interval
     index.enabled = enabled == "on"
+    index.ai_origination_live_trade = ai_origination_live_trade == "on"
     db.commit()
     log_event(db, "BOT", f"Index config updated: {index.symbol}")
     return RedirectResponse("/settings?tab=instruments", status_code=303)

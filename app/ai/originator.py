@@ -334,7 +334,7 @@ def _in_reopen_cooldown(db: Session, index_symbol: str) -> bool:
     )
 
 
-def _open_paper_trade(
+def _open_trade(
     db: Session,
     index: IndexConfig,
     provider: str,
@@ -375,6 +375,19 @@ def _open_paper_trade(
     origin = f"AI_ORIGIN_{provider.strip().upper()}"
     strategy_name = f"AI Origination - {index.display_name or index.symbol}"
 
+    # Paper by default, everywhere. Goes LIVE only when BOTH this specific
+    # index has ai_origination_live_trade explicitly checked in Settings >
+    # Instruments AND the server-side SMARTAPI_LIVE_TRADING switch is on --
+    # the same two-key pattern every other live-capable strategy in this app
+    # already uses (see MultiStrategyManager.resolve_mode). place_market_order
+    # itself independently no-ops back to a "PAPER_ORDER" id if the server
+    # switch is off, so this can never place a real order on its own even if
+    # the index flag alone were somehow wrong.
+    mode = TradingMode.LIVE if index.ai_origination_live_trade and smartapi.settings.live_trading else TradingMode.PAPER
+    entry_order_id = None
+    if mode == TradingMode.LIVE:
+        entry_order_id = smartapi.place_market_order(contract, "BUY", contract.lot_size)
+
     trade = StrategyTrade(
         trade_id=uuid4().hex,
         strategy_name=strategy_name,
@@ -387,15 +400,16 @@ def _open_paper_trade(
         expiry=contract.expiry,
         option_type=contract.option_type,
         quantity=contract.lot_size,
+        investment_amount=round(entry_price * contract.lot_size, 2),
         entry_price=round(entry_price, 2),
         current_premium=round(entry_price, 2),
         stoploss=stoploss,
         target=target,
         entry_time=utc_now(),
-        mode=TradingMode.PAPER,
+        mode=mode,
         status=TradeStatus.OPEN,
         result=TradeResult.OPEN,
-        entry_order_id=None,
+        entry_order_id=entry_order_id,
         highest_price=round(entry_price, 2),
         lowest_price=round(entry_price, 2),
         trailing_active=False,
@@ -431,12 +445,16 @@ def run_origination_checks(
     option_finder: Optional[OptionFinder] = None,
     db: Session | None = None,
 ) -> None:
-    """Independent, paper-only AI entry-origination check for the AI Origination
-    page. Never touches real risk/state/stats/telegram -- every resulting trade
-    carries an AI_ORIGIN_* origin, the same isolation convention used by
-    app/ai/alternative_trader.py and app/ai/exit_shadow.py. Owns its own DB
-    session when called from the scheduler; smartapi/option_finder must be
-    supplied there since this module has no app-context access of its own."""
+    """Independent AI entry-origination check for the AI Origination page.
+    Paper by default on every index; goes live only for an index that's had
+    ai_origination_live_trade explicitly checked in Settings > Instruments,
+    and even then only if SMARTAPI_LIVE_TRADING is also on server-side (see
+    _open_trade). Every resulting trade carries an AI_ORIGIN_* origin,
+    the same isolation convention used by app/ai/alternative_trader.py and
+    app/ai/exit_shadow.py, so it's still fully separated from real SIGNAL
+    trades regardless of paper/live mode. Owns its own DB session when called
+    from the scheduler; smartapi/option_finder must be supplied there since
+    this module has no app-context access of its own."""
     if smartapi is None or option_finder is None:
         logger.info("[AI][ORIGIN] Skipped: no smartapi/option_finder available in this context")
         return
@@ -532,7 +550,7 @@ def run_origination_checks(
                         continue
                     logger.info("[AI][ORIGIN] %s -> %s (%s, %s)", index.symbol, decision.action, provider_name, turn)
                     if decision.action in ("BUY_CE", "BUY_PE") and (decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT:
-                        _open_paper_trade(session, index, provider_name, decision, smartapi, option_finder)
+                        _open_trade(session, index, provider_name, decision, smartapi, option_finder)
             except Exception as exc:
                 logger.exception("[AI][ORIGIN] Check failed for index %s", index.symbol)
                 # Previously silent beyond the server log file (not reachable from the

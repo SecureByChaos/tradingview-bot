@@ -115,10 +115,10 @@
   </div>
 
   <div class="tab-pane fade {% if tab == 'instruments' %}show active{% endif %}" id="instruments-pane" role="tabpanel">
-    <div class="alert alert-info">Bank Nifty ships pre-configured. Nifty and Sensex are disabled by default with placeholder spot tokens — verify the exchange segment, spot token, lot size, and strike interval against your broker's instrument master before enabling them for live or paper trading.</div>
+    <div class="alert alert-info">Bank Nifty ships pre-configured. Nifty and Sensex are disabled by default with placeholder spot tokens — verify the exchange segment, spot token, lot size, and strike interval against your broker's instrument master before enabling them for live or paper trading. "AI Origination Live" is a separate, per-index switch that only affects AI-originated trades (see the AI Origination page) — it defaults off (paper), and even when checked, real orders still require SMARTAPI_LIVE_TRADING to be enabled on the server.</div>
     {% if indexes %}<div class="table-responsive responsive-table">
       <table class="table table-dark table-sm align-middle table-instruments">
-        <thead><tr><th>Symbol</th><th>Display Name</th><th>Option Segment</th><th>Instrument Name</th><th>Spot Exchange</th><th>Spot Symbol</th><th>Spot Token</th><th>Lot Size</th><th>Strike Interval</th><th>Enabled</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Symbol</th><th>Display Name</th><th>Option Segment</th><th>Instrument Name</th><th>Spot Exchange</th><th>Spot Symbol</th><th>Spot Token</th><th>Lot Size</th><th>Strike Interval</th><th>Enabled</th><th title="Lets AI Origination place real orders on this index instead of paper. Still requires SMARTAPI_LIVE_TRADING to be on server-side -- this checkbox alone will not move real money.">AI Origination Live</th><th>Actions</th></tr></thead>
         <tbody>
         {% for index in indexes %}
           <tr>
@@ -133,6 +133,7 @@
               <td data-label="Lot Size"><input class="form-control form-control-sm" type="number" name="lot_size" value="{{ index.lot_size }}"></td>
               <td data-label="Strike Interval"><input class="form-control form-control-sm" type="number" name="strike_interval" value="{{ index.strike_interval }}"></td>
               <td data-label="Enabled"><input type="checkbox" name="enabled" {% if index.enabled %}checked{% endif %}></td>
+              <td data-label="AI Origination Live"><input type="checkbox" name="ai_origination_live_trade" {% if index.ai_origination_live_trade %}checked{% endif %}></td>
               <td data-label="Actions"><button class="btn btn-sm btn-success" type="submit">Save</button></td>
             </form>
           </tr>
