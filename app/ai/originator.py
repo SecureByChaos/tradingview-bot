@@ -279,17 +279,24 @@ def _build_provider_order(settings: AISettings, cycle_toggle: int) -> list[tuple
     return order
 
 
-def _has_open_origination(db: Session, index_symbol: str) -> bool:
-    return (
-        db.scalar(
-            select(StrategyTrade.id).where(
-                StrategyTrade.index_symbol == index_symbol,
-                StrategyTrade.status == TradeStatus.OPEN,
-                StrategyTrade.origin.like("AI_ORIGIN_%"),
-            ).limit(1)
-        )
-        is not None
-    )
+def _has_open_origination(db: Session, index_symbol: str, provider: str | None = None) -> bool:
+    """Whether there's already an open AI Origination trade on this index.
+    provider=None checks across any provider (used to decide whether it's even
+    worth fetching price/ticks this cycle); a specific provider checks only
+    that provider's own slot -- each provider gets its own independent trade
+    per index rather than competing for one shared slot, so e.g. Claude can
+    open and hold its own Bank Nifty trade at the same time OpenAI has one
+    open too, instead of whichever provider goes first each cycle blocking
+    the other out entirely."""
+    conditions = [
+        StrategyTrade.index_symbol == index_symbol,
+        StrategyTrade.status == TradeStatus.OPEN,
+    ]
+    if provider:
+        conditions.append(StrategyTrade.origin == f"AI_ORIGIN_{provider.strip().upper()}")
+    else:
+        conditions.append(StrategyTrade.origin.like("AI_ORIGIN_%"))
+    return db.scalar(select(StrategyTrade.id).where(*conditions).limit(1)) is not None
 
 
 def _in_reopen_cooldown(db: Session, index_symbol: str) -> bool:
@@ -445,7 +452,11 @@ def run_origination_checks(
             if not index.enabled:
                 continue
             try:
-                if _has_open_origination(session, index.symbol):
+                # Skip the whole index this cycle only if every configured
+                # provider already has its own open trade here -- if even one
+                # provider has room, it's still worth fetching price/ticks so
+                # that provider gets its turn below.
+                if all(_has_open_origination(session, index.symbol, provider_name) for _, provider_name, _ in provider_order):
                     continue
                 # Cooldown disabled for now, on purpose -- observing raw
                 # AI Origination trade volume with no throttle to see where the
@@ -487,12 +498,13 @@ def run_origination_checks(
                     day_ohlc = None
                 user_prompt = _build_user_prompt(index, price, ticks, day_ohlc)
                 for turn, provider_name, view in provider_order:
-                    # Whichever provider goes first this cycle can fill the
-                    # index's one trade slot; if it does, the other one is
-                    # skipped for this index this cycle, same as before -- the
-                    # only change is who gets first refusal isn't fixed.
-                    if _has_open_origination(session, index.symbol):
-                        break
+                    # Each provider gets its own independent trade slot per
+                    # index -- Claude and OpenAI can each hold their own open
+                    # Bank Nifty trade at the same time, rather than racing for
+                    # one shared slot where whichever goes first blocks the
+                    # other out entirely.
+                    if _has_open_origination(session, index.symbol, provider_name):
+                        continue
                     decision = _call_provider(provider_name, view, user_prompt)
                     if decision is None:
                         continue
