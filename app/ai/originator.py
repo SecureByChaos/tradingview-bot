@@ -37,10 +37,23 @@ _MIN_CONFIDENCE_TO_ACT = 0.55
 # just doesn't call the AI or act on anything until the window closes.
 _TRADING_START_HOUR = 9
 _TRADING_START_MINUTE = 30
+# Mirrors the 15:15 end-of-day square-off every other trade in this app is
+# already subject to (see monitor_open_trades in multi_strategy.py) -- without
+# this, origination had a start gate but no end gate, so it kept opening brand
+# new trades all evening (observed well past 9 PM IST). Each one got caught by
+# that same 15:15 TIME_EXIT check on the very next 30s monitor cycle and
+# closed instantly at breakeven, since that check re-evaluates every open
+# trade's age against wall-clock time on every cycle, not just once at 15:15.
+_TRADING_END_HOUR = 15
+_TRADING_END_MINUTE = 15
 
 
 def _still_observing(now_ist) -> bool:
     return (now_ist.hour, now_ist.minute) < (_TRADING_START_HOUR, _TRADING_START_MINUTE)
+
+
+def _past_trading_end(now_ist) -> bool:
+    return (now_ist.hour, now_ist.minute) >= (_TRADING_END_HOUR, _TRADING_END_MINUTE)
 
 SYSTEM_PROMPT = (
     "You are an options entry-timing assistant running an independent, "
@@ -471,10 +484,19 @@ def run_origination_checks(
                 #     continue
                 price = round(smartapi.get_index_spot(index), 2)
                 record_index_tick_if_stale(session, index.symbol, price)
-                if _still_observing(to_ist(utc_now())):
+                now_ist = to_ist(utc_now())
+                if _still_observing(now_ist):
                     logger.info(
                         "[AI][ORIGIN] %s: still observing (market open until %02d:%02d IST), recording ticks only",
                         index.symbol, _TRADING_START_HOUR, _TRADING_START_MINUTE,
+                    )
+                    continue
+                if _past_trading_end(now_ist):
+                    logger.info(
+                        "[AI][ORIGIN] %s: past trading end (%02d:%02d IST), no new entries -- "
+                        "a trade opened now would just be caught by the 15:15 square-off "
+                        "check and closed at breakeven a monitor cycle later",
+                        index.symbol, _TRADING_END_HOUR, _TRADING_END_MINUTE,
                     )
                     continue
                 cutoff = utc_now() - timedelta(minutes=_LOOKBACK_MINUTES)
