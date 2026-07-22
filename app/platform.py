@@ -696,7 +696,64 @@ def get_exit_shadow_summary(db: Session) -> dict[str, Any]:
         comparisons_with_time.sort(key=lambda item: item[0], reverse=True)
     comparisons = [row for _, row in comparisons_with_time]
 
-    return {"live": live, "comparisons": comparisons}
+    # Closed SIGNAL trades that got shadow-checked (AIExitCall rows exist)
+    # but where the AI never actually called EXIT -- every check said HOLD
+    # (or errored). Before this, that history had nowhere to surface: the
+    # "live" table above only covers trades still OPEN, and "comparisons"
+    # only ever included a trade once the AI called EXIT on it specifically.
+    # The checks still ran and wrote rows the whole time -- they just sat in
+    # the database with no page ever reading them back for a HOLD-only trade.
+    checked_trade_ids = list(db.scalars(select(AIExitCall.trade_id).distinct()))
+    held_only: list[dict[str, Any]] = []
+    if checked_trade_ids:
+        held_conditions = [
+            StrategyTrade.trade_id.in_(checked_trade_ids),
+            StrategyTrade.status == TradeStatus.CLOSED,
+            StrategyTrade.origin == "SIGNAL",
+        ]
+        if exit_trade_ids:
+            held_conditions.append(StrategyTrade.trade_id.notin_(exit_trade_ids))
+        held_trades = list(
+            db.scalars(
+                select(StrategyTrade).where(*held_conditions).order_by(StrategyTrade.exit_time.desc()).limit(30)
+            )
+        )
+        for trade in held_trades:
+            calls = list(
+                db.scalars(
+                    select(AIExitCall)
+                    .where(AIExitCall.trade_id == trade.trade_id)
+                    .order_by(AIExitCall.checked_at.desc())
+                )
+            )
+            if not calls:
+                continue
+            latest_by_provider: dict[str, AIExitCall] = {}
+            for call in calls:
+                latest_by_provider.setdefault(call.provider, call)
+            held_only.append({
+                "trade_id": trade.trade_id,
+                "strategy_name": trade.strategy_name,
+                "index_display_name": _index_display_name(trade.index_symbol),
+                "position_label": "Long call" if trade.option_type == "CE" else "Long put",
+                "calls": [
+                    {
+                        "provider": call.provider,
+                        "decision": call.decision,
+                        "confidence": call.confidence,
+                        "reasoning": call.reasoning,
+                        "checked_at": format_ist(call.checked_at),
+                    }
+                    for call in latest_by_provider.values()
+                ],
+                "checks_run": len(calls),
+                "real_pnl_percent": trade.pnl_percent,
+                "real_result": trade.result,
+                "real_exit_reason": trade.exit_reason,
+                "exit_time": format_ist(trade.exit_time),
+            })
+
+    return {"live": live, "comparisons": comparisons, "held_only": held_only}
 
 
 def get_origination_summary(db: Session, limit: int = 30) -> dict[str, Any]:

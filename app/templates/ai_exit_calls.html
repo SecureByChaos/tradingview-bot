@@ -71,4 +71,40 @@
 {% else %}
 {{ empty_state("AI hasn't called an exit yet -- nothing to compare.") }}
 {% endif %}
+
+<div class="section-header"><h4 class="mb-0">Closed trades -- AI held throughout</h4></div>
+{% if held_only %}
+<div class="table-responsive responsive-table">
+  <table class="table table-dark table-hover align-middle">
+    <thead><tr><th>Strategy</th><th>Position</th><th>AI opinion (final check)</th><th>Checks</th><th>Real outcome</th><th>Closed</th></tr></thead>
+    <tbody>
+    {% for row in held_only %}
+      <tr>
+        <td data-label="Strategy">{{ row.strategy_name }}</td>
+        <td data-label="Position">{{ row.index_display_name }} · {{ row.position_label }}</td>
+        <td data-label="AI opinion">
+          {% if row.calls %}
+            {% for call in row.calls %}
+              <div class="mb-1">
+                <span class="badge {% if call.decision == 'HOLD' %}text-bg-success{% else %}text-bg-secondary{% endif %}">{{ call.provider|title }}: {{ call.decision }}</span>
+                {% if call.confidence is not none %}<span class="text-muted" style="font-size:.78rem;"> {{ "%.0f"|format(call.confidence * 100) }}%</span>{% endif %}
+                <div class="text-muted" style="font-size:.78rem;">{{ call.reasoning }}</div>
+              </div>
+            {% endfor %}
+          {% endif %}
+        </td>
+        <td data-label="Checks">{{ row.checks_run }}</td>
+        <td data-label="Real outcome">
+          <span class="{% if (row.real_pnl_percent or 0) >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(row.real_pnl_percent or 0) }}%</span>
+          <div class="text-muted" style="font-size:.78rem;">{{ row.real_result }} · {{ row.real_exit_reason }}</div>
+        </td>
+        <td data-label="Closed">{{ row.exit_time }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+{{ empty_state("No closed trades with AI-held shadow history yet.") }}
+{% endif %}
 {% endblock %}
