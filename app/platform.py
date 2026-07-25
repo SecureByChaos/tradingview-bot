@@ -360,6 +360,12 @@ def strategy_trades_query_for_filter(
         # page, making it look like alternatives were being generated for
         # AI Origin trades when none actually were.
         query = query.where(StrategyTrade.origin.like("AI_ALT_%"))
+    elif origin == "ai_origin":
+        # Fully self-originated AI trades (no TradingView signal involved),
+        # kept distinct from AI_ALT_* above for the same reason: these are
+        # different experiments with different mechanics and mixing them makes
+        # both uninterpretable.
+        query = query.where(StrategyTrade.origin.like("AI_ORIGIN_%"))
     return query.order_by(StrategyTrade.entry_time.desc())
 
 

@@ -119,6 +119,12 @@ def _ensure_columns() -> None:
             "ai_reasoning": "ALTER TABLE strategy_trades ADD COLUMN ai_reasoning TEXT",
             "sl_mode": "ALTER TABLE strategy_trades ADD COLUMN sl_mode VARCHAR(16)",
             "investment_amount": "ALTER TABLE strategy_trades ADD COLUMN investment_amount FLOAT NOT NULL DEFAULT 0.0",
+            # Nullable on purpose -- these are forward-only diagnostic captures
+            # and cannot be backfilled, so NULL honestly means "not recorded
+            # for this trade" rather than a fabricated default.
+            "spot_at_entry": "ALTER TABLE strategy_trades ADD COLUMN spot_at_entry FLOAT",
+            "day_ohlc_present": "ALTER TABLE strategy_trades ADD COLUMN day_ohlc_present BOOLEAN",
+            "tick_sample_count": "ALTER TABLE strategy_trades ADD COLUMN tick_sample_count INTEGER",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():

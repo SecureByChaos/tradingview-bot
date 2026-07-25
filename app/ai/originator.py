@@ -341,6 +341,9 @@ def _open_trade(
     decision: _Decision,
     smartapi: SmartAPIClient,
     option_finder: OptionFinder,
+    spot_at_entry: float | None = None,
+    day_ohlc_present: bool | None = None,
+    tick_sample_count: int | None = None,
 ) -> Optional[StrategyTrade]:
     def _is_sane(value: float | None) -> bool:
         return value is not None and _MIN_SL_TARGET_PERCENT <= value <= _MAX_SL_TARGET_PERCENT
@@ -414,6 +417,9 @@ def _open_trade(
         lowest_price=round(entry_price, 2),
         trailing_active=False,
         sl_mode=SLMode.TRAILING if use_trailing else SLMode.FIXED,
+        spot_at_entry=spot_at_entry,
+        day_ohlc_present=day_ohlc_present,
+        tick_sample_count=tick_sample_count,
         origin=origin,
         ai_action=decision.action,
         ai_confidence=decision.confidence,
@@ -550,7 +556,21 @@ def run_origination_checks(
                         continue
                     logger.info("[AI][ORIGIN] %s -> %s (%s, %s)", index.symbol, decision.action, provider_name, turn)
                     if decision.action in ("BUY_CE", "BUY_PE") and (decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT:
-                        _open_trade(session, index, provider_name, decision, smartapi, option_finder)
+                        _open_trade(
+                            session, index, provider_name, decision, smartapi, option_finder,
+                            # Snapshot of the prompt inputs this specific
+                            # decision was made on -- see StrategyTrade's
+                            # spot_at_entry/day_ohlc_present/tick_sample_count
+                            # comment. Captured here rather than inside
+                            # _open_trade because this is the only scope that
+                            # knows what actually went into the prompt.
+                            spot_at_entry=price,
+                            day_ohlc_present=day_ohlc is not None,
+                            # len(ticks) + 1: _build_user_prompt appends the
+                            # current live price to the recorded ticks, so the
+                            # model saw one more sample than the query returned.
+                            tick_sample_count=len(ticks) + 1,
+                        )
             except Exception as exc:
                 logger.exception("[AI][ORIGIN] Check failed for index %s", index.symbol)
                 # Previously silent beyond the server log file (not reachable from the

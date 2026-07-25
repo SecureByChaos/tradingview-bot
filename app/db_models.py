@@ -315,6 +315,26 @@ class StrategyTrade(Base):
     # invalid or unreasonably wide, that specific trade falls back to trailing
     # instead of a number we picked -- see app/ai/originator.py.
     sl_mode: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # Diagnostic snapshot of what the AI actually saw at entry. Null for every
+    # non-AI_ORIGIN_* trade and for AI_ORIGIN_* trades opened before these
+    # columns existed -- none of it is reconstructable after the fact, which is
+    # exactly why it's stored now:
+    #   spot_at_entry     -- index spot at the moment of the decision. Lets a
+    #                        premium move be converted to index points, to test
+    #                        whether stops fire inside normal intraday noise.
+    #   day_ohlc_present  -- whether the "Today's session range" line made it
+    #                        into the prompt. It's best-effort (Angel One often
+    #                        returns zeroed OHLC for index instruments) and is
+    #                        the only thing anchoring the 45-min window to the
+    #                        broader session, so its absence is a real variable.
+    #   tick_sample_count -- how many price samples the 45-min window actually
+    #                        contained. Varies ~3 to 100+ depending on whether
+    #                        a dashboard tab was open driving tick recording,
+    #                        so it's a confound under every cross-trade and
+    #                        cross-provider comparison.
+    spot_at_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
+    day_ohlc_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    tick_sample_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # origin distinguishes the original TradingView signal ("SIGNAL") from a paper
     # trade opened because an AI reviewer proposed an alternative call after
     # rejecting the original signal ("AI_ALT_OPENAI", "AI_ALT_CLAUDE", etc). Lets

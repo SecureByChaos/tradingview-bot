@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import reports
@@ -19,7 +20,7 @@ from app.ai.context_repository import get_context_log_for_review
 from app.ai.factory import create_reviewer
 from app.ai.repository import create_settings as create_ai_settings, get_settings as get_ai_settings, update_settings as update_ai_settings
 from app.database import get_db
-from app.db_models import AIContextLog, AITradeReview, BotStatus, IndexConfig, PlatformSettings, SLMode, StrategyConfig, StrategyTrade, TradeStatus, TradingMode
+from app.db_models import AIContextLog, AITradeReview, BotStatus, IndexConfig, PlatformSettings, SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeStatus, TradingMode
 from app.platform import (
     ai_reviews_query_for_filter,
     get_dashboard_summary,
@@ -188,7 +189,7 @@ def history(
     origin: str = "all",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    origin_filter = origin if origin in ("signal", "ai_alt") else None
+    origin_filter = origin if origin in ("signal", "ai_alt", "ai_origin") else None
     trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter)))
     # Net P&L in rupees across whatever filter/date-range/origin is currently
     # applied -- only closed trades have a real profit_loss (open trades default
@@ -223,16 +224,75 @@ def history_export(
     """CSV export of the Trade History table, honoring whatever filter/date-range/
     origin is currently applied on the page -- same query as the HTML view, just
     written out as a file instead of rendered."""
-    origin_filter = origin if origin in ("signal", "ai_alt") else None
+    origin_filter = origin if origin in ("signal", "ai_alt", "ai_origin") else None
     trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter)))
+
+    # MFE/MAE come from the 30-second premium samples in strategy_trade_ticks,
+    # NOT from StrategyTrade.highest_price/lowest_price. Those two stored
+    # columns feed the trailing-stop engine and are only maintained on the side
+    # the trailing logic needs: for a long trade monitor_open_trades updates
+    # highest_price and never touches lowest_price (it stays at its entry-time
+    # seed value), and vice versa for shorts. So the stored low on a long trade
+    # is not a real adverse excursion. The tick table has every sample for both
+    # directions and backfills correctly for trades already closed.
+    tick_extremes = {
+        row.trade_id: (row.low, row.high)
+        for row in db.execute(
+            select(
+                StrategyTradeTick.trade_id.label("trade_id"),
+                func.min(StrategyTradeTick.premium).label("low"),
+                func.max(StrategyTradeTick.premium).label("high"),
+            ).group_by(StrategyTradeTick.trade_id)
+        )
+    }
+
+    def _excursion(trade: StrategyTrade) -> tuple[str, str]:
+        """(MFE %, MAE %) against entry, signed so favourable is always
+        positive and adverse always negative regardless of long/short."""
+        extremes = tick_extremes.get(trade.trade_id)
+        if not extremes or not trade.entry_price:
+            return "", ""
+        low, high = extremes
+        if low is None or high is None:
+            return "", ""
+        direction = -1 if trade.signal.startswith("SELL") else 1
+        best = high if direction == 1 else low
+        worst = low if direction == 1 else high
+        mfe = ((best - trade.entry_price) / trade.entry_price) * 100 * direction
+        mae = ((worst - trade.entry_price) / trade.entry_price) * 100 * direction
+        return f"{mfe:.2f}", f"{mae:.2f}"
+
+    def _configured_percent(trade: StrategyTrade) -> tuple[str, str]:
+        """(SL %, Target %) as actually configured at entry, recovered from the
+        stored absolute stoploss/target levels. AI Origination sets these from
+        the model's own proposal, so they vary per trade rather than being a
+        single global setting."""
+        if not trade.entry_price:
+            return "", ""
+        direction = -1 if trade.signal.startswith("SELL") else 1
+        sl = ((trade.entry_price - trade.stoploss) / trade.entry_price) * 100 * direction
+        target = ((trade.target - trade.entry_price) / trade.entry_price) * 100 * direction
+        return f"{sl:.2f}", f"{target:.2f}"
 
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow([
+        # Existing columns -- unchanged order and labels so prior exports stay
+        # directly comparable. All new fields are appended after these.
         "Strategy", "Origin", "Entry Time (IST)", "Exit Time (IST)", "Duration",
         "Signal", "Strike", "Entry", "Capital Invested (Rs)", "Exit", "P&L %", "P&L (Rs)", "Result", "Status", "Mode",
+        # Tier 1 -- exit path and the risk band actually in force
+        "Exit Reason", "SL Mode", "SL %", "Target %",
+        # Tier 2 -- excursions
+        "MFE %", "MAE %", "Premium High (stored)", "Premium Low (stored)",
+        # Tier 3 -- model output at entry
+        "AI Confidence", "AI Reasoning",
+        # Tier 4 -- prompt-input quality (forward-only; blank for older trades)
+        "Tick Samples", "Day OHLC Present", "Spot At Entry", "Expiry",
     ])
     for trade in trades:
+        mfe, mae = _excursion(trade)
+        sl_percent, target_percent = _configured_percent(trade)
         writer.writerow([
             trade.strategy_name,
             origin_label(trade.origin),
@@ -249,6 +309,20 @@ def history_export(
             trade.result,
             trade.status,
             trade.mode,
+            trade.exit_reason or "",
+            trade.sl_mode or "",
+            sl_percent,
+            target_percent,
+            mfe,
+            mae,
+            trade.highest_price if trade.highest_price is not None else "",
+            trade.lowest_price if trade.lowest_price is not None else "",
+            f"{trade.ai_confidence:.4f}" if trade.ai_confidence is not None else "",
+            (trade.ai_reasoning or "").replace("\n", " ").strip(),
+            trade.tick_sample_count if trade.tick_sample_count is not None else "",
+            "" if trade.day_ohlc_present is None else ("YES" if trade.day_ohlc_present else "NO"),
+            trade.spot_at_entry if trade.spot_at_entry is not None else "",
+            trade.expiry or "",
         ])
     buffer.seek(0)
 
