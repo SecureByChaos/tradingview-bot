@@ -5,7 +5,7 @@ import os
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
@@ -75,9 +75,45 @@ def init_db() -> None:
 
     Base.metadata.create_all(bind=engine)
     _ensure_columns()
+    _backfill_trade_costs()
     _seed_default_strategy()
     _seed_default_ai_settings()
     _seed_default_indexes()
+
+
+def _backfill_trade_costs() -> None:
+    """Populate estimated_cost/net_pnl on closed trades that predate those
+    columns. Unlike the forward-only diagnostic fields, cost IS fully derivable
+    after the fact -- it's a pure function of entry price, exit price and
+    quantity, all of which every closed row already has. Backfilling means the
+    cost picture is available immediately on the existing 21-24 Jul set rather
+    than only on trades from here on.
+
+    Converges after one pass: any real round trip costs at least the Rs 40
+    brokerage, so a backfilled row never matches the estimated_cost == 0 filter
+    again. Re-runs on later startups are a single cheap query.
+    """
+    from app.db_models import StrategyTrade
+    from app.trade_costs import estimate_round_trip_cost
+
+    with Session(engine) as session:
+        pending = list(
+            session.scalars(
+                select(StrategyTrade).where(
+                    StrategyTrade.status == "CLOSED",
+                    StrategyTrade.estimated_cost == 0.0,
+                    StrategyTrade.exit_price.is_not(None),
+                )
+            )
+        )
+        if not pending:
+            return
+        for trade in pending:
+            trade.estimated_cost = estimate_round_trip_cost(
+                trade.entry_price, trade.exit_price, trade.quantity
+            ).total
+            trade.net_pnl = round(trade.profit_loss - trade.estimated_cost, 2)
+        session.commit()
 
 
 def _ensure_columns() -> None:
@@ -122,6 +158,8 @@ def _ensure_columns() -> None:
             # Nullable on purpose -- these are forward-only diagnostic captures
             # and cannot be backfilled, so NULL honestly means "not recorded
             # for this trade" rather than a fabricated default.
+            "estimated_cost": "ALTER TABLE strategy_trades ADD COLUMN estimated_cost FLOAT NOT NULL DEFAULT 0.0",
+            "net_pnl": "ALTER TABLE strategy_trades ADD COLUMN net_pnl FLOAT NOT NULL DEFAULT 0.0",
             "spot_at_entry": "ALTER TABLE strategy_trades ADD COLUMN spot_at_entry FLOAT",
             "day_ohlc_present": "ALTER TABLE strategy_trades ADD COLUMN day_ohlc_present BOOLEAN",
             "tick_sample_count": "ALTER TABLE strategy_trades ADD COLUMN tick_sample_count INTEGER",

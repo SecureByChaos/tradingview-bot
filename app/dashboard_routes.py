@@ -281,6 +281,8 @@ def history_export(
         # directly comparable. All new fields are appended after these.
         "Strategy", "Origin", "Entry Time (IST)", "Exit Time (IST)", "Duration",
         "Signal", "Strike", "Entry", "Capital Invested (Rs)", "Exit", "P&L %", "P&L (Rs)", "Result", "Status", "Mode",
+        # Costs -- P&L (Rs) above stays GROSS and unchanged; these are additive
+        "Est. Cost (Rs)", "Net P&L (Rs)",
         # Tier 1 -- exit path and the risk band actually in force
         "Exit Reason", "SL Mode", "SL %", "Target %",
         # Tier 2 -- excursions
@@ -309,6 +311,8 @@ def history_export(
             trade.result,
             trade.status,
             trade.mode,
+            f"{trade.estimated_cost:.2f}" if trade.status == "CLOSED" else "",
+            f"{trade.net_pnl:.2f}" if trade.status == "CLOSED" else "",
             trade.exit_reason or "",
             trade.sl_mode or "",
             sl_percent,

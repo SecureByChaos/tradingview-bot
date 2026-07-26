@@ -25,6 +25,13 @@ class ExitReason(str, Enum):
     # closed while it was still open." See monitor_open_trades in
     # multi_strategy.py for the stall-window/stall-band check that uses this.
     STALL_EXIT = "STALL_EXIT"
+    # Distinct from STOPLOSS on purpose. Both are "premium fell to a level",
+    # but they mean opposite things about the trade: STOPLOSS is the original
+    # stop firing on a trade that never worked, TRAIL_EXIT is the trailing stop
+    # banking a trade that reached at least +8% and then gave some back. Folding
+    # them together would make the trailing-stop change unmeasurable -- you
+    # could not tell a rescued winner from a plain loss in exit_reason.
+    TRAIL_EXIT = "TRAIL_EXIT"
 
 
 class WebhookPayload(BaseModel):

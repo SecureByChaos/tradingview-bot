@@ -295,8 +295,17 @@ class StrategyTrade(Base):
     target: Mapped[float] = mapped_column(Float, nullable=False)
     entry_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     exit_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # GROSS profit/loss -- (exit - entry) * quantity, no costs deducted. Left
+    # deliberately unchanged so every historical row stays comparable to the
+    # analysis already run against it. Costs are recorded separately below.
     profit_loss: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     pnl_percent: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    # Estimated round-trip cost (brokerage, STT, exchange txn, SEBI, stamp
+    # duty, GST, plus configurable slippage) and profit_loss net of it. See
+    # app/trade_costs.py. Set at close time; 0.0 on open trades and on rows
+    # that closed before these columns existed.
+    estimated_cost: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    net_pnl: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     result: Mapped[str] = mapped_column(String(16), default=TradeResult.OPEN, nullable=False)
     status: Mapped[str] = mapped_column(String(16), default=TradeStatus.OPEN, index=True, nullable=False)
     mode: Mapped[str] = mapped_column(String(16), default=TradingMode.PAPER, nullable=False)

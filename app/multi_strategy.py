@@ -15,6 +15,7 @@ from app.platform import get_index_config, log_event, update_strategy_stats_afte
 from app.signal_validation import check_premium_sanity, check_spot_price_deviation
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
+from app.trade_costs import estimate_round_trip_cost
 from app.time_utils import IST, format_ist, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,27 @@ logger = logging.getLogger(__name__)
 # earlier, AI-Origination-specific "this isn't developing" exit.
 _STALL_WINDOW_MINUTES = 60
 _STALL_BAND_PERCENT = 5.0
+
+# AI Origination only, and deliberately so. Every AI Origination trade runs in
+# FIXED mode in practice (the TRAILING fallback only engages when the model
+# returns unusable sl/target numbers, which it reliably doesn't), and the FIXED
+# branch has no protection at all between the stop and the target. The measured
+# consequence across 21-24 Jul: trades repeatedly travelled most of the way to
+# target and gave it all back, including peaks of +17.26% and +13.65% that
+# closed at -12.09% and -14.67%.
+#
+# These constants are scoped to AI_ORIGIN_* trades ONLY. The same FIXED branch
+# is shared by BNV5.1/BNV6/BNV7/NV1, which are currently the profitable
+# strategies -- changing their behaviour here would both alter what's working
+# and confound the single-variable measurement this change exists to enable.
+#
+# The 5% trail is anchored to ENTRY price, not to the running high, matching
+# the existing TRAILING branch's form (trailing_stop = high - entry*offset).
+# That tightens proportionally as the trade runs and is the already-tested
+# shape; against a running-high anchor it differs by ~1pp on a trade peaking
+# at +20%.
+_AI_ORIGIN_TRAIL_ACTIVATION_PERCENT = 8.0
+_AI_ORIGIN_TRAIL_OFFSET_PERCENT = 5.0
 
 
 class MultiStrategyTradeManager:
@@ -340,12 +362,42 @@ class MultiStrategyTradeManager:
                         elif not trade.trailing_active and premium <= trade.stoploss:
                             reason = ExitReason.STOPLOSS
                     else:
-                        if premium <= trade.stoploss:
+                        # AI Origination only -- arms a trailing stop once the
+                        # trade has proven itself, keeping the original stop in
+                        # force until activation and the target in force
+                        # throughout. For every other strategy trailing_active
+                        # stays False here, so the two checks below run in
+                        # their original order with their original meaning and
+                        # behaviour is unchanged.
+                        if trade.origin.startswith("AI_ORIGIN_"):
+                            activation_price = trade.entry_price * (1 + _AI_ORIGIN_TRAIL_ACTIVATION_PERCENT / 100)
+                            if not trade.trailing_active and premium >= activation_price:
+                                trade.trailing_active = True
+                                logger.info(
+                                    "[TRAIL] %s armed at %.2f (entry %.2f, +%.1f%%)",
+                                    trade.trade_id, premium, trade.entry_price, _AI_ORIGIN_TRAIL_ACTIVATION_PERCENT,
+                                )
+                            if trade.trailing_active:
+                                trade.trailing_stop = round(
+                                    trade.highest_price
+                                    - (trade.entry_price * (_AI_ORIGIN_TRAIL_OFFSET_PERCENT / 100)),
+                                    2,
+                                )
+                        if trade.trailing_active and trade.trailing_stop is not None and premium <= trade.trailing_stop:
+                            reason = ExitReason.TRAIL_EXIT
+                        elif premium <= trade.stoploss:
                             reason = ExitReason.STOPLOSS
                         elif premium >= trade.target:
                             reason = ExitReason.TARGET
 
-                if reason is None and trade.origin.startswith("AI_ORIGIN_"):
+                # Trailing activation exempts a trade from STALL_EXIT for the
+                # rest of its life. STALL_EXIT exists to kill trades going
+                # nowhere; a trade that reached +8% went somewhere, and the
+                # trail owns it from that point. Written as an exemption rather
+                # than a check-ordering so exit_reason stays unambiguous when
+                # reading the results -- a trade that armed the trail can never
+                # afterwards be recorded as a stall.
+                if reason is None and trade.origin.startswith("AI_ORIGIN_") and not trade.trailing_active:
                     # SQLite doesn't reliably round-trip tzinfo even on a
                     # DateTime(timezone=True) column -- trade.entry_time can
                     # come back offset-naive, which breaks a raw subtraction
@@ -396,6 +448,12 @@ class MultiStrategyTradeManager:
         direction = -1 if trade.signal.startswith("SELL") else 1
         trade.profit_loss = round((exit_price - trade.entry_price) * trade.quantity * direction, 2)
         trade.pnl_percent = round(((exit_price - trade.entry_price) / trade.entry_price) * 100 * direction, 2)
+        # Gross figures above are left exactly as they were. Cost is recorded
+        # alongside rather than deducted, so historical rows stay comparable.
+        trade.estimated_cost = estimate_round_trip_cost(
+            trade.entry_price, exit_price, trade.quantity
+        ).total
+        trade.net_pnl = round(trade.profit_loss - trade.estimated_cost, 2)
         trade.result = self.result_for_pnl(trade.pnl_percent)
         trade.status = TradeStatus.CLOSED
         trade.exit_reason = reason.value

@@ -407,6 +407,47 @@ class SmartAPIClient:
             return None
         return values
 
+    def get_candles(
+        self,
+        exchange: str,
+        symboltoken: str,
+        interval: str,
+        from_dt: str,
+        to_dt: str,
+    ) -> list[list[Any]]:
+        """Historical OHLCV candles via getCandleData.
+
+        from_dt/to_dt are IST strings in SmartAPI's required "YYYY-MM-DD HH:MM"
+        format. Returns raw rows: [timestamp_ist, open, high, low, close, volume].
+
+        Shares the same throttle as the quote calls. That's deliberately
+        conservative -- getCandleData sits in a different rate-limit bucket to
+        /quote, but this method runs alongside live trading loops that already
+        contend for the quote budget, and a historical backfill is never worth
+        starving an entry/exit check.
+
+        Note for option contracts specifically: Angel One only serves candles
+        for instruments still present in the live scrip master. Once a contract
+        expires it drops out and its history becomes permanently unretrievable,
+        which is why the 20-24 Jul option pull has to happen before the 28-Jul
+        expiry rather than whenever convenient.
+        """
+        self._throttle_quote_call()
+        params = {
+            "exchange": exchange,
+            "symboltoken": str(symboltoken),
+            "interval": interval,
+            "fromdate": from_dt,
+            "todate": to_dt,
+        }
+        response = self._call_with_reauth(self.client.getCandleData, params)
+        if not response or response.get("status") is False:
+            raise SmartAPIError(f"getCandleData failed for {symboltoken}: {response}")
+        data = response.get("data") or []
+        if not isinstance(data, list):
+            raise SmartAPIError(f"Unexpected getCandleData response for {symboltoken}: {response}")
+        return data
+
     def place_market_order(
         self,
         contract: OptionContract,

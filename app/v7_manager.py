@@ -16,6 +16,7 @@ from app.signal_validation import check_premium_sanity, check_spot_price_deviati
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
 from app.time_utils import IST, format_ist, utc_now
+from app.trade_costs import estimate_round_trip_cost
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +368,11 @@ class V7Manager:
         trade.exit_time = utc_now()
         trade.profit_loss = round((exit_price - trade.entry_price) * trade.quantity, 2)
         trade.pnl_percent = round(((exit_price - trade.entry_price) / trade.entry_price) * 100, 2)
+        # Gross above unchanged; cost recorded alongside. See app/trade_costs.py.
+        trade.estimated_cost = estimate_round_trip_cost(
+            trade.entry_price, exit_price, trade.quantity
+        ).total
+        trade.net_pnl = round(trade.profit_loss - trade.estimated_cost, 2)
         trade.result = self.result_for_pnl(trade.pnl_percent)
         trade.status = TradeStatus.CLOSED
         trade.exit_reason = reason.value
