@@ -163,6 +163,7 @@ def _ensure_columns() -> None:
             "spot_at_entry": "ALTER TABLE strategy_trades ADD COLUMN spot_at_entry FLOAT",
             "day_ohlc_present": "ALTER TABLE strategy_trades ADD COLUMN day_ohlc_present BOOLEAN",
             "tick_sample_count": "ALTER TABLE strategy_trades ADD COLUMN tick_sample_count INTEGER",
+            "market_context_json": "ALTER TABLE strategy_trades ADD COLUMN market_context_json TEXT",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():

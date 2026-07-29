@@ -17,3 +17,5 @@ data/*.sqlite3
 data/*.sqlite3-*
 *.log
 .DS_Store
+pinescripts/NIFTY_QuickScalp_CE_PE.pine
+/pinescripts

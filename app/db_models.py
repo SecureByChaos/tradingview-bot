@@ -344,6 +344,13 @@ class StrategyTrade(Base):
     spot_at_entry: Mapped[float | None] = mapped_column(Float, nullable=True)
     day_ohlc_present: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     tick_sample_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Full structural market context at entry (JSON: regime, CPR, ADX, levels,
+    # active setups). Phase 1 computes and stores this WITHOUT feeding it to
+    # the prompt -- so that when Phase 2 does start prompting with it, there is
+    # already a body of paired "what the market looked like" / "what the model
+    # decided blind" / "what happened" data to evaluate against. Null for every
+    # trade before Phase 1 and for all non-AI_ORIGIN_* trades.
+    market_context_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # origin distinguishes the original TradingView signal ("SIGNAL") from a paper
     # trade opened because an AI reviewer proposed an alternative call after
     # rejecting the original signal ("AI_ALT_OPENAI", "AI_ALT_CLAUDE", etc). Lets
@@ -388,6 +395,41 @@ class IndexPriceTick(Base):
     index_symbol: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     price: Mapped[float] = mapped_column(Float, nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True, nullable=False)
+
+
+class Candle(Base):
+    """Exchange OHLCV candles per index, from SmartAPI getCandleData.
+
+    Exists to replace IndexPriceTick as the AI's market-data input. Ticks were
+    sampled by whatever happened to call the recorder, so their density varied
+    with whether a browser tab was open -- a confound underneath every
+    comparison. Candles come from the exchange and don't vary with anything.
+
+    Storage policy: 1-minute rows are the source of truth for the live path,
+    with 5/15/60-minute derived by resampling, so the timeframes cannot drift
+    out of agreement with each other. 5-minute rows are ALSO stored directly
+    for historical backfill, because SmartAPI only serves ~30 days of 1-minute
+    but ~100 days per request of 5-minute -- a multi-year backtest is only
+    possible at 5-minute. See scripts/backfill_candles.py, which checks the two
+    agree on their overlapping window before any fitted parameter is trusted.
+
+    volume is stored but is always 0 for index instruments -- the index itself
+    isn't traded. Real volume/VWAP needs the FUTIDX contract (Phase 3).
+    """
+
+    __tablename__ = "candles"
+
+    index_symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
+    interval: Mapped[str] = mapped_column(String(16), primary_key=True)
+    # IST-naive minute timestamp. SmartAPI returns IST-offset strings; storing
+    # the naive local minute keeps the primary key stable and comparisons cheap
+    # without re-introducing the tzinfo round-trip problem SQLite has.
+    ts_ist: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
+    open: Mapped[float] = mapped_column(Float, nullable=False)
+    high: Mapped[float] = mapped_column(Float, nullable=False)
+    low: Mapped[float] = mapped_column(Float, nullable=False)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    volume: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
 
 
 class TradeRecord(Base):

@@ -15,6 +15,16 @@ from app.ai.json_utils import extract_json_object
 from app.ai.repository import get_settings
 from app.database import SessionLocal
 from app.db_models import AISettings, IndexConfig, IndexPriceTick, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.market_context import MarketContext, build_market_context
+from app.market_data import (
+    FIFTEEN_MINUTE,
+    FIVE_MINUTE,
+    ONE_MINUTE,
+    load_bars,
+    parse_smartapi_row,
+    resample,
+    store_bars,
+)
 from app.models import Signal
 from app.option_finder import OptionFinder
 from app.platform import list_index_configs, log_event, record_index_tick_if_stale
@@ -36,7 +46,13 @@ _MIN_CONFIDENCE_TO_ACT = 0.55
 # there's already real momentum history by the time trading is allowed, it
 # just doesn't call the AI or act on anything until the window closes.
 _TRADING_START_HOUR = 9
-_TRADING_START_MINUTE = 30
+# Moved from 09:30 to 09:45 in Phase 1. The opening range is 09:15-09:45, so
+# entries starting at 09:30 left a 15-minute window in which every
+# opening-range-derived setup was undefined -- precisely when breakout logic
+# matters most. Waiting until the range has actually closed means every entry
+# is considered against complete structural context. It also cuts trade count
+# slightly, which is the direction the cost arithmetic wants anyway.
+_TRADING_START_MINUTE = 45
 # Mirrors the 15:15 end-of-day square-off every other trade in this app is
 # already subject to (see monitor_open_trades in multi_strategy.py) -- without
 # this, origination had a start gate but no end gate, so it kept opening brand
@@ -102,6 +118,15 @@ _TRAILING_FALLBACK_TARGET_PERCENT = 20.0
 # SIGNAL trades already get, applied here regardless of result since the
 # problem is reopen velocity, not just losing streaks.
 _REOPEN_COOLDOWN_MINUTES = 30
+
+# Candle warm-up. ADX(14) and ATR(14) on resampled 5-minute bars need roughly
+# 28 bars minimum and closer to 100 to stabilise; 5 trading days of 1-minute
+# data yields ~375 five-minute bars, comfortably inside SmartAPI's ~30-day
+# 1-minute limit. It also delivers previous-day high/low/close and multi-day
+# range context for free, which the CPR classifier needs.
+_CANDLE_WARMUP_DAYS = 7
+# Bars loaded per context build. 7 days x 375 one-minute bars ~= 2600.
+_CANDLE_LOAD_LIMIT = 3000
 
 
 @dataclass(frozen=True)
@@ -334,6 +359,54 @@ def _in_reopen_cooldown(db: Session, index_symbol: str) -> bool:
     )
 
 
+def _load_market_context(
+    db: Session, index: IndexConfig, spot: float, now_ist, smartapi: SmartAPIClient
+) -> MarketContext | None:
+    """Refresh 1-minute candles for this index, then build the structural
+    context from them. Returns None on any shortfall -- callers fail closed.
+
+    Candles replace IndexPriceTick as the market-data input specifically
+    because tick density varied with whether a dashboard tab happened to be
+    open, silently changing the AI's input resolution between ~3 and 100+
+    samples. Exchange candles don't vary with anything.
+    """
+    if not index.spot_token:
+        return None
+    try:
+        # Pull a rolling window rather than only the newest bar: cheap (one
+        # call), self-healing after any gap, and the upsert makes re-fetching
+        # overlapping minutes free.
+        from_dt = (now_ist - timedelta(days=_CANDLE_WARMUP_DAYS)).strftime("%Y-%m-%d %H:%M")
+        to_dt = now_ist.strftime("%Y-%m-%d %H:%M")
+        rows = smartapi.get_candles(
+            exchange=index.spot_exchange,
+            symboltoken=index.spot_token,
+            interval=ONE_MINUTE,
+            from_dt=from_dt,
+            to_dt=to_dt,
+        )
+        if rows:
+            store_bars(db, index.symbol, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
+    except Exception as exc:
+        # Non-fatal here: stored history may still be sufficient. The
+        # sufficiency check below is what actually decides.
+        logger.info("[AI][ORIGIN] %s: candle refresh failed (%s), using stored history", index.symbol, exc)
+
+    bars_1m = load_bars(db, index.symbol, ONE_MINUTE, limit=_CANDLE_LOAD_LIMIT)
+    if not bars_1m:
+        return None
+    bars_5m = resample(bars_1m, FIVE_MINUTE)
+    bars_15m = resample(bars_1m, FIFTEEN_MINUTE)
+    return build_market_context(
+        index_symbol=index.symbol,
+        bars_1m=bars_1m,
+        bars_5m=bars_5m,
+        bars_15m=bars_15m,
+        spot=spot,
+        as_of=now_ist.replace(tzinfo=None),
+    )
+
+
 def _open_trade(
     db: Session,
     index: IndexConfig,
@@ -344,6 +417,7 @@ def _open_trade(
     spot_at_entry: float | None = None,
     day_ohlc_present: bool | None = None,
     tick_sample_count: int | None = None,
+    market_context: MarketContext | None = None,
 ) -> Optional[StrategyTrade]:
     def _is_sane(value: float | None) -> bool:
         return value is not None and _MIN_SL_TARGET_PERCENT <= value <= _MAX_SL_TARGET_PERCENT
@@ -420,6 +494,7 @@ def _open_trade(
         spot_at_entry=spot_at_entry,
         day_ohlc_present=day_ohlc_present,
         tick_sample_count=tick_sample_count,
+        market_context_json=json.dumps(market_context.as_dict()) if market_context else None,
         origin=origin,
         ai_action=decision.action,
         ai_confidence=decision.confidence,
@@ -542,6 +617,31 @@ def run_origination_checks(
                 except Exception as exc:
                     logger.info("[AI][ORIGIN] %s: get_index_ohlc failed (%s)", index.symbol, exc)
                     day_ohlc = None
+
+                # PHASE 1: computed, logged, and stored per trade -- but
+                # deliberately NOT passed to _build_user_prompt. The prompt is
+                # unchanged so that Phase 0's trailing stop can be measured as
+                # a single variable over a clean week. Feeding this in is
+                # Phase 2, and only after an offline replay says it helps.
+                # See docs/ai-origination-roadmap.md.
+                market_context = _load_market_context(session, index, price, now_ist, smartapi)
+                if market_context is None:
+                    # Fail closed. A partial context is worse than none: it
+                    # still reads as authoritative. And at ~0.6-1.8% round-trip
+                    # cost a marginal trade is negative expectancy, so skipping
+                    # is the cheaper error.
+                    logger.info(
+                        "[AI][ORIGIN] %s: insufficient candle history for market context, skipping cycle",
+                        index.symbol,
+                    )
+                    continue
+                logger.info(
+                    "[AI][ORIGIN][CTX] %s regime=%s adx=%s cpr=%s setups=%s",
+                    index.symbol, market_context.regime, market_context.adx,
+                    market_context.cpr.classification if market_context.cpr else None,
+                    sorted(k for k, v in market_context.setups.items() if v),
+                )
+
                 user_prompt = _build_user_prompt(index, price, ticks, day_ohlc)
                 for turn, provider_name, view in provider_order:
                     # Each provider gets its own independent trade slot per
@@ -570,6 +670,7 @@ def run_origination_checks(
                             # current live price to the recorded ticks, so the
                             # model saw one more sample than the query returned.
                             tick_sample_count=len(ticks) + 1,
+                            market_context=market_context,
                         )
             except Exception as exc:
                 logger.exception("[AI][ORIGIN] Check failed for index %s", index.symbol)
