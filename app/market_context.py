@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from app.indicators import ADXPoint, SupertrendPoint, adx, atr, ema, last_valid, rsi, supertrend
@@ -51,6 +51,21 @@ ADX_TRENDING = 25.0
 # between a breakout and a failed breakout.
 FAILED_BREAKOUT_LOOKBACK_BARS = 6
 EXTENDED_ATR_MULTIPLE = 2.0
+
+# Previous-session levels (and therefore CPR, which is derived from them) are
+# omitted rather than trusted once the gap to the last available session bar
+# exceeds this. Sized to comfortably cover a long weekend plus one holiday --
+# a wider gap means the "previous day" row is more likely a stale pre-holiday
+# session than yesterday, and a wrong PDH/PDL is worse than none (see
+# build_market_context's fail-closed rationale).
+_MAX_PREVIOUS_DAY_GAP_DAYS = 5
+
+# Drift lookback windows fed into the prompt's DRIFT section. Each is only
+# rendered when the full window fits inside the session that's already
+# elapsed -- a truncated window (e.g. a "45-minute" drift computed from 30
+# minutes of data) is worse than omitting it, the same fail-closed principle
+# as everything else in this module.
+DRIFT_WINDOWS_MINUTES = {"drift_15m": 15, "drift_45m": 45, "drift_180m": 180}
 
 
 @dataclass
@@ -93,10 +108,16 @@ class MarketContext:
     ema50: float | None
     supertrend_5m: int | None
     supertrend_15m: int | None
+    supertrend_5m_value: float | None
+    supertrend_15m_value: float | None
     htf_ema20: float | None
     htf_ema50: float | None
     distance_from_ema21_atr: float | None
     day_range_atr_multiple: float | None
+    drift_15m: float | None = None
+    drift_45m: float | None = None
+    drift_180m: float | None = None
+    drift_since_open: float | None = None
     setups: dict[str, bool] = field(default_factory=dict)
     setup_strength: dict[str, float] = field(default_factory=dict)
     regime: str = "UNKNOWN"
@@ -135,10 +156,16 @@ class MarketContext:
             "ema50": self.ema50,
             "supertrend_5m": self.supertrend_5m,
             "supertrend_15m": self.supertrend_15m,
+            "supertrend_5m_value": self.supertrend_5m_value,
+            "supertrend_15m_value": self.supertrend_15m_value,
             "htf_ema20": self.htf_ema20,
             "htf_ema50": self.htf_ema50,
             "distance_from_ema21_atr": self.distance_from_ema21_atr,
             "day_range_atr_multiple": self.day_range_atr_multiple,
+            "drift_15m": self.drift_15m,
+            "drift_45m": self.drift_45m,
+            "drift_180m": self.drift_180m,
+            "drift_since_open": self.drift_since_open,
             "regime": self.regime,
             "setups": {k: v for k, v in self.setups.items() if v},
             "setup_strength": self.setup_strength,
@@ -182,11 +209,22 @@ def compute_levels(bars_5m: list[Bar], session_date: date) -> Levels:
 
     if previous_bars:
         last_day = max(b.ts_ist.date() for b in previous_bars)
-        prev_day_bars = [b for b in previous_bars if b.ts_ist.date() == last_day]
-        if prev_day_bars:
-            levels.previous_day_high = round(max(b.high for b in prev_day_bars), 2)
-            levels.previous_day_low = round(min(b.low for b in prev_day_bars), 2)
-            levels.previous_day_close = round(prev_day_bars[-1].close, 2)
+        gap_days = (session_date - last_day).days
+        if gap_days > _MAX_PREVIOUS_DAY_GAP_DAYS:
+            # Stale record -- most likely a gap across an unaccounted-for
+            # holiday rather than yesterday's actual session. Omit rather than
+            # pass a previous-day level (and therefore CPR, which depends on
+            # it) that reads as current but isn't.
+            logger.info(
+                "[CONTEXT] previous-session bars %s days stale (last=%s, today=%s), omitting previous-day levels",
+                gap_days, last_day, session_date,
+            )
+        else:
+            prev_day_bars = [b for b in previous_bars if b.ts_ist.date() == last_day]
+            if prev_day_bars:
+                levels.previous_day_high = round(max(b.high for b in prev_day_bars), 2)
+                levels.previous_day_low = round(min(b.low for b in prev_day_bars), 2)
+                levels.previous_day_close = round(prev_day_bars[-1].close, 2)
 
     if today_bars:
         levels.day_open = round(today_bars[0].open, 2)
@@ -241,6 +279,44 @@ def _failed_breakout(bars: list[Bar], level: float, above: bool, lookback: int) 
         return False
     latest = window[-1]
     return (latest.close <= level) if above else (latest.close >= level)
+
+
+def _price_at_or_before(bars_1m: list[Bar], target: datetime) -> float | None:
+    """Close of the most recent 1-minute bar at or before `target`, or None if
+    no such bar exists (target predates all stored history)."""
+    price: float | None = None
+    for bar in bars_1m:
+        if bar.ts_ist <= target:
+            price = bar.close
+        else:
+            break
+    return price
+
+
+def _compute_drifts(
+    bars_1m: list[Bar], as_of: datetime, spot: float, day_open: float | None
+) -> dict[str, float | None]:
+    """% price change over each DRIFT_WINDOWS_MINUTES window, plus since-open.
+
+    A window is rendered only when it fits entirely inside today's elapsed
+    session -- e.g. at 09:51 (36 minutes since the 09:15 open) the 3-hour
+    window would reach back to 06:51, before the market even opened, so it's
+    None rather than a truncated/misleading figure. Since-open has no such
+    truncation risk: it's always anchored to the actual session open.
+    """
+    session_open = as_of.replace(hour=9, minute=15, second=0, microsecond=0)
+    drifts: dict[str, float | None] = {}
+    for name, minutes in DRIFT_WINDOWS_MINUTES.items():
+        target = as_of - timedelta(minutes=minutes)
+        if target < session_open:
+            drifts[name] = None
+            continue
+        reference = _price_at_or_before(bars_1m, target)
+        drifts[name] = round((spot - reference) / reference * 100, 3) if reference else None
+    drifts["drift_since_open"] = (
+        round((spot - day_open) / day_open * 100, 3) if day_open else None
+    )
+    return drifts
 
 
 def build_market_context(
@@ -367,6 +443,8 @@ def build_market_context(
     if st_fast_point:
         strength["supertrend_fast_direction"] = float(st_fast_point.direction)
 
+    drifts = _compute_drifts(bars_1m, as_of, spot, levels.day_open)
+
     return MarketContext(
         index_symbol=index_symbol,
         as_of=as_of,
@@ -384,10 +462,16 @@ def build_market_context(
         ema50=round(float(ema50_value), 2) if ema50_value else None,
         supertrend_5m=st_5m_point.direction if st_5m_point else None,
         supertrend_15m=st_15m_point.direction if st_15m_point else None,
+        supertrend_5m_value=round(st_5m_point.value, 2) if st_5m_point else None,
+        supertrend_15m_value=round(st_15m_point.value, 2) if st_15m_point else None,
         htf_ema20=round(float(htf_ema20), 2) if htf_ema20 else None,
         htf_ema50=round(float(htf_ema50), 2) if htf_ema50 else None,
         distance_from_ema21_atr=distance_atr,
         day_range_atr_multiple=day_range_atr,
+        drift_15m=drifts["drift_15m"],
+        drift_45m=drifts["drift_45m"],
+        drift_180m=drifts["drift_180m"],
+        drift_since_open=drifts["drift_since_open"],
         setups=setups,
         setup_strength=strength,
         regime=regime,

@@ -14,8 +14,8 @@ from app.ai.client import AIClient
 from app.ai.json_utils import extract_json_object
 from app.ai.repository import get_settings
 from app.database import SessionLocal
-from app.db_models import AISettings, IndexConfig, IndexPriceTick, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
-from app.market_context import MarketContext, build_market_context
+from app.db_models import AISettings, IndexConfig, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.market_context import ADX_NO_TREND, ADX_TRENDING, CPR, MarketContext, build_market_context
 from app.market_data import (
     FIFTEEN_MINUTE,
     FIVE_MINUTE,
@@ -33,8 +33,6 @@ from app.time_utils import format_ist, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
-_LOOKBACK_MINUTES = 45
-_MIN_TICKS_REQUIRED = 3
 # Higher than the 0.3 floor used for alternative-call trades: those are
 # adjusting a setup TradingView/the AI already flagged, this is fabricating a
 # brand-new position from momentum data alone, with nothing else to anchor
@@ -73,15 +71,37 @@ def _past_trading_end(now_ist) -> bool:
 
 SYSTEM_PROMPT = (
     "You are an options entry-timing assistant running an independent, "
-    "paper-trading-only experiment. You are given recent spot-price history for "
-    "one index, and when available, today's real exchange-reported session "
-    "open/high/low -- but no volume, no options chain data, no technical "
-    "indicators, no support/resistance, nothing else. This is deliberately "
-    "limited data. Decide whether there is a genuinely clear momentum case for "
-    "opening a fresh CE (bullish) or PE (bearish) position right now, or "
-    "whether the data is too thin/ambiguous to justify one -- in which case "
+    "paper-trading-only experiment. You are given today's market structure and "
+    "technical context for one index: regime measures (trend strength via ADX, "
+    "volatility via ATR, and the prior session's pivot-range classification), "
+    "key price levels (today's opening range, the previous session's "
+    "high/low/close, and today's range so far), trend indicators (moving "
+    "averages, Supertrend on two timeframes, RSI), how far price has extended "
+    "from its short-term mean, and price drift over several lookback windows. "
+    "This is your complete picture of the current setup -- you are not given "
+    "an options chain, open interest, PCR, India VIX, news, or a record of "
+    "your own past trades. Decide whether there is a genuinely clear momentum "
+    "case for opening a fresh CE (bullish) or PE (bearish) position right now, "
+    "or whether the data is too thin/ambiguous to justify one -- in which case "
     "choose NONE. Do not invent data you were not given, and do not feel "
-    "pressured to pick a side; NONE is the correct answer most of the time. "
+    "pressured to pick a side; NONE is the correct answer most of the time.\n\n"
+    "Being at the top or bottom of a range is not by itself directional "
+    "evidence. It is equally consistent with continuation and with exhaustion. "
+    "A breakout means a completed bar has closed beyond a pre-defined level -- "
+    "the opening range or the previous day's high/low -- and held there. Price "
+    "merely sitting near the highest point of a recent window is not a "
+    "breakout; over any rising window that is true by construction.\n\n"
+    "Weigh ADX before acting on trend. Below 20 there is no established trend "
+    "to continue, and extremes are more likely to reverse than extend. Between "
+    "20 and 25 a trend is developing. Above 25 continuation is better "
+    "supported.\n\n"
+    "On a wide-CPR day, expect range-bound conditions and treat breakout "
+    "signals with particular scepticism. On a narrow-CPR day, trending "
+    "conditions are more likely.\n\n"
+    "Treat large extension from EMA21 in ATR terms as a caution rather than "
+    "confirmation, especially when ADX is weak -- a fast move that has already "
+    "travelled several ATR is more likely to be spent than to continue.\n\n"
+    "NONE remains the correct answer most of the time. "
     "sl_percent and target_percent are PERCENTAGE POINTS on the option premium, "
     "e.g. 10 means a 10% stop-loss, NOT a 0-1 fraction -- unlike confidence, "
     "which IS 0-1. A typical sl_percent is 8-15 and target_percent is 15-30; "
@@ -138,35 +158,215 @@ class _ProviderView:
     timeout_seconds: int
 
 
-def _build_user_prompt(
-    index: IndexConfig, current_price: float, ticks: list[IndexPriceTick], day_ohlc: dict[str, float] | None = None
-) -> str:
-    prices = [tick.price for tick in ticks] + [current_price]
-    earliest = prices[0]
-    change_percent = round(((current_price - earliest) / earliest) * 100, 3) if earliest else 0.0
-    up_moves = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
-    down_moves = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
+def _position_line(
+    label: str, spot: float, high: float | None, low: float | None, atr_value: float | None
+) -> str | None:
+    """'above/below by X pts (Y ATR)' relative to a high/low pair, or None when
+    the levels aren't available. Shared by the opening-range and previous-day
+    STRUCTURE lines -- both are "where does price sit relative to a bracket"
+    questions with the same shape."""
+    if high is None or low is None:
+        return None
+    if spot > high:
+        distance = spot - high
+        atr_txt = f" ({distance / atr_value:.2f} ATR)" if atr_value else ""
+        return f"{label}: above high by {distance:.2f} pts{atr_txt}"
+    if spot < low:
+        distance = low - spot
+        atr_txt = f" ({distance / atr_value:.2f} ATR)" if atr_value else ""
+        return f"{label}: below low by {distance:.2f} pts{atr_txt}"
+    return f"{label}: inside range"
+
+
+def _breakout_state_text(ctx: MarketContext) -> str:
+    """Direct counter to the diagnosed defect: distinguishes a held breakout
+    from a failed one from no breakout at all, rather than letting the model
+    infer breakout-ness from "price is near a window extreme" (see
+    app/market_context.py's module docstring for the failure mode)."""
+    if ctx.setups.get("ORB_BREAK_UP"):
+        return f"closed above OR high, held {int(ctx.setup_strength.get('orb_bars_held_up', 0.0))} bar(s)"
+    if ctx.setups.get("ORB_BREAK_DOWN"):
+        return f"closed below OR low, held {int(ctx.setup_strength.get('orb_bars_held_down', 0.0))} bar(s)"
+    if ctx.setups.get("FAILED_BREAKOUT_UP"):
+        return "failed breakout above OR high, closed back inside"
+    if ctx.setups.get("FAILED_BREAKOUT_DOWN"):
+        return "failed breakout below OR low, closed back inside"
+    return "no breakout"
+
+
+def _ema_stack_text(ema9: float | None, ema21: float | None, ema50: float | None) -> str | None:
+    if ema9 is None or ema21 is None or ema50 is None:
+        return None
+    if ema9 > ema21 > ema50:
+        return "stacked up"
+    if ema9 < ema21 < ema50:
+        return "stacked down"
+    return "mixed"
+
+
+def _adx_regime_text(adx_value: float | None) -> str | None:
+    if adx_value is None:
+        return None
+    if adx_value < ADX_NO_TREND:
+        return f"{adx_value:.1f}  -> no established trend (<{ADX_NO_TREND:.0f})"
+    if adx_value < ADX_TRENDING:
+        return f"{adx_value:.1f}  -> developing trend ({ADX_NO_TREND:.0f}-{ADX_TRENDING:.0f})"
+    return f"{adx_value:.1f}  -> established trend (>{ADX_TRENDING:.0f})"
+
+
+def _cpr_regime_text(cpr: CPR | None) -> str | None:
+    if cpr is None:
+        return None
+    if cpr.classification == "NARROW":
+        note = "narrow, trending day more likely"
+    elif cpr.classification == "WIDE":
+        note = "wide, range-bound day more likely"
+    else:
+        note = "moderate"
+    return f"{cpr.width_percent:.2f}% -> {note}"
+
+
+def _ordinal(n: int) -> str:
+    if 11 <= (n % 100) <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _drift_text(value: float | None) -> str:
+    # "not available" rather than omitting the line entirely -- DRIFT is
+    # always a live dimension of the prompt; a missing window (e.g. the
+    # 3-hour window before 12:15 IST) should read as "not yet possible to
+    # know", not as though the concept doesn't apply this cycle.
+    return f"{value:+.2f}%" if value is not None else "not available"
+
+
+def _build_user_prompt(index: IndexConfig, current_price: float, ctx: MarketContext, now_ist: datetime) -> str:
+    """Structural market-context prompt (Phase 1b). Replaces the Phase 0/1
+    eight-line tick-window prompt, whose "window high/low" and "up/down move
+    count" lines were the direct cause of the diagnosed failure mode: over any
+    window sampled while price drifts, the latest price *is* the window high
+    by construction, so "price is at the window high" restated "price went
+    up" rather than carrying real information. See app/market_context.py's
+    module docstring and docs/ai-origination-roadmap.md Phase 2 for the
+    losing-trade evidence this fixes.
+
+    Every section is built defensively: a value that isn't available (warm-up
+    incomplete, previous-day record stale, opening range not yet closed) omits
+    its line rather than rendering a fabricated zero or the literal string
+    "None" -- a phantom level is worse than no level. See _prompt_has_defect,
+    which is the backstop if this ever fails to hold.
+    """
+    session_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    session_close = now_ist.replace(hour=_TRADING_END_HOUR, minute=_TRADING_END_MINUTE, second=0, microsecond=0)
+    minutes_since_open = max(int((now_ist - session_open).total_seconds() // 60), 0)
+    minutes_to_close = max(int((session_close - now_ist).total_seconds() // 60), 0)
+
     lines = [
         f"Index: {index.display_name or index.symbol}",
-        f"Lookback window: last {_LOOKBACK_MINUTES} minutes, {len(prices)} price samples",
-        f"Earliest price in window: {earliest}",
-        f"Current price: {current_price}",
-        f"Change over window: {change_percent}%",
-        f"Window high: {round(max(prices), 2)}",
-        f"Window low: {round(min(prices), 2)}",
-        f"Up moves: {up_moves}, Down moves: {down_moves} (sample-to-sample)",
+        f"Current price: {current_price:.2f}",
+        f"Time: {now_ist.strftime('%H:%M')} IST ({minutes_since_open} min since open, {minutes_to_close} min to close)",
+        "",
+        "REGIME",
     ]
-    if day_ohlc is not None:
-        # Exchange-reported full-session range, independent of our own
-        # tick-sampling gaps -- gives real context for where "current price"
-        # sits within today's actual range, not just within our lookback
-        # window. Not always available (see SmartAPIClient.get_index_ohlc);
-        # omitted entirely rather than guessed at when missing.
-        lines.append(
-            f"Today's session range so far: open {day_ohlc['open']}, high {day_ohlc['high']}, "
-            f"low {day_ohlc['low']}, previous close {day_ohlc['close']}"
+    adx_text = _adx_regime_text(ctx.adx)
+    if adx_text is not None:
+        lines.append(f"  ADX(14) 5-min: {adx_text}")
+    cpr_text = _cpr_regime_text(ctx.cpr)
+    if cpr_text is not None:
+        lines.append(f"  CPR width: {cpr_text}")
+    if ctx.atr_value is not None:
+        atr_pct_txt = f" ({ctx.atr_percent:.2f}% of price)" if ctx.atr_percent is not None else ""
+        lines.append(f"  ATR(14): {ctx.atr_value:.2f} pts{atr_pct_txt}")
+
+    levels = ctx.levels
+    structure_lines: list[str] = []
+    if levels.opening_range_complete and levels.opening_range_high is not None and levels.opening_range_low is not None:
+        structure_lines.append(
+            f"  Opening range (09:15-09:45): high {levels.opening_range_high:.2f}, low {levels.opening_range_low:.2f}"
         )
-    return "\n".join(lines) + "\n\nDecide: BUY_CE, BUY_PE, or NONE?"
+        or_position = _position_line(
+            "Position vs opening range", current_price, levels.opening_range_high, levels.opening_range_low, ctx.atr_value
+        )
+        if or_position is not None:
+            structure_lines.append(f"  {or_position}")
+        structure_lines.append(f"  Breakout state: {_breakout_state_text(ctx)}")
+    if levels.previous_day_high is not None and levels.previous_day_low is not None and levels.previous_day_close is not None:
+        structure_lines.append(
+            f"  Previous day: high {levels.previous_day_high:.2f}, low {levels.previous_day_low:.2f}, "
+            f"close {levels.previous_day_close:.2f}"
+        )
+        pd_position = _position_line(
+            "Position vs previous day", current_price, levels.previous_day_high, levels.previous_day_low, ctx.atr_value
+        )
+        if pd_position is not None:
+            structure_lines.append(f"  {pd_position}")
+    if levels.day_open is not None and levels.day_high is not None and levels.day_low is not None:
+        structure_lines.append(
+            f"  Today: open {levels.day_open:.2f}, high {levels.day_high:.2f}, low {levels.day_low:.2f}"
+        )
+        if levels.day_high > levels.day_low:
+            percentile = round((current_price - levels.day_low) / (levels.day_high - levels.day_low) * 100)
+            structure_lines.append(
+                f"  Position in today's range: {_ordinal(percentile)} percentile (0 = low, 100 = high)"
+            )
+    if structure_lines:
+        lines += ["", "STRUCTURE", *structure_lines]
+
+    trend_lines: list[str] = []
+    if ctx.supertrend_15m is not None:
+        direction = "up" if ctx.supertrend_15m == 1 else "down"
+        value_txt = f" ({ctx.supertrend_15m_value:.2f})" if ctx.supertrend_15m_value is not None else ""
+        trend_lines.append(f"  Supertrend 15-min: {direction}{value_txt}")
+    if ctx.supertrend_5m is not None:
+        direction = "up" if ctx.supertrend_5m == 1 else "down"
+        value_txt = f" ({ctx.supertrend_5m_value:.2f})" if ctx.supertrend_5m_value is not None else ""
+        trend_lines.append(f"  Supertrend 5-min: {direction}{value_txt}")
+    if ctx.supertrend_5m is not None and ctx.supertrend_15m is not None:
+        trend_lines.append(f"  Aligned: {'yes' if ctx.supertrend_5m == ctx.supertrend_15m else 'no'}")
+    stack_text = _ema_stack_text(ctx.ema9, ctx.ema21, ctx.ema50)
+    if stack_text is not None:
+        trend_lines.append(
+            f"  EMA9 {ctx.ema9:.2f} / EMA21 {ctx.ema21:.2f} / EMA50 {ctx.ema50:.2f} -> {stack_text}"
+        )
+    if ctx.rsi_value is not None:
+        trend_lines.append(f"  RSI(14): {ctx.rsi_value:.2f}")
+    if trend_lines:
+        lines += ["", "TREND", *trend_lines]
+
+    extension_lines: list[str] = []
+    if ctx.ema21 is not None:
+        distance = round(current_price - ctx.ema21, 2)
+        atr_txt = f" ({ctx.distance_from_ema21_atr:.2f} ATR)" if ctx.distance_from_ema21_atr is not None else ""
+        extension_lines.append(f"  Distance from EMA21: {distance:+.2f} pts{atr_txt}")
+    if levels.day_high is not None and levels.day_low is not None:
+        day_range = round(levels.day_high - levels.day_low, 2)
+        atr_txt = f" ({ctx.day_range_atr_multiple:.2f} ATR)" if ctx.day_range_atr_multiple is not None else ""
+        extension_lines.append(f"  Today's range: {day_range:.2f} pts{atr_txt}")
+    if extension_lines:
+        lines += ["", "EXTENSION", *extension_lines]
+
+    lines += [
+        "",
+        "DRIFT",
+        f"  15 min: {_drift_text(ctx.drift_15m)}",
+        f"  45 min: {_drift_text(ctx.drift_45m)}",
+        f"  3 hours: {_drift_text(ctx.drift_180m)}",
+        f"  Since open: {_drift_text(ctx.drift_since_open)}",
+    ]
+
+    lines += ["", "Decide: BUY_CE, BUY_PE, or NONE?"]
+    return "\n".join(lines)
+
+
+def _prompt_has_defect(prompt: str) -> bool:
+    """Backstop for the omit-don't-fabricate rule above: if a None, nan, or a
+    literal zero-with-no-real-meaning distance still made it into the rendered
+    text despite every guard in _build_user_prompt, treat the prompt as
+    malformed rather than send it -- a prompt that still parses is the failure
+    mode most likely to go unnoticed, per the spec this implements."""
+    return "None" in prompt or "nan" in prompt or "0.00 pts" in prompt
 
 
 @dataclass(frozen=True)
@@ -598,41 +798,27 @@ def run_origination_checks(
                         index.symbol, _TRADING_END_HOUR, _TRADING_END_MINUTE,
                     )
                     continue
-                cutoff = utc_now() - timedelta(minutes=_LOOKBACK_MINUTES)
-                ticks = list(
-                    session.scalars(
-                        select(IndexPriceTick)
-                        .where(IndexPriceTick.index_symbol == index.symbol, IndexPriceTick.recorded_at >= cutoff)
-                        .order_by(IndexPriceTick.recorded_at)
-                    )
-                )
-                if len(ticks) < _MIN_TICKS_REQUIRED:
-                    logger.info("[AI][ORIGIN] %s: not enough tick history yet (%s samples)", index.symbol, len(ticks))
-                    continue
-
-                # Best-effort real day OHLC on top of our own tick sampling --
-                # never blocks the check if it fails or comes back unusable.
-                try:
-                    day_ohlc = smartapi.get_index_ohlc(index)
-                except Exception as exc:
-                    logger.info("[AI][ORIGIN] %s: get_index_ohlc failed (%s)", index.symbol, exc)
-                    day_ohlc = None
-
-                # PHASE 1: computed, logged, and stored per trade -- but
-                # deliberately NOT passed to _build_user_prompt. The prompt is
-                # unchanged so that Phase 0's trailing stop can be measured as
-                # a single variable over a clean week. Feeding this in is
-                # Phase 2, and only after an offline replay says it helps.
-                # See docs/ai-origination-roadmap.md.
+                # PHASE 1b: now the sole source of the entry prompt (see
+                # _build_user_prompt). Fail closed on any shortfall -- a
+                # partial context still reads as authoritative, and at
+                # ~0.6-1.8% round-trip cost a marginal trade is negative
+                # expectancy, so skipping is the cheaper error.
                 market_context = _load_market_context(session, index, price, now_ist, smartapi)
                 if market_context is None:
-                    # Fail closed. A partial context is worse than none: it
-                    # still reads as authoritative. And at ~0.6-1.8% round-trip
-                    # cost a marginal trade is negative expectancy, so skipping
-                    # is the cheaper error.
                     logger.info(
                         "[AI][ORIGIN] %s: insufficient candle history for market context, skipping cycle",
                         index.symbol,
+                    )
+                    continue
+                if market_context.adx is None or market_context.atr_value is None or (
+                    market_context.supertrend_5m is None or market_context.supertrend_15m is None
+                ):
+                    # ADX/ATR/Supertrend are the core regime/trend read the
+                    # prompt is built around -- a degraded prompt missing them
+                    # is worse than skipping the cycle, same fail-closed rule
+                    # as a missing market_context entirely.
+                    logger.info(
+                        "[AI][ORIGIN] %s: ADX/ATR/Supertrend not yet warmed up, skipping cycle", index.symbol
                     )
                     continue
                 logger.info(
@@ -642,7 +828,17 @@ def run_origination_checks(
                     sorted(k for k, v in market_context.setups.items() if v),
                 )
 
-                user_prompt = _build_user_prompt(index, price, ticks, day_ohlc)
+                user_prompt = _build_user_prompt(index, price, market_context, now_ist)
+                if _prompt_has_defect(user_prompt):
+                    logger.error(
+                        "[AI][ORIGIN] %s: malformed prompt (contains None/nan/0.00 pts), skipping cycle", index.symbol
+                    )
+                    log_event(
+                        session, "AI_ORIGIN",
+                        f"[{index.display_name or index.symbol}] Malformed prompt detected, cycle skipped",
+                        level="ERROR",
+                    )
+                    continue
                 for turn, provider_name, view in provider_order:
                     # Each provider gets its own independent trade slot per
                     # index -- Claude and OpenAI can each hold their own open
@@ -655,21 +851,28 @@ def run_origination_checks(
                     if decision is None:
                         continue
                     logger.info("[AI][ORIGIN] %s -> %s (%s, %s)", index.symbol, decision.action, provider_name, turn)
+                    if decision.action == "NONE":
+                        # Only forward-facing signal of whether the model is
+                        # well-judged-conservative or just quiet -- previously
+                        # ai_reasoning only persisted for trades that opened,
+                        # so a session of all-NONE had no record of why.
+                        logger.debug(
+                            "[AI][ORIGIN] %s NONE reasoning (%s): %s", index.symbol, provider_name, decision.reasoning
+                        )
                     if decision.action in ("BUY_CE", "BUY_PE") and (decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT:
                         _open_trade(
                             session, index, provider_name, decision, smartapi, option_finder,
                             # Snapshot of the prompt inputs this specific
                             # decision was made on -- see StrategyTrade's
-                            # spot_at_entry/day_ohlc_present/tick_sample_count
-                            # comment. Captured here rather than inside
-                            # _open_trade because this is the only scope that
-                            # knows what actually went into the prompt.
+                            # spot_at_entry comment. day_ohlc_present and
+                            # tick_sample_count are no longer computed as of
+                            # Phase 1b: the prompt input is now market_context
+                            # (stored in full via market_context_json), not
+                            # ticks/day OHLC, so those two diagnostic columns
+                            # are left at their default (None) for new trades
+                            # rather than fed a value that no longer means
+                            # anything.
                             spot_at_entry=price,
-                            day_ohlc_present=day_ohlc is not None,
-                            # len(ticks) + 1: _build_user_prompt appends the
-                            # current live price to the recorded ticks, so the
-                            # model saw one more sample than the query returned.
-                            tick_sample_count=len(ticks) + 1,
                             market_context=market_context,
                         )
             except Exception as exc:
