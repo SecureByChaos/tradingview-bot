@@ -265,21 +265,39 @@ def main() -> int:
     logger.info("MULTIPLE-COMPARISON CONTEXT")
     logger.info("  comparisons run: %s", total)
     logger.info("  Bonferroni-corrected alpha: %.6f (uncorrected 0.05)", corrected)
-    logger.info("  clearing corrected alpha on the independent subsample: %s",
-                sum(1 for r in results if r.p_indep < corrected))
+    clearing = [r for r in results if r.p_indep < corrected]
+    logger.info("  clearing corrected alpha on the independent subsample: %s", len(clearing))
+    for r in clearing:
+        logger.info("    %s %s %s %s edge %+.2fpp p=%.6f",
+                    r.index_symbol, r.horizon, r.setup, r.regime, r.edge, r.p_indep)
 
     positives = [r for r in results if r.survives]
     negatives = [r for r in results if r.reliably_negative]
 
     # Consistency is the defence that does not depend on a threshold: a real
-    # effect should appear in both indices and both horizons, not one cell.
-    by_setup: dict[str, list[Result]] = defaultdict(list)
+    # effect should appear on both indices and at both horizons.
+    #
+    # Keyed on (setup, regime), NOT setup alone. An earlier version only
+    # considered regime == "all" and therefore reported "0 consistent" while a
+    # setup was replicating across both indices and both horizons WITHIN a
+    # regime. A conditional effect is still an effect; it just isn't visible
+    # in the pooled cell, which is the entire reason for splitting by regime.
+    by_key: dict[tuple[str, str], list[Result]] = defaultdict(list)
     for r in positives:
-        if r.regime == "all":
-            by_setup[r.setup].append(r)
+        by_key[(r.setup, r.regime)].append(r)
     consistent = {
-        name: rows for name, rows in by_setup.items()
+        key: rows for key, rows in by_key.items()
         if len({r.index_symbol for r in rows}) == 2 and len({r.horizon for r in rows}) == 2
+    }
+
+    # The mirror check: the same setup/regime reliably BACKWARDS on both
+    # indices is equally informative and equally hard to get by chance.
+    by_key_neg: dict[tuple[str, str], list[Result]] = defaultdict(list)
+    for r in negatives:
+        by_key_neg[(r.setup, r.regime)].append(r)
+    consistent_negative = {
+        key: rows for key, rows in by_key_neg.items()
+        if len({r.index_symbol for r in rows}) == 2
     }
 
     logger.info("=" * 108)
@@ -295,21 +313,40 @@ def main() -> int:
             "direction, and continuing to search here has poor expected value."
         )
     else:
-        logger.info("VERDICT: %s positive cell(s); %s consistent across BOTH indices and BOTH horizons.",
-                    len(positives), len(consistent))
-        for name, rows in sorted(consistent.items()):
-            edges = ", ".join(f"{r.index_symbol}/{r.horizon} {r.edge:+.2f}pp" for r in sorted(rows, key=lambda x: x.index_symbol))
-            logger.info("  CONSISTENT  %-28s %s", name, edges)
+        logger.info(
+            "VERDICT: %s positive cell(s); %s (setup, regime) combination(s) replicate "
+            "across BOTH indices and BOTH horizons.", len(positives), len(consistent),
+        )
+        for (name, regime), rows in sorted(consistent.items()):
+            edges = ", ".join(
+                f"{r.index_symbol}/{r.horizon} {r.edge:+.2f}pp"
+                for r in sorted(rows, key=lambda x: (x.index_symbol, x.horizon))
+            )
+            logger.info("  CONSISTENT  %-28s %-12s %s", name, regime, edges)
         if not consistent:
             logger.info(
-                "  None is consistent across partitions. With %s comparisons run, isolated "
+                "  None replicates across partitions. With %s comparisons run, isolated "
                 "positive cells are the expected appearance of noise -- treat them as such "
                 "unless they replicate.", total,
             )
         logger.info(
-            "Take at most TWO candidates to the holdout, preferring consistency over the "
+            "Take at most TWO candidates to the holdout, preferring replication over the "
             "lowest p-value. The holdout is single-use."
         )
+
+    if consistent_negative:
+        logger.info("-" * 108)
+        logger.info(
+            "%s (setup, regime) combination(s) reliably BACKWARDS on BOTH indices -- "
+            "as hard to get by chance as a positive replication, and equally informative:",
+            len(consistent_negative),
+        )
+        for (name, regime), rows in sorted(consistent_negative.items()):
+            edges = ", ".join(
+                f"{r.index_symbol}/{r.horizon} {r.edge:+.2f}pp"
+                for r in sorted(rows, key=lambda x: (x.index_symbol, x.horizon))
+            )
+            logger.info("  CONSISTENT-NEGATIVE  %-28s %-12s %s", name, regime, edges)
 
     if negatives:
         logger.info("-" * 108)
