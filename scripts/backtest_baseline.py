@@ -49,7 +49,22 @@ FORWARD_CHECKS = (6, 12)  # 30 and 60 minutes at 5-minute bars
 # Smoke-test coefficient ONLY. The real number comes from
 # scripts/backtest/premium.py fitted against the option archive. Using this in
 # a reported result would make that result a restatement of this guess.
-SMOKE_MULTIPLIER = 0.5
+#
+# UNITS MATTER AND ARE EASY TO GET WRONG HERE. This is premium PERCENT move per
+# index PERCENT move (an elasticity / lambda), NOT delta. Delta is premium
+# RUPEES per index POINT. They differ by spot/premium, which for Nifty is
+# roughly 24,250/112 ~= 216:
+#
+#     lambda = delta * spot / premium = 0.5 * 24250 / 112 ~= 108
+#
+# Cross-checked against a real fill: Rs 115.35 -> Rs 137.20 (+18.94%) on ~44
+# Nifty points (0.181%) gives 18.94 / 0.181 ~= 105. Consistent.
+#
+# An earlier version of this file defaulted to 0.5, conflating the two. That is
+# wrong by a factor of ~200 and would have made every premium-space number in
+# the output meaningless while still looking plausible.
+SMOKE_LAMBDA_NIFTY = 105.0
+SMOKE_LAMBDA_BANKNIFTY = 105.0
 
 
 def _tradeable_mask(arrays) -> np.ndarray:
@@ -113,13 +128,30 @@ def _directional_baseline(arrays, eligible: np.ndarray, direction: np.ndarray, d
             continue
         entry = close[idx]
         exit_price = close[target_index[idx]]
-        signed = (exit_price - entry) / entry * 100.0 * direction[idx]
+        raw = (exit_price - entry) / entry * 100.0
+        signed = raw * direction[idx]
         wins = int(np.sum(signed > 0))
-        z, p = _binomial_z(wins, idx.size)
+
+        # BASE RATE, not 50%. Over a rising two-year sample the index closes up
+        # more often than down, so an always-long rule beats a coin flip on
+        # market drift alone and would look like edge. The correct null is the
+        # unconditional up-rate applied in whichever direction the rule chose:
+        # long bars are credited the up-rate, short bars its complement.
+        up_rate = float(np.mean(raw > 0))
+        n_long = int(np.sum(direction[idx] == 1))
+        n_short = idx.size - n_long
+        base_rate = (n_long * up_rate + n_short * (1.0 - up_rate)) / idx.size
+        hit_rate = wins / idx.size
+        z, p = _binomial_z(wins, idx.size, p0=base_rate)
         logger.info(
-            "  %2d min forward | n=%6d | hit=%.2f%% | mean=%+.4f%% | median=%+.4f%% | z=%+.2f p=%.4f",
-            forward_bars * 5, idx.size, wins / idx.size * 100,
-            float(np.mean(signed)), float(np.median(signed)), z, p,
+            "  %2d min | n=%6d | hit=%.2f%% | base=%.2f%% | edge=%+.2fpp | "
+            "mean=%+.4f%% | z=%+.2f p=%.4f",
+            forward_bars * 5, idx.size, hit_rate * 100, base_rate * 100,
+            (hit_rate - base_rate) * 100, float(np.mean(signed)), z, p,
+        )
+        logger.info(
+            "         (unconditional up-rate %.2f%%, %s long / %s short signals)",
+            up_rate * 100, n_long, n_short,
         )
 
     # Does a bigger drift predict better? If the rule has any edge at all it
@@ -135,12 +167,17 @@ def _directional_baseline(arrays, eligible: np.ndarray, direction: np.ndarray, d
         if idx.size < 50:
             continue
         entry = close[idx]
-        signed = (close[target_index[idx]] - entry) / entry * 100.0 * direction[idx]
+        raw = (close[target_index[idx]] - entry) / entry * 100.0
+        signed = raw * direction[idx]
         wins = int(np.sum(signed > 0))
-        z, p = _binomial_z(wins, idx.size)
+        up_rate = float(np.mean(raw > 0))
+        n_long = int(np.sum(direction[idx] == 1))
+        base_rate = (n_long * up_rate + (idx.size - n_long) * (1.0 - up_rate)) / idx.size
+        z, p = _binomial_z(wins, idx.size, p0=base_rate)
         logger.info(
-            "    drift %.2f-%.2f%% | n=%6d | hit=%.2f%% | mean=%+.4f%% | z=%+.2f p=%.4f",
-            low, high, idx.size, wins / idx.size * 100, float(np.mean(signed)), z, p,
+            "    drift %.2f-%.2f%% | n=%6d | hit=%.2f%% | base=%.2f%% | edge=%+.2fpp | z=%+.2f p=%.4f",
+            low, high, idx.size, wins / idx.size * 100, base_rate * 100,
+            (wins / idx.size - base_rate) * 100, z, p,
         )
 
 
@@ -207,12 +244,13 @@ def main() -> int:
     parser.add_argument("--smoke", action="store_true", help="Last 30 sessions only")
     args = parser.parse_args()
 
-    multiplier = args.multiplier if args.multiplier is not None else SMOKE_MULTIPLIER
+    multiplier = args.multiplier if args.multiplier is not None else SMOKE_LAMBDA_NIFTY
     if args.multiplier is None:
         logger.warning(
-            "No --multiplier given: using the smoke value %.2f. Premium-space numbers "
-            "below are indicative only. Fit the real coefficient from the option "
-            "archive before reporting anything.", SMOKE_MULTIPLIER,
+            "No --multiplier given: using the smoke value %.1f (premium %% per index %%, "
+            "NOT delta). Premium-space numbers below are indicative only -- fit the real "
+            "coefficient per index/DTE/moneyness from the option archive before reporting "
+            "anything.", SMOKE_LAMBDA_NIFTY,
         )
 
     connection = sqlite3.connect(args.db)
@@ -257,9 +295,11 @@ def main() -> int:
 
     logger.info("=" * 72)
     logger.info(
-        "Read the hit rates against 50%%. A z below ~2 means the drift rule is "
-        "indistinguishable from a coin flip on this sample, and the gate sweep "
-        "would be tuning filters over a signal that isn't there."
+        "Read the EDGE column, not the hit rate -- edge is hit minus the "
+        "unconditional base rate. Anything inside +/-1pp is noise. A z below ~2 "
+        "means the drift rule is indistinguishable from the base rate on this "
+        "sample, and the gate sweep would be tuning filters over a signal that "
+        "isn't there."
     )
     return 0
 
