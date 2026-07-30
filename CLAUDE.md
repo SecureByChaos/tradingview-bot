@@ -206,8 +206,20 @@ ATM puts are 1.3–1.5× more sensitive than calls (Nifty λ −97 vs +64, Bank 
 identical percentage stop is a **materially tighter index distance on a PE than a CE** —
 12% on a Nifty put is ~0.11% of index movement versus ~0.18% on a call.
 
-Nobody chose that asymmetry, and it persists under any entry rule. Worth considering
-before any future risk-parameter work.
+Nobody chose that asymmetry, and it persists under any entry rule. **Specify future risk
+parameters in index points or ATR multiples, not premium percent** — a "12% stop" is
+2.02 ATR on a Nifty call and 1.27 ATR on a put, which are different bets wearing the
+same label.
+
+### Days-to-expiry materially affects stop survivability
+
+Same 12% stop, breached by noise within 60 min: Bank Nifty calls 36.5% at 2–5 DTE versus
+23.4% at 6–10 DTE. Longer-dated contracts carry higher premium, so the same percentage
+is a wider index distance.
+
+AI Origination calls `find_atm_contract(signal, index, 0)` — nearest expiry, no offset,
+always. An expiry offset is the cheapest structural improvement identified so far and is
+independent of whether any entry signal works. Untested; see the roadmap.
 
 ### Backtest tooling
 

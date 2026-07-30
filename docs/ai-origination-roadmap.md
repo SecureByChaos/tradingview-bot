@@ -83,6 +83,74 @@ that. Given the heavy PE skew on several sessions, this is a plausible contribut
 loss clustering — and it would persist under *any* entry rule, including a purely
 deterministic one.
 
+## Stop survivability, corrected (30 Jul 2026)
+
+Method: `scripts/stop_survivability.py`, two years, fitted per-bucket coefficients,
+60-minute forward window from every eligible bar.
+
+An earlier figure — "a 10% stop is breached by noise in 62.3% (BN) / 55.8% (NIFTY) of
+bars" — used a **flat multiplier of 105 for everything** and was wrong. Percentage of
+bars breaching a 12% stop within 60 minutes:
+
+| Bucket | old (flat 105) | corrected |
+|---|---|---|
+| BANKNIFTY CE 2–5 DTE | 56.0% | 36.5% |
+| BANKNIFTY CE 6–10 DTE | 56.0% | 23.4% |
+| BANKNIFTY PE 2–5 DTE | 54.0% | 45.5% |
+| NIFTY CE 2–5 DTE | 49.5% | 31.4% |
+| NIFTY PE 2–5 DTE | 45.8% | 47.1% |
+
+The correction runs in **opposite directions for calls and puts**: fitted call
+coefficients (47–68) are roughly half the old flat value so call rates fall sharply,
+while fitted put coefficients (−85 to −108) straddle it and barely move. The pooled
+figure was approximately right for puts and badly wrong for calls. Never pool them.
+
+### "Structurally broken" was too strong — retract it
+
+At 15–18% on a 6–10 DTE call, breach rates are 11–19%. Survivable configurations plainly
+exist. The problem was never that the stop is impossible to survive; it is that no stop
+helps without an edge.
+
+MFE and MAE come back near-symmetric from random entry (BANKNIFTY CE −8.72% / +8.28%;
+NIFTY PE −11.15% / +12.22%). That symmetry is the martingale signature, and it is why
+sweeping exit rules against unconditional entry can only find configurations that lose
+*less*, never one that wins.
+
+### Days-to-expiry is a larger lever than the stop percentage
+
+The most actionable risk-side finding, and it is independent of whether any entry signal
+works. Same 12% stop, breach rate by DTE bucket:
+
+| | 2–5 DTE | 6–10 DTE | reduction |
+|---|---|---|---|
+| BANKNIFTY CE | 36.5% | 23.4% | −36% |
+| BANKNIFTY PE | 45.5% | 31.6% | −31% |
+| NIFTY CE | 31.4% | 26.1% | −17% |
+| NIFTY PE | 47.1% | 37.4% | −21% |
+
+Mechanism: longer-dated contracts carry higher premium, so λ falls and the same
+percentage stop becomes a wider index distance.
+
+**AI Origination currently uses `find_atm_contract(signal, index, 0)` — nearest available
+expiry, no offset, always.** Moving to a later expiry would materially reduce
+noise-stopping at no cost, and would apply to the rule-based strategies too. Test it
+properly before acting on it, but it is the cheapest structural improvement identified so
+far.
+
+### Stops in comparable units
+
+A percentage stop is not a comparable quantity across option types. Nifty, 2–5 DTE,
+nominal 12% stop:
+
+| | index points | ATR multiples |
+|---|---|---|
+| CE | 43 | 2.02 |
+| PE | 27 | 1.27 |
+
+Same label, 37% tighter stop on the put. Bank Nifty shows the same effect (101 vs 79
+points). Any future risk-parameter work should be specified in index points or ATR
+multiples, not premium percent.
+
 ## Original framing (retained for context — see SUPERSEDED above)
 
 43 valid trades, 21–24 Jul. 20 Jul excluded — those trades accepted sub-1% stops, from
