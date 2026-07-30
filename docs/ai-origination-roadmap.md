@@ -20,6 +20,73 @@ Status as of 30 Jul 2026.
 >
 > See "Two-year backtest results" below. Keep the rest of this document for the reasoning
 > and the caveats, not for the plan.
+>
+> **Update, same day:** indicator-based setups — which are a different input from drift —
+> DO show a replicated positive edge, but only in a specific time window. See "Indicator
+> setup results" below. That is the live thread; the drift premise remains dead.
+
+## Indicator setup results (30 Jul 2026) — the current live thread
+
+Method: `scripts/setup_significance.py`. Same discipline as the drift test — edge against
+the unconditional base rate, non-overlapping subsample, day-block bootstrap,
+direction-aware verdict. 16 setups declared before any result was inspected.
+
+### What replicated
+
+**Momentum and breakout setups work between 11:00 and 14:00, and fail after 14:00.**
+
+Two conceptually distinct families agree, which matters more than either alone:
+
+| Setup | Regime | BN 30m | BN 60m | NIFTY 30m | NIFTY 60m |
+|---|---|---|---|---|---|
+| `EMA_STACK` | 11:00–14:00 | +1.62 | +1.88 | +2.53 | **+3.95** |
+| `ST_ALIGNED` | 11:00–14:00 | +1.71 | +2.20 | +3.21 | +4.09 |
+| `ORB_BREAK[hold=2]` | 11:00–14:00 | +1.65 | — | +3.23 | +4.91 |
+| `PDH_PDL_BREAK[hold=3]` | 11:00–14:00 | +1.74 | — | +2.32 | +3.95 |
+
+All CIs exclude zero. **`NIFTY 60min EMA_STACK 1100_1400` clears Bonferroni** at
+p = 0.000035 against a 0.000103 threshold over 484 comparisons — the only cell in any
+analysis so far to survive the harshest correction rather than relying on replication.
+
+And the mirror, which is the same claim from the other side: `ST_ALIGNED` is reliably
+**backwards** 14:00–15:15 on both indices (BN −2.31 / −3.11, Nifty −2.40). A sign flip in
+adjacent, disjoint windows of the same sessions.
+
+### The economics are marginal
+
+Best cell is +3.95pp. At symmetric ±12% payoffs that is ~0.95% gross against ~0.56%
+costs — **+0.39% net**. Bank Nifty's +1.88pp is ~0.45% gross, i.e. **net negative**.
+
+So: Nifty midday trend-following is marginally net positive; Bank Nifty is not. Any
+viable version has to come from the win/loss ratio, not the hit rate.
+
+### Caveat that must be resolved before trusting the late-session result
+
+The 60-minute forward window is **clipped at session end**. A 14:30 signal measures ~45
+minutes and a 15:00 signal ~15, so the "60min" label is wrong inside the 14:00–15:15
+bucket and the effective horizon shrinks systematically across it.
+
+Truncation should dilute an edge toward zero rather than make it negative, so it probably
+does not explain a reliable −2.3 to −3.1pp. But it is a distortion correlated with the
+exact variable under test. **Re-run 14:00–15:15 with a 15-minute horizon that fits inside
+the window before treating late-session reversal as established.**
+
+### Also outstanding: the drift test was never run conditionally
+
+`band_significance.py` pooled all times of day. If momentum works midday and reverses
+late, pooling would produce a net negative — which is what it found. That does not
+overturn the drift result, but it was never tested conditionally, and it should be before
+"momentum is dead" is treated as settled.
+
+### Holdout candidates (single-use, at most two)
+
+1. **`EMA_STACK` @ 11:00–14:00** — Bonferroni-clearing, full four-partition replication
+2. **`ORB_BREAK[hold=2]` @ 11:00–14:00** — different information family, so a genuine
+   second test rather than a restatement
+
+`ST_ALIGNED` is a near-duplicate of `EMA_STACK`; taking both would spend the holdout twice
+on one idea. Do the truncation check and the conditional drift re-run first — either could
+change which candidate deserves the single shot.
 
 ## Two-year backtest results (30 Jul 2026)
 

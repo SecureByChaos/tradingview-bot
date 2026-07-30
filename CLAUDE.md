@@ -199,6 +199,23 @@ around a non-predictive input produces better-argued coin flips.
 
 Full numbers, method and caveats: `docs/ai-origination-roadmap.md`.
 
+### Indicator setups DO show an edge — but only midday (30 Jul 2026)
+
+Separate from drift, and this is the current live thread. Momentum and breakout setups
+(`EMA_STACK`, `ST_ALIGNED`, `ORB_BREAK`, `PDH_PDL_BREAK`) show a replicated positive edge
+**between 11:00 and 14:00** across both indices and both horizons, and are reliably
+*backwards* after 14:00. `NIFTY 60min EMA_STACK 1100_1400` at +3.95pp is the only cell in
+any analysis to clear a Bonferroni threshold (p = 0.000035 over 484 comparisons).
+
+Economics are marginal: +3.95pp is ~0.95% gross against ~0.56% costs. Nifty is net
+positive by a thin margin; Bank Nifty is not.
+
+**Unresolved before this is acted on:** the 60-minute forward window is clipped at session
+end, so the "60min" horizon is wrong inside the 14:00–15:15 bucket. Re-run that bucket at
+a 15-minute horizon before treating late-session reversal as established. And
+`band_significance.py` pooled all times of day, so the drift test was never run
+conditionally — worth doing before "momentum is dead" is treated as settled.
+
 ### Put/call sensitivity asymmetry
 
 ATM puts are 1.3–1.5× more sensitive than calls (Nifty λ −97 vs +64, Bank Nifty −72 vs
