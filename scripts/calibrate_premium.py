@@ -29,12 +29,32 @@ from scripts.backtest.premium import fit_premium_model, select_multiplier
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("calibrate_premium")
 
-# Live fill used as a smoke test, from 29 July: Nifty ATM ran Rs 115.35 ->
-# Rs 137.20 (+18.94%) on roughly 44 index points against a ~24,250 spot
-# (0.181%). That implies lambda ~= 105. A fitted ATM coefficient far from this
-# means something is wrong with the fit, not that the market changed.
-SMOKE_EXPECTED_NIFTY_ATM = 105.0
-SMOKE_TOLERANCE = 0.6  # accept within +/-60%; this is a sanity bound, not a test
+# First-principles expectation, NOT a single observed fill.
+#
+#     lambda = delta * spot / premium
+#
+# The premium term is why a single trade is a bad reference: elasticity scales
+# inversely with premium, so a cheap 0-DTE contract and a 6-DTE contract on the
+# same index have very different lambdas. An earlier version hardcoded 105 from
+# one 29-July fill (Rs 115.35 -> Rs 137.20, +18.94% on 0.181% index) and then
+# flagged a perfectly good 6-10 DTE fit as 44% off, because that fill was a
+# cheaper contract than the archive holds.
+#
+# Reference premiums below are ATM levels observed in the 20-24 July archive
+# period, so the expectation matches the data actually being fitted.
+SMOKE_REFERENCE = {
+    # index: (spot, atm_premium, dte_bucket)
+    "NIFTY": (23950.0, 160.0, "2-5"),
+    "BANKNIFTY": (56900.0, 420.0, "2-5"),
+}
+ASSUMED_ATM_DELTA = 0.5
+# Tightened from 60%: with a correct reference, a good fit lands inside ~15%.
+# Anything past 25% is worth investigating rather than waving through.
+SMOKE_TOLERANCE = 0.25
+
+
+def _expected_lambda(spot: float, premium: float) -> float:
+    return ASSUMED_ATM_DELTA * spot / premium * 1.0
 
 
 def _load_index_series(db_path: str, table: str) -> dict[str, dict[datetime, float]]:
@@ -105,24 +125,48 @@ def main() -> int:
         logger.info("  %s", fit.describe())
 
     logger.info("=" * 78)
-    logger.info("Smoke check against the 29-Jul live fill (expected Nifty ATM CE ~%.0f):", SMOKE_EXPECTED_NIFTY_ATM)
-    try:
-        nifty_atm, extrapolated = select_multiplier(fits, "NIFTY", dte=6, option_type="CE")
-        deviation = abs(nifty_atm - SMOKE_EXPECTED_NIFTY_ATM) / SMOKE_EXPECTED_NIFTY_ATM
+    logger.info("Smoke check against first principles (delta * spot / premium):")
+    for index_symbol, (spot, premium, dte_bucket) in SMOKE_REFERENCE.items():
+        expected = _expected_lambda(spot, premium)
+        matching = [
+            f for f in fits
+            if f.index_symbol == index_symbol
+            and f.option_type == "CE"
+            and f.moneyness_bucket == "ATM"
+            and f.dte_bucket == dte_bucket
+        ]
+        if not matching:
+            logger.warning("  %s: no ATM CE fit in the %s DTE bucket", index_symbol, dte_bucket)
+            continue
+        fit = matching[0]
+        deviation = abs(fit.multiplier - expected) / expected
         verdict = "OK" if deviation <= SMOKE_TOLERANCE else "SUSPECT"
         logger.info(
-            "  NIFTY ATM fitted=%.1f expected~%.0f deviation=%.0f%% -> %s%s",
-            nifty_atm, SMOKE_EXPECTED_NIFTY_ATM, deviation * 100, verdict,
-            "  [extrapolated]" if extrapolated else "",
+            "  %-10s ATM CE dte=%s fitted=%6.1f expected=%6.1f (spot %.0f / prem %.0f) "
+            "deviation=%.0f%% -> %s",
+            index_symbol, dte_bucket, fit.multiplier, expected, spot, premium,
+            deviation * 100, verdict,
         )
         if verdict == "SUSPECT":
             logger.warning(
                 "  A coefficient this far off usually means a units error (delta vs "
-                "elasticity) or a resolution mismatch between the two series, not a "
-                "real market property. Resolve before trusting any backtest output."
+                "elasticity) or timestamp misalignment between the two series, not a "
+                "real market property. Resolve before trusting backtest output."
             )
-    except ValueError as exc:
-        logger.warning("  %s", exc)
+
+    # Put/call asymmetry is a real property, not an artefact, and it matters for
+    # risk sizing: an identical percentage stop on a PE corresponds to a smaller
+    # index move than on a CE.
+    for index_symbol in SMOKE_REFERENCE:
+        ce = [f for f in fits if f.index_symbol == index_symbol and f.option_type == "CE" and f.moneyness_bucket == "ATM"]
+        pe = [f for f in fits if f.index_symbol == index_symbol and f.option_type == "PE" and f.moneyness_bucket == "ATM"]
+        if ce and pe:
+            ce_mean = sum(f.multiplier for f in ce) / len(ce)
+            pe_mean = sum(abs(f.multiplier) for f in pe) / len(pe)
+            logger.info(
+                "  %-10s ATM |PE|/CE sensitivity ratio = %.2f (PE %.1f vs CE %.1f)",
+                index_symbol, pe_mean / ce_mean if ce_mean else 0.0, pe_mean, ce_mean,
+            )
 
     logger.info("=" * 78)
     banknifty = [f for f in fits if f.index_symbol == "BANKNIFTY"]
