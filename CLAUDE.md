@@ -184,14 +184,50 @@ python -m scripts.pull_option_candles --dry-run             # option candle pull
 
 ## Current state / open items
 
-- **Phase 0 shipped locally, not deployed.** Trailing stop, cost fields, candle-pull
-  script. See `docs/ai-origination-roadmap.md` for the full phase plan and the numbers
-  behind it.
-- AI Origination is roughly breakeven gross, below breakeven after costs. The diagnosis
-  is that it is uncompensated for costs, not broken.
-- **Unconfirmed:** whether Nifty's spot token was corrected to `99926000` in
-  Settings > Instruments, and whether the BNV6 Pine Script JSON comma bug (missing comma
-  after `htf_confirmation`, trailing comma before the trend object's closing brace) was
-  fixed on TradingView.
-- Sample sizes are small (tens of trades, days not weeks). Be honest about that in any
-  analysis; do not present a four-day result as established.
+### AI Origination's entry signal does not work (30 Jul 2026)
+
+A two-year backtest over ~37,000 five-minute bars per index found **no positive
+directional edge** in the 45-minute drift rule the originator runs on — on either index,
+at either horizon, in any drift band. Zero of 16 bands clear a Bonferroni threshold. Six
+bands are reliably *negative*, and they cover the drift range where ~25,000 of ~37,000
+bars sit, i.e. where almost every trade actually happens.
+
+This supersedes the earlier "breakeven gross, uncompensated for costs" diagnosis. It is
+not a cost problem and it is not a prompt problem. **Do not build entry gates, enriched
+prompts, or setup filters on this signal without new evidence** — enriching the context
+around a non-predictive input produces better-argued coin flips.
+
+Full numbers, method and caveats: `docs/ai-origination-roadmap.md`.
+
+### Put/call sensitivity asymmetry
+
+ATM puts are 1.3–1.5× more sensitive than calls (Nifty λ −97 vs +64, Bank Nifty −72 vs
++56, fitted from real option candles and validated against first principles). So an
+identical percentage stop is a **materially tighter index distance on a PE than a CE** —
+12% on a Nifty put is ~0.11% of index movement versus ~0.18% on a call.
+
+Nobody chose that asymmetry, and it persists under any entry rule. Worth considering
+before any future risk-parameter work.
+
+### Backtest tooling
+
+`scripts/backtest/` (numpy-only, isolated from `app.main`'s import graph — a stray pandas
+import there costs 80 MB on a 414 MB box), plus `band_significance.py`,
+`calibrate_premium.py`, `backtest_baseline.py`, `backfill_candles.py`.
+
+Two traps already fallen into once each, both documented in the roadmap: overlapping
+forward windows inflate significance by ~√(window/stride), and premium *elasticity* is
+not *delta* (they differ by ~200× for Nifty).
+
+### Still unconfirmed
+
+- Whether Nifty's spot token was corrected to `99926000` in Settings > Instruments.
+- Whether the BNV6 Pine Script JSON comma bug (missing comma after `htf_confirmation`,
+  trailing comma before the trend object's closing brace) was fixed on TradingView.
+
+### Standing caution
+
+Live-trade sample sizes remain small (tens of trades, days not weeks). Be honest about
+that in any analysis; do not present a four-day result as established. The four-day
+result that started this work read as "weak but real edge" and two years of data said
+otherwise.

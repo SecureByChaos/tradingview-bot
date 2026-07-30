@@ -1,8 +1,89 @@
 # AI Origination — path to profitability
 
-Status as of 26 Jul 2026. Phase 0 built locally, not yet deployed.
+Status as of 30 Jul 2026.
 
-## Where the system stands
+> ## SUPERSEDED — read this first
+>
+> **The premise of this document was wrong.** Everything below Phase 0 was built on the
+> assumption that AI Origination had a weak-but-real directional signal that was simply
+> uncompensated for costs, and that better market context would sharpen it.
+>
+> A two-year backtest across ~37,000 five-minute bars per index says otherwise:
+> **trading with 45-minute spot drift has no detectable directional edge at all**, and is
+> mildly *inverted* in the drift range where most trades actually occur.
+>
+> The Phase 2/3 plan below (enriched prompts, setup detection, entry gating) is therefore
+> answering the wrong question. Adding context cannot rescue a signal that does not
+> predict. The Phase 0 and Phase 1 work still stands on its own merits — the trailing
+> stop, cost fields and candle store are all independently useful — but the roadmap's
+> destination no longer follows from its starting point.
+>
+> See "Two-year backtest results" below. Keep the rest of this document for the reasoning
+> and the caveats, not for the plan.
+
+## Two-year backtest results (30 Jul 2026)
+
+Method: `scripts/band_significance.py`, 2024-07-29 to 2026-07-28, both indices,
+30- and 60-minute horizons, four drift bands.
+
+Critically, the first pass **overstated significance badly**. Sampling every 5 minutes
+with a 60-minute forward window means consecutive samples share 11 of 12 forward bars.
+They are not independent, but the binomial standard error assumes they are — inflating z
+by roughly √12. Corrected via a non-overlapping subsample plus a day-block bootstrap.
+
+**No band shows a positive edge with a confidence interval excluding zero.**
+**Zero of 16 bands clear a Bonferroni-corrected threshold.**
+
+The one encouraging result from the earlier 30-day run — Bank Nifty drift ≥0.50% at
++2.79pp — collapsed to a CI of [−0.92, +6.31] once dependence was handled. It was an
+artefact of overlapping samples and a 51-observation subsample.
+
+Six bands are **reliably negative**, and they are where production trades. The
+0.00–0.25% drift range holds ~25,000 of ~37,000 bars:
+
+| Index | Horizon | Band | Edge | 90% CI |
+|---|---|---|---|---|
+| BANKNIFTY | 30 min | 0.00–0.10 | −1.36pp | [−2.22, −0.53] |
+| BANKNIFTY | 30 min | 0.10–0.25 | −2.00pp | [−3.27, −0.84] |
+| BANKNIFTY | 60 min | 0.10–0.25 | −2.19pp | [−3.53, −0.82] |
+| NIFTY | 30 min | 0.00–0.10 | −1.40pp | [−2.20, −0.62] |
+| NIFTY | 30 min | 0.10–0.25 | −1.32pp | [−2.54, −0.11] |
+| NIFTY | 60 min | 0.00–0.10 | −0.98pp | [−1.84, −0.16] |
+
+### Why inverting the rule is not the obvious fix
+
+Two reasons, and the second is arithmetic rather than caution.
+
+These bands were **selected on the same two years** a fade rule would be validated
+against. An inverted rule inherits the full selection bias and means nothing until it
+clears the untouched holdout.
+
+More decisively: at symmetric ±12% payoffs, a 2pp hit-rate edge is worth about **0.48%
+per trade against ~0.56% costs — still net negative.** A directional edge of this size
+cannot carry the system alone. Any viable version lives in the win/loss *ratio*, not the
+hit rate.
+
+## Put/call sensitivity asymmetry (30 Jul 2026)
+
+Independent of the signal question, and probably the most operationally significant
+finding. From `scripts/calibrate_premium.py`, fitted against 64 archived contracts:
+
+| Index | ATM CE λ | ATM PE λ | ratio |
+|---|---|---|---|
+| NIFTY | +63.6 | −97.1 | **1.53** |
+| BANKNIFTY | +56.2 | −72.1 | **1.28** |
+
+(λ = premium % move per index % move. Validated against first principles — Bank Nifty
+fitted 65.4 vs theoretical 67.7, Nifty 68.0 vs 74.8.)
+
+**An identical percentage stop is a materially different index distance on a put than on
+a call.** A 12% stop on a Nifty PE is ~0.11% of index movement; on a CE, ~0.18%. Every PE
+trade has been running a tighter effective stop than every CE trade, and nobody chose
+that. Given the heavy PE skew on several sessions, this is a plausible contributor to the
+loss clustering — and it would persist under *any* entry rule, including a purely
+deterministic one.
+
+## Original framing (retained for context — see SUPERSEDED above)
 
 43 valid trades, 21–24 Jul. 20 Jul excluded — those trades accepted sub-1% stops, from
 before the 5–50% validation band existed, so their exits aren't comparable.
@@ -18,8 +99,10 @@ before the 5–50% validation band existed, so their exits aren't comparable.
 | Profit factor after ~1.8% round-trip costs | 0.78 |
 | Expectancy per trade | +0.27% |
 
-**One percentage point above breakeven gross, below breakeven net.** The system is not
-broken — it is uncompensated for costs.
+This was read at the time as "one percentage point above breakeven gross, below breakeven
+net — not broken, just uncompensated for costs." The two-year result says that reading was
+too generous: 43 trades over four days could not distinguish a weak edge from no edge, and
+the larger sample says no edge.
 
 Caveat that should travel with every number above: 43 trades over four days with a heavy
 directional skew is a small, regime-specific sample.
@@ -92,7 +175,17 @@ meant to measure one variable.
 Also largely subsumed: a trail at high−5% captures the near-miss peaks (21.60%, 19.22%,
 17.75%, 17.26%) regardless of where the target sits. Revisit after a clean week.
 
-## Phase 1 — SmartAPI candle layer (not started)
+## Phase 1 — SmartAPI candle layer (BUILT, 29 Jul 2026)
+
+Shipped: `app/market_data.py` (candle store, session-anchored resampling),
+`app/indicators.py`, `app/market_context.py` (levels, CPR, setups), wired into
+`originator.py` computing and persisting `market_context_json` per trade **without**
+feeding the prompt. Backfill via `scripts/backfill_candles.py`; equivalence between
+resampled-1-minute and exchange-served 5-minute verified at 0 mismatches over 1,500 bars.
+
+This phase was worth building regardless of the Phase 2/3 outcome — it is what made the
+two-year backtest possible, which is what revealed the premise was wrong. That is the
+argument for building measurement infrastructure before acting on hypotheses.
 
 Do **not** change prompts in this phase. Phase 0 must be measurable alone.
 
@@ -129,6 +222,15 @@ from EMA in ATR units, previous-day H/L/C, opening range 9:15–9:30, 5-day H/L,
 multi-window drift.
 
 ## Phase 2 — prove the prompt change offline first
+
+> **Not started, and per the SUPERSEDED note at the top, should not start as written.**
+> This phase assumes the model is making poor use of a real signal. The two-year result
+> says there is no signal in 45-minute drift to make better use of. An enriched prompt
+> reasoning over a non-predictive input produces better-argued coin flips.
+>
+> The observation below — that the model reads *being at an extreme* as directional
+> evidence — is still a genuine defect in its reasoning. It just isn't the reason the
+> system loses money.
 
 Replay over 20 Jul onward: same moments, production prompt vs enriched prompt, scored
 against actual outcomes.
@@ -196,3 +298,34 @@ which did it — and Phase 0 is the change backed by arithmetic rather than hypo
   backfilled and are blank for everything before Phase 0 deploys.
 - The 95-row 7-day view vs the 43-trade valid set needs confirming with
   `python -m scripts.reconcile_origination` rather than assumed.
+- **Overlapping samples inflate significance.** Any forward-window analysis sampled more
+  frequently than the window length produces dependent observations. The binomial standard
+  error assumes independence and will overstate z by roughly √(window/stride). Use
+  `scripts/band_significance.py`'s day-block bootstrap, not a raw z, for anything that
+  informs a decision. This error was made once already and produced three "significant"
+  bands that all evaporated.
+- **Bank Nifty premium coefficients are fitted on 0–10 DTE only.** Bank Nifty now trades
+  a ~27 DTE monthly, outside the fitted range, where gamma differs substantially.
+  `select_multiplier` returns an `extrapolated` flag for exactly this — surface it rather
+  than applying the coefficient silently.
+
+## Method notes worth keeping
+
+Things that turned out to matter more than expected, recorded so they aren't relearned.
+
+- **Test against the base rate, not 50%.** Over a rising sample an always-long rule beats
+  a coin flip on market drift alone.
+- **Direction of a confidence interval matters.** A CI excluding zero on the negative side
+  is evidence a rule is backwards, not evidence of exploitable edge. Both are findings;
+  they are not the same finding.
+- **Premium elasticity is not delta.** λ = premium % per index %, delta = premium ₹ per
+  index point. They differ by spot/premium — roughly 200× for Nifty. Conflating them
+  produces plausible-looking output that is meaningless; the tell was 100% end-of-day
+  exits, because nothing ever reached a band.
+- **Hit rate alone cannot carry this system.** At symmetric ±12% payoffs a 2pp edge is
+  ~0.48% per trade against ~0.56% costs. Any viable configuration lives in the win/loss
+  *ratio*.
+- **Expired contracts vanish from the broker API but survive in archived filenames.**
+  `pull_option_candles.py` writes `<TRADINGSYMBOL>_<TOKEN>.csv` so metadata stays
+  recoverable after the scrip master drops the instrument. That is the normal case for
+  any historical calibration, not an edge case.
