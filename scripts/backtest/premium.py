@@ -33,7 +33,19 @@ OPTION_CANDLE_DIR = Path("data/option_candles")
 INSTRUMENT_CACHE = Path("data/instruments.json")
 
 # Beyond this the fit is extrapolation, not measurement.
-MAX_FITTED_DTE = 8
+MAX_FITTED_DTE = 10
+
+
+def _dte_bucket(dte: int) -> str:
+    if dte < 0:
+        return "unknown"
+    if dte <= 1:
+        return "0-1"
+    if dte <= 5:
+        return "2-5"
+    if dte <= 10:
+        return "6-10"
+    return "11+"
 # Moneyness buckets, in strike-intervals away from spot.
 MONEYNESS_BUCKETS = ((-2, -1), (-1, 1), (1, 2))
 
@@ -41,6 +53,7 @@ MONEYNESS_BUCKETS = ((-2, -1), (-1, 1), (1, 2))
 @dataclass(frozen=True)
 class PremiumFit:
     index_symbol: str
+    option_type: str
     dte_bucket: str
     moneyness_bucket: str
     multiplier: float       # premium %% move per 1%% index move
@@ -51,8 +64,8 @@ class PremiumFit:
     def describe(self) -> str:
         flag = "  [EXTRAPOLATED]" if self.extrapolated else ""
         return (
-            f"{self.index_symbol:<10} dte={self.dte_bucket:<6} "
-            f"money={self.moneyness_bucket:<8} mult={self.multiplier:6.2f} "
+            f"{self.index_symbol:<10} {self.option_type} dte={self.dte_bucket:<6} "
+            f"money={self.moneyness_bucket:<8} mult={self.multiplier:8.2f} "
             f"r2={self.r_squared:5.3f} n={self.n_samples:<6}{flag}"
         )
 
@@ -111,9 +124,17 @@ def _parse_symbol_filename(stem: str) -> dict | None:
 
 
 def _parse_expiry(raw: str) -> datetime | None:
+    """Parse an expiry string.
+
+    The format string must NOT be uppercased. An earlier version did
+    `fmt.upper()`, turning "%d%b%Y" into "%D%B%Y" -- Python rejects %D, so every
+    parse failed silently and DTE fell back to 99, collapsing every bucket into
+    "99+". Only the VALUE is uppercased, to match "28JUL2026".
+    """
+    text = str(raw).strip().upper()
     for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y"):
         try:
-            return datetime.strptime(str(raw).strip().upper(), fmt.upper())
+            return datetime.strptime(text, fmt)
         except ValueError:
             continue
     return None
@@ -166,6 +187,7 @@ def fit_premium_model(
             from_filename += 1
 
         index_symbol = str(meta.get("name", "")).upper()
+        option_type = "CE" if str(meta.get("symbol", "")).upper().endswith("CE") else "PE"
         spot_map = index_series.get(index_symbol)
         if not spot_map:
             continue
@@ -189,8 +211,8 @@ def fit_premium_model(
             if abs(index_ret) < 1e-6:
                 continue
 
-            dte = (expiry.date() - ts.date()).days if expiry else 99
-            dte_bucket = "0-2" if dte <= 2 else "3-8" if dte <= MAX_FITTED_DTE else f"{dte}+"
+            dte = (expiry.date() - ts.date()).days if expiry else -1
+            dte_bucket = _dte_bucket(dte)
             steps = (strike - spot) / interval if interval else 0.0
             money_bucket = "OTM"
             for low, high in MONEYNESS_BUCKETS:
@@ -198,9 +220,13 @@ def fit_premium_model(
                     money_bucket = "ATM" if (low, high) == (-1, 1) else f"{low}:{high}"
                     break
 
-            buckets.setdefault((index_symbol, dte_bucket, money_bucket), []).append(
-                (index_ret, premium_ret)
-            )
+            # Option type MUST be part of the key. A call gains when the index
+            # rises and a put loses; pooling them into one regression drives the
+            # coefficient toward zero or negative, which is exactly what the
+            # first run produced (-7.44, -10.07, -16.65 with r2 ~ 0.002-0.074).
+            buckets.setdefault(
+                (index_symbol, option_type, dte_bucket, money_bucket), []
+            ).append((index_ret, premium_ret))
 
     if from_filename:
         logger.info("Recovered metadata from filename for %s expired contracts", from_filename)
@@ -210,7 +236,7 @@ def fit_premium_model(
     )
 
     fits: list[PremiumFit] = []
-    for (index_symbol, dte_bucket, money_bucket), pairs in sorted(buckets.items()):
+    for (index_symbol, option_type, dte_bucket, money_bucket), pairs in sorted(buckets.items()):
         if len(pairs) < 50:
             continue
         x = np.array([p[0] for p in pairs], dtype=np.float64)
@@ -225,36 +251,40 @@ def fit_premium_model(
         fits.append(
             PremiumFit(
                 index_symbol=index_symbol,
+                option_type=option_type,
                 dte_bucket=dte_bucket,
                 moneyness_bucket=money_bucket,
                 multiplier=slope,
                 r_squared=r2,
                 n_samples=len(pairs),
-                extrapolated=dte_bucket.endswith("+"),
+                extrapolated=dte_bucket in ("11+", "unknown"),
             )
         )
     return fits
 
 
-def select_multiplier(fits: list[PremiumFit], index_symbol: str, dte: int) -> tuple[float, bool]:
-    """Pick the ATM multiplier for an index and DTE.
+def select_multiplier(
+    fits: list[PremiumFit], index_symbol: str, dte: int, option_type: str = "CE"
+) -> tuple[float, bool]:
+    """Pick the ATM multiplier for an index, DTE and option type.
 
     Returns (multiplier, extrapolated). Callers MUST surface the extrapolated
-    flag in their output -- a Bank Nifty 27-DTE result carrying an 8-DTE
-    coefficient is a materially different claim from a measured one.
+    flag -- a Bank Nifty 27-DTE result carrying a 6-10 DTE coefficient is a
+    materially different claim from a measured one.
     """
     candidates = [
         f for f in fits
-        if f.index_symbol == index_symbol and f.moneyness_bucket == "ATM"
+        if f.index_symbol == index_symbol
+        and f.moneyness_bucket == "ATM"
+        and f.option_type == option_type
     ]
     if not candidates:
-        raise ValueError(f"No ATM premium fit for {index_symbol}")
-    wanted = "0-2" if dte <= 2 else "3-8" if dte <= MAX_FITTED_DTE else None
-    if wanted is not None:
-        for fit in candidates:
-            if fit.dte_bucket == wanted:
-                return fit.multiplier, False
-    # Outside the fitted range: fall back to the longest-dated fit available
-    # and mark it extrapolated rather than pretending it was measured.
+        raise ValueError(f"No ATM {option_type} premium fit for {index_symbol}")
+    wanted = _dte_bucket(dte)
+    for fit in candidates:
+        if fit.dte_bucket == wanted and not fit.extrapolated:
+            return fit.multiplier, False
+    # Outside the fitted range: fall back to the best-sampled fit and mark it
+    # extrapolated rather than pretending it was measured.
     best = max(candidates, key=lambda f: f.n_samples)
     return best.multiplier, True

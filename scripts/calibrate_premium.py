@@ -105,9 +105,9 @@ def main() -> int:
         logger.info("  %s", fit.describe())
 
     logger.info("=" * 78)
-    logger.info("Smoke check against the 29-Jul live fill (expected Nifty ATM ~%.0f):", SMOKE_EXPECTED_NIFTY_ATM)
+    logger.info("Smoke check against the 29-Jul live fill (expected Nifty ATM CE ~%.0f):", SMOKE_EXPECTED_NIFTY_ATM)
     try:
-        nifty_atm, extrapolated = select_multiplier(fits, "NIFTY", dte=2)
+        nifty_atm, extrapolated = select_multiplier(fits, "NIFTY", dte=6, option_type="CE")
         deviation = abs(nifty_atm - SMOKE_EXPECTED_NIFTY_ATM) / SMOKE_EXPECTED_NIFTY_ATM
         verdict = "OK" if deviation <= SMOKE_TOLERANCE else "SUSPECT"
         logger.info(
@@ -126,7 +126,7 @@ def main() -> int:
 
     logger.info("=" * 78)
     banknifty = [f for f in fits if f.index_symbol == "BANKNIFTY"]
-    if banknifty and all(f.dte_bucket in ("0-2", "3-8") for f in banknifty):
+    if banknifty and all(f.dte_bucket in ("0-1", "2-5", "6-10") for f in banknifty):
         logger.warning(
             "Bank Nifty fits cover 0-8 DTE only. Bank Nifty now trades the ~27 DTE "
             "monthly, which is outside this range -- gamma differs substantially. "
