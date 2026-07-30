@@ -66,16 +66,48 @@ def _load_instrument_lookup() -> dict[str, dict]:
     authoritative.
     """
     if not INSTRUMENT_CACHE.exists():
-        raise SystemExit(
-            f"Instrument master cache not found at {INSTRUMENT_CACHE}. "
-            "Start the app once so it downloads."
-        )
+        # Not fatal: filename parsing covers every expired contract anyway, and
+        # expired contracts are the whole archive.
+        logger.info("No instrument cache at %s; relying on filename parsing", INSTRUMENT_CACHE)
+        return {}
     lookup: dict[str, dict] = {}
     for item in json.loads(INSTRUMENT_CACHE.read_text(encoding="utf-8")):
         token = str(item.get("token") or "")
         if token:
             lookup[token] = item
     return lookup
+
+
+# BANKNIFTY28JUL2655900CE -> name, 28JUL26 expiry, 55900 strike, CE.
+# The expiry field is fixed-width (2 digits, 3 letters, 2 digits), which is what
+# makes this unambiguous -- everything between it and the CE/PE suffix is the
+# strike. A general "split the digits" parse would NOT be safe here.
+_SYMBOL_RE = re.compile(
+    r"^(?P<name>[A-Z]+?)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<yy>\d{2})(?P<strike>\d+)(?P<opt>CE|PE)$"
+)
+
+
+def _parse_symbol_filename(stem: str) -> dict | None:
+    """Recover contract metadata from the archived filename.
+
+    Needed because the scrip master only lists LIVE instruments. Once a
+    contract expires it drops out, so any archive older than the current expiry
+    cycle cannot be looked up by token -- which is the normal case for exactly
+    the historical data this calibration depends on. The filename is the only
+    surviving record, and pull_option_candles.py writes it as
+    <TRADINGSYMBOL>_<TOKEN>.csv precisely so this remains possible.
+    """
+    symbol = stem.rsplit("_", 1)[0].upper()
+    match = _SYMBOL_RE.match(symbol)
+    if not match:
+        return None
+    return {
+        "name": match.group("name"),
+        "expiry": f"{match.group('day')}{match.group('mon')}20{match.group('yy')}",
+        "strike": float(match.group("strike")),
+        "symbol": symbol,
+        "_from_filename": True,
+    }
 
 
 def _parse_expiry(raw: str) -> datetime | None:
@@ -118,13 +150,20 @@ def fit_premium_model(
 
     lookup = _load_instrument_lookup()
     buckets: dict[tuple, list[tuple[float, float]]] = {}
+    from_filename = 0
 
     for path in sorted(candle_dir.glob("*.csv")):
         token = path.stem.rsplit("_", 1)[-1]
         meta = lookup.get(token)
         if meta is None:
-            logger.info("Skipping %s: token not in scrip master (likely expired)", path.name)
-            continue
+            # Expected, not exceptional: an expired contract is absent from the
+            # scrip master by design, and every archive worth calibrating on is
+            # of expired contracts. Fall back to the filename.
+            meta = _parse_symbol_filename(path.stem)
+            if meta is None:
+                logger.warning("Skipping %s: not in scrip master and filename unparseable", path.name)
+                continue
+            from_filename += 1
 
         index_symbol = str(meta.get("name", "")).upper()
         spot_map = index_series.get(index_symbol)
@@ -162,6 +201,13 @@ def fit_premium_model(
             buckets.setdefault((index_symbol, dte_bucket, money_bucket), []).append(
                 (index_ret, premium_ret)
             )
+
+    if from_filename:
+        logger.info("Recovered metadata from filename for %s expired contracts", from_filename)
+    logger.info(
+        "Matched %s buckets; sample counts: %s",
+        len(buckets), {k: len(v) for k, v in sorted(buckets.items())},
+    )
 
     fits: list[PremiumFit] = []
     for (index_symbol, dte_bucket, money_bucket), pairs in sorted(buckets.items()):
