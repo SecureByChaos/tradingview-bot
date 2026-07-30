@@ -86,7 +86,15 @@ class BandResult:
 
     @property
     def survives(self) -> bool:
-        return (self.ci_low > 0) or (self.ci_high < 0)
+        """Direction matters. A CI excluding zero on the NEGATIVE side is not a
+        tradeable edge for a rule that trades WITH the drift -- it is evidence
+        the rule is backwards in that band. Only a positive CI supports
+        proceeding to Part C as specified."""
+        return self.ci_low > 0
+
+    @property
+    def reliably_negative(self) -> bool:
+        return self.ci_high < 0
 
 
 def _eligible_and_signal(arrays):
@@ -260,29 +268,49 @@ def main() -> int:
     logger.info("  bands clearing corrected alpha on the independent subsample: %s", len(clearing))
 
     survivors = [r for r in results if r.survives]
+    negatives = [r for r in results if r.reliably_negative]
     logger.info("=" * 100)
     if survivors:
-        logger.info("VERDICT: %s band(s) have a bootstrap CI excluding zero:", len(survivors))
+        logger.info("VERDICT: %s band(s) show POSITIVE edge with a CI excluding zero:", len(survivors))
         for r in survivors:
             logger.info(
                 "  %s %s %s -> edge %+.2fpp, CI [%+.2f, %+.2f], n_indep=%s",
                 r.index_symbol, r.horizon, r.band, r.edge_indep, r.ci_low, r.ci_high, r.n_indep,
             )
         logger.info(
-            "These are candidates for Part C. Note they were selected from the same "
-            "two years the sweep would run on, so the locked holdout carries more "
-            "weight than usual -- any sweep conditional on them inherits that bias."
+            "These are candidates for Part C. They were selected from the same two "
+            "years the sweep would run on, so the locked holdout carries more weight "
+            "than usual -- any sweep conditional on them inherits that bias."
         )
     else:
         logger.info(
-            "VERDICT: every band's bootstrap CI straddles zero. The 45-minute drift "
-            "signal is indistinguishable from noise at this sample size."
+            "VERDICT: NO band shows a positive edge with a CI excluding zero. Trading "
+            "WITH 45-minute drift has no detectable edge across two years."
         )
         logger.info(
-            "Per the decision rule: STOP. Do not run the gate sweep and do not build "
-            "entry gates on these bands. Two years of index data could not detect a "
-            "tradeable directional edge -- the answer is to stop paying to rediscover "
-            "that 15 trades at a time, not to search harder for a filter."
+            "Per the decision rule: STOP. Do not run the gate sweep on the momentum "
+            "premise. The answer is to stop paying to rediscover this 15 trades at a "
+            "time, not to search harder for a filter."
+        )
+
+    if negatives:
+        logger.info("-" * 100)
+        logger.info(
+            "%s band(s) are reliably NEGATIVE (CI entirely below zero). The rule is not "
+            "merely uninformative there, it is backwards:", len(negatives),
+        )
+        for r in negatives:
+            logger.info(
+                "  %s %s %s -> edge %+.2fpp, CI [%+.2f, %+.2f], n_full=%s",
+                r.index_symbol, r.horizon, r.band, r.edge_full, r.ci_low, r.ci_high, r.n_full,
+            )
+        logger.info(
+            "Before treating this as a fade signal, note two things. (1) These bands "
+            "were selected on the same data, so an inverted rule inherits the full "
+            "selection bias and MUST be validated on the untouched holdout. (2) At "
+            "symmetric +/-12%% payoffs a 2pp hit-rate edge is worth about 0.48%% per "
+            "trade against ~0.56%% costs -- still net negative. Inversion only pays if "
+            "the win/loss RATIO is asymmetric, which is the Part C question."
         )
     return 0
 
