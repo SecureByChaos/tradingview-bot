@@ -183,8 +183,30 @@ def main() -> int:
             "  (Bank Nifty monthly)" if dte == 27 else "",
         )
     logger.info(
-        "  At 3 DTE that is ~1.5%% over 45 minutes -- an eighth of a 12%% stop, and the "
+        "  At 3 DTE that is -2.0%% over 45 minutes -- a sixth of a 12%% stop, and the "
         "amount every backtest result so far has been optimistic by."
+    )
+
+    # Sign alone is not sufficient. Real theta is MORE negative at shorter
+    # expiry; if a bucket that came out negative still orders backwards against
+    # its longer-dated sibling, it is negative by accident and equally unusable.
+    ordering_ok = True
+    for index_symbol in ("BANKNIFTY", "NIFTY"):
+        for option_type in ("CE", "PE"):
+            short = next((f for f in fitted_theta if f.index_symbol == index_symbol
+                          and f.option_type == option_type and f.dte_bucket == "2-5"), None)
+            long = next((f for f in fitted_theta if f.index_symbol == index_symbol
+                         and f.option_type == option_type and f.dte_bucket == "6-10"), None)
+            if short and long and short.theta_per_minute >= long.theta_per_minute:
+                ordering_ok = False
+    theta_usable = ordering_ok and all(f.theta_is_plausible for f in fitted_theta)
+    logger.info("")
+    logger.info(
+        "  EMPIRICAL THETA USABLE: %s%s",
+        "yes" if theta_usable else "NO",
+        "" if theta_usable else
+        " -- signs and/or DTE ordering fail. Buckets that happen to be negative are "
+        "negative by accident, not by measurement. Use theta_assumed_per_minute.",
     )
 
     logger.info("=" * 78)
@@ -252,6 +274,7 @@ def main() -> int:
                 "multiplier is premium PERCENT per index PERCENT (elasticity), NOT delta. "
                 "Delta is premium rupees per index point; the two differ by spot/premium."
             ),
+            "theta_empirical_usable": theta_usable,
             "theta_note": (
                 "theta_per_minute is the EMPIRICAL joint-fit coefficient and is generally "
                 "NOT usable: on a 1-minute archive the elapsed-time column is nearly "
