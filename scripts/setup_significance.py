@@ -58,6 +58,15 @@ HORIZONS = ((6, "30min"), (12, "60min"))
 MIN_SIGNALS = 100          # below this the bootstrap is not informative
 BOOTSTRAP_ITERATIONS = 2000
 
+# Forward windows are CLIPPED at session end (see forward_window_bounds). A
+# 60-minute horizon therefore measures ~45 minutes from a 14:30 signal and ~15
+# from a 15:00 one, so inside the 14:00-15:15 bucket the "60min" label is wrong
+# and the effective horizon shrinks systematically across the window. That is a
+# distortion correlated with the exact variable under test, which is why
+# --horizons exists: re-run that bucket at a horizon that FITS inside it
+# (3 bars = 15 min) and see whether the reversal survives.
+TRUNCATION_WARNING_REGIMES = {"1400_1515"}
+
 
 @dataclass
 class Result:
@@ -180,8 +189,22 @@ def main() -> int:
     parser.add_argument("--table", default="candles")
     parser.add_argument("--interval", default="FIVE_MINUTE")
     parser.add_argument("--regimes", action="store_true", help="Also split by CPR / ADX / session third")
+    parser.add_argument(
+        "--horizons", default="",
+        help="Comma-separated forward-bar counts, e.g. '3' for 15 min. Overrides the "
+             "default 30/60 min. Use a horizon that fits inside the regime under test.",
+    )
     parser.add_argument("--seed", type=int, default=20260730)
     args = parser.parse_args()
+
+    horizons = HORIZONS
+    if args.horizons:
+        horizons = tuple(
+            (int(bars.strip()), f"{int(bars.strip()) * 5}min")
+            for bars in args.horizons.split(",")
+            if bars.strip()
+        )
+        logger.info("Horizon override: %s", ", ".join(label for _, label in horizons))
 
     rng = np.random.default_rng(args.seed)
     setups = default_setups()
@@ -212,7 +235,7 @@ def main() -> int:
         for setup in setups:
             signals = build_signals(arrays, setup)
             assert_causal(arrays, setup, signals)
-            for forward_bars, horizon_label in HORIZONS:
+            for forward_bars, horizon_label in horizons:
                 for regime_name, regime_mask in regimes.items():
                     mask = eligible & regime_mask
                     n_sig, n_indep, edge, ci_low, ci_high, p = _evaluate(
@@ -249,13 +272,26 @@ def main() -> int:
     if args.regimes:
         logger.info("=" * 108)
         logger.info("REGIME SPLITS (only cells whose CI excludes zero)")
+        truncated_seen = False
         for r in sorted(results, key=lambda x: (x.setup, x.index_symbol, x.regime)):
             if r.regime == "all" or not (r.survives or r.reliably_negative):
                 continue
+            # Flag cells where the forward window cannot fit inside the regime,
+            # so a truncation artefact is never silently read as a result.
+            truncated = r.regime in TRUNCATION_WARNING_REGIMES and r.horizon != "15min"
+            truncated_seen = truncated_seen or truncated
             logger.info(
-                "  %-10s %-7s %-28s %-12s n=%6d edge %+6.2fpp  [%+6.2f, %+6.2f]  %s",
+                "  %-10s %-7s %-28s %-12s n=%6d edge %+6.2fpp  [%+6.2f, %+6.2f]  %s%s",
                 r.index_symbol, r.horizon, r.setup, r.regime, r.n_signals, r.edge,
                 r.ci_low, r.ci_high, "POSITIVE" if r.survives else "BACKWARDS",
+                "  [TRUNCATED WINDOW]" if truncated else "",
+            )
+        if truncated_seen:
+            logger.warning(
+                "  Cells marked TRUNCATED WINDOW sit in 14:00-15:15, where the forward "
+                "window is clipped at session end -- the stated horizon is not the "
+                "horizon actually measured. Re-run with --horizons 3 before treating "
+                "any of them as a finding."
             )
 
     # --- multiple-comparison accounting -------------------------------------

@@ -75,6 +75,7 @@ class BandResult:
     index_symbol: str
     horizon: str
     band: str
+    regime: str
     n_full: int
     edge_full: float
     n_indep: int
@@ -117,6 +118,27 @@ def _eligible_and_signal(arrays):
     direction[drift > 0] = 1
     direction[drift < 0] = -1
     return eligible, direction, drift
+
+
+def _session_masks(arrays, split: bool) -> dict[str, np.ndarray]:
+    """Time-of-day partitions.
+
+    The original drift test POOLED all times of day. The indicator work
+    subsequently found that momentum setups are positive 11:00-14:00 and
+    reliably backwards after 14:00 -- and a pooled test across two windows of
+    opposite sign will report the net, which is roughly what it did report.
+    That does not overturn the drift result, but it means the drift rule was
+    never tested conditionally, so this re-runs it split.
+    """
+    n = len(arrays)
+    masks: dict[str, np.ndarray] = {"all": np.ones(n, dtype=bool)}
+    if not split:
+        return masks
+    minutes = arrays.minutes_since_open
+    masks["0945_1100"] = minutes < 105
+    masks["1100_1400"] = (minutes >= 105) & (minutes < 285)
+    masks["1400_1515"] = minutes >= 285
+    return masks
 
 
 def _edge(wins: int, ups: int, longs: int, n: int) -> float:
@@ -208,6 +230,12 @@ def main() -> int:
     parser.add_argument("--table", default="candles")
     parser.add_argument("--interval", default="FIVE_MINUTE")
     parser.add_argument("--iterations", type=int, default=2000)
+    parser.add_argument(
+        "--by-session", action="store_true",
+        help="Split by time of day. The original test pooled all sessions, and the "
+             "indicator work found momentum is positive 11:00-14:00 and backwards after "
+             "14:00 -- a pooled test across windows of opposite sign reports the net.",
+    )
     parser.add_argument("--seed", type=int, default=20260730)
     args = parser.parse_args()
 
@@ -235,34 +263,39 @@ def main() -> int:
         arrays = build_arrays(symbol, bars)
         eligible, direction, drift = _eligible_and_signal(arrays)
 
-        for forward_bars, horizon_label in HORIZONS:
-            logger.info("  %s horizon", horizon_label)
-            logger.info(
-                "    %-12s %8s %9s %8s %9s %8s %9s  %s",
-                "band", "n_full", "edge_full", "n_indep", "edge_ind", "z_ind", "p_ind", "bootstrap 90% CI",
-            )
-            for band_label, low, high in BANDS:
-                (n_full, edge_full, n_indep, edge_indep, z, p, ci_low, ci_high) = _analyse_band(
-                    arrays, eligible, direction, drift, forward_bars, low, high, args.iterations, rng
-                )
-                if n_full == 0:
-                    continue
-                verdict = "EXCLUDES ZERO" if (ci_low > 0 or ci_high < 0) else "straddles zero"
+        regimes = _session_masks(arrays, args.by_session)
+        for regime_name, regime_mask in regimes.items():
+            eligible_regime = eligible & regime_mask
+            for forward_bars, horizon_label in HORIZONS:
+                logger.info("  %s horizon | %s", horizon_label, regime_name)
                 logger.info(
-                    "    %-12s %8d %+8.2fpp %8d %+8.2fpp %+8.2f %9.4f  [%+.2f, %+.2f]  %s",
-                    band_label, n_full, edge_full, n_indep, edge_indep, z, p, ci_low, ci_high, verdict,
+                    "    %-12s %8s %9s %8s %9s %8s %9s  %s",
+                    "band", "n_full", "edge_full", "n_indep", "edge_ind", "z_ind", "p_ind", "bootstrap 90% CI",
                 )
-                results.append(
-                    BandResult(symbol, horizon_label, band_label, n_full, edge_full,
-                               n_indep, edge_indep, z, p, ci_low, ci_high)
-                )
+                for band_label, low, high in BANDS:
+                    (n_full, edge_full, n_indep, edge_indep, z, p, ci_low, ci_high) = _analyse_band(
+                        arrays, eligible_regime, direction, drift, forward_bars, low, high, args.iterations, rng
+                    )
+                    if n_full == 0:
+                        continue
+                    verdict = "EXCLUDES ZERO" if (ci_low > 0 or ci_high < 0) else "straddles zero"
+                    logger.info(
+                        "    %-12s %8d %+8.2fpp %8d %+8.2fpp %+8.2f %9.4f  [%+.2f, %+.2f]  %s",
+                        band_label, n_full, edge_full, n_indep, edge_indep, z, p, ci_low, ci_high, verdict,
+                    )
+                    results.append(
+                        BandResult(symbol, horizon_label, band_label, regime_name, n_full, edge_full,
+                                   n_indep, edge_indep, z, p, ci_low, ci_high)
+                    )
 
     # --- 0c. Multiple-comparison context ------------------------------------
     logger.info("=" * 100)
     tested = len(results)
     bonferroni = 0.05 / tested if tested else float("nan")
     logger.info("Multiple-comparison context:")
-    logger.info("  bands tested: %s (%s indices x %s bands x %s horizons)", tested, len(symbols), len(BANDS), len(HORIZONS))
+    logger.info("  bands tested: %s (%s indices x %s bands x %s horizons x %s regimes)",
+                tested, len(symbols), len(BANDS), len(HORIZONS),
+                len(_session_masks(arrays, args.by_session)))
     logger.info("  Bonferroni-corrected alpha: %.5f (uncorrected 0.05)", bonferroni)
     clearing = [r for r in results if r.p_indep < bonferroni]
     logger.info("  bands clearing corrected alpha on the independent subsample: %s", len(clearing))
@@ -274,8 +307,8 @@ def main() -> int:
         logger.info("VERDICT: %s band(s) show POSITIVE edge with a CI excluding zero:", len(survivors))
         for r in survivors:
             logger.info(
-                "  %s %s %s -> edge %+.2fpp, CI [%+.2f, %+.2f], n_indep=%s",
-                r.index_symbol, r.horizon, r.band, r.edge_indep, r.ci_low, r.ci_high, r.n_indep,
+                "  %s %s %s %s -> edge %+.2fpp, CI [%+.2f, %+.2f], n_indep=%s",
+                r.index_symbol, r.horizon, r.band, r.regime, r.edge_indep, r.ci_low, r.ci_high, r.n_indep,
             )
         logger.info(
             "These are candidates for Part C. They were selected from the same two "
@@ -301,8 +334,8 @@ def main() -> int:
         )
         for r in negatives:
             logger.info(
-                "  %s %s %s -> edge %+.2fpp, CI [%+.2f, %+.2f], n_full=%s",
-                r.index_symbol, r.horizon, r.band, r.edge_full, r.ci_low, r.ci_high, r.n_full,
+                "  %s %s %s %s -> edge %+.2fpp, CI [%+.2f, %+.2f], n_full=%s",
+                r.index_symbol, r.horizon, r.band, r.regime, r.edge_full, r.ci_low, r.ci_high, r.n_full,
             )
         logger.info(
             "Before treating this as a fade signal, note two things. (1) These bands "
