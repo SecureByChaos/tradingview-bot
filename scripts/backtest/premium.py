@@ -36,6 +36,36 @@ INSTRUMENT_CACHE = Path("data/instruments.json")
 MAX_FITTED_DTE = 10
 
 
+# Minutes in an NSE equity trading session (09:15-15:30).
+SESSION_MINUTES = 375
+
+
+def theoretical_theta_per_minute(dte: int) -> float:
+    """Stated-assumption decay for an ATM option, as premium percent per minute.
+
+    Used when the empirical joint fit fails its plausibility check, which on a
+    1-minute archive it generally will -- the elapsed-time column has almost no
+    independent variation, so the coefficient absorbs the mean residual instead
+    of decay.
+
+    An at-the-money option is essentially all time value, and that value decays
+    roughly as sqrt(T). The fractional loss per day is therefore about 1/(2T),
+    so:
+
+        per-day fraction   = 1 / (2 * dte)
+        per-minute percent = -100 / (2 * dte * 375)
+
+    At 4 DTE that is ~12.5%/day, or ~1.5% over a 45-minute hold -- an eighth of
+    a 12% stop, and material. At 8 DTE it halves.
+
+    This is an ASSUMPTION, not a measurement. Every result computed with it
+    should also be reported without it, so the size of the assumption stays
+    visible rather than baked in.
+    """
+    effective_dte = max(dte, 1)
+    return -100.0 / (2.0 * effective_dte * SESSION_MINUTES)
+
+
 def _dte_bucket(dte: int) -> str:
     if dte < 0:
         return "unknown"
@@ -76,6 +106,21 @@ class PremiumFit:
         """Decay over a typical hold, which is the figure worth reasoning about
         against a 12%% stop."""
         return None if self.theta_per_minute is None else self.theta_per_minute * 45
+
+    @property
+    def theta_is_plausible(self) -> bool:
+        """Whether the fitted theta can be decay at all.
+
+        A long option loses time value; theta must be NEGATIVE. A positive
+        coefficient means the term is absorbing something else -- with a
+        1-minute archive nearly every gap is exactly one minute, so
+        `theta * minutes` behaves as an intercept and soaks up the mean
+        residual (gamma convexity, sample drift) rather than measuring decay.
+
+        This is a validity check, not a preference. An implausible sign means
+        the coefficient is uninterpretable and must not be used.
+        """
+        return self.theta_per_minute is not None and self.theta_per_minute < 0
 
     def describe(self) -> str:
         flag = "  [EXTRAPOLATED]" if self.extrapolated else ""

@@ -25,7 +25,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from scripts.backtest.premium import fit_premium_model, select_multiplier
+from scripts.backtest.premium import (
+    SESSION_MINUTES,
+    fit_premium_model,
+    select_multiplier,
+    theoretical_theta_per_minute,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("calibrate_premium")
@@ -133,27 +138,54 @@ def main() -> int:
     logger.info("=" * 78)
     logger.info("Time decay (theta), from the joint fit y = lambda*x + theta*minutes:")
     fitted_theta = [f for f in fits if f.theta_per_minute is not None and f.moneyness_bucket == "ATM"]
-    if not fitted_theta:
-        logger.warning(
-            "  No theta fitted. That normally means the elapsed-time column had almost no "
-            "independent variation -- if nearly every gap in the archive is exactly one "
-            "minute, the time term cannot be separated from a constant."
-        )
     for f in sorted(fitted_theta, key=lambda x: (x.index_symbol, x.option_type, x.dte_bucket)):
         logger.info(
             "  %-10s %s dte=%-6s theta/min=%+.4f%%  over 45min=%+.2f%%  "
-            "(lambda %.1f -> %.1f joint, r2 %.3f -> %.3f)",
+            "(lambda %.1f -> %.1f joint, r2 %.3f -> %.3f)%s",
             f.index_symbol, f.option_type, f.dte_bucket, f.theta_per_minute,
             f.theta_per_45min, f.multiplier, f.multiplier_joint or 0.0,
             f.r_squared, f.r_squared_joint or 0.0,
+            "" if f.theta_is_plausible else "   <-- IMPLAUSIBLE (positive)",
         )
-    if fitted_theta:
-        worst = min(fitted_theta, key=lambda f: f.theta_per_45min or 0.0)
+
+    implausible = [f for f in fitted_theta if not f.theta_is_plausible]
+    if implausible:
+        logger.warning("")
+        logger.warning(
+            "  %s of %s ATM buckets fitted a POSITIVE theta. A long option cannot gain "
+            "value from time passing, so these coefficients are not measuring decay.",
+            len(implausible), len(fitted_theta),
+        )
+        logger.warning(
+            "  Cause: the archive is 1-minute, so nearly every gap is exactly one minute. "
+            "With no intercept in the model, theta*minutes behaves as an intercept and "
+            "absorbs the mean residual -- gamma convexity, sample drift -- rather than "
+            "decay. The large shifts in lambda when the term is added (e.g. 68.0 -> 80.0) "
+            "are the same collinearity showing up."
+        )
+        logger.warning(
+            "  A second tell: theta should be MORE negative at shorter expiry. If the "
+            "6-10 DTE bucket reads more negative than 2-5, the ordering is backwards and "
+            "confirms the term is not decay."
+        )
+        logger.warning(
+            "  DO NOT feed these into compute_outcomes. Use the stated-assumption "
+            "fallback below and report every result both with and without it."
+        )
+
+    logger.info("")
+    logger.info("  Stated-assumption decay (ATM, ~1/(2*DTE) per day over a %s-minute session):", SESSION_MINUTES)
+    for dte in (1, 3, 8, 27):
+        per_min = theoretical_theta_per_minute(dte)
         logger.info(
-            "  Largest decay over a 45-minute hold: %s %s dte=%s at %+.2f%%. Compare that "
-            "against a 12%% stop -- it is the amount every backtest result was optimistic by.",
-            worst.index_symbol, worst.option_type, worst.dte_bucket, worst.theta_per_45min,
+            "    %2d DTE -> %+.4f%%/min, %+.2f%% over a 45-minute hold%s",
+            dte, per_min, per_min * 45,
+            "  (Bank Nifty monthly)" if dte == 27 else "",
         )
+    logger.info(
+        "  At 3 DTE that is ~1.5%% over 45 minutes -- an eighth of a 12%% stop, and the "
+        "amount every backtest result so far has been optimistic by."
+    )
 
     logger.info("=" * 78)
     logger.info("Smoke check against first principles (delta * spot / premium):")
@@ -220,6 +252,15 @@ def main() -> int:
                 "multiplier is premium PERCENT per index PERCENT (elasticity), NOT delta. "
                 "Delta is premium rupees per index point; the two differ by spot/premium."
             ),
+            "theta_note": (
+                "theta_per_minute is the EMPIRICAL joint-fit coefficient and is generally "
+                "NOT usable: on a 1-minute archive the elapsed-time column is nearly "
+                "constant, so with no intercept the term absorbs the mean residual rather "
+                "than measuring decay. Check theta_is_plausible (theta must be negative). "
+                "When it is false, use theta_assumed_per_minute, which is a stated "
+                "assumption of ~1/(2*DTE) per day, and report results both with and "
+                "without it."
+            ),
             "fits": [
                 {
                     "index_symbol": f.index_symbol,
@@ -231,6 +272,12 @@ def main() -> int:
                     "n_samples": f.n_samples,
                     "extrapolated": f.extrapolated,
                     "theta_per_minute": None if f.theta_per_minute is None else round(f.theta_per_minute, 6),
+                    "theta_is_plausible": f.theta_is_plausible,
+                    "theta_assumed_per_minute": round(
+                        theoretical_theta_per_minute(
+                            {"0-1": 1, "2-5": 3, "6-10": 8}.get(f.dte_bucket, 27)
+                        ), 6,
+                    ),
                     "multiplier_joint": None if f.multiplier_joint is None else round(f.multiplier_joint, 4),
                     "r_squared_joint": None if f.r_squared_joint is None else round(f.r_squared_joint, 4),
                 }
