@@ -210,11 +210,20 @@ any analysis to clear a Bonferroni threshold (p = 0.000035 over 484 comparisons)
 Economics are marginal: +3.95pp is ~0.95% gross against ~0.56% costs. Nifty is net
 positive by a thin margin; Bank Nifty is not.
 
-**Unresolved before this is acted on:** the 60-minute forward window is clipped at session
-end, so the "60min" horizon is wrong inside the 14:00–15:15 bucket. Re-run that bucket at
-a 15-minute horizon before treating late-session reversal as established. And
-`band_significance.py` pooled all times of day, so the drift test was never run
-conditionally — worth doing before "momentum is dead" is treated as settled.
+**Resolved 31 Jul.** Both follow-ups are done:
+
+- The late-session momentum reversal was a **truncation artefact** — forward windows are
+  clipped at session end, and every setup reversal in 14:00–15:15 vanishes at a 15-minute
+  horizon. Withdrawn. `setup_significance.py` now flags truncated cells.
+- Drift's late-session negatives **do** survive the same check, so low-drift late-session
+  mean reversion is real. Two similar-looking findings, one artefact and one not —
+  replication across indices did not distinguish them, only the horizon check did.
+- Conditional drift: the low-drift negative holds at 15/30/60 min on both indices, which
+  makes it the most robust result in the exercise. One narrow exception — Nifty 0.25–0.50%
+  drift midday, positive at all three horizons but single-index.
+
+**Whenever a forward-window analysis is sampled near a session boundary, check it at a
+horizon that fits inside the window before believing it.**
 
 ### Put/call sensitivity asymmetry
 

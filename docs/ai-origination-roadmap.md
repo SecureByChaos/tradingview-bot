@@ -9,8 +9,10 @@ Status as of 30 Jul 2026.
 > uncompensated for costs, and that better market context would sharpen it.
 >
 > A two-year backtest across ~37,000 five-minute bars per index says otherwise:
-> **trading with 45-minute spot drift has no detectable directional edge at all**, and is
-> mildly *inverted* in the drift range where most trades actually occur.
+> **trading with 45-minute spot drift has no detectable directional edge in the range
+> where most trades occur**, and is mildly *inverted* there. Confirmed at 15, 30 and 60
+> minute horizons on both indices. One narrow conditional exception exists — see
+> "Conditional drift results" below — but it does not cover the bands production trades.
 >
 > The Phase 2/3 plan below (enriched prompts, setup detection, entry gating) is therefore
 > answering the wrong question. Adding context cannot rescue a signal that does not
@@ -24,6 +26,58 @@ Status as of 30 Jul 2026.
 > **Update, same day:** indicator-based setups — which are a different input from drift —
 > DO show a replicated positive edge, but only in a specific time window. See "Indicator
 > setup results" below. That is the live thread; the drift premise remains dead.
+
+## Conditional drift results and the truncation check (31 Jul 2026)
+
+Two follow-ups that between them corrected one finding and confirmed another.
+
+### The late-session momentum reversal was a truncation artefact
+
+Forward windows are clipped at session end, so a 60-minute horizon measures ~45 minutes
+from a 14:30 signal and ~15 from a 15:00 one. Re-running the setups at a 15-minute
+horizon that fits inside 14:00–15:15: **every momentum reversal disappears.**
+`ST_ALIGNED`, `EMA_STACK` and `ST_ALIGNED_ADX` were all reliably negative there at 30/60
+min; none appears at 15 min.
+
+So the "momentum flips sign after 14:00" story is withdrawn for indicator setups. The
+midday positive stands on its own.
+
+`setup_significance.py` now flags any 14:00–15:15 cell at a horizon longer than 15
+minutes as `[TRUNCATED WINDOW]`, so this cannot be silently rediscovered.
+
+### Drift late-session negatives DO survive the same check
+
+Unlike the setups. At 15 minutes: Bank Nifty 0.10–0.25 @ 14:00–15:15 is −2.82pp
+[−4.92, −0.74]; Nifty 0.00–0.10 is −2.62pp [−4.10, −1.22]; Nifty 0.10–0.25 is −2.15pp
+[−4.27, −0.07]. Late-session mean reversion in low-drift bands is real.
+
+Two superficially similar findings, one artefact and one not. Worth remembering that
+"it replicated across indices" did not distinguish them — only the horizon check did.
+
+### The low-drift negative is now the most robust result in the whole exercise
+
+Bands 0.00–0.25% are reliably negative at **15, 30 and 60 minutes, on both indices, in
+most regimes.** That range holds ~25,000 of ~37,000 bars — i.e. where almost every AI
+Origination trade lives. Trading with drift there is not merely uninformative, it is
+backwards, and the conclusion has now survived three horizons.
+
+### One conditional positive, narrower than it first looked
+
+| Cell | 15min | 30min | 60min |
+|---|---|---|---|
+| NIFTY 0.25–0.50 @ 11:00–14:00 | +3.58 | +3.62 | +3.98 |
+
+Horizon-robust and monotonically increasing, which is what a real accumulating edge looks
+like. But **Nifty only** — the equivalent Bank Nifty cell straddles zero at every horizon.
+
+The 0.50+ midday cells that looked strong at 60 min (BN +6.53pp, Nifty +8.57pp) **do not
+survive at 15 min** (−0.15pp and +0.90pp). n_indep was 186 and 120. Treat them as noise.
+
+### Net effect on the earlier conclusion
+
+"No detectable edge at all" was too strong and has been corrected in the SUPERSEDED block.
+The accurate statement: no edge in the bands production trades, reliably negative there,
+with one narrow single-index conditional exception at higher drift during midday.
 
 ## Indicator setup results (30 Jul 2026) — the current live thread
 
@@ -78,15 +132,26 @@ late, pooling would produce a net negative — which is what it found. That does
 overturn the drift result, but it was never tested conditionally, and it should be before
 "momentum is dead" is treated as settled.
 
-### Holdout candidates (single-use, at most two)
+### Holdout candidates (single-use, at most two) — revised 31 Jul
 
-1. **`EMA_STACK` @ 11:00–14:00** — Bonferroni-clearing, full four-partition replication
-2. **`ORB_BREAK[hold=2]` @ 11:00–14:00** — different information family, so a genuine
-   second test rather than a restatement
+Both follow-up checks are now done. Everything that survived points at the same window:
+**11:00–14:00**. Three independent constructions agree — indicator trend state, level
+breakouts, and raw drift bands.
 
-`ST_ALIGNED` is a near-duplicate of `EMA_STACK`; taking both would spend the holdout twice
-on one idea. Do the truncation check and the conditional drift re-run first — either could
-change which candidate deserves the single shot.
+1. **`EMA_STACK` @ 11:00–14:00** — Bonferroni-clearing at 60 min, replicates across both
+   indices and both horizons at 30/60 min. At 15 min only Nifty survives, so the effect
+   is horizon-dependent; that is expected for a directional edge but should be stated.
+2. **`ORB_BREAK[hold=2]` @ 11:00–14:00** — different information family (level-based, not
+   trend-based), so a genuine second test rather than a restatement.
+
+`ST_ALIGNED` is a near-duplicate of `EMA_STACK`. The Nifty drift 0.25–0.50 @ 11:00–14:00
+cell is horizon-robust and tempting, but it is single-index and drift is the same
+underlying quantity `EMA_STACK` measures more stably — taking it would be a third bet on
+one idea.
+
+Caveat that now applies more strongly than when this list was first written: the
+11:00–14:00 window was itself chosen after seeing results. The holdout is carrying more
+selection than originally planned.
 
 ## Two-year backtest results (30 Jul 2026)
 
