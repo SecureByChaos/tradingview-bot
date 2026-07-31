@@ -180,6 +180,9 @@ def build_signals(arrays: IndexArrays, setup: Setup) -> np.ndarray:
     elif name == "NV1":
         direction = _nv1_signals(arrays, setup.params)
 
+    elif name == "BNV6":
+        direction = _bnv6_signals(arrays, setup.params)
+
     else:
         raise ValueError(f"Unknown setup: {name}")
 
@@ -194,12 +197,17 @@ def build_signals(arrays: IndexArrays, setup: Setup) -> np.ndarray:
 # reproduced here is the ENTRY QUALITY -- directly comparable to the indicator
 # setups above under the same base-rate, bootstrap and direction-aware test.
 #
-# BNV5.1 and BNV6 are deliberately ABSENT. Both gate on above_vwap/below_vwap,
-# and VWAP requires volume, which is identically zero on index candles. They
-# need the FUTIDX contract. Reproducing them with the VWAP condition silently
-# dropped would test a different strategy and produce a confident, wrong
-# comparison -- exactly the failure the indicator-equivalence check exists to
-# prevent.
+# BNV5.1 is deliberately ABSENT -- tested separately, outside this sweep.
+#
+# BNV6 IS included below, now that FUTIDX candles exist
+# (scripts/backfill_futures.py). It still only produces real signals when
+# evaluated against a FUTIDX symbol's arrays: its VWAP condition is
+# meaningless on spot index bars, where volume is identically zero, so
+# arrays.vwap is NaN everywhere and _bnv6_signals simply never fires there.
+# Reproducing it with the VWAP condition silently dropped -- rather than
+# leaving it structurally unable to fire on the wrong instrument -- would
+# test a different strategy and produce a confident, wrong comparison,
+# exactly the failure the indicator-equivalence check exists to prevent.
 # ---------------------------------------------------------------------------
 
 
@@ -307,6 +315,124 @@ def _nv1_signals(arrays: IndexArrays, params: dict) -> np.ndarray:
     return _apply_daily_cap(direction, arrays.session_id, max_trades)
 
 
+def _apply_cooldown(direction: np.ndarray, cooldown_bars: int) -> np.ndarray:
+    """Keep a signal only if at least `cooldown_bars` array positions have
+    elapsed since the last kept signal (either direction), counted
+    continuously across session boundaries -- NOT reset per session.
+
+    This mirrors Pine's `bar_index - lastSignalBar >= cooldownBars` exactly:
+    on an intraday-only chart, bar_index has no gap between the last bar of
+    one session and the first bar of the next, so a cooldown armed late on
+    one day can genuinely suppress a signal early the next. Distinct from
+    _apply_daily_cap's per-session reset, which BNV7/NV1 use instead -- a
+    different real mechanism in a different real strategy, not a stylistic
+    choice to normalise away.
+    """
+    out = np.zeros_like(direction)
+    last_signal = -(10**9)
+    for i in range(direction.size):
+        if direction[i] != 0 and (i - last_signal) >= cooldown_bars:
+            out[i] = direction[i]
+            last_signal = i
+    return out
+
+
+def _prior_rolling_max(values: np.ndarray, window: int) -> np.ndarray:
+    """max(values[i-window : i]) -- the window ending at the bar BEFORE i,
+    never including bar i itself. Mirrors Pine's `ta.highest(series,
+    window)[1]`. No session-reset: the source script doesn't gate this by
+    session either, so a signal shortly after one session's open can
+    legitimately reference the previous session's closing bars, exactly as
+    the live indicator would."""
+    n = values.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    for i in range(window, n):
+        out[i] = np.max(values[i - window:i])
+    return out
+
+
+def _prior_rolling_min(values: np.ndarray, window: int) -> np.ndarray:
+    """min(values[i-window : i]), see _prior_rolling_max."""
+    n = values.size
+    out = np.full(n, np.nan, dtype=np.float64)
+    for i in range(window, n):
+        out[i] = np.min(values[i - window:i])
+    return out
+
+
+def _bnv6_signals(arrays: IndexArrays, params: dict) -> np.ndarray:
+    """BNV6.2 Momentum, transcribed verbatim from the Pine source:
+
+        bull_trend    = ema9 > ema21 and close > ema9
+        above_vwap    = close > ta.vwap(close)
+        rsi_bull      = rsi > 55
+        htf_bull      = ema9_15m > ema21_15m
+        atr_ok        = atr > 80.0
+        strong_trend  = abs(ema9 - ema21) > atr * 0.15
+        bull_breakout = close > ta.highest(high, 3)[1]
+        long_setup    = bull_trend and above_vwap and rsi_bull and htf_bull
+                         and atr_ok and strong_trend and bull_breakout
+
+    (mirrored for short_setup/bear_*/below_vwap/rsi_bear). A signal is kept
+    only if at least `cooldown_bars` (default 24) bars have elapsed since the
+    last kept signal in EITHER direction -- see _apply_cooldown.
+
+    ta.vwap(close) is session-anchored VWAP using CLOSE as the source series,
+    not the more common hlc3 -- an exact, deliberate detail of the source
+    script, not a simplification. Needs real volume, so this only fires on
+    FUTIDX arrays; see the module-level comment above and
+    scripts/backfill_futures.py.
+    """
+    atr_threshold = float(params.get("atr_threshold", 80.0))
+    trend_strength_factor = float(params.get("trend_strength_factor", 0.15))
+    rsi_bull_level = float(params.get("rsi_bull_level", 55.0))
+    rsi_bear_level = float(params.get("rsi_bear_level", 45.0))
+    breakout_bars = int(params.get("breakout_bars", 3))
+    cooldown_bars = int(params.get("cooldown_bars", 24))
+
+    close = arrays.close.astype(np.float64)
+    high = arrays.high.astype(np.float64)
+    low = arrays.low.astype(np.float64)
+    ema9 = arrays.ema9.astype(np.float64)
+    ema21 = arrays.ema21.astype(np.float64)
+    atr14 = arrays.atr14.astype(np.float64)
+    rsi14 = arrays.rsi14.astype(np.float64)
+    vwap = arrays.vwap.astype(np.float64)
+    htf_ema9 = arrays.htf_ema9.astype(np.float64)
+    htf_ema21 = arrays.htf_ema21.astype(np.float64)
+
+    bull_trend = (ema9 > ema21) & (close > ema9)
+    bear_trend = (ema9 < ema21) & (close < ema9)
+    above_vwap = close > vwap
+    below_vwap = close < vwap
+    rsi_bull = rsi14 > rsi_bull_level
+    rsi_bear = rsi14 < rsi_bear_level
+    htf_bull = htf_ema9 > htf_ema21
+    htf_bear = htf_ema9 < htf_ema21
+    atr_ok = atr14 > atr_threshold
+    ema_gap = np.abs(ema9 - ema21)
+    strong_trend = ema_gap > (atr14 * trend_strength_factor)
+
+    prior_high = _prior_rolling_max(high, breakout_bars)
+    prior_low = _prior_rolling_min(low, breakout_bars)
+    bull_breakout = close > prior_high
+    bear_breakout = close < prior_low
+
+    warm = (
+        ~np.isnan(ema9) & ~np.isnan(ema21) & ~np.isnan(atr14) & ~np.isnan(rsi14)
+        & ~np.isnan(vwap) & ~np.isnan(htf_ema9) & ~np.isnan(htf_ema21)
+        & ~np.isnan(prior_high) & ~np.isnan(prior_low)
+    )
+
+    long_setup = warm & bull_trend & above_vwap & rsi_bull & htf_bull & atr_ok & strong_trend & bull_breakout
+    short_setup = warm & bear_trend & below_vwap & rsi_bear & htf_bear & atr_ok & strong_trend & bear_breakout
+
+    direction = np.zeros(len(arrays), dtype=np.int8)
+    direction[long_setup] = LONG
+    direction[short_setup & ~long_setup] = SHORT
+    return _apply_cooldown(direction, cooldown_bars)
+
+
 def default_setups() -> list[Setup]:
     """The full sweep, declared BEFORE any result is inspected.
 
@@ -332,6 +458,7 @@ def default_setups() -> list[Setup]:
     # question.
     setups.append(Setup("BNV7"))
     setups.append(Setup("NV1"))
+    setups.append(Setup("BNV6"))
     return setups
 
 
@@ -356,6 +483,14 @@ def assert_causal(arrays: IndexArrays, setup: Setup, signals: np.ndarray) -> Non
     if setup.name == "NV1":
         cold_htf = np.isnan(arrays.htf_ema50)
         assert not np.any(signals[cold_htf] != 0), "NV1 fired before the HTF EMAs warmed up"
+
+    # BNV6 requires VWAP (never warms up on spot index bars -- zero volume --
+    # which is exactly the point) and its own 15-minute HTF EMA9/21 pair.
+    if setup.name == "BNV6":
+        cold_bnv6 = np.isnan(arrays.vwap) | np.isnan(arrays.htf_ema9) | np.isnan(arrays.htf_ema21)
+        assert not np.any(signals[cold_bnv6] != 0), (
+            f"{setup.label} fired before VWAP/HTF EMA9/21 warmed up"
+        )
 
     # No signal may reference a bar in a different session than its own via a
     # run that crossed the boundary.

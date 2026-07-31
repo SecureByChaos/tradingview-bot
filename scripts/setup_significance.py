@@ -202,6 +202,14 @@ def main() -> int:
     )
     parser.add_argument("--start", default="", help="First session date to include (YYYY-MM-DD)")
     parser.add_argument("--seed", type=int, default=20260730)
+    parser.add_argument(
+        "--setups", default="",
+        help="Comma-separated setup names to run (matches Setup.name, e.g. 'BNV6'). "
+             "Default: run the full declared sweep. Filtering the already-declared list "
+             "down to a subset is not the same as adding a setup after seeing results -- "
+             "the full sweep was still fixed up front; this just chooses what to report "
+             "from a single run.",
+    )
     args = parser.parse_args()
 
     horizons = HORIZONS
@@ -215,6 +223,12 @@ def main() -> int:
 
     rng = np.random.default_rng(args.seed)
     setups = default_setups()
+    if args.setups:
+        wanted = {name.strip().upper() for name in args.setups.split(",") if name.strip()}
+        setups = [s for s in setups if s.name.upper() in wanted]
+        if not setups:
+            logger.error("No declared setup matches --setups %s", args.setups)
+            return 1
     logger.info("Setups declared up front: %s", len(setups))
 
     connection = sqlite3.connect(args.db)

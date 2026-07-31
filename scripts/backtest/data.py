@@ -43,6 +43,7 @@ class IndexArrays:
     high: np.ndarray
     low: np.ndarray
     close: np.ndarray
+    volume: np.ndarray
     ema9: np.ndarray
     ema20: np.ndarray        # BNV7's filter EMA and NV1's fast trend EMA
     ema21: np.ndarray
@@ -52,6 +53,16 @@ class IndexArrays:
     # bar stamped T is only usable from T+15 onward.
     htf_ema20: np.ndarray
     htf_ema50: np.ndarray
+    # BNV6's own HTF pair (EMA9/21, not NV1's EMA20/50) -- same T+15 mapping.
+    htf_ema9: np.ndarray
+    htf_ema21: np.ndarray
+    # Session-anchored VWAP of CLOSE (not typical price) -- BNV6's Pine source
+    # calls ta.vwap(close) verbatim, so this replicates that exact source
+    # series rather than the more common hlc3 convention. Identically NaN on
+    # spot index bars, where volume is always zero (0/0): meaningless there by
+    # construction, meaningful only when built from FUTIDX bars (real volume).
+    # See scripts/backfill_futures.py.
+    vwap: np.ndarray
     atr14: np.ndarray
     rsi14: np.ndarray
     adx14: np.ndarray
@@ -115,6 +126,7 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
     high = np.array([b.high for b in bars], dtype=np.float32)
     low = np.array([b.low for b in bars], dtype=np.float32)
     close = np.array([b.close for b in bars], dtype=np.float32)
+    volume = np.array([b.volume for b in bars], dtype=np.float32)
 
     # --- session identity -------------------------------------------------
     dates = np.array([b.ts_ist.date() for b in bars])
@@ -139,10 +151,14 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
     bars_15m = resample(bars, FIFTEEN_MINUTE)
     st_15m_points = supertrend(bars_15m, period=7, multiplier=3.0)
     closes_15m = [b.close for b in bars_15m]
+    ema9_15m = ema(closes_15m, 9)
     ema20_15m = ema(closes_15m, 20)
+    ema21_15m = ema(closes_15m, 21)
     ema50_15m = ema(closes_15m, 50)
     st_15m_dir = np.zeros(n, dtype=np.int8)
+    htf_ema9 = np.full(n, NAN, dtype=np.float32)
     htf_ema20 = np.full(n, NAN, dtype=np.float32)
+    htf_ema21 = np.full(n, NAN, dtype=np.float32)
     htf_ema50 = np.full(n, NAN, dtype=np.float32)
     if bars_15m:
         # A 15-minute bar stamped T covers [T, T+15) and is only CLOSED at
@@ -157,8 +173,12 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
             if pointer >= 0:
                 point = st_15m_points[pointer]
                 st_15m_dir[i] = 0 if point is None else point.direction
+                if ema9_15m[pointer] is not None:
+                    htf_ema9[i] = ema9_15m[pointer]
                 if ema20_15m[pointer] is not None:
                     htf_ema20[i] = ema20_15m[pointer]
+                if ema21_15m[pointer] is not None:
+                    htf_ema21[i] = ema21_15m[pointer]
                 if ema50_15m[pointer] is not None:
                     htf_ema50[i] = ema50_15m[pointer]
 
@@ -173,6 +193,7 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
     minutes_open = np.zeros(n, dtype=np.int16)
     held_above = np.zeros(n, dtype=np.int16)
     held_below = np.zeros(n, dtype=np.int16)
+    vwap = np.full(n, NAN, dtype=np.float32)
 
     # Previous-session OHLC, computed strictly from completed sessions.
     session_high: dict[int, float] = {}
@@ -189,6 +210,12 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
     or_h = or_l = NAN
     current_session = -1
     session_pdh = session_pdl = session_pdc = session_cpr_width = NAN
+    # Session-anchored VWAP-of-close accumulators. Reset alongside every other
+    # per-session running value below, at the same session-boundary check --
+    # ta.vwap resets at the start of a new session/day by Pine's own default
+    # anchor, same as or_h/or_l/running_high/running_low here.
+    cum_close_volume = 0.0
+    cum_volume = 0.0
 
     for i in range(n):
         s = int(session_id[i])
@@ -198,6 +225,8 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
             current_session = s
             running_high, running_low = -1e18, 1e18
             or_h = or_l = NAN
+            cum_close_volume = 0.0
+            cum_volume = 0.0
             if s - 1 in session_high:
                 session_pdh = session_high[s - 1]
                 session_pdl = session_low[s - 1]
@@ -234,6 +263,15 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
         span = running_high - running_low
         range_pct[i] = ((float(close[i]) - running_low) / span * 100) if span > 0 else NAN
 
+        # VWAP-of-close: cumulative sum(close*volume)/sum(volume) since the
+        # session's first bar. Identically NaN (0/0) whenever cumulative
+        # volume is still zero -- true for the entire session on spot index
+        # bars (volume always 0), which is exactly why BNV6 cannot fire on
+        # them and needs FUTIDX bars instead.
+        cum_close_volume += float(close[i]) * float(volume[i])
+        cum_volume += float(volume[i])
+        vwap[i] = (cum_close_volume / cum_volume) if cum_volume > 0 else NAN
+
         # Consecutive completed bars closed beyond the opening range. Resets
         # at a session boundary and on the first bar that closes back inside.
         same_session_as_previous = i > 0 and int(session_id[i - 1]) == s
@@ -249,9 +287,10 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
     arrays = IndexArrays(
         index_symbol=index_symbol,
         ts=ts, session_id=session_id,
-        open=open_, high=high, low=low, close=close,
+        open=open_, high=high, low=low, close=close, volume=volume,
         ema9=ema9, ema20=ema20, ema21=ema21, ema50=ema50,
-        htf_ema20=htf_ema20, htf_ema50=htf_ema50,
+        htf_ema9=htf_ema9, htf_ema20=htf_ema20, htf_ema21=htf_ema21, htf_ema50=htf_ema50,
+        vwap=vwap,
         atr14=atr14, rsi14=rsi14, adx14=adx14,
         st_5m_dir=st_5m_dir, st_15m_dir=st_15m_dir,
         or_high=or_high, or_low=or_low,
