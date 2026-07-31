@@ -210,6 +210,9 @@ def _expiry_contracts(
                 "strike": int(target_strike),
                 "option_type": option_type,
                 "expiry": expiry,
+                # Not traded -- selected by proximity to ATM. Labelled so the
+                # dry-run listing doesn't claim these came from trade history.
+                "atm_band": True,
             }
     if not contracts:
         listed = sorted({float(s) for s in on_expiry["strike_normalized"].dropna().unique()})
@@ -415,7 +418,9 @@ def main() -> int:
             logger.info(
                 "  %s token=%s strike=%s %s%s",
                 contract["tradingsymbol"], contract["symboltoken"], contract["strike"],
-                contract["option_type"], " (neighbour)" if contract.get("neighbour") else " (TRADED)",
+                contract["option_type"],
+                " (ATM band)" if contract.get("atm_band")
+                else (" (neighbour)" if contract.get("neighbour") else " (TRADED)"),
             )
         logger.info("Dry run -- %s contracts x %s days = %s API calls would be made",
                     len(all_contracts), len(days), len(all_contracts) * len(days))
