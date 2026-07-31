@@ -19,6 +19,17 @@ class SmartAPIError(RuntimeError):
     pass
 
 
+class SmartAPIRateLimitedError(SmartAPIError):
+    """Raised when a call is still rate-limited after the full backoff
+    retry -- distinct from a generic SmartAPIError specifically so callers
+    (and this class itself) never conflate it with a fatal auth/session
+    failure. Unlike an expired token, this recovers on its own; the broker
+    connection is deliberately left CONNECTED so the very next call gets a
+    clean attempt rather than every subsequent call failing instantly until a
+    manual process restart. See _retry_rate_limited's docstring for the
+    incident this was added to fix."""
+
+
 BROKER_CONNECTED = "CONNECTED"
 BROKER_RECONNECTING = "RECONNECTING"
 BROKER_FAILED = "FAILED"
@@ -30,6 +41,17 @@ BROKER_FAILED = "FAILED"
 # per enabled index), webhook-triggered entries/exits, and manual dashboard
 # actions. A small margin above 1.0s avoids edge-of-window rejections.
 _MIN_QUOTE_INTERVAL_SECONDS = 1.05
+
+# Rate-limit recovery backoff. Deliberately much more patient than the
+# generic 3-attempt/~3.5s retry used elsewhere in this file for auth/token
+# issues: those are software-side and either fix immediately (refresh) or
+# don't (dead session). "Access denied because of exceeding access rate" is
+# an externally-imposed cooldown that can run for minutes, often triggered by
+# something else entirely (an analysis script sharing this account's quota)
+# rather than anything wrong with this session -- so it deserves more patience
+# before giving up on a given call, without ever touching self._status.
+_RATE_LIMIT_MAX_ATTEMPTS = 6
+_RATE_LIMIT_BACKOFF_CAP_SECONDS = 15.0
 
 
 class SmartAPIClient:
@@ -55,6 +77,12 @@ class SmartAPIClient:
         self._recovery_count_total = 0
         self._recovery_count = 0
         self._recovery_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        # Rate-limit visibility, tracked separately from _recovery_count
+        # (which is auth/token recovery only) -- see _retry_rate_limited.
+        self._last_rate_limited: Optional[datetime] = None
+        self._rate_limit_hits_total = 0
+        self._rate_limit_hits_today = 0
+        self._rate_limit_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
     @staticmethod
     def _now_ist() -> datetime:
@@ -101,6 +129,9 @@ class SmartAPIClient:
             "jwt_status": self._jwt_status,
             "feed_token_status": self._feed_status,
             "ltp_status": self._ltp_status,
+            "last_rate_limited": self._last_rate_limited,
+            "rate_limit_hits_today": self._rate_limit_hits_today,
+            "rate_limit_hits_total": self._rate_limit_hits_total,
         }
 
     def authenticate(self) -> None:
@@ -242,6 +273,52 @@ class SmartAPIClient:
             self._mark_failed(last_error)
             raise SmartAPIError(last_error)
 
+    def _retry_rate_limited(self, func, method_name: str | None, *args, **kwargs):
+        """Retries a rate-limited call with capped exponential backoff and
+        never marks the broker FAILED on exhaustion.
+
+        Root cause of the Friday 11:48-14:33 outage: the previous version of
+        this logic gave a rate-limited call exactly 3 quick attempts (~3.5s
+        total) before calling _mark_failed, which latches self._status to
+        BROKER_FAILED -- and every subsequent call, on ANY endpoint, then
+        fails instantly (see the BROKER_FAILED guards in authenticate/
+        _refresh_session/_call_with_reauth/client) until the process is
+        manually restarted. "Access denied because of exceeding access rate"
+        is an externally-imposed, self-clearing cooldown, not a broken
+        session -- it does not mean the JWT/refresh token are bad, so it must
+        never be treated the same as an auth failure. This retries for
+        longer, and on exhaustion raises SmartAPIRateLimitedError while
+        leaving self._status untouched, so the very next call (30s/5min
+        later, whatever the caller's own cadence is) gets a clean attempt
+        instead of a bricked connection.
+        """
+        total_wait = 0.0
+        for attempt in range(_RATE_LIMIT_MAX_ATTEMPTS):
+            delay = min(0.5 * (2 ** attempt), _RATE_LIMIT_BACKOFF_CAP_SECONDS)
+            total_wait += delay
+            time.sleep(delay)
+            retry_func = getattr(self._client, method_name, func) if method_name and self._client is not None else func
+            logger.info("[AUTH] Retrying rate-limited request (attempt %s/%s)", attempt + 1, _RATE_LIMIT_MAX_ATTEMPTS)
+            retry_response = retry_func(*args, **kwargs)
+            if not self._rate_limited(retry_response):
+                logger.info("[AUTH] Rate limit recovered after %s attempt(s)", attempt + 1)
+                return retry_response
+            today = self._now_ist().date()
+            if self._rate_limit_date != today:
+                self._rate_limit_hits_today = 0
+                self._rate_limit_date = today
+            self._rate_limit_hits_today += 1
+            self._rate_limit_hits_total += 1
+            self._last_rate_limited = self._now_ist()
+        logger.error(
+            "[AUTH] Rate limit still in effect after %s attempts (%.1fs total) -- leaving broker session "
+            "intact for the next call rather than marking it FAILED",
+            _RATE_LIMIT_MAX_ATTEMPTS, total_wait,
+        )
+        raise SmartAPIRateLimitedError(
+            "SmartAPI rate limit recovery failed for this call; broker session left active for retry"
+        )
+
     def _call_with_reauth(self, func, *args, **kwargs):
         if self._status == BROKER_FAILED:
             raise SmartAPIError(f"Broker in FAILED state: {self._last_error}")
@@ -264,24 +341,17 @@ class SmartAPIClient:
                 logger.warning("[AUTH] Access rate limit detected")
 
         method_name = getattr(func, "__name__", None)
+
+        if rate_limited and not auth_error:
+            # Pure rate limiting: handled entirely by the backoff retry above,
+            # which never touches auth/session state. Let SmartAPIRateLimitedError
+            # propagate as-is rather than folding it into the generic except
+            # below -- callers that care can distinguish "try again shortly"
+            # from a real recovery failure.
+            return self._retry_rate_limited(func, method_name, *args, **kwargs)
+
         try:
-            if auth_error:
-                self._refresh_session()
-            elif rate_limited:
-                for attempt in range(3):
-                    delay = 0.5 * (2 ** attempt)
-                    time.sleep(delay)
-                    retry_func = getattr(self._client, method_name, func) if method_name and self._client is not None else func
-                    logger.info("[AUTH] Retrying original request")
-                    retry_response = retry_func(*args, **kwargs)
-                    if not self._rate_limited(retry_response):
-                        logger.info("[AUTH] Recovery successful")
-                        return retry_response
-                    if attempt == 2:
-                        self._mark_failed(f"Rate limit persists: {retry_response}")
-                        logger.error("[AUTH] Recovery failed; API response: %s", retry_response)
-                        raise SmartAPIError(f"SmartAPI rate limit recovery failed: {retry_response}")
-                raise SmartAPIError("SmartAPI rate limit recovery failed")
+            self._refresh_session()
         except Exception:
             logger.exception("[AUTH] Recovery failed")
             raise
@@ -289,7 +359,12 @@ class SmartAPIClient:
         retry_func = getattr(self._client, method_name, func) if method_name and self._client is not None else func
         logger.info("[AUTH] Retrying original request")
         retry_response = retry_func(*args, **kwargs)
-        if self._token_expired(retry_response) or self._rate_limited(retry_response):
+        if self._rate_limited(retry_response):
+            # The freshly-refreshed session is itself being rate-limited --
+            # still the same transient, non-fatal condition, so it gets the
+            # same patient backoff rather than an immediate _mark_failed.
+            return self._retry_rate_limited(func, method_name, *args, **kwargs)
+        if self._token_expired(retry_response):
             self._mark_failed(f"Recovery failed: {retry_response}")
             logger.error("[AUTH] Recovery failed; API response: %s", retry_response)
             raise SmartAPIError(f"SmartAPI recovery failed: {retry_response}")

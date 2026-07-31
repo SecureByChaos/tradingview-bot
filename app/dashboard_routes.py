@@ -294,6 +294,11 @@ def history_export(
         # Risk in comparable units -- a percentage stop is not the same bet on a
         # CE as on a PE, since puts are 1.3-1.5x more index-sensitive
         "Stop (idx pts)", "Stop (ATR)", "Target (idx pts)", "Target (ATR)", "Risk Units Extrapolated",
+        # Tier 6 -- data quality at entry (forward-only; blank for trades before
+        # this column existed). YES means the candle refresh failed this cycle
+        # and the entry decision was made on stale stored history rather than
+        # a fresh pull -- see app/ai/originator.py's _load_market_context.
+        "Data Stale",
     ])
     for trade in trades:
         mfe, mae = _excursion(trade)
@@ -335,6 +340,7 @@ def history_export(
             trade.target_index_points if trade.target_index_points is not None else "",
             trade.target_atr_multiple if trade.target_atr_multiple is not None else "",
             "" if trade.risk_units_extrapolated is None else ("YES" if trade.risk_units_extrapolated else "NO"),
+            "" if trade.data_stale is None else ("YES" if trade.data_stale else "NO"),
         ])
     buffer.seek(0)
 

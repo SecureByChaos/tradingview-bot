@@ -366,6 +366,16 @@ class StrategyTrade(Base):
     # (e.g. Bank Nifty's ~27 DTE monthly against a 0-10 DTE archive). Callers
     # must surface this rather than treating the numbers as measured.
     risk_units_extrapolated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # True when this trade's market_context_json was built after the live
+    # candle refresh call itself failed (rate limit, network, auth) this
+    # cycle -- i.e. from whatever was already stored rather than a fresh
+    # pull. Added after the Friday incident where a SmartAPI rate-limit
+    # episode caused a silent fallback with no record of which trades, if
+    # any, were affected. Null for every trade before this column existed;
+    # False (not just absence of True) once it does, so "not stale" is an
+    # observed fact rather than an assumed default. See
+    # app/ai/originator.py's _load_market_context.
+    data_stale: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # origin distinguishes the original TradingView signal ("SIGNAL") from a paper
     # trade opened because an AI reviewer proposed an alternative call after
     # rejecting the original signal ("AI_ALT_OPENAI", "AI_ALT_CLAUDE", etc). Lets

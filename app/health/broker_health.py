@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import perf_counter
 
 import pyotp
 
 from app.health.models import CRITICAL, HEALTHY, WARNING, HealthResult
+
+# How recently a rate-limit hit must have occurred to still downgrade broker
+# health to WARNING. Rate limiting is transient and self-clearing (see
+# SmartAPIClient._retry_rate_limited) -- a hit from hours ago shouldn't keep
+# the dashboard showing a warning after the connection has long since
+# recovered on its own.
+_RATE_LIMIT_WARNING_WINDOW = timedelta(minutes=15)
 
 
 class BrokerHealth:
@@ -34,10 +41,14 @@ class BrokerHealth:
             latency = round((perf_counter() - started) * 1000, 2)
             ltp = HealthResult(HEALTHY, "BANKNIFTY LTP available", latency)
             websocket = self._websocket_status(client)
-            status = HEALTHY if broker_state == "CONNECTED" and websocket != "disconnected" else WARNING
+            recently_rate_limited = self._recently_rate_limited(state.get("last_rate_limited"))
+            status = HEALTHY if broker_state == "CONNECTED" and websocket != "disconnected" and not recently_rate_limited else WARNING
+            message = "SmartAPI session active"
+            if recently_rate_limited:
+                message = "SmartAPI session active but recently rate-limited by the exchange"
             broker = HealthResult(
                 status,
-                "SmartAPI session active",
+                message,
                 details={
                     "websocket": websocket,
                     "status": broker_state or "UNKNOWN",
@@ -47,11 +58,20 @@ class BrokerHealth:
                     "jwt_status": state.get("jwt_status"),
                     "feed_token_status": state.get("feed_token_status"),
                     "ltp_status": state.get("ltp_status"),
+                    "last_rate_limited": state.get("last_rate_limited"),
+                    "rate_limit_hits_today": state.get("rate_limit_hits_today", 0),
                 },
             )
             return broker, auth, ltp
         except Exception as exc:
             return HealthResult(CRITICAL, str(exc)), auth, HealthResult(CRITICAL, str(exc))
+
+    @staticmethod
+    def _recently_rate_limited(last_rate_limited: object) -> bool:
+        if not isinstance(last_rate_limited, datetime):
+            return False
+        now = last_rate_limited.tzinfo and datetime.now(last_rate_limited.tzinfo) or datetime.now()
+        return now - last_rate_limited <= _RATE_LIMIT_WARNING_WINDOW
 
     def _authentication(self, jwt: str | None, feed: str | None, refresh: str | None, state: dict[str, object]) -> HealthResult:
         if not jwt or not feed:

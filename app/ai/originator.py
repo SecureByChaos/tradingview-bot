@@ -562,17 +562,30 @@ def _in_reopen_cooldown(db: Session, index_symbol: str) -> bool:
 
 def _load_market_context(
     db: Session, index: IndexConfig, spot: float, now_ist, smartapi: SmartAPIClient
-) -> MarketContext | None:
+) -> tuple[MarketContext | None, bool]:
     """Refresh 1-minute candles for this index, then build the structural
-    context from them. Returns None on any shortfall -- callers fail closed.
+    context from them. Returns (None, False) on any shortfall -- callers fail
+    closed.
 
     Candles replace IndexPriceTick as the market-data input specifically
     because tick density varied with whether a dashboard tab happened to be
     open, silently changing the AI's input resolution between ~3 and 100+
     samples. Exchange candles don't vary with anything.
+
+    The second element of the return tuple is `data_stale`: True when the
+    live refresh call itself failed (rate limit, network, auth) and this
+    context was built entirely from whatever candles were already stored.
+    That fallback is deliberately still allowed to produce a context rather
+    than failing the cycle outright -- stored history is often still good
+    enough -- but the caller must not treat "a context was returned" as proof
+    the refresh succeeded. See the Friday rate-limit incident this was added
+    for: a failed refresh was previously invisible past an INFO log line, so
+    there was no way to tell which trades, if any, were opened on data that
+    was minutes-to-hours old rather than fresh.
     """
     if not index.spot_token:
-        return None
+        return None, False
+    data_stale = False
     try:
         # Pull a rolling window rather than only the newest bar: cheap (one
         # call), self-healing after any gap, and the upsert makes re-fetching
@@ -590,15 +603,17 @@ def _load_market_context(
             store_bars(db, index.symbol, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
     except Exception as exc:
         # Non-fatal here: stored history may still be sufficient. The
-        # sufficiency check below is what actually decides.
+        # sufficiency check below is what actually decides whether to proceed
+        # at all; data_stale is what tells the caller it proceeded on old data.
+        data_stale = True
         logger.info("[AI][ORIGIN] %s: candle refresh failed (%s), using stored history", index.symbol, exc)
 
     bars_1m = load_bars(db, index.symbol, ONE_MINUTE, limit=_CANDLE_LOAD_LIMIT)
     if not bars_1m:
-        return None
+        return None, data_stale
     bars_5m = resample(bars_1m, FIVE_MINUTE)
     bars_15m = resample(bars_1m, FIFTEEN_MINUTE)
-    return build_market_context(
+    context = build_market_context(
         index_symbol=index.symbol,
         bars_1m=bars_1m,
         bars_5m=bars_5m,
@@ -606,6 +621,7 @@ def _load_market_context(
         spot=spot,
         as_of=now_ist.replace(tzinfo=None),
     )
+    return context, data_stale
 
 
 def _open_trade(
@@ -619,6 +635,7 @@ def _open_trade(
     day_ohlc_present: bool | None = None,
     tick_sample_count: int | None = None,
     market_context: MarketContext | None = None,
+    data_stale: bool = False,
 ) -> Optional[StrategyTrade]:
     def _is_sane(value: float | None) -> bool:
         return value is not None and _MIN_SL_TARGET_PERCENT <= value <= _MAX_SL_TARGET_PERCENT
@@ -712,6 +729,7 @@ def _open_trade(
         day_ohlc_present=day_ohlc_present,
         tick_sample_count=tick_sample_count,
         market_context_json=json.dumps(market_context.as_dict()) if market_context else None,
+        data_stale=data_stale,
         stop_index_points=stop_units.index_points,
         stop_atr_multiple=stop_units.atr_multiple,
         target_index_points=target_units.index_points,
@@ -825,13 +843,28 @@ def run_origination_checks(
                 # partial context still reads as authoritative, and at
                 # ~0.6-1.8% round-trip cost a marginal trade is negative
                 # expectancy, so skipping is the cheaper error.
-                market_context = _load_market_context(session, index, price, now_ist, smartapi)
+                market_context, data_stale = _load_market_context(session, index, price, now_ist, smartapi)
                 if market_context is None:
                     logger.info(
                         "[AI][ORIGIN] %s: insufficient candle history for market context, skipping cycle",
                         index.symbol,
                     )
                     continue
+                if data_stale:
+                    # Made visible rather than only the INFO line inside
+                    # _load_market_context -- this is the exact gap the Friday
+                    # rate-limit incident exposed: a failed refresh was
+                    # otherwise indistinguishable from a fresh one to anything
+                    # reading logs/dashboard/exports after the fact.
+                    logger.warning(
+                        "[AI][ORIGIN] %s: candle refresh failed this cycle -- market context built from STALE "
+                        "stored history, not a fresh pull", index.symbol,
+                    )
+                    log_event(
+                        session, "AI_ORIGIN",
+                        f"[{index.display_name or index.symbol}] Candle refresh failed, using stale stored history",
+                        level="WARNING",
+                    )
                 if market_context.adx is None or market_context.atr_value is None or (
                     market_context.supertrend_5m is None or market_context.supertrend_15m is None
                 ):
@@ -896,6 +929,7 @@ def run_origination_checks(
                             # anything.
                             spot_at_entry=price,
                             market_context=market_context,
+                            data_stale=data_stale,
                         )
             except Exception as exc:
                 logger.exception("[AI][ORIGIN] Check failed for index %s", index.symbol)
