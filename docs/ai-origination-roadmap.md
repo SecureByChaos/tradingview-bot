@@ -27,6 +27,59 @@ Status as of 30 Jul 2026.
 > DO show a replicated positive edge, but only in a specific time window. See "Indicator
 > setup results" below. That is the live thread; the drift premise remains dead.
 
+## HOLDOUT RESULT — 31 Jul 2026. The holdout is now spent.
+
+`scripts/holdout_test.py`, window 2026-05-29 to 2026-07-28, candidates
+`EMA_STACK@1100_1400` and `ORB_BREAK[hold=2]@1100_1400`, live risk band
+(12% stop / 20% target / 8%-5% trail), costs via `trade_costs`, decay at the stated
+−0.0444%/min (3 DTE).
+
+**NOT CONFIRMED on all four cells. Every one is net negative.**
+
+| | n | edge | 90% CI | W/L | NET (with decay) |
+|---|---|---|---|---|---|
+| BANKNIFTY `EMA_STACK` | 1209 | +2.33pp | [−4.10, +8.10] | 0.61 | **−1.68%** |
+| BANKNIFTY `ORB_BREAK[2]` | 767 | +1.15pp | [−6.72, +8.44] | 0.55 | **−2.28%** |
+| NIFTY `EMA_STACK` | 1118 | +0.80pp | [−5.94, +6.39] | 0.62 | **−1.96%** |
+| NIFTY `ORB_BREAK[2]` | 735 | +0.05pp | [−6.68, +5.93] | 0.53 | **−2.37%** |
+
+### The hit rate was fine; the win/loss ratio killed it
+
+Win rates came in at 52–59%, *better* than the fit window implied. But average win was
+~6% against average loss of ~9–11%, giving a W/L ratio of 0.53–0.68. A directional edge
+cannot survive that. This is the concrete instance of the earlier arithmetic: the result
+lives in the ratio, not the hit rate.
+
+Decay accounted for roughly 0.7–0.9pp of the net figure — material, but every cell was
+already negative without it.
+
+### Process error, recorded because it affects how much the result is worth
+
+The candidates were chosen from the **contaminated** full-period run, before the clean
+selection check was run. The clean run (`--end 2026-05-28`) lists `ST_ALIGNED@1100_1400`
+as replicating across all four partitions; `EMA_STACK@1100_1400` does not appear there.
+
+`EMA_STACK` remains defensible — it is the Bonferroni-clearing cell on the fit window
+(p = 0.000051) and is highly correlated with `ST_ALIGNED` — so the answer would very
+likely have been the same. But that cannot now be demonstrated, because the holdout is
+used. **Run clean selection BEFORE naming candidates, not after.**
+
+### An observation deliberately NOT acted on
+
+Average win of ~6% against a 20% target means almost nothing reached target: the 8%/5%
+trailing stop exits first, while losers run the full 12% stop. That asymmetry plausibly
+explains the poor W/L ratio and calls Phase 0's trailing stop into question.
+
+It comes from holdout data. Tuning on it is exactly what the holdout exists to prevent.
+Pursue it only against fresh out-of-sample data.
+
+### Where this leaves the programme
+
+Two years of index candles, three independent signal constructions (45-minute drift,
+trend-state setups, level breakouts) and a locked holdout have **not demonstrated a
+tradeable edge in intraday index direction.** Reported plainly, per the spec's own
+instruction that this was a legitimate possible outcome.
+
 ## Conditional drift results and the truncation check (31 Jul 2026)
 
 Two follow-ups that between them corrected one finding and confirmed another.

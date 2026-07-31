@@ -199,7 +199,23 @@ around a non-predictive input produces better-argued coin flips.
 
 Full numbers, method and caveats: `docs/ai-origination-roadmap.md`.
 
-### Indicator setups DO show an edge — but only midday (30 Jul 2026)
+### The holdout was spent on 31 Jul 2026 and did NOT confirm
+
+`data/holdout_record.json` records it. Window 2026-05-29 to 2026-07-28, candidates
+`EMA_STACK@1100_1400` and `ORB_BREAK[hold=2]@1100_1400`. All four cells NOT CONFIRMED,
+all net negative (−1.68% to −2.37% per trade after costs and decay).
+
+Win rates were fine at 52–59%. The **win/loss ratio killed it: 0.53–0.68**, average win
+~6% against average loss ~9–11%.
+
+**The holdout is used. Re-running it turns it into in-sample data and retroactively
+invalidates this result too.** `holdout_test.py` refuses without `--force`, and a forced
+run is logged permanently. Any new hypothesis needs genuinely fresh out-of-sample data.
+
+Net position: two years of candles, three independent signal constructions and a locked
+holdout have not demonstrated a tradeable edge in intraday index direction.
+
+### Indicator setups showed a fit-window edge — but only midday, and it did not hold up (30 Jul 2026)
 
 Separate from drift, and this is the current live thread. Momentum and breakout setups
 (`EMA_STACK`, `ST_ALIGNED`, `ORB_BREAK`, `PDH_PDL_BREAK`) show a replicated positive edge
