@@ -41,6 +41,12 @@ app.db_models.Candle), keyed under "<INDEX_SYMBOL>_FUT" as its index_symbol
 -- e.g. "BANKNIFTY_FUT" -- so existing load_bars/resample tooling works
 unmodified. Volume on these rows is real (unlike the spot index rows), which
 is the entire point.
+
+Also resamples and stores 5-minute rows alongside the 1-minute ones (no extra
+API calls -- resampled in-process from what was already fetched), because
+scripts/setup_significance.py's default --interval is FIVE_MINUTE and reads
+whichever index_symbols exist at that interval. Without this, a FUTIDX symbol
+would silently never appear in that script's default run.
 """
 
 from __future__ import annotations
@@ -58,7 +64,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import SessionLocal
 from app.db_models import IndexConfig
-from app.market_data import ONE_MINUTE, parse_smartapi_row, store_bars
+from app.market_data import FIVE_MINUTE, ONE_MINUTE, parse_smartapi_row, resample, store_bars
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
 from app.time_utils import IST, utc_now
@@ -216,7 +222,10 @@ def main() -> int:
                 logger.warning("%s: no candles returned", fut_symbol)
                 continue
             written = store_bars(session, fut_symbol, ONE_MINUTE, bars)
-            logger.info("%s -> %s rows stored", fut_symbol, written)
+            logger.info("%s -> %s rows stored (1-minute)", fut_symbol, written)
+            bars_5m = resample(bars, FIVE_MINUTE)
+            written_5m = store_bars(session, fut_symbol, FIVE_MINUTE, bars_5m)
+            logger.info("%s -> %s rows stored (5-minute, resampled)", fut_symbol, written_5m)
 
     logger.info("Done.")
     return 0
