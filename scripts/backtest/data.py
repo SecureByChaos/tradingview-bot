@@ -44,8 +44,14 @@ class IndexArrays:
     low: np.ndarray
     close: np.ndarray
     ema9: np.ndarray
+    ema20: np.ndarray        # BNV7's filter EMA and NV1's fast trend EMA
     ema21: np.ndarray
     ema50: np.ndarray
+    # 15-minute EMAs mapped back to 5-minute bars, for NV1's HTF agreement
+    # filter. Mapped with the same closed-bar rule as st_15m_dir: a 15-minute
+    # bar stamped T is only usable from T+15 onward.
+    htf_ema20: np.ndarray
+    htf_ema50: np.ndarray
     atr14: np.ndarray
     rsi14: np.ndarray
     adx14: np.ndarray
@@ -118,6 +124,7 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
     # --- indicators, from the live engine's own functions ------------------
     closes = [b.close for b in bars]
     ema9 = _as_float32(ema(closes, 9))
+    ema20 = _as_float32(ema(closes, 20))
     ema21 = _as_float32(ema(closes, 21))
     ema50 = _as_float32(ema(closes, 50))
     atr14 = _as_float32(atr(bars, 14))
@@ -131,7 +138,12 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
     # --- 15-minute Supertrend, mapped back without look-ahead --------------
     bars_15m = resample(bars, FIFTEEN_MINUTE)
     st_15m_points = supertrend(bars_15m, period=7, multiplier=3.0)
+    closes_15m = [b.close for b in bars_15m]
+    ema20_15m = ema(closes_15m, 20)
+    ema50_15m = ema(closes_15m, 50)
     st_15m_dir = np.zeros(n, dtype=np.int8)
+    htf_ema20 = np.full(n, NAN, dtype=np.float32)
+    htf_ema50 = np.full(n, NAN, dtype=np.float32)
     if bars_15m:
         # A 15-minute bar stamped T covers [T, T+15) and is only CLOSED at
         # T+15. A 5-minute bar at time t may therefore use it only when
@@ -145,6 +157,10 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
             if pointer >= 0:
                 point = st_15m_points[pointer]
                 st_15m_dir[i] = 0 if point is None else point.direction
+                if ema20_15m[pointer] is not None:
+                    htf_ema20[i] = ema20_15m[pointer]
+                if ema50_15m[pointer] is not None:
+                    htf_ema50[i] = ema50_15m[pointer]
 
     # --- per-session running state, all causal ----------------------------
     or_high = np.full(n, NAN, dtype=np.float32)
@@ -234,7 +250,8 @@ def build_arrays(index_symbol: str, bars: list[Bar]) -> IndexArrays:
         index_symbol=index_symbol,
         ts=ts, session_id=session_id,
         open=open_, high=high, low=low, close=close,
-        ema9=ema9, ema21=ema21, ema50=ema50,
+        ema9=ema9, ema20=ema20, ema21=ema21, ema50=ema50,
+        htf_ema20=htf_ema20, htf_ema50=htf_ema50,
         atr14=atr14, rsi14=rsi14, adx14=adx14,
         st_5m_dir=st_5m_dir, st_15m_dir=st_15m_dir,
         or_high=or_high, or_low=or_low,

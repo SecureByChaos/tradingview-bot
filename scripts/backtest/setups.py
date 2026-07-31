@@ -174,10 +174,137 @@ def build_signals(arrays: IndexArrays, setup: Setup) -> np.ndarray:
         direction[stretched_up] = SHORT
         direction[stretched_down] = LONG
 
+    elif name == "BNV7":
+        direction = _bnv7_signals(arrays, setup.params)
+
+    elif name == "NV1":
+        direction = _nv1_signals(arrays, setup.params)
+
     else:
         raise ValueError(f"Unknown setup: {name}")
 
     return direction
+
+
+# ---------------------------------------------------------------------------
+# Live strategy entry conditions, transcribed from the Pine sources.
+#
+# SCOPE: entry signals only. Exits, position state and sizing are owned by the
+# bot (or, for BNV7, by v7_manager's own premium-percent engine), so what is
+# reproduced here is the ENTRY QUALITY -- directly comparable to the indicator
+# setups above under the same base-rate, bootstrap and direction-aware test.
+#
+# BNV5.1 and BNV6 are deliberately ABSENT. Both gate on above_vwap/below_vwap,
+# and VWAP requires volume, which is identically zero on index candles. They
+# need the FUTIDX contract. Reproducing them with the VWAP condition silently
+# dropped would test a different strategy and produce a confident, wrong
+# comparison -- exactly the failure the indicator-equivalence check exists to
+# prevent.
+# ---------------------------------------------------------------------------
+
+
+def _session_hhmm(arrays: IndexArrays) -> np.ndarray:
+    """Bar time as HHMM ints, for the strategies' own session windows."""
+    times = arrays.ts.astype("datetime64[m]").astype(object)
+    return np.array([t.hour * 100 + t.minute for t in times], dtype=np.int32)
+
+
+def _apply_daily_cap(direction: np.ndarray, session: np.ndarray, max_per_day: int) -> np.ndarray:
+    """Keep only the first `max_per_day` signals in each session.
+
+    Both strategies cap daily trades. The cap does not change the edge of an
+    individual signal, but it does change WHICH signals are taken, so leaving
+    it out would measure a strategy nobody runs.
+    """
+    out = np.zeros_like(direction)
+    count = 0
+    current = -1
+    for i in range(direction.size):
+        if session[i] != current:
+            current = int(session[i])
+            count = 0
+        if direction[i] != 0 and count < max_per_day:
+            out[i] = direction[i]
+            count += 1
+    return out
+
+
+def _bnv7_signals(arrays: IndexArrays, params: dict) -> np.ndarray:
+    """BNV7: Supertrend cross + EMA20 filter + ADX, 09:30-14:30, max 3/day.
+
+        buySignal  = crossover(close, supertrend) and close > ema and inSession
+                     and adx > 18 and tradeCount < maxTrades
+    """
+    adx_min = float(params.get("adx_min", 18))
+    max_trades = int(params.get("max_trades", 3))
+    n = len(arrays)
+    close = arrays.close.astype(np.float64)
+    st_dir = arrays.st_5m_dir
+
+    # ta.crossover(close, supertrend) is equivalent to the Supertrend direction
+    # flipping to bullish, which is what st_5m_dir already encodes.
+    flip_up = np.zeros(n, dtype=bool)
+    flip_down = np.zeros(n, dtype=bool)
+    flip_up[1:] = (st_dir[1:] == 1) & (st_dir[:-1] == -1)
+    flip_down[1:] = (st_dir[1:] == -1) & (st_dir[:-1] == 1)
+
+    hhmm = _session_hhmm(arrays)
+    in_session = (hhmm >= 930) & (hhmm <= 1430)
+    trending = ~np.isnan(arrays.adx14) & (arrays.adx14 > adx_min)
+    warm = ~np.isnan(arrays.ema20)
+
+    direction = np.zeros(n, dtype=np.int8)
+    direction[flip_up & (close > arrays.ema20) & in_session & trending & warm] = LONG
+    direction[flip_down & (close < arrays.ema20) & in_session & trending & warm] = SHORT
+    return _apply_daily_cap(direction, arrays.session_id, max_trades)
+
+
+def _nv1_signals(arrays: IndexArrays, params: dict) -> np.ndarray:
+    """NV1: Supertrend flip held N bars + EMA20/50 trend + ADX + HTF agreement.
+
+        entryReadyLong = bullHoldBars == confirmBars + 1
+        longSignal = not longSwingUsed and inSession and underLimit and
+                     not pastForceExit and entryReadyLong and trendUp and
+                     adxOk and htfBull
+
+    The `holdBars == confirmBars + 1` equality (not >=) makes this fire exactly
+    once per swing, which is also what longSwingUsed enforces -- so the
+    one-shot-per-swing behaviour falls out of the equality and needs no extra
+    state here.
+    """
+    adx_min = float(params.get("adx_min", 22))
+    confirm_bars = int(params.get("confirm_bars", 2))
+    max_trades = int(params.get("max_trades", 3))
+    n = len(arrays)
+    st_dir = arrays.st_5m_dir
+
+    # Consecutive bars in the current Supertrend direction.
+    hold_bull = np.zeros(n, dtype=np.int32)
+    hold_bear = np.zeros(n, dtype=np.int32)
+    for i in range(n):
+        if st_dir[i] == 1:
+            hold_bull[i] = (hold_bull[i - 1] + 1) if i > 0 else 1
+            hold_bear[i] = 0
+        elif st_dir[i] == -1:
+            hold_bear[i] = (hold_bear[i - 1] + 1) if i > 0 else 1
+            hold_bull[i] = 0
+
+    hhmm = _session_hhmm(arrays)
+    in_session = (hhmm >= 920) & (hhmm <= 1445) & (hhmm < 1500)
+    adx_ok = ~np.isnan(arrays.adx14) & (arrays.adx14 >= adx_min)
+    warm = ~np.isnan(arrays.ema50) & ~np.isnan(arrays.htf_ema50)
+
+    trend_up = arrays.ema20 > arrays.ema50
+    trend_down = arrays.ema20 < arrays.ema50
+    htf_bull = arrays.htf_ema20 > arrays.htf_ema50
+    htf_bear = arrays.htf_ema20 < arrays.htf_ema50
+
+    direction = np.zeros(n, dtype=np.int8)
+    ready_long = hold_bull == (confirm_bars + 1)
+    ready_short = hold_bear == (confirm_bars + 1)
+    direction[ready_long & trend_up & adx_ok & htf_bull & in_session & warm] = LONG
+    direction[ready_short & trend_down & adx_ok & htf_bear & in_session & warm] = SHORT
+    return _apply_daily_cap(direction, arrays.session_id, max_trades)
 
 
 def default_setups() -> list[Setup]:
@@ -199,6 +326,12 @@ def default_setups() -> list[Setup]:
         setups.append(Setup("FAILED_BREAKOUT", {"lookback": lookback}))
     for atr_mult in (1.5, 2.0):
         setups.append(Setup("EXTENDED_FADE", {"atr_mult": atr_mult}))
+    # Live strategies, at their production parameters only -- no sweep. These
+    # are being evaluated as configured, not optimised, so adding parameter
+    # variants would both inflate the comparison count and answer a different
+    # question.
+    setups.append(Setup("BNV7"))
+    setups.append(Setup("NV1"))
     return setups
 
 
@@ -215,9 +348,14 @@ def assert_causal(arrays: IndexArrays, setup: Setup, signals: np.ndarray) -> Non
         )
 
     # ADX-gated setups cannot fire before ADX has warmed up.
-    if setup.name in ("ST_ALIGNED_ADX", "EXTENDED_FADE"):
+    if setup.name in ("ST_ALIGNED_ADX", "EXTENDED_FADE", "BNV7", "NV1"):
         cold = np.isnan(arrays.adx14)
         assert not np.any(signals[cold] != 0), f"{setup.label} fired before ADX warmed up"
+
+    # NV1 requires the 15-minute HTF EMAs; it cannot fire before they exist.
+    if setup.name == "NV1":
+        cold_htf = np.isnan(arrays.htf_ema50)
+        assert not np.any(signals[cold_htf] != 0), "NV1 fired before the HTF EMAs warmed up"
 
     # No signal may reference a bar in a different session than its own via a
     # run that crossed the boundary.
