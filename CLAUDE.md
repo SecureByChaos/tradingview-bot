@@ -199,6 +199,24 @@ around a non-predictive input produces better-argued coin flips.
 
 Full numbers, method and caveats: `docs/ai-origination-roadmap.md`.
 
+### The rule-based strategies are NOT validated either (31 Jul 2026)
+
+Measured on entry quality over the same two years, same test as everything else:
+
+- **BNV7** is reliably *anti-predictive* — −5.95pp (Bank Nifty) and −4.37pp (Nifty) at
+  30 min, CIs excluding zero on both. The worst performer of any setup tested. Caveat:
+  this measures fixed-horizon direction, while BNV7's live exits are `v7_manager`'s
+  trailing engine, which could rescue a poor-direction entry. Evidence about the entry,
+  not proof about the strategy.
+- **NV1** fires 46/62 times in 22 months — under three a month, untestable. Its claimed
+  PF 5.18 rests on 19 trades.
+- **BNV5.1 and BNV6** cannot be tested at all: both gate on VWAP, which needs volume, and
+  index candles report volume as zero. **Archiving FUTIDX candles is the highest-value
+  data task** — it is the only route to assessing half the live strategy set.
+
+Do not assume the rule-based strategies are the validated component. Three of four are
+unassessed and the fourth looks bad.
+
 ### The holdout was spent on 31 Jul 2026 and did NOT confirm
 
 `data/holdout_record.json` records it. Window 2026-05-29 to 2026-07-28, candidates

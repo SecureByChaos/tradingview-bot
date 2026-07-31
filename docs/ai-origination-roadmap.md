@@ -27,6 +27,65 @@ Status as of 30 Jul 2026.
 > DO show a replicated positive edge, but only in a specific time window. See "Indicator
 > setup results" below. That is the live thread; the drift premise remains dead.
 
+## Existing-strategy comparison (31 Jul 2026) — and it inverts the premise
+
+The assumption throughout has been that the rule-based strategies are the profitable
+component and AI Origination is the problem. Measured on entry quality, on the same two
+years, with the same base-rate/bootstrap/direction-aware test as everything else:
+
+### BNV7's entry signal is reliably ANTI-predictive
+
+| | n | edge | 90% CI |
+|---|---|---|---|
+| BANKNIFTY 30min | 336 | **−5.95pp** | [−10.24, −1.48] |
+| NIFTY 30min | 375 | **−4.37pp** | [−8.39, −0.16] |
+| BANKNIFTY 60min | 336 | −3.57pp | [−7.73, +0.63] |
+| NIFTY 60min | 375 | −1.18pp | [−5.14, +3.01] |
+
+Backwards on **both** indices at 30 minutes, and −7.7 / −7.2pp on wide-CPR days. One of
+only three consistent-negative combinations in a 506-comparison run — and the worst
+performer of any setup tested, live or hypothetical.
+
+**Caveat that stops this being conclusive.** This measures fixed-horizon directional
+return from entry. BNV7's live exits come from `v7_manager`'s premium-percent trailing
+engine, not a fixed horizon, and a trailing exit can profit from an entry with poor
+average direction if occasional trends run far enough. So this is evidence the ENTRY has
+no edge, not proof the STRATEGY loses money. Resolving it properly needs option premium
+paths, which the archive cannot supply beyond 20–24 July.
+
+### NV1 fires too rarely to be validated at all
+
+46 signals on Bank Nifty, 62 on Nifty — over 22 months. Under three a month, below the
+100-signal floor for any meaningful test.
+
+Its own docstring claims PF 5.18 from **19 trades**. At this rate it would take years of
+live data to distinguish that from luck, and the quoted validation window
+(Dec 2025 – Jul 2026) overlaps the spent holdout. Treat the claim as untested.
+
+That is a property of the strategy, not a gap in the test: a rule that fires this rarely
+cannot be validated on any practical timescale.
+
+### BNV5.1 and BNV6 could not be tested
+
+Both gate entries on `above_vwap`/`below_vwap`. VWAP requires volume, which is identically
+zero on index candles — index instruments are not traded. They need the current-month
+FUTIDX contract. Reproducing them with the VWAP condition dropped would test a different
+strategy and produce a confident, wrong comparison.
+
+**Archiving FUTIDX candles is now the highest-value data task**, since it is the only
+route to assessing half the live strategy set.
+
+### What this means
+
+Of the four live strategies: two cannot be assessed, one cannot be assessed for lack of
+signals, and the one that can looks worse than the generic indicator setups. The
+hypothetical setups (`ST_ALIGNED`, `PDH_PDL_BREAK` @ 11:00–14:00) replicate positively
+where BNV7 replicates negatively.
+
+The live P&L remains real evidence — but it is now in tension with the entry-quality
+measurement, and that tension should be resolved before more capital is allocated on the
+assumption that these strategies are validated.
+
 ## HOLDOUT RESULT — 31 Jul 2026. The holdout is now spent.
 
 `scripts/holdout_test.py`, window 2026-05-29 to 2026-07-28, candidates
