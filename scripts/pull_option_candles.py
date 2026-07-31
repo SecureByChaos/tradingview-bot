@@ -162,16 +162,41 @@ def _expiry_contracts(
     )
 
     wanted_expiry = _angel_expiry(expiry)
+    index_options = scrip[
+        (scrip["exch_seg"] == exchange)
+        & (scrip["name"].astype(str).str.upper() == index_symbol.upper())
+        & (scrip["symbol"].astype(str).str.upper().str.endswith(("CE", "PE")))
+    ]
+    if index_options.empty:
+        raise SystemExit(
+            f"No {index_symbol} options at all on {exchange} in the instrument master. "
+            "Check --index and --exchange."
+        )
+
+    on_expiry = index_options[index_options["expiry"].astype(str).str.upper() == wanted_expiry]
+    if on_expiry.empty:
+        # Guessing an expiry date is the single most likely way to use this
+        # mode wrong, so answer the question rather than restating it.
+        available = sorted(
+            {str(e).upper() for e in index_options["expiry"].dropna().unique()},
+            key=lambda text: (_parse_expiry_sort_key(text), text),
+        )
+        raise SystemExit(
+            f"No {index_symbol} contracts on {exchange} for expiry {wanted_expiry}.\n"
+            f"Available expiries in the instrument master:\n  "
+            + "\n  ".join(available[:20])
+            + ("\n  ..." if len(available) > 20 else "")
+        )
+
     contracts: dict[str, dict[str, Any]] = {}
     for step in range(-band, band + 1):
         target_strike = atm + (step * interval)
         for option_type in ("CE", "PE"):
-            matches = scrip[
-                (scrip["exch_seg"] == exchange)
-                & (scrip["name"].astype(str).str.upper() == index_symbol.upper())
-                & (scrip["expiry"].astype(str).str.upper() == wanted_expiry)
-                & (scrip["strike_normalized"] == target_strike)
-                & (scrip["symbol"].astype(str).str.upper().str.endswith(option_type))
+            # Tolerance rather than float equality: strike_normalized is a
+            # divided float, so an exact == against an int can miss.
+            matches = on_expiry[
+                ((on_expiry["strike_normalized"] - target_strike).abs() < 0.5)
+                & (on_expiry["symbol"].astype(str).str.upper().str.endswith(option_type))
             ]
             if matches.empty:
                 continue
@@ -187,11 +212,28 @@ def _expiry_contracts(
                 "expiry": expiry,
             }
     if not contracts:
+        listed = sorted({float(s) for s in on_expiry["strike_normalized"].dropna().unique()})
+        nearest = min(listed, key=lambda s: abs(s - atm)) if listed else None
         raise SystemExit(
-            f"No contracts found for {index_symbol} expiry {wanted_expiry} around strike {atm}. "
-            "Check the expiry is listed in the instrument master and is not already expired."
+            f"{index_symbol} {wanted_expiry} exists but has no strikes within the "
+            f"+/-{band} band around ATM {atm}. Nearest listed strike: {nearest}. "
+            "The strike interval may be wrong for this index -- check Settings > Instruments."
         )
     return list(contracts.values())
+
+
+def _parse_expiry_sort_key(text: str) -> datetime:
+    parsed = _parse_expiry_maybe(text)
+    return parsed if parsed else datetime.max
+
+
+def _parse_expiry_maybe(text: str) -> datetime | None:
+    for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(str(text).strip().upper(), fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _load_scrip_master(settings: Any) -> pd.DataFrame:
