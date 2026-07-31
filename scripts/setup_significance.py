@@ -54,6 +54,37 @@ logger = logging.getLogger("setup_significance")
 
 TRADING_START = time(9, 45)
 TRADING_END = time(15, 15)
+
+# FUTIDX series are stored in the same `candles` table under "<INDEX>_FUT", so a
+# naive `SELECT DISTINCT index_symbol` returns four symbols once futures are
+# backfilled. That breaks two things at once, and the second is serious:
+#
+#   1. Every setup would run on both spot and futures, roughly doubling the
+#      comparison count and tightening the Bonferroni threshold for no
+#      information gain -- futures track spot almost exactly.
+#   2. Worse, the replication test (`len({index_symbol}) == 2`) would be
+#      satisfied by BANKNIFTY + BANKNIFTY_FUT. That is the SAME signal on the
+#      SAME underlying counted twice, not cross-index replication. Replication
+#      across independent partitions is the main defence against false
+#      positives in this harness; spot-vs-futures satisfying it silently
+#      disables that defence.
+#
+# So: volume-dependent setups run ONLY on futures (spot volume is always zero,
+# making VWAP meaningless), everything else runs ONLY on spot, and replication
+# is keyed on the UNDERLYING rather than the raw symbol.
+FUTURES_SUFFIX = "_FUT"
+VOLUME_DEPENDENT_SETUPS = {"BNV6"}
+
+
+def _is_futures(symbol: str) -> bool:
+    return symbol.upper().endswith(FUTURES_SUFFIX)
+
+
+def _underlying(symbol: str) -> str:
+    """BANKNIFTY_FUT -> BANKNIFTY. Used for the replication key so futures and
+    spot on the same index can never count as two independent partitions."""
+    upper = symbol.upper()
+    return upper[: -len(FUTURES_SUFFIX)] if upper.endswith(FUTURES_SUFFIX) else upper
 HORIZONS = ((6, "30min"), (12, "60min"))
 MIN_SIGNALS = 100          # below this the bootstrap is not informative
 BOOTSTRAP_ITERATIONS = 2000
@@ -71,6 +102,10 @@ TRUNCATION_WARNING_REGIMES = {"1400_1515"}
 @dataclass
 class Result:
     index_symbol: str
+    # Spot index behind this series. Equal to index_symbol for spot, and the
+    # stripped name for futures -- replication must be keyed on this, never on
+    # index_symbol, or BANKNIFTY and BANKNIFTY_FUT count as two partitions.
+    underlying: str
     horizon: str
     setup: str
     regime: str
@@ -244,6 +279,7 @@ def main() -> int:
 
     results: list[Result] = []
     too_few: dict[str, dict[str, int]] = {}
+    skipped_pairings: dict[str, set[str]] = {}
     for symbol in sorted(symbols):
         bars = load_bars_sqlite(args.db, args.table, symbol, args.interval)
         if args.start:
@@ -260,7 +296,17 @@ def main() -> int:
         eligible = _eligible(arrays)
         regimes = _regime_masks(arrays, args.regimes)
 
+        is_futures = _is_futures(symbol)
         for setup in setups:
+            needs_volume = setup.name.upper() in VOLUME_DEPENDENT_SETUPS
+            if needs_volume != is_futures:
+                # Volume-dependent setups only make sense on futures (spot
+                # volume is zero, so VWAP is NaN); everything else only on
+                # spot, since running it on futures too would duplicate the
+                # same signal and corrupt both the comparison count and the
+                # replication test.
+                skipped_pairings.setdefault(setup.label, set()).add(symbol)
+                continue
             signals = build_signals(arrays, setup)
             assert_causal(arrays, setup, signals)
             for forward_bars, horizon_label in horizons:
@@ -278,8 +324,8 @@ def main() -> int:
                             too_few.setdefault(setup.label, {})[f"{symbol}/{horizon_label}"] = n_sig
                         continue
                     results.append(
-                        Result(symbol, horizon_label, setup.label, regime_name,
-                               n_sig, n_indep, edge, ci_low, ci_high, p)
+                        Result(symbol, _underlying(symbol), horizon_label, setup.label,
+                               regime_name, n_sig, n_indep, edge, ci_low, ci_high, p)
                     )
 
     if not results:
@@ -328,6 +374,12 @@ def main() -> int:
                 "any of them as a finding."
             )
 
+    if skipped_pairings:
+        logger.info("=" * 108)
+        logger.info("SETUP/SERIES PAIRING (volume-dependent setups run on futures only):")
+        for label, syms in sorted(skipped_pairings.items()):
+            logger.info("  %-28s not run on: %s", label, ", ".join(sorted(syms)))
+
     if too_few:
         logger.info("=" * 108)
         logger.info("EXCLUDED -- fewer than %s signals, so not testable:", MIN_SIGNALS)
@@ -373,7 +425,7 @@ def main() -> int:
         by_key[(r.setup, r.regime)].append(r)
     consistent = {
         key: rows for key, rows in by_key.items()
-        if len({r.index_symbol for r in rows}) == 2
+        if len({r.underlying for r in rows}) == 2
         and (horizons_run < 2 or len({r.horizon for r in rows}) == 2)
     }
     if horizons_run < 2:
@@ -389,7 +441,7 @@ def main() -> int:
         by_key_neg[(r.setup, r.regime)].append(r)
     consistent_negative = {
         key: rows for key, rows in by_key_neg.items()
-        if len({r.index_symbol for r in rows}) == 2
+        if len({r.underlying for r in rows}) == 2
     }
 
     logger.info("=" * 108)
