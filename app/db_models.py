@@ -439,7 +439,11 @@ class Candle(Base):
     agree on their overlapping window before any fitted parameter is trusted.
 
     volume is stored but is always 0 for index instruments -- the index itself
-    isn't traded. Real volume/VWAP needs the FUTIDX contract (Phase 3).
+    isn't traded. Real volume/VWAP needs the FUTIDX contract, which
+    scripts/backfill_futures.py stores in this same table under
+    "<INDEX_SYMBOL>_FUT" as index_symbol (e.g. "BANKNIFTY_FUT") -- a distinct
+    key, not a new table, so existing load_bars/resample tooling needs no
+    changes to read futures candles instead of spot ones.
     """
 
     __tablename__ = "candles"
