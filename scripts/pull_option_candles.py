@@ -39,6 +39,16 @@ USAGE
     # widen/narrow the strike band around each traded strike (default 2)
     python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07 --strike-band 3
 
+    # EXPIRY MODE -- archive a named expiry's ATM band regardless of what was
+    # traded. Needed for premium calibration, which requires a DTE RANGE: Bank
+    # Nifty trades a ~27 DTE monthly while the archive only covers 0-10 DTE, so
+    # every Bank Nifty coefficient is currently extrapolated. Trade-driven
+    # pulling cannot fix that, because it only ever reaches the DTE buckets
+    # that happened to be traded -- and with the 5-DTE floor now in place there
+    # may be no Bank Nifty trades to drive a pull from at all.
+    python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07 \
+        --index BANKNIFTY --expiry 28AUG2026 --strike-band 4
+
 Output: data/option_candles/<TRADINGSYMBOL>_<TOKEN>.csv, one file per contract,
 columns timestamp_ist,open,high,low,close,volume. Existing files are skipped so
 the script is safely resumable if it dies partway or hits a rate limit.
@@ -100,6 +110,87 @@ def _traded_contracts(start: date, end: date) -> list[dict[str, Any]]:
             "option_type": trade.option_type,
             "expiry": trade.expiry,
         }
+    return list(contracts.values())
+
+
+def _latest_spot(index_symbol: str) -> float | None:
+    """Most recent stored close for an index, used to locate ATM.
+
+    Read from the candle store rather than SmartAPI on purpose: it needs no
+    authentication, costs nothing against the shared rate-limit budget, and
+    works in --dry-run. ATM only needs to be right to the nearest strike
+    interval, so a close from the last session is entirely adequate.
+    """
+    from app.db_models import Candle
+
+    with SessionLocal() as session:
+        return session.scalar(
+            select(Candle.close)
+            .where(Candle.index_symbol == index_symbol)
+            .order_by(Candle.ts_ist.desc())
+            .limit(1)
+        )
+
+
+def _expiry_contracts(
+    index_symbol: str, expiry: str, band: int, scrip: pd.DataFrame,
+    strike_intervals: dict[str, int], exchange: str, spot_override: float | None = None,
+) -> list[dict[str, Any]]:
+    """Contracts around ATM for a NAMED expiry, independent of what was traded.
+
+    The trade-driven path above can only archive contracts AI Origination
+    actually took. That is the wrong tool for calibration, for two reasons:
+
+      * The premium coefficients need a DTE RANGE. Bank Nifty currently trades
+        a ~27 DTE monthly while the archive only covers 0-10 DTE, so every Bank
+        Nifty figure is extrapolated -- and no amount of trade-driven archiving
+        fixes that if the trades keep landing in the same bucket.
+      * With the 5-DTE floor now in place, Bank Nifty may not trade at all on
+        most days, so there may be no trades to drive a pull from.
+    """
+    interval = strike_intervals.get(index_symbol, 100)
+    spot = spot_override if spot_override else _latest_spot(index_symbol)
+    if not spot:
+        raise SystemExit(
+            f"No stored candles for {index_symbol} to locate ATM, and no --spot given. "
+            "Run scripts/backfill_candles.py first, or pass --spot."
+        )
+    atm = round(float(spot) / interval) * interval
+    logger.info(
+        "%s: spot ~%.2f -> ATM %s, band +/-%s x %s points",
+        index_symbol, float(spot), atm, band, interval,
+    )
+
+    wanted_expiry = _angel_expiry(expiry)
+    contracts: dict[str, dict[str, Any]] = {}
+    for step in range(-band, band + 1):
+        target_strike = atm + (step * interval)
+        for option_type in ("CE", "PE"):
+            matches = scrip[
+                (scrip["exch_seg"] == exchange)
+                & (scrip["name"].astype(str).str.upper() == index_symbol.upper())
+                & (scrip["expiry"].astype(str).str.upper() == wanted_expiry)
+                & (scrip["strike_normalized"] == target_strike)
+                & (scrip["symbol"].astype(str).str.upper().str.endswith(option_type))
+            ]
+            if matches.empty:
+                continue
+            row = matches.iloc[0]
+            symbol = str(row["symbol"])
+            contracts[symbol] = {
+                "tradingsymbol": symbol,
+                "symboltoken": str(row["token"]),
+                "exchange": exchange,
+                "index_symbol": index_symbol,
+                "strike": int(target_strike),
+                "option_type": option_type,
+                "expiry": expiry,
+            }
+    if not contracts:
+        raise SystemExit(
+            f"No contracts found for {index_symbol} expiry {wanted_expiry} around strike {atm}. "
+            "Check the expiry is listed in the instrument master and is not already expired."
+        )
     return list(contracts.values())
 
 
@@ -192,9 +283,23 @@ def main() -> int:
     # TIME-CRITICAL" section. A hardcoded fallback window would always be an
     # already-expired one sooner or later, and would fail by silently
     # returning nothing rather than telling the caller their dates are wrong.
-    parser.add_argument("--start", required=True, help="First trade date to include (YYYY-MM-DD)")
-    parser.add_argument("--end", required=True, help="Last trade date to include (YYYY-MM-DD)")
-    parser.add_argument("--strike-band", type=int, default=2, help="Strikes either side of each traded strike")
+    parser.add_argument("--start", required=True, help="First session date to fetch (YYYY-MM-DD)")
+    parser.add_argument("--end", required=True, help="Last session date to fetch (YYYY-MM-DD)")
+    parser.add_argument("--strike-band", type=int, default=2, help="Strikes either side of ATM / each traded strike")
+    parser.add_argument(
+        "--expiry", default="",
+        help=(
+            "Archive a NAMED expiry's ATM band instead of whatever was traded, e.g. "
+            "28AUG2026. Needed for calibration: the coefficients require a DTE range, and "
+            "the trade-driven path can only reach DTE buckets that were actually traded."
+        ),
+    )
+    parser.add_argument("--index", default="", help="Index symbol, required with --expiry (e.g. BANKNIFTY)")
+    parser.add_argument("--exchange", default="NFO", help="Option exchange segment for --expiry mode")
+    parser.add_argument(
+        "--spot", type=float, default=None,
+        help="Override the spot used to locate ATM in --expiry mode. Defaults to the latest stored candle close.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="List contracts without calling the API")
     parser.add_argument(
         "--during-market-hours", action="store_true",
@@ -221,13 +326,11 @@ def main() -> int:
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end = datetime.strptime(args.end, "%Y-%m-%d").date()
 
-    settings = get_settings()
-    contracts = _traded_contracts(start, end)
-    if not contracts:
-        logger.error("No AI Origination trades found between %s and %s", start, end)
+    if args.expiry and not args.index:
+        logger.error("--expiry requires --index (e.g. --index BANKNIFTY)")
         return 1
-    logger.info("Found %s distinct traded contracts", len(contracts))
 
+    settings = get_settings()
     strike_intervals: dict[str, int] = {}
     with SessionLocal() as session:
         from app.db_models import IndexConfig
@@ -236,11 +339,31 @@ def main() -> int:
             strike_intervals[index.symbol] = index.strike_interval or 100
 
     scrip = _load_scrip_master(settings)
-    all_contracts = _expand_strike_band(contracts, scrip, args.strike_band, strike_intervals)
-    logger.info(
-        "Expanded to %s contracts with a +/-%s strike band (%s traded, %s neighbours)",
-        len(all_contracts), args.strike_band, len(contracts), len(all_contracts) - len(contracts),
-    )
+
+    if args.expiry:
+        all_contracts = _expiry_contracts(
+            args.index.upper(), args.expiry, args.strike_band, scrip,
+            strike_intervals, args.exchange.upper(), args.spot,
+        )
+        logger.info(
+            "Expiry mode: %s contracts for %s %s (+/-%s strikes around ATM)",
+            len(all_contracts), args.index.upper(), args.expiry, args.strike_band,
+        )
+    else:
+        contracts = _traded_contracts(start, end)
+        if not contracts:
+            logger.error(
+                "No AI Origination trades found between %s and %s. If you meant to archive a "
+                "specific expiry regardless of what was traded, use --expiry/--index.",
+                start, end,
+            )
+            return 1
+        logger.info("Found %s distinct traded contracts", len(contracts))
+        all_contracts = _expand_strike_band(contracts, scrip, args.strike_band, strike_intervals)
+        logger.info(
+            "Expanded to %s contracts with a +/-%s strike band (%s traded, %s neighbours)",
+            len(all_contracts), args.strike_band, len(contracts), len(all_contracts) - len(contracts),
+        )
 
     days = _trading_days(start, end)
     logger.info("Trading days in range: %s", ", ".join(d.isoformat() for d in days))
