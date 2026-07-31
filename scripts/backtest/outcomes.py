@@ -77,6 +77,8 @@ def compute_outcomes(
     direction: int,
     premium_multiplier: float,
     max_forward_bars: int = MAX_FORWARD_BARS,
+    theta_per_minute: float = 0.0,
+    minutes_per_bar: int = 5,
 ) -> Outcomes:
     """Simulate the exit engine for every bar as a hypothetical entry.
 
@@ -135,8 +137,14 @@ def compute_outcomes(
                     fav_index_pct = (entry - low[j]) / entry * 100.0
                     adv_index_pct = (entry - high[j]) / entry * 100.0
 
-                fav = fav_index_pct * premium_multiplier
-                adv = adv_index_pct * premium_multiplier
+                # Time decay, applied to both sides. A long option bleeds
+                # premium whether or not the index moves, so leaving this at
+                # zero makes every result optimistic -- most at 0-1 DTE, least
+                # at 27. theta_per_minute is normally negative, so this shifts
+                # the favourable side down and the adverse side further down.
+                decay = theta_per_minute * (j - i) * minutes_per_bar
+                fav = fav_index_pct * premium_multiplier + decay
+                adv = adv_index_pct * premium_multiplier + decay
                 best = max(best, fav)
                 worst = min(worst, adv)
 

@@ -164,6 +164,11 @@ def _ensure_columns() -> None:
             "day_ohlc_present": "ALTER TABLE strategy_trades ADD COLUMN day_ohlc_present BOOLEAN",
             "tick_sample_count": "ALTER TABLE strategy_trades ADD COLUMN tick_sample_count INTEGER",
             "market_context_json": "ALTER TABLE strategy_trades ADD COLUMN market_context_json TEXT",
+            "stop_index_points": "ALTER TABLE strategy_trades ADD COLUMN stop_index_points FLOAT",
+            "stop_atr_multiple": "ALTER TABLE strategy_trades ADD COLUMN stop_atr_multiple FLOAT",
+            "target_index_points": "ALTER TABLE strategy_trades ADD COLUMN target_index_points FLOAT",
+            "target_atr_multiple": "ALTER TABLE strategy_trades ADD COLUMN target_atr_multiple FLOAT",
+            "risk_units_extrapolated": "ALTER TABLE strategy_trades ADD COLUMN risk_units_extrapolated BOOLEAN",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():

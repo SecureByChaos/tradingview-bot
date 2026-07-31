@@ -27,6 +27,7 @@ from app.market_data import (
 )
 from app.models import Signal
 from app.option_finder import OptionFinder
+from app.premium_model import days_to_expiry, to_risk_units
 from app.platform import list_index_configs, log_event, record_index_tick_if_stale
 from app.smartapi_client import SmartAPIClient
 from app.time_utils import format_ist, to_ist, utc_now
@@ -652,6 +653,22 @@ def _open_trade(
     origin = f"AI_ORIGIN_{provider.strip().upper()}"
     strategy_name = f"AI Origination - {index.display_name or index.symbol}"
 
+    # Risk in comparable units. The premium percentages above are what the
+    # engine acts on and nothing here changes that -- but they are not
+    # comparable across option types, since an identical percentage is a much
+    # tighter index distance on a put. Recording the index-point and ATR
+    # equivalents makes the actual bet visible.
+    dte = days_to_expiry(contract.expiry, to_ist(utc_now()).date())
+    atr_at_entry = market_context.atr_value if market_context else None
+    stop_units = to_risk_units(
+        abs(sl_percent or 0.0), index.symbol, contract.option_type, dte,
+        spot_at_entry, atr_at_entry,
+    )
+    target_units = to_risk_units(
+        abs(target_percent or 0.0), index.symbol, contract.option_type, dte,
+        spot_at_entry, atr_at_entry,
+    )
+
     # Paper by default, everywhere. Goes LIVE only when BOTH this specific
     # index has ai_origination_live_trade explicitly checked in Settings >
     # Instruments AND the server-side SMARTAPI_LIVE_TRADING switch is on --
@@ -695,6 +712,11 @@ def _open_trade(
         day_ohlc_present=day_ohlc_present,
         tick_sample_count=tick_sample_count,
         market_context_json=json.dumps(market_context.as_dict()) if market_context else None,
+        stop_index_points=stop_units.index_points,
+        stop_atr_multiple=stop_units.atr_multiple,
+        target_index_points=target_units.index_points,
+        target_atr_multiple=target_units.atr_multiple,
+        risk_units_extrapolated=stop_units.extrapolated if stop_units.index_points is not None else None,
         origin=origin,
         ai_action=decision.action,
         ai_confidence=decision.confidence,

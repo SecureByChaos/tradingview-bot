@@ -351,6 +351,21 @@ class StrategyTrade(Base):
     # decided blind" / "what happened" data to evaluate against. Null for every
     # trade before Phase 1 and for all non-AI_ORIGIN_* trades.
     market_context_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Stop and target expressed in units that are comparable across option
+    # types. A "12% stop" is 2.02 ATR on a Nifty call and 1.27 ATR on a put,
+    # because ATM puts are 1.28-1.53x more index-sensitive -- so the premium
+    # percent is a label that hides what is actually being risked. Computed at
+    # entry from the fitted per-bucket coefficients (app/premium_model.py) and
+    # the contract's own spot/ATR. Null when no fitted coefficient covers the
+    # contract, or when ATR was unavailable -- never guessed.
+    stop_index_points: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stop_atr_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_index_points: Mapped[float | None] = mapped_column(Float, nullable=True)
+    target_atr_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # True when the coefficient used came from outside the fitted DTE range
+    # (e.g. Bank Nifty's ~27 DTE monthly against a 0-10 DTE archive). Callers
+    # must surface this rather than treating the numbers as measured.
+    risk_units_extrapolated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # origin distinguishes the original TradingView signal ("SIGNAL") from a paper
     # trade opened because an AI reviewer proposed an alternative call after
     # rejecting the original signal ("AI_ALT_OPENAI", "AI_ALT_CLAUDE", etc). Lets

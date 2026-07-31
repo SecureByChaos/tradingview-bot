@@ -291,6 +291,9 @@ def history_export(
         "AI Confidence", "AI Reasoning",
         # Tier 4 -- prompt-input quality (forward-only; blank for older trades)
         "Tick Samples", "Day OHLC Present", "Spot At Entry", "Expiry",
+        # Risk in comparable units -- a percentage stop is not the same bet on a
+        # CE as on a PE, since puts are 1.3-1.5x more index-sensitive
+        "Stop (idx pts)", "Stop (ATR)", "Target (idx pts)", "Target (ATR)", "Risk Units Extrapolated",
     ])
     for trade in trades:
         mfe, mae = _excursion(trade)
@@ -327,6 +330,11 @@ def history_export(
             "" if trade.day_ohlc_present is None else ("YES" if trade.day_ohlc_present else "NO"),
             trade.spot_at_entry if trade.spot_at_entry is not None else "",
             trade.expiry or "",
+            trade.stop_index_points if trade.stop_index_points is not None else "",
+            trade.stop_atr_multiple if trade.stop_atr_multiple is not None else "",
+            trade.target_index_points if trade.target_index_points is not None else "",
+            trade.target_atr_multiple if trade.target_atr_multiple is not None else "",
+            "" if trade.risk_units_extrapolated is None else ("YES" if trade.risk_units_extrapolated else "NO"),
         ])
     buffer.seek(0)
 

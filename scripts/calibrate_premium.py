@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sqlite3
 import sys
@@ -95,6 +96,11 @@ def main() -> int:
     parser.add_argument("--db", default="data/trading.db")
     parser.add_argument("--table", default="candles")
     parser.add_argument("--candles", default="data/option_candles")
+    parser.add_argument(
+        "--write", action="store_true",
+        help="Write fits to data/premium_coefficients.json for app/premium_model.py. "
+             "That file is how the live app gets these numbers without importing numpy.",
+    )
     args = parser.parse_args()
 
     index_series = _load_index_series(args.db, args.table)
@@ -123,6 +129,31 @@ def main() -> int:
     logger.info("Fitted coefficients (premium %% per index %%):")
     for fit in sorted(fits, key=lambda f: (f.index_symbol, f.dte_bucket, f.moneyness_bucket)):
         logger.info("  %s", fit.describe())
+
+    logger.info("=" * 78)
+    logger.info("Time decay (theta), from the joint fit y = lambda*x + theta*minutes:")
+    fitted_theta = [f for f in fits if f.theta_per_minute is not None and f.moneyness_bucket == "ATM"]
+    if not fitted_theta:
+        logger.warning(
+            "  No theta fitted. That normally means the elapsed-time column had almost no "
+            "independent variation -- if nearly every gap in the archive is exactly one "
+            "minute, the time term cannot be separated from a constant."
+        )
+    for f in sorted(fitted_theta, key=lambda x: (x.index_symbol, x.option_type, x.dte_bucket)):
+        logger.info(
+            "  %-10s %s dte=%-6s theta/min=%+.4f%%  over 45min=%+.2f%%  "
+            "(lambda %.1f -> %.1f joint, r2 %.3f -> %.3f)",
+            f.index_symbol, f.option_type, f.dte_bucket, f.theta_per_minute,
+            f.theta_per_45min, f.multiplier, f.multiplier_joint or 0.0,
+            f.r_squared, f.r_squared_joint or 0.0,
+        )
+    if fitted_theta:
+        worst = min(fitted_theta, key=lambda f: f.theta_per_45min or 0.0)
+        logger.info(
+            "  Largest decay over a 45-minute hold: %s %s dte=%s at %+.2f%%. Compare that "
+            "against a 12%% stop -- it is the amount every backtest result was optimistic by.",
+            worst.index_symbol, worst.option_type, worst.dte_bucket, worst.theta_per_45min,
+        )
 
     logger.info("=" * 78)
     logger.info("Smoke check against first principles (delta * spot / premium):")
@@ -178,6 +209,36 @@ def main() -> int:
             "every Bank Nifty backtest result as extrapolated. Do not apply an "
             "8-DTE coefficient to a 27-DTE contract silently."
         )
+
+    if args.write:
+        out_path = Path("data/premium_coefficients.json")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "scripts/calibrate_premium.py",
+            "note": (
+                "multiplier is premium PERCENT per index PERCENT (elasticity), NOT delta. "
+                "Delta is premium rupees per index point; the two differ by spot/premium."
+            ),
+            "fits": [
+                {
+                    "index_symbol": f.index_symbol,
+                    "option_type": f.option_type,
+                    "dte_bucket": f.dte_bucket,
+                    "moneyness_bucket": f.moneyness_bucket,
+                    "multiplier": round(f.multiplier, 4),
+                    "r_squared": round(f.r_squared, 4),
+                    "n_samples": f.n_samples,
+                    "extrapolated": f.extrapolated,
+                    "theta_per_minute": None if f.theta_per_minute is None else round(f.theta_per_minute, 6),
+                    "multiplier_joint": None if f.multiplier_joint is None else round(f.multiplier_joint, 4),
+                    "r_squared_joint": None if f.r_squared_joint is None else round(f.r_squared_joint, 4),
+                }
+                for f in fits
+            ],
+        }
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("Wrote %s fits to %s", len(fits), out_path)
 
     logger.info("Pass the chosen value to the baseline, e.g.:")
     logger.info("  python -m scripts.backtest_baseline --db %s --multiplier <value>", args.db)

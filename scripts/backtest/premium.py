@@ -60,13 +60,33 @@ class PremiumFit:
     r_squared: float
     n_samples: int
     extrapolated: bool
+    # Joint fit adding an elapsed-time term:
+    #     premium_ret = lambda * index_ret + theta * minutes
+    # theta is premium PERCENT lost per MINUTE held, and it is normally
+    # negative -- a long option bleeds time value whether or not the index
+    # moves. The directional-only fit above has no intercept, so any systematic
+    # decay is currently absorbed into the slope rather than reported, which
+    # makes every backtest number mildly optimistic.
+    theta_per_minute: float | None = None
+    multiplier_joint: float | None = None
+    r_squared_joint: float | None = None
+
+    @property
+    def theta_per_45min(self) -> float | None:
+        """Decay over a typical hold, which is the figure worth reasoning about
+        against a 12%% stop."""
+        return None if self.theta_per_minute is None else self.theta_per_minute * 45
 
     def describe(self) -> str:
         flag = "  [EXTRAPOLATED]" if self.extrapolated else ""
+        theta = (
+            f" theta/min={self.theta_per_minute:+.4f} (45m {self.theta_per_45min:+.2f}%)"
+            if self.theta_per_minute is not None else ""
+        )
         return (
             f"{self.index_symbol:<10} {self.option_type} dte={self.dte_bucket:<6} "
             f"money={self.moneyness_bucket:<8} mult={self.multiplier:8.2f} "
-            f"r2={self.r_squared:5.3f} n={self.n_samples:<6}{flag}"
+            f"r2={self.r_squared:5.3f} n={self.n_samples:<6}{theta}{flag}"
         )
 
 
@@ -224,9 +244,14 @@ def fit_premium_model(
             # rises and a put loses; pooling them into one regression drives the
             # coefficient toward zero or negative, which is exactly what the
             # first run produced (-7.44, -10.07, -16.65 with r2 ~ 0.002-0.074).
+            # Elapsed minutes carried alongside so theta can be fitted jointly.
+            # Mostly 1.0 (the archive is 1-minute), but gaps exist where a
+            # strike did not trade, and those longer intervals are what give
+            # the time term any leverage at all.
+            minutes = max((ts - prev_ts).total_seconds() / 60.0, 0.0)
             buckets.setdefault(
                 (index_symbol, option_type, dte_bucket, money_bucket), []
-            ).append((index_ret, premium_ret))
+            ).append((index_ret, premium_ret, minutes))
 
     if from_filename:
         logger.info("Recovered metadata from filename for %s expired contracts", from_filename)
@@ -241,6 +266,7 @@ def fit_premium_model(
             continue
         x = np.array([p[0] for p in pairs], dtype=np.float64)
         y = np.array([p[1] for p in pairs], dtype=np.float64)
+        m = np.array([p[2] for p in pairs], dtype=np.float64)
         # Through the origin: a zero index move should imply a zero premium
         # move. An intercept here would silently absorb theta decay into what
         # is meant to be a directional sensitivity.
@@ -248,6 +274,25 @@ def fit_premium_model(
         residual = y - slope * x
         ss_total = float(np.sum((y - y.mean()) ** 2))
         r2 = 1.0 - float(np.sum(residual**2)) / ss_total if ss_total > 0 else 0.0
+
+        # Joint fit: y = lambda*x + theta*m, solved from the 2x2 normal
+        # equations. Reported alongside rather than replacing the directional
+        # fit, so results can be run both ways and the optimism of ignoring
+        # decay stays visible instead of hidden.
+        theta = multiplier_joint = r2_joint = None
+        sxx, sxm, smm = float(x @ x), float(x @ m), float(m @ m)
+        sxy, smy = float(x @ y), float(m @ y)
+        det = sxx * smm - sxm * sxm
+        # A near-singular system means the elapsed-time column carries almost no
+        # independent variation (nearly every gap is exactly one minute). Report
+        # nothing rather than a coefficient the data cannot support.
+        if abs(det) > 1e-9 and smm > 0:
+            lam_j = (sxy * smm - smy * sxm) / det
+            theta_j = (smy * sxx - sxy * sxm) / det
+            residual_j = y - lam_j * x - theta_j * m
+            r2_joint = 1.0 - float(np.sum(residual_j**2)) / ss_total if ss_total > 0 else 0.0
+            multiplier_joint = float(lam_j)
+            theta = float(theta_j)
         fits.append(
             PremiumFit(
                 index_symbol=index_symbol,
@@ -258,6 +303,9 @@ def fit_premium_model(
                 r_squared=r2,
                 n_samples=len(pairs),
                 extrapolated=dte_bucket in ("11+", "unknown"),
+                theta_per_minute=theta,
+                multiplier_joint=multiplier_joint,
+                r_squared_joint=r2_joint,
             )
         )
     return fits
