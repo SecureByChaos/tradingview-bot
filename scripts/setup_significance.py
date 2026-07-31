@@ -318,13 +318,24 @@ def main() -> int:
     # setup was replicating across both indices and both horizons WITHIN a
     # regime. A conditional effect is still an effect; it just isn't visible
     # in the pooled cell, which is the entire reason for splitting by regime.
+    # Require both horizons only when both were actually run. With a single
+    # horizon (e.g. --horizons 3) the two-horizon test is unsatisfiable, so
+    # leaving it in would report "0 consistent" for structural reasons and read
+    # as a negative result when nothing was tested.
+    horizons_run = len({r.horizon for r in results})
     by_key: dict[tuple[str, str], list[Result]] = defaultdict(list)
     for r in positives:
         by_key[(r.setup, r.regime)].append(r)
     consistent = {
         key: rows for key, rows in by_key.items()
-        if len({r.index_symbol for r in rows}) == 2 and len({r.horizon for r in rows}) == 2
+        if len({r.index_symbol for r in rows}) == 2
+        and (horizons_run < 2 or len({r.horizon for r in rows}) == 2)
     }
+    if horizons_run < 2:
+        logger.info(
+            "Single horizon run: replication is assessed across indices only, not "
+            "across horizons."
+        )
 
     # The mirror check: the same setup/regime reliably BACKWARDS on both
     # indices is equally informative and equally hard to get by chance.

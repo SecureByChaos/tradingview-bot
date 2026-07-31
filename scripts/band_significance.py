@@ -236,8 +236,22 @@ def main() -> int:
              "indicator work found momentum is positive 11:00-14:00 and backwards after "
              "14:00 -- a pooled test across windows of opposite sign reports the net.",
     )
+    parser.add_argument(
+        "--horizons", default="",
+        help="Comma-separated forward-bar counts, e.g. '3' for 15 min. Needed for the "
+             "14:00-15:15 regime, where a 60-minute window is clipped at session end and "
+             "the stated horizon is not the one measured.",
+    )
     parser.add_argument("--seed", type=int, default=20260730)
     args = parser.parse_args()
+
+    horizons = HORIZONS
+    if args.horizons:
+        horizons = tuple(
+            (int(b.strip()), f"{int(b.strip()) * 5}min")
+            for b in args.horizons.split(",") if b.strip()
+        )
+        logger.info("Horizon override: %s", ", ".join(label for _, label in horizons))
 
     rng = np.random.default_rng(args.seed)
 
@@ -266,7 +280,7 @@ def main() -> int:
         regimes = _session_masks(arrays, args.by_session)
         for regime_name, regime_mask in regimes.items():
             eligible_regime = eligible & regime_mask
-            for forward_bars, horizon_label in HORIZONS:
+            for forward_bars, horizon_label in horizons:
                 logger.info("  %s horizon | %s", horizon_label, regime_name)
                 logger.info(
                     "    %-12s %8s %9s %8s %9s %8s %9s  %s",
@@ -294,7 +308,7 @@ def main() -> int:
     bonferroni = 0.05 / tested if tested else float("nan")
     logger.info("Multiple-comparison context:")
     logger.info("  bands tested: %s (%s indices x %s bands x %s horizons x %s regimes)",
-                tested, len(symbols), len(BANDS), len(HORIZONS),
+                tested, len(symbols), len(BANDS), len(horizons),
                 len(_session_masks(arrays, args.by_session)))
     logger.info("  Bonferroni-corrected alpha: %.5f (uncorrected 0.05)", bonferroni)
     clearing = [r for r in results if r.p_indep < bonferroni]
