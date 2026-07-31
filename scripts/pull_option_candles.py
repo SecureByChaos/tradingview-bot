@@ -2,13 +2,17 @@
 actually traded, so the trailing-stop parameters can be tuned against the real
 premium path instead of against MFE/MAE extremes alone.
 
-WHY THIS IS TIME-CRITICAL
--------------------------
+WHY THIS IS TIME-CRITICAL, EVERY TIME YOU RUN IT
+-------------------------------------------------
 Angel One serves getCandleData only for instruments still present in the live
 scrip master. An expired F&O contract drops out and its intraday history
-becomes permanently unretrievable -- there is no archive to go back to. Most of
-the 20-24 Jul dataset traded the 28-Jul expiry, so this must run BEFORE that
-expiry. After it, this data does not exist anywhere.
+becomes permanently unretrievable -- there is no archive to go back to. This
+is not a one-time deadline: it recurs every expiry cycle. The original 20-24
+Jul archive was deadline-bound by the 28-Jul expiry; whatever contracts are
+trading now have their own, later deadline. --start/--end have no default for
+exactly this reason -- there is no date range that stays correct to fall back
+on, and a stale default would silently go looking for trades in an
+already-expired window instead of failing loudly.
 
 WHAT IT GIVES YOU THAT MFE/MAE CANNOT
 -------------------------------------
@@ -24,13 +28,16 @@ have taken, not only on trades production actually took.
 
 USAGE
 -----
-    python -m scripts.pull_option_candles --start 2026-07-20 --end 2026-07-24
+    # --start/--end must cover dates with actual AI Origination trades already
+    # recorded for the contract(s) you want archived -- this pulls candles for
+    # contracts that were traded, not a symbol/expiry you name directly.
+    python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07
 
     # dry run: show what would be fetched, make no API calls
-    python -m scripts.pull_option_candles --start 2026-07-20 --end 2026-07-24 --dry-run
+    python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07 --dry-run
 
     # widen/narrow the strike band around each traded strike (default 2)
-    python -m scripts.pull_option_candles --strike-band 3
+    python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07 --strike-band 3
 
 Output: data/option_candles/<TRADINGSYMBOL>_<TOKEN>.csv, one file per contract,
 columns timestamp_ist,open,high,low,close,volume. Existing files are skipped so
@@ -181,8 +188,12 @@ def _trading_days(start: date, end: date) -> list[date]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--start", default="2026-07-20", help="First trade date to include (YYYY-MM-DD)")
-    parser.add_argument("--end", default="2026-07-24", help="Last trade date to include (YYYY-MM-DD)")
+    # No defaults, deliberately -- see the module docstring's "WHY THIS IS
+    # TIME-CRITICAL" section. A hardcoded fallback window would always be an
+    # already-expired one sooner or later, and would fail by silently
+    # returning nothing rather than telling the caller their dates are wrong.
+    parser.add_argument("--start", required=True, help="First trade date to include (YYYY-MM-DD)")
+    parser.add_argument("--end", required=True, help="Last trade date to include (YYYY-MM-DD)")
     parser.add_argument("--strike-band", type=int, default=2, help="Strikes either side of each traded strike")
     parser.add_argument("--dry-run", action="store_true", help="List contracts without calling the API")
     parser.add_argument(
