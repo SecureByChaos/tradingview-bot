@@ -41,7 +41,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime, time
 
 import numpy as np
 
@@ -194,6 +194,13 @@ def main() -> int:
         help="Comma-separated forward-bar counts, e.g. '3' for 15 min. Overrides the "
              "default 30/60 min. Use a horizon that fits inside the regime under test.",
     )
+    parser.add_argument(
+        "--end", default="",
+        help="Last session date to include (YYYY-MM-DD). Use this to EXCLUDE the holdout "
+             "window from selection -- a candidate chosen using holdout data is not "
+             "testable on it.",
+    )
+    parser.add_argument("--start", default="", help="First session date to include (YYYY-MM-DD)")
     parser.add_argument("--seed", type=int, default=20260730)
     args = parser.parse_args()
 
@@ -224,6 +231,12 @@ def main() -> int:
     results: list[Result] = []
     for symbol in sorted(symbols):
         bars = load_bars_sqlite(args.db, args.table, symbol, args.interval)
+        if args.start:
+            cutoff = datetime.strptime(args.start, "%Y-%m-%d").date()
+            bars = [b for b in bars if b.ts_ist.date() >= cutoff]
+        if args.end:
+            cutoff = datetime.strptime(args.end, "%Y-%m-%d").date()
+            bars = [b for b in bars if b.ts_ist.date() <= cutoff]
         if len(bars) < 500:
             continue
         logger.info("=" * 108)
