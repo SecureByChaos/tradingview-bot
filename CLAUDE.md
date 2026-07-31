@@ -233,6 +233,30 @@ run is logged permanently. Any new hypothesis needs genuinely fresh out-of-sampl
 Net position: two years of candles, three independent signal constructions and a locked
 holdout have not demonstrated a tradeable edge in intraday index direction.
 
+### Walk-forward revised this: the problem is likely the EXIT, not the entry (31 Jul 2026)
+
+Six consecutive windows over two years show the midday setups are **MOSTLY POSITIVE or
+better almost everywhere** — Nifty `ST_ALIGNED` 6/6 windows positive (mean +3.96pp),
+`ORB_BREAK[hold=2]` 5/6 with 4 significant (mean +4.41pp). The edge is *not* concentrated
+in one period.
+
+Caveat: those setups were selected on this same data, so read it as "conditional on that
+selection, the edge isn't period-specific" rather than independent confirmation.
+
+The reconciliation with the failed holdout is arithmetic, not contradiction. At +4.41pp
+with symmetric ±12% payoffs: gross +1.06%, costs −0.56%, theta −1.00% → **net −0.50%**.
+A 4pp edge does not survive costs plus decay under the current exit configuration.
+
+The holdout showed the mechanism: hit rates were fine (52–59%), but average win ~6%
+against average loss ~9–11%. Almost nothing reaches the 20% target because the 8%/5%
+trail exits first, while losers run the full 12% stop.
+
+**So the working conclusion is now: a small, real, stable entry edge exists, and the risk
+construction spends more than it is worth.** Do NOT tune exits on the holdout (spent) or
+on the two-year data (spent by selection). That needs fresh out-of-sample data, which is
+what the live paper system accumulates — making "keep paper running" the highest-value
+standing item.
+
 ### Indicator setups showed a fit-window edge — but only midday, and it did not hold up (30 Jul 2026)
 
 Separate from drift, and this is the current live thread. Momentum and breakout setups
