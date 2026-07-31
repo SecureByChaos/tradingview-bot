@@ -127,6 +127,17 @@ SYSTEM_PROMPT = (
 # trailing-stop methodology instead of a fixed number we picked ourselves.
 _MIN_SL_TARGET_PERCENT = 5.0
 _MAX_SL_TARGET_PERCENT = 50.0
+# Week 2 roadmap, Section 3. find_atm_contract always takes the nearest
+# available expiry with no offset, so whatever DTE happens to be listed is
+# whatever gets traded. CLAUDE.md's days-to-expiry finding: an identical 12%
+# stop, breached by noise within 60 min, hits 36.5% of the time at 2-5 DTE
+# versus 23.4% at 6-10 DTE on Bank Nifty calls -- the same risk band is a
+# meaningfully worse bet close to expiry, independent of whether the entry
+# signal is right. 5 matches the roadmap's own "~5 DTE" floor; note this
+# still allows DTE=5 itself, which sits in premium_model's higher-risk "2-5"
+# bucket rather than "6-10" -- raise to 6 here if the intent was to exclude
+# that bucket entirely rather than approximately.
+_MIN_DTE_TO_TRADE = 5
 # Trailing fallback's own parameters -- these aren't "correcting" the AI's
 # entry/exit judgment, they're the same trailing-engine knobs every other
 # trailing-mode strategy in this app already uses (StrategyConfig.trailing_*),
@@ -658,9 +669,28 @@ def _open_trade(
     signal = Signal.BUY_CE if option_type == "CE" else Signal.BUY_PE
     try:
         contract = option_finder.find_atm_contract(signal, index, 0)
+    except Exception as exc:
+        logger.info("[AI][ORIGIN] Skipped: could not resolve contract for %s (%s)", index.symbol, exc)
+        return None
+
+    # DTE floor, checked before spending a quote-budget LTP call: whatever
+    # find_atm_contract's nearest-available-expiry-no-offset selection
+    # happens to return is not exempt from the noise-stop-rate finding above
+    # just because it's close to expiry. -1 (unparseable expiry) fails this
+    # too, deliberately -- an expiry we can't verify meets the floor doesn't
+    # get the benefit of the doubt.
+    dte = days_to_expiry(contract.expiry, to_ist(utc_now()).date())
+    if dte < _MIN_DTE_TO_TRADE:
+        logger.info(
+            "[AI][ORIGIN] %s: nearest expiry %s is %s DTE, below the %s-DTE floor -- skipping",
+            index.symbol, contract.expiry, dte, _MIN_DTE_TO_TRADE,
+        )
+        return None
+
+    try:
         entry_price = smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
     except Exception as exc:
-        logger.info("[AI][ORIGIN] Skipped: could not resolve contract/price for %s (%s)", index.symbol, exc)
+        logger.info("[AI][ORIGIN] Skipped: could not resolve price for %s (%s)", index.symbol, exc)
         return None
 
     sl_percent = _TRAILING_INITIAL_SL_PERCENT if use_trailing else decision.sl_percent
@@ -675,7 +705,6 @@ def _open_trade(
     # comparable across option types, since an identical percentage is a much
     # tighter index distance on a put. Recording the index-point and ATR
     # equivalents makes the actual bet visible.
-    dte = days_to_expiry(contract.expiry, to_ist(utc_now()).date())
     atr_at_entry = market_context.atr_value if market_context else None
     stop_units = to_risk_units(
         abs(sl_percent or 0.0), index.symbol, contract.option_type, dte,
