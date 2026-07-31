@@ -229,6 +229,7 @@ def main() -> int:
         connection.close()
 
     results: list[Result] = []
+    too_few: dict[str, dict[str, int]] = {}
     for symbol in sorted(symbols):
         bars = load_bars_sqlite(args.db, args.table, symbol, args.interval)
         if args.start:
@@ -255,6 +256,12 @@ def main() -> int:
                         arrays, mask, signals, forward_bars, rng
                     )
                     if n_sig < MIN_SIGNALS:
+                        # Record rather than silently drop. A setup that fires
+                        # too rarely to test is a finding -- it means the
+                        # strategy cannot be validated in any reasonable
+                        # timeframe -- and silence looks identical to "not run".
+                        if regime_name == "all":
+                            too_few.setdefault(setup.label, {})[f"{symbol}/{horizon_label}"] = n_sig
                         continue
                     results.append(
                         Result(symbol, horizon_label, setup.label, regime_name,
@@ -306,6 +313,17 @@ def main() -> int:
                 "horizon actually measured. Re-run with --horizons 3 before treating "
                 "any of them as a finding."
             )
+
+    if too_few:
+        logger.info("=" * 108)
+        logger.info("EXCLUDED -- fewer than %s signals, so not testable:", MIN_SIGNALS)
+        for label, counts in sorted(too_few.items()):
+            detail = ", ".join(f"{k} n={v}" for k, v in sorted(counts.items()))
+            logger.info("  %-28s %s", label, detail)
+        logger.info(
+            "  A strategy firing this rarely cannot be validated in a reasonable "
+            "timeframe. That is a property of the strategy, not a gap in the test."
+        )
 
     # --- multiple-comparison accounting -------------------------------------
     total = len(results)
