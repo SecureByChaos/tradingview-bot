@@ -54,7 +54,9 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.database import SessionLocal
 from app.db_models import StrategyTrade
+from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
+from app.time_utils import utc_now
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("pull_option_candles")
@@ -183,7 +185,27 @@ def main() -> int:
     parser.add_argument("--end", default="2026-07-24", help="Last trade date to include (YYYY-MM-DD)")
     parser.add_argument("--strike-band", type=int, default=2, help="Strikes either side of each traded strike")
     parser.add_argument("--dry-run", action="store_true", help="List contracts without calling the API")
+    parser.add_argument(
+        "--during-market-hours", action="store_true",
+        help=(
+            "Allow pulling while NSE is open despite sharing the SmartAPI account's rate-limit "
+            "budget with live origination. Off by default -- even an urgent pre-expiry pull "
+            "shouldn't silently degrade live trading's own data quality; use this only when "
+            "the deadline genuinely can't wait until after close."
+        ),
+    )
     args = parser.parse_args()
+
+    if not args.dry_run and not args.during_market_hours and check_market_hours(utc_now()) is None:
+        # check_market_hours returns None specifically when the timestamp IS
+        # within NSE trading hours -- see app/signal_validation.py.
+        logger.error(
+            "Refusing to pull during NSE market hours: this script authenticates its own SmartAPI "
+            "session and can exhaust the account's shared rate-limit budget, degrading live "
+            "origination's own candle refresh. Re-run outside market hours, use --dry-run "
+            "(no SmartAPI calls), or pass --during-market-hours if the expiry deadline can't wait."
+        )
+        return 1
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end = datetime.strptime(args.end, "%Y-%m-%d").date()

@@ -46,7 +46,9 @@ from app.market_data import (
     resample,
     store_bars,
 )
+from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
+from app.time_utils import utc_now
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("backfill_candles")
@@ -145,7 +147,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--years", type=float, default=2.0, help="Years of 5-minute history")
     parser.add_argument("--verify-only", action="store_true", help="Skip fetching, just compare stored series")
+    parser.add_argument(
+        "--during-market-hours", action="store_true",
+        help=(
+            "Allow fetching while NSE is open despite sharing the SmartAPI account's rate-limit "
+            "budget with live origination. Off by default -- see the Friday 11:48-14:33 outage "
+            "in the week 2 roadmap, where an analysis run overlapping market hours is the leading "
+            "suspect for starving live origination's own candle refresh."
+        ),
+    )
     args = parser.parse_args()
+
+    if not args.verify_only and not args.during_market_hours and check_market_hours(utc_now()) is None:
+        # check_market_hours returns None specifically when the timestamp IS
+        # within NSE trading hours (it returns a string only to explain why
+        # it *isn't*) -- see app/signal_validation.py.
+        logger.error(
+            "Refusing to fetch during NSE market hours: this script authenticates its own SmartAPI "
+            "session and can exhaust the account's shared rate-limit budget, degrading live "
+            "origination's own candle refresh. Re-run outside market hours, use --verify-only "
+            "(no SmartAPI calls), or pass --during-market-hours to override."
+        )
+        return 1
 
     settings = get_settings()
     with SessionLocal() as session:
