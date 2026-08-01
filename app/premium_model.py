@@ -164,6 +164,64 @@ def to_risk_units(
     )
 
 
+def symmetric_premium_percent(
+    proposed_percent: float,
+    index_symbol: str,
+    option_type: str,
+    dte: int,
+    moneyness: str = "ATM",
+) -> tuple[float, bool]:
+    """Rescale a premium-percent risk level so CE and PE are the SAME bet.
+
+    THE PROBLEM THIS SOLVES
+    -----------------------
+    A "12% stop" is not one setting, it is two different bets wearing one
+    label. ATM puts are 1.28x (Bank Nifty) to 1.53x (Nifty) more sensitive to
+    index movement than calls, so the identical percentage is a much tighter
+    index distance on a put:
+
+        Nifty, 2-5 DTE, nominal 12% stop -> CE 43 index points (2.02 ATR)
+                                         -> PE 27 index points (1.27 ATR)
+
+    Puts were therefore being stopped by materially smaller moves than calls
+    under the same nominal setting, and nobody chose that.
+
+    THE FIX
+    -------
+    Interpret the proposed percentage against a CALL reference, convert it to
+    an index distance, then convert back using the ACTUAL contract's
+    sensitivity:
+
+        index_pct   = proposed_percent / |lambda_call|
+        premium_pct = index_pct * |lambda_actual|
+
+    For a call that is a no-op. For a put it WIDENS the premium stop by the
+    sensitivity ratio, so the index distance matches. A 12% call stop becomes
+    an ~18% put stop -- same bet, honestly labelled.
+
+    Returns (adjusted_percent, bucket_matched). When no fitted coefficient
+    covers this contract, returns the input unchanged with matched=False --
+    deliberately NOT silently borrowing an unrelated bucket's coefficient,
+    which would produce a confident wrong distance.
+    """
+    if not proposed_percent:
+        return proposed_percent, False
+    actual = lambda_for(index_symbol, option_type, dte, moneyness)
+    reference = lambda_for(index_symbol, "CE", dte, moneyness)
+    if actual is None or reference is None:
+        logger.info(
+            "[RISK] %s %s dte=%s: no fitted coefficient, keeping premium-percent behaviour",
+            index_symbol, option_type, dte,
+        )
+        return proposed_percent, False
+    lam_actual, _ = actual
+    lam_reference, _ = reference
+    if not lam_reference or not lam_actual:
+        return proposed_percent, False
+    adjusted = proposed_percent / abs(lam_reference) * abs(lam_actual)
+    return round(adjusted, 2), True
+
+
 def days_to_expiry(expiry: str, as_of_date) -> int:
     """Days between a stored expiry string and a date. -1 when unparseable."""
     from datetime import datetime

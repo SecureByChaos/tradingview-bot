@@ -366,6 +366,17 @@ class StrategyTrade(Base):
     # (e.g. Bank Nifty's ~27 DTE monthly against a 0-10 DTE archive). Callers
     # must surface this rather than treating the numbers as measured.
     risk_units_extrapolated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Whether a fitted premium coefficient covered this contract's
+    # (index, option_type, dte, moneyness) bucket. False means the CE/PE
+    # symmetry rescale could NOT be applied and the trade fell back to raw
+    # premium-percent behaviour -- so its stop is not comparable to a matched
+    # trade's. Must be surfaced, not silently absorbed.
+    calibration_bucket_matched: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Trailing activation and width, per trade rather than the shared
+    # StrategyConfig defaults, because they carry the same CE/PE asymmetry as
+    # the stop and need the same rescale.
+    trail_activate_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trail_width_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     # True when this trade's market_context_json was built after the live
     # candle refresh call itself failed (rate limit, network, auth) this
     # cycle -- i.e. from whatever was already stored rather than a fresh

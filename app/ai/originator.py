@@ -27,7 +27,7 @@ from app.market_data import (
 )
 from app.models import Signal
 from app.option_finder import OptionFinder
-from app.premium_model import days_to_expiry, to_risk_units
+from app.premium_model import days_to_expiry, symmetric_premium_percent, to_risk_units
 from app.platform import list_index_configs, log_event, record_index_tick_if_stale
 from app.smartapi_client import SmartAPIClient
 from app.time_utils import format_ist, to_ist, utc_now
@@ -156,6 +156,14 @@ _REOPEN_COOLDOWN_MINUTES = 30
 # data yields ~375 five-minute bars, comfortably inside SmartAPI's ~30-day
 # 1-minute limit. It also delivers previous-day high/low/close and multi-day
 # range context for free, which the CPR classifier needs.
+# Mirrors _AI_ORIGIN_TRAIL_* in app/multi_strategy.py, duplicated rather than
+# imported to avoid a circular import (the scheduler wires both modules). These
+# are the PRE-rescale nominals; symmetric_premium_percent adjusts them per
+# contract at entry, and monitor_open_trades reads the stored per-trade values.
+# If the multi_strategy constants change, change these too.
+_TRAIL_ACTIVATION_NOMINAL = 8.0
+_TRAIL_WIDTH_NOMINAL = 5.0
+
 _CANDLE_WARMUP_DAYS = 7
 # Bars loaded per context build. 7 days x 375 one-minute bars ~= 2600.
 _CANDLE_LOAD_LIMIT = 3000
@@ -668,7 +676,7 @@ def _open_trade(
     option_type = "CE" if decision.action == "BUY_CE" else "PE"
     signal = Signal.BUY_CE if option_type == "CE" else Signal.BUY_PE
     try:
-        contract = option_finder.find_atm_contract(signal, index, 0)
+        contract = option_finder.find_atm_contract(signal, index, 0, min_dte=_MIN_DTE_TO_TRADE)
     except Exception as exc:
         logger.info("[AI][ORIGIN] Skipped: could not resolve contract for %s (%s)", index.symbol, exc)
         return None
@@ -679,11 +687,15 @@ def _open_trade(
     # just because it's close to expiry. -1 (unparseable expiry) fails this
     # too, deliberately -- an expiry we can't verify meets the floor doesn't
     # get the benefit of the doubt.
+    # find_atm_contract now ROLLS to a later expiry to satisfy the floor, so
+    # this only fires when no listed expiry is far enough out -- rare, and a
+    # genuine reason to skip rather than trade a contract the calibration
+    # cannot describe.
     dte = days_to_expiry(contract.expiry, to_ist(utc_now()).date())
     if dte < _MIN_DTE_TO_TRADE:
         logger.info(
-            "[AI][ORIGIN] %s: nearest expiry %s is %s DTE, below the %s-DTE floor -- skipping",
-            index.symbol, contract.expiry, dte, _MIN_DTE_TO_TRADE,
+            "[AI][ORIGIN] %s: no expiry at least %s DTE out (nearest %s at %s DTE) -- skipping",
+            index.symbol, _MIN_DTE_TO_TRADE, contract.expiry, dte,
         )
         return None
 
@@ -695,8 +707,35 @@ def _open_trade(
 
     sl_percent = _TRAILING_INITIAL_SL_PERCENT if use_trailing else decision.sl_percent
     target_percent = _TRAILING_FALLBACK_TARGET_PERCENT if use_trailing else decision.target_percent
+
+    # Rescale so a CE and a PE with the same nominal percentage are the same
+    # bet in index terms. Puts are 1.28-1.53x more index-sensitive, so an
+    # unadjusted percentage stops them on a materially smaller move. See
+    # premium_model.symmetric_premium_percent. A call is unchanged; a put's
+    # premium stop widens so the index distance matches.
+    #
+    # bucket_matched=False means no fitted coefficient covers this contract --
+    # the original percentage is kept unchanged rather than borrowing an
+    # unrelated bucket's coefficient, and the trade is flagged in the export.
+    sl_percent, bucket_matched = symmetric_premium_percent(
+        sl_percent, index.symbol, contract.option_type, dte
+    )
+    target_percent, _ = symmetric_premium_percent(
+        target_percent, index.symbol, contract.option_type, dte
+    )
     stoploss = round(entry_price * (1 - sl_percent / 100), 2)
     target = round(entry_price * (1 + target_percent / 100), 2)
+
+    # The trailing parameters carry the identical asymmetry -- an 8% activation
+    # and 5% trail are also tighter index distances on a put -- so they get the
+    # same rescale and are stored per trade rather than read from the shared
+    # defaults at monitor time.
+    trail_activate, _ = symmetric_premium_percent(
+        _TRAIL_ACTIVATION_NOMINAL, index.symbol, contract.option_type, dte
+    )
+    trail_width, _ = symmetric_premium_percent(
+        _TRAIL_WIDTH_NOMINAL, index.symbol, contract.option_type, dte
+    )
     origin = f"AI_ORIGIN_{provider.strip().upper()}"
     strategy_name = f"AI Origination - {index.display_name or index.symbol}"
 
@@ -759,6 +798,9 @@ def _open_trade(
         tick_sample_count=tick_sample_count,
         market_context_json=json.dumps(market_context.as_dict()) if market_context else None,
         data_stale=data_stale,
+        calibration_bucket_matched=bucket_matched,
+        trail_activate_percent=trail_activate,
+        trail_width_percent=trail_width,
         stop_index_points=stop_units.index_points,
         stop_atr_multiple=stop_units.atr_multiple,
         target_index_points=target_units.index_points,
