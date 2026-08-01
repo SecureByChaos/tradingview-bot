@@ -347,7 +347,20 @@ def fit_premium_model(
                 multiplier=slope,
                 r_squared=r2,
                 n_samples=len(pairs),
-                extrapolated=dte_bucket in ("11+", "unknown"),
+                # A FITTED bucket is measured, by definition -- every bucket
+                # here cleared the 50-sample minimum against real option
+                # candles. "11+" was hardcoded as extrapolated when the archive
+                # held nothing past 10 DTE; once the Bank Nifty monthly was
+                # archived that became wrong, and actively harmful: with "11+"
+                # marked extrapolated, select_multiplier could not match Bank
+                # Nifty's ~27 DTE contract and fell back to the 6-10 bucket at
+                # lambda ~-67 instead of the correct ~-28 -- a 2.4x error in
+                # every derived stop distance.
+                #
+                # Extrapolation is a property of a LOOKUP that finds no bucket
+                # for the DTE it was asked about, not of the fit. select_multiplier
+                # already reports that separately.
+                extrapolated=dte_bucket == "unknown",
                 theta_per_minute=theta,
                 multiplier_joint=multiplier_joint,
                 r_squared_joint=r2_joint,
