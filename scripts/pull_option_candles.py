@@ -325,6 +325,30 @@ def _angel_expiry(expiry: str) -> str:
     return raw.upper()
 
 
+# Angel error codes that describe the REQUEST, not a transient condition.
+# Retrying these is guaranteed to fail identically.
+#   AB1012 - from-date is in the future
+#   AB1010 - invalid date format / range
+_PERMANENT_ERROR_CODES = ("AB1012", "AB1010")
+
+
+def _error_code(exc: Exception) -> str | None:
+    text = str(exc)
+    return next((code for code in _PERMANENT_ERROR_CODES if code in text), None)
+
+
+def _is_permanent_error(exc: Exception) -> bool:
+    """Whether the broker rejected the request itself rather than failing to serve it.
+
+    Matched on the error code in the raised message, since SmartAPIError carries
+    the whole response dict as its text. Falls back to the message wording,
+    because the code is what changes between SDK versions, not the prose.
+    """
+    if _error_code(exc):
+        return True
+    return "can't be greater than current datetime" in str(exc)
+
+
 def _row_date(raw: Any) -> date | None:
     """Session date from an archived timestamp, e.g. '2026-07-27T09:15:00+05:30'."""
     try:
@@ -357,11 +381,21 @@ def _load_existing(path: Path) -> tuple[dict[str, list[Any]], set[date]]:
     return rows, days
 
 
-def _trading_days(start: date, end: date) -> list[date]:
+def _trading_days(start: date, end: date, today: date) -> list[date]:
+    """Weekdays in the range, clamped to today.
+
+    The clamp is not defensive tidiness. The pull calendar for filling DTE
+    buckets is written in FUTURE dates -- "re-run around 14 Aug for the 11-20
+    bucket" -- so running tomorrow's command today is the expected mistake, not
+    an exotic one. Unclamped, every future day becomes an AB1012
+    ("From datetime can't be greater than current datetime") that the retry
+    loop then attempts three times, per day, per contract: a 14-contract pull
+    over 8 future days is 336 pointless requests against a shared rate limit.
+    """
     days = []
     current = start
     while current <= end:
-        if current.weekday() < 5:
+        if current.weekday() < 5 and current <= today:
             days.append(current)
         current += timedelta(days=1)
     return days
@@ -455,7 +489,22 @@ def main() -> int:
             len(all_contracts), args.strike_band, len(contracts), len(all_contracts) - len(contracts),
         )
 
-    days = _trading_days(start, end)
+    today_ist = to_ist(utc_now()).date()
+    days = _trading_days(start, end, today_ist)
+    if not days:
+        logger.error(
+            "No fetchable trading days between %s and %s. Today is %s, and the broker "
+            "serves no candles for a session that has not happened yet. If you are "
+            "working from the DTE-bucket pull calendar, those dates are future dates -- "
+            "run the command on or after them, not before.",
+            start, end, today_ist,
+        )
+        return 1
+    if end > today_ist:
+        logger.warning(
+            "--end %s is in the future; clamped to %s. Re-run after %s to pick up the "
+            "remaining sessions.", end, days[-1], end,
+        )
     logger.info("Trading days in range: %s", ", ".join(d.isoformat() for d in days))
 
     if args.dry_run:
@@ -475,7 +524,7 @@ def main() -> int:
     smartapi = SmartAPIClient(settings)
     smartapi.authenticate()
 
-    today = to_ist(utc_now()).date()
+    today = today_ist
     ok, skipped, failed = 0, 0, 0
     for contract in sorted(all_contracts, key=lambda c: c["tradingsymbol"]):
         out_path = OUTPUT_DIR / f"{contract['tradingsymbol']}_{contract['symboltoken']}.csv"
@@ -512,6 +561,15 @@ def main() -> int:
                     )
                     break
                 except Exception as exc:
+                    if _is_permanent_error(exc):
+                        # Retrying a deterministic rejection just spends the
+                        # shared rate-limit budget to get the same answer.
+                        logger.warning(
+                            "  %s %s rejected and will not succeed on retry: %s",
+                            contract["tradingsymbol"], day, _error_code(exc) or exc,
+                        )
+                        contract_failed = True
+                        break
                     if attempt == 2:
                         logger.warning("  %s %s failed after 3 attempts: %s", contract["tradingsymbol"], day, exc)
                         contract_failed = True
