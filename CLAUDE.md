@@ -382,6 +382,13 @@ check: `calibrate_premium` reports covered vs missing DTE buckets per index and 
 `pull_option_candles` command to fill a gap. A missing bucket is not a rounding error
 there; elasticity varies more than 2× across the traded range.
 
+**Filling a DTE bucket means pulling the same contract more than once, as it ages.**
+One pull only ever reaches the DTE the contract happened to be at. For a 25 Aug expiry:
+pull around 27 Jul–3 Aug for `21+`, around 5–14 Aug for `11-20`, around 15–20 Aug for
+`6-10`. `pull_option_candles` merges on re-run (it used to skip any contract whose file
+existed, which made every pull after the first a silent no-op — that is why `11-20` was
+empty). Today's date is always re-fetched, since a mid-session file holds a partial day.
+
 ### Backtest tooling
 
 `scripts/backtest/` (numpy-only, isolated from `app.main`'s import graph — a stray pandas

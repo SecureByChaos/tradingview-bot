@@ -50,8 +50,21 @@ USAGE
         --index BANKNIFTY --expiry 28AUG2026 --strike-band 4
 
 Output: data/option_candles/<TRADINGSYMBOL>_<TOKEN>.csv, one file per contract,
-columns timestamp_ist,open,high,low,close,volume. Existing files are skipped so
-the script is safely resumable if it dies partway or hits a rate limit.
+columns timestamp_ist,open,high,low,close,volume.
+
+RE-RUNS EXTEND, THEY DO NOT SKIP
+---------------------------------
+An earlier version skipped any contract whose file already existed. That was
+fine for the original use -- one archive, one deadline, resumable if it died
+partway -- and silently wrong for the use this actually has now, which is
+pulling the SAME contract repeatedly as it ages so its DTE buckets fill in.
+A 25AUG contract has to be pulled near 22 DTE, again near 15, again near 8, and
+skipping on existence means every pull after the first is a no-op that reports
+success. That is how the 11-20 DTE bucket stayed empty.
+
+So a re-run now fetches only the days not already in the file and merges them,
+deduplicating on timestamp. Today's date is always re-fetched, because a file
+written mid-session holds a partial day that would otherwise look complete.
 """
 
 from __future__ import annotations
@@ -73,7 +86,7 @@ from app.database import SessionLocal
 from app.db_models import StrategyTrade
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
-from app.time_utils import utc_now
+from app.time_utils import to_ist, utc_now
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("pull_option_candles")
@@ -312,6 +325,38 @@ def _angel_expiry(expiry: str) -> str:
     return raw.upper()
 
 
+def _row_date(raw: Any) -> date | None:
+    """Session date from an archived timestamp, e.g. '2026-07-27T09:15:00+05:30'."""
+    try:
+        return datetime.fromisoformat(str(raw)).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_existing(path: Path) -> tuple[dict[str, list[Any]], set[date]]:
+    """Rows already archived keyed by timestamp, plus the dates they cover.
+
+    Keying on the timestamp string rather than a parsed datetime keeps the
+    merge exact: rows are rewritten verbatim, so a re-run cannot subtly reformat
+    an archive that a fitted coefficient already depends on.
+    """
+    rows: dict[str, list[Any]] = {}
+    days: set[date] = set()
+    if not path.exists():
+        return rows, days
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)  # header
+        for row in reader:
+            if not row:
+                continue
+            rows[str(row[0])] = row
+            parsed = _row_date(row[0])
+            if parsed is not None:
+                days.add(parsed)
+    return rows, days
+
+
 def _trading_days(start: date, end: date) -> list[date]:
     days = []
     current = start
@@ -430,15 +475,26 @@ def main() -> int:
     smartapi = SmartAPIClient(settings)
     smartapi.authenticate()
 
+    today = to_ist(utc_now()).date()
     ok, skipped, failed = 0, 0, 0
     for contract in sorted(all_contracts, key=lambda c: c["tradingsymbol"]):
         out_path = OUTPUT_DIR / f"{contract['tradingsymbol']}_{contract['symboltoken']}.csv"
-        if out_path.exists():
+        existing_rows, covered_days = _load_existing(out_path)
+        # Today is always re-fetched: a file written mid-session holds a partial
+        # day, and a partial day that looks complete is worse than no day, since
+        # it silently biases the sample toward morning bars.
+        missing_days = [day for day in days if day not in covered_days or day >= today]
+        if not missing_days:
             skipped += 1
             continue
+        if existing_rows:
+            logger.info(
+                "  %s: %s day(s) already archived, fetching %s more",
+                contract["tradingsymbol"], len(covered_days), len(missing_days),
+            )
         rows: list[list[Any]] = []
         contract_failed = False
-        for day in days:
+        for day in missing_days:
             # One call per contract per day. Fetching the whole range in a
             # single call would be fewer requests, but a single failure would
             # then lose every day rather than one -- and with an immovable
@@ -463,21 +519,42 @@ def main() -> int:
                         logger.info("  %s %s attempt %s failed (%s), retrying", contract["tradingsymbol"], day, attempt + 1, exc)
         if not rows:
             failed += 1
-            logger.warning("No candles returned for %s -- contract may already have expired", contract["tradingsymbol"])
+            logger.warning(
+                "No candles returned for %s -- contract may already have expired%s",
+                contract["tradingsymbol"],
+                f" (keeping the {len(existing_rows)} rows already archived)" if existing_rows else "",
+            )
             continue
+
+        # Merge, newest reading wins on a duplicate timestamp. That matters for
+        # the always-refetched current day: the second pull of a session
+        # supersedes the partial first one rather than sitting alongside it.
+        merged = dict(existing_rows)
+        added = 0
+        for row in rows:
+            key = str(row[0])
+            if key not in merged:
+                added += 1
+            merged[key] = row
+
         with out_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             writer.writerow(["timestamp_ist", "open", "high", "low", "close", "volume"])
-            writer.writerows(rows)
+            # Sorted on the raw ISO timestamp, which is lexicographically
+            # ordered for a fixed offset -- and NSE is always +05:30.
+            writer.writerows(merged[key] for key in sorted(merged))
         ok += 1
         logger.info(
-            "%s -> %s rows%s%s",
-            contract["tradingsymbol"], len(rows),
+            "%s -> %s rows total (+%s new)%s%s",
+            contract["tradingsymbol"], len(merged), added,
             " (TRADED)" if not contract.get("neighbour") else "",
             " [PARTIAL - some days failed]" if contract_failed else "",
         )
 
-    logger.info("Done. %s written, %s already present, %s returned nothing.", ok, skipped, failed)
+    logger.info(
+        "Done. %s written or extended, %s already complete for this range, %s returned nothing.",
+        ok, skipped, failed,
+    )
     if failed:
         logger.warning(
             "Contracts returning nothing are most likely already expired and unrecoverable. "
