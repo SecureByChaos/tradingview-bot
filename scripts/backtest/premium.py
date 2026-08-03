@@ -8,11 +8,19 @@ Delta 0.5 is used only as a smoke test. A real trade on 29 July ran
 Rs 115.35 -> Rs 137.20 on roughly 44 Nifty points, which is consistent with
 ~0.5 -- that validates the method, not the coefficient.
 
-KNOWN GAP, stated loudly because silently extrapolating it would be the most
-expensive kind of quiet error: the option archive covers 0-8 DTE. Bank Nifty
-now trades a ~27 DTE monthly, outside the fitted range. Applying an 8-DTE
-coefficient to a 27-DTE contract would systematically misstate results, so
-fit_premium_model refuses to do it and marks such buckets extrapolated.
+DTE BUCKETING IS NOT COSMETIC
+-----------------------------
+Elasticity falls sharply with time to expiry -- Bank Nifty ATM CE measures
+~65 at 2-5 DTE against ~25 at 11+, because a longer-dated contract carries far
+more premium and the same index move is a smaller fraction of it. A bucket that
+spans too wide a DTE range therefore averages together contracts that behave
+differently, and the average fits neither end.
+
+The buckets were originally 0-1 / 2-5 / 6-10 / 11+, which was adequate only
+while the archive stopped at 10 DTE. Once the Bank Nifty monthly was archived,
+"11+" spanned 11 to ~30 days in one fit while live positions sat at 22 -- so
+11-20 and 21+ are now separated. Anything that changes _dte_bucket must be
+mirrored in app/premium_model.py; tests/test_premium_buckets.py enforces that.
 """
 
 from __future__ import annotations
@@ -31,10 +39,6 @@ logger = logging.getLogger(__name__)
 
 OPTION_CANDLE_DIR = Path("data/option_candles")
 INSTRUMENT_CACHE = Path("data/instruments.json")
-
-# Beyond this the fit is extrapolation, not measurement.
-MAX_FITTED_DTE = 10
-
 
 # Minutes in an NSE equity trading session (09:15-15:30).
 SESSION_MINUTES = 375
@@ -66,7 +70,24 @@ def theoretical_theta_per_minute(dte: int) -> float:
     return -100.0 / (2.0 * effective_dte * SESSION_MINUTES)
 
 
+# Nominal DTE used to represent each bucket when a single number is needed
+# (the stated-assumption theta, mainly). Midpoint of the range, except "21+"
+# which is anchored on ~27 -- the Bank Nifty monthly cycle that actually
+# populates it -- rather than an unbounded upper edge.
+DTE_BUCKET_ORDER = ("0-1", "2-5", "6-10", "11-20", "21+")
+DTE_BUCKET_NOMINAL = {"0-1": 1, "2-5": 3, "6-10": 8, "11-20": 15, "21+": 27}
+
+
 def _dte_bucket(dte: int) -> str:
+    """DTE -> bucket label.
+
+    MIRRORED in app/premium_model.py, which cannot import this module because
+    the live app must not pull numpy into its import graph (~15 MB on a 414 MB
+    box). tests/test_premium_buckets.py asserts the two stay identical -- a
+    silent divergence would have the calibration writing one bucket name and
+    the live lookup asking for another, which surfaces only as every contract
+    falling back to "extrapolated" for no visible reason.
+    """
     if dte < 0:
         return "unknown"
     if dte <= 1:
@@ -75,7 +96,11 @@ def _dte_bucket(dte: int) -> str:
         return "2-5"
     if dte <= 10:
         return "6-10"
-    return "11+"
+    if dte <= 20:
+        return "11-20"
+    return "21+"
+
+
 # Moneyness buckets, in strike-intervals away from spot.
 MONEYNESS_BUCKETS = ((-2, -1), (-1, 1), (1, 2))
 
@@ -100,6 +125,31 @@ class PremiumFit:
     theta_per_minute: float | None = None
     multiplier_joint: float | None = None
     r_squared_joint: float | None = None
+    # Median premium and spot LEVELS observed in this bucket. Not used by the
+    # fit -- they exist so the first-principles smoke check can compare against
+    # what this bucket actually contained, instead of a premium hardcoded from
+    # one archive period. See expected_lambda below.
+    median_premium: float | None = None
+    median_spot: float | None = None
+
+    def expected_lambda(self, assumed_delta: float = 0.5) -> float | None:
+        """First-principles elasticity for this bucket: delta * spot / premium.
+
+        Derived from the bucket's OWN median levels rather than a fixed
+        reference, which is what makes the check valid for every bucket
+        including ones added later. An earlier version hardcoded ATM premiums
+        observed in the 20-24 July archive and then flagged a perfectly good
+        6-10 DTE fit as 44% off, purely because that period held cheaper
+        contracts than the bucket being checked.
+
+        Only delta stays assumed. That is the honest residual: 0.5 is right for
+        a true ATM option and drifts up slightly for longer-dated ones, so a
+        long-dated bucket reading ~5-10% above expectation is the assumption
+        showing, not a fault in the fit.
+        """
+        if not self.median_premium or not self.median_spot:
+            return None
+        return assumed_delta * self.median_spot / self.median_premium
 
     @property
     def theta_per_45min(self) -> float | None:
@@ -294,9 +344,12 @@ def fit_premium_model(
             # strike did not trade, and those longer intervals are what give
             # the time term any leverage at all.
             minutes = max((ts - prev_ts).total_seconds() / 60.0, 0.0)
+            # premium and spot LEVELS ride along unused by the regression, so
+            # the smoke check can reconstruct delta * spot / premium from this
+            # bucket's own contents rather than a hardcoded reference.
             buckets.setdefault(
                 (index_symbol, option_type, dte_bucket, money_bucket), []
-            ).append((index_ret, premium_ret, minutes))
+            ).append((index_ret, premium_ret, minutes, premium, spot))
 
     if from_filename:
         logger.info("Recovered metadata from filename for %s expired contracts", from_filename)
@@ -312,6 +365,11 @@ def fit_premium_model(
         x = np.array([p[0] for p in pairs], dtype=np.float64)
         y = np.array([p[1] for p in pairs], dtype=np.float64)
         m = np.array([p[2] for p in pairs], dtype=np.float64)
+        # Median, not mean: premium levels are right-skewed and a handful of
+        # deep-value rows would drag a mean well away from what the bucket
+        # typically held.
+        median_premium = float(np.median(np.array([p[3] for p in pairs], dtype=np.float64)))
+        median_spot = float(np.median(np.array([p[4] for p in pairs], dtype=np.float64)))
         # Through the origin: a zero index move should imply a zero premium
         # move. An intercept here would silently absorb theta decay into what
         # is meant to be a directional sensitivity.
@@ -364,6 +422,8 @@ def fit_premium_model(
                 theta_per_minute=theta,
                 multiplier_joint=multiplier_joint,
                 r_squared_joint=r2_joint,
+                median_premium=median_premium,
+                median_spot=median_spot,
             )
         )
     return fits

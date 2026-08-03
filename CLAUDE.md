@@ -54,6 +54,7 @@ bug once put AI Origination trades on the AI Alternatives page.
 | `trade-monitor` | 30s |
 | `ai-exit-shadow-check` | 3 min |
 | `ai-origination-check` | 5 min |
+| `option-chain-collect` | 5 min, mon-fri 09:00-15:59 IST (archival only) |
 | `daily-square-off` | 15:15 IST cron |
 
 ## Gotchas that have caused real bugs
@@ -79,6 +80,16 @@ zeros. Handle the `None`.
 instruments still in the live scrip master. Once a contract expires its intraday history
 is gone permanently — there is no archive. Any historical option pull is deadline-bound
 by expiry.
+
+**The DTE bucket function is deliberately duplicated and must not diverge.**
+`_dte_bucket` exists in both `scripts/backtest/premium.py` (numpy, fits the
+coefficients) and `app/premium_model.py` (stdlib, reads them at runtime). It cannot be
+imported across that boundary — nothing in `app.main`'s graph may pull numpy in.
+Divergence fails silently: the calibration writes one bucket name, the live lookup asks
+for another, no bucket ever matches, and every contract quietly falls back to an
+extrapolated coefficient. Across the real DTE range that is a factor-level error
+(Bank Nifty ATM CE ≈ 65 at 2–5 DTE, ≈ 25 at 21+). `tests/test_premium_buckets.py`
+enforces parity; buckets are `0-1 / 2-5 / 6-10 / 11-20 / 21+`.
 
 **Index tokens are one digit apart and easy to confuse.**
 Nifty 50 spot = `99926000`, Bank Nifty spot = `99926009`, both NSE. A wrong token here
@@ -144,6 +155,35 @@ track record. It does not know which strike or premium its decision will produce
 does not know it already has positions open. Diagnosed failure mode: it reads *being at
 an extreme* as directional evidence ("price at session highs, therefore bullish").
 
+## Option-chain archive (collection only)
+
+`app/option_chain.py` snapshots OI, IV, volume, LTP and spot every 5 minutes for both
+indices, ATM ± 10 strikes, across the nearest two expiries plus the monthly if the
+nearest two missed it (Bank Nifty's already are monthlies; Nifty's usually are not).
+
+**Nothing live reads it and nothing in it is interpreted.** No PCR column — it is a
+ratio of summed OI, derivable at query time, and storing it would bake in a strike
+range a future analysis may not want. It exists because chain history cannot be
+backfilled: Angel serves none, so the archive can only start from the day it starts.
+Evaluating it needs months and the same significance machinery the price setups went
+through — do not wire it into a signal before that.
+
+It writes to **`data/option_chain.db`, a separate SQLite file**, not the trading DB.
+At ~210 rows per snapshot it accumulates on the order of 500 MB/year, which must not
+land in the file order placement and risk locks depend on. `--status` projects growth
+from measured bytes per row.
+
+**The rate-limit separation is partial and the code says so.** Angel limits per API
+key, so a second client on the same credentials buys no budget and merely drops the
+process-wide throttle. Set `SMARTAPI_ANALYTICS_*` for a real second key; without it the
+collector shares the live budget and stays subordinate — hard per-cycle call cap, and a
+full skip for 15 minutes after any rate limit on the live client. Cost is ~7 requests
+per cycle either way.
+
+Run `python -m scripts.collect_option_chain --once --probe` after deploying. Field
+names in `getMarketData` are not stable across SDK versions, and an archive of null
+open interest accumulates silently and looks fine until someone tries to use it.
+
 ## Live-trading safety (two-key pattern)
 
 Real orders require **both**:
@@ -180,6 +220,10 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000   # run
 pytest                                                      # tests
 python -m scripts.reconcile_origination                     # trade population split
 python -m scripts.pull_option_candles --dry-run             # option candle pull
+python -m scripts.calibrate_premium --db data/trading.db --write   # refit coefficients
+python -m scripts.collect_option_chain --status             # chain archive size/coverage
+python -m scripts.collect_option_chain --plan               # what would be collected
+python -m scripts.collect_option_chain --once --probe       # check broker field names
 ```
 
 ## Current state / open items
@@ -301,9 +345,16 @@ Same 12% stop, breached by noise within 60 min: Bank Nifty calls 36.5% at 2–5 
 23.4% at 6–10 DTE. Longer-dated contracts carry higher premium, so the same percentage
 is a wider index distance.
 
-AI Origination calls `find_atm_contract(signal, index, 0)` — nearest expiry, no offset,
-always. An expiry offset is the cheapest structural improvement identified so far and is
-independent of whether any entry signal works. Untested; see the roadmap.
+**Resolved 3 Aug.** AI Origination now passes a 5-DTE floor that *rolls forward* to the
+next listed expiry rather than skipping the trade, and stop/target/trail percentages are
+rescaled through `symmetric_premium_percent()` so a CE and a PE at the same nominal
+setting are the same index distance. Confirmed holding in live data — all trades at 8 or
+22 DTE, nothing under 5.
+
+Coefficient coverage is the constraint on that rescale, and it is now a first-class
+check: `calibrate_premium` reports covered vs missing DTE buckets per index and names the
+`pull_option_candles` command to fill a gap. A missing bucket is not a rounding error
+there; elasticity varies more than 2× across the traded range.
 
 ### Backtest tooling
 

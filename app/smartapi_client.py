@@ -482,6 +482,78 @@ class SmartAPIClient:
             return None
         return values
 
+    def get_market_data(self, mode: str, exchange_tokens: dict[str, list[str]]) -> list[dict[str, Any]]:
+        """Batched quotes via getMarketData. Returns the 'fetched' rows.
+
+        mode is LTP, OHLC or FULL. FULL is the only one carrying open interest
+        and traded volume, which is what the option-chain archive needs.
+
+        Batching is the point: getMarketData takes up to 50 tokens per request,
+        so a 168-strike chain costs 4 slots against the throttle where 168
+        ltpData calls would cost 168 and take nearly three minutes to serialise.
+
+        Same /quote rate-limit family as get_ltp, so it shares the throttle.
+        Returns [] rather than raising when the response is unusable -- callers
+        are archival or best-effort, and a bad quote payload should never take
+        down a loop that has other work to do.
+        """
+        self._throttle_quote_call()
+        try:
+            response = self._call_with_reauth(
+                self.client.getMarketData,
+                mode,
+                {exchange: [str(token) for token in tokens] for exchange, tokens in exchange_tokens.items()},
+            )
+        except Exception as exc:
+            logger.info("SmartAPI getMarketData(%s) failed: %s", mode, exc)
+            return []
+        if not response or response.get("status") is False:
+            logger.info("SmartAPI getMarketData(%s) returned no data: %s", mode, response)
+            return []
+        try:
+            fetched = response["data"]["fetched"]
+        except (KeyError, TypeError):
+            logger.info("Unexpected getMarketData(%s) response shape: %s", mode, response)
+            return []
+        if not isinstance(fetched, list):
+            return []
+        unfetched = (response.get("data") or {}).get("unfetched") or []
+        if unfetched:
+            # Not an error: Angel returns partial results rather than failing
+            # the batch. Logged because a token that never fetches is usually a
+            # delisted or wrongly-normalised instrument, not a transient.
+            logger.info("getMarketData(%s): %s token(s) unfetched", mode, len(unfetched))
+        return fetched
+
+    def get_option_greeks(self, name: str, expirydate: str) -> list[dict[str, Any]]:
+        """Per-strike greeks including implied volatility, via optionGreek.
+
+        Optional by design. The endpoint is not present in every SmartAPI SDK
+        version, so its absence is detected rather than assumed and reported as
+        an empty result. The option-chain archive treats IV as nullable for
+        exactly this reason -- losing IV is acceptable, losing the OI and
+        volume alongside it would not be.
+
+        name is the underlying (e.g. "BANKNIFTY"), expirydate is DDMMMYYYY.
+        """
+        method = getattr(self.client, "optionGreek", None)
+        if method is None:
+            logger.info(
+                "SmartAPI SDK has no optionGreek method; implied volatility will not be "
+                "recorded. Everything else in the option-chain snapshot is unaffected."
+            )
+            return []
+        self._throttle_quote_call()
+        try:
+            response = self._call_with_reauth(method, {"name": name, "expirydate": expirydate})
+        except Exception as exc:
+            logger.info("SmartAPI optionGreek failed for %s %s: %s", name, expirydate, exc)
+            return []
+        if not response or response.get("status") is False:
+            return []
+        data = response.get("data") or []
+        return data if isinstance(data, list) else []
+
     def get_candles(
         self,
         exchange: str,

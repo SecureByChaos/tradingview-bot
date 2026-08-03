@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -43,9 +43,50 @@ class Settings:
     default_strategy_name: str = "V5.1"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
+    # --- Option-chain archival (collection only, no live trading effect) ---
+    option_chain_collection_enabled: bool = True
+    # Strikes either side of ATM. 10 gives a 21-strike chain per expiry per
+    # side, which is the minimum useful width for an IV skew or OI-wall study.
+    # Raising this raises storage roughly linearly -- see the volume note in
+    # app/option_chain_store.py before increasing it.
+    option_chain_strike_band: int = 10
+    option_chain_expiry_count: int = 2
+    option_chain_interval_minutes: int = 5
+
+    # Optional SECOND set of SmartAPI credentials, used only by the option-chain
+    # collector. Angel One rate-limits per API key, so this is the only way to
+    # give analysis work a budget that genuinely cannot starve live trading --
+    # a second session on the same key shares the same quota and merely drops
+    # the process-wide throttle. Leave blank to run the collector subordinate
+    # to the live client instead.
+    smartapi_analytics_api_key: str = ""
+    smartapi_analytics_client_id: str = ""
+    smartapi_analytics_pin: str = ""
+    smartapi_analytics_totp_secret: str = ""
+
     @property
     def order_quantity(self) -> int:
         return self.quantity_lots * self.banknifty_lot_size
+
+    def as_analytics_credentials(self) -> "Settings":
+        """A copy whose primary SmartAPI credentials are the analytics ones.
+
+        SmartAPIClient reads settings.smartapi_* directly, so handing it a
+        swapped copy is what lets one client class serve both budgets without
+        threading a credential set through every call.
+
+        live_trading is forced off: this client exists to read market data, and
+        nothing should be able to place an order through it even if the env var
+        is on for the live client.
+        """
+        return replace(
+            self,
+            smartapi_api_key=self.smartapi_analytics_api_key,
+            smartapi_client_id=self.smartapi_analytics_client_id,
+            smartapi_pin=self.smartapi_analytics_pin,
+            smartapi_totp_secret=self.smartapi_analytics_totp_secret,
+            live_trading=False,
+        )
 
 
 def _get_bool(key: str, default: bool) -> bool:
@@ -88,4 +129,12 @@ def get_settings() -> Settings:
         secure_cookies=_get_bool("SECURE_COOKIES", False),
         default_strategy_name=os.getenv("DEFAULT_STRATEGY_NAME", "V5.1"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),  # type: ignore[arg-type]
+        option_chain_collection_enabled=_get_bool("OPTION_CHAIN_COLLECTION_ENABLED", True),
+        option_chain_strike_band=_get_int("OPTION_CHAIN_STRIKE_BAND", 10),
+        option_chain_expiry_count=_get_int("OPTION_CHAIN_EXPIRY_COUNT", 2),
+        option_chain_interval_minutes=_get_int("OPTION_CHAIN_INTERVAL_MINUTES", 5),
+        smartapi_analytics_api_key=os.getenv("SMARTAPI_ANALYTICS_API_KEY", ""),
+        smartapi_analytics_client_id=os.getenv("SMARTAPI_ANALYTICS_CLIENT_ID", ""),
+        smartapi_analytics_pin=os.getenv("SMARTAPI_ANALYTICS_PIN", ""),
+        smartapi_analytics_totp_secret=os.getenv("SMARTAPI_ANALYTICS_TOTP_SECRET", ""),
     )

@@ -18,6 +18,8 @@ def create_scheduler(
     monitor: TradeMonitor,
     health_manager: object | None = None,
     originator_job: Callable[[], None] | None = None,
+    option_chain_job: Callable[[], None] | None = None,
+    option_chain_interval_minutes: int = 5,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(
@@ -44,6 +46,30 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+        )
+    if option_chain_job is not None:
+        # Archival only -- nothing live reads what this writes. Restricted to
+        # weekdays and roughly session hours by cron as a first gate; the job
+        # itself re-checks market hours, so a holiday costs one no-op call
+        # rather than a wasted sweep.
+        #
+        # coalesce + max_instances=1 matter more here than elsewhere: if the
+        # process is paused or the broker is slow, a backlog of chain sweeps
+        # firing at once is exactly the burst that would contend with live
+        # trading's rate-limit budget.
+        scheduler.add_job(
+            option_chain_job,
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-15",
+                minute=f"*/{max(option_chain_interval_minutes, 1)}",
+                timezone=IST,
+            ),
+            id="option-chain-collect",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
         )
     scheduler.add_job(
         monitor.square_off,

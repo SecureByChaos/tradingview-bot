@@ -42,6 +42,18 @@ COEFFICIENTS_PATH = Path("data/premium_coefficients.json")
 
 
 def _dte_bucket(dte: int) -> str:
+    """DTE -> bucket label.
+
+    MIRRORED from scripts/backtest/premium.py, which this module deliberately
+    does not import -- that module is numpy-based and nothing in app.main's
+    import graph may pull numpy in. tests/test_premium_buckets.py asserts the
+    two copies agree.
+
+    Divergence is the failure mode worth guarding against, because it is
+    silent: the calibration would write "21+" while this lookup asked for
+    "11+", no bucket would ever match, and every contract would quietly fall
+    back to an extrapolated coefficient with nothing in the logs to say why.
+    """
     if dte < 0:
         return "unknown"
     if dte <= 1:
@@ -50,7 +62,9 @@ def _dte_bucket(dte: int) -> str:
         return "2-5"
     if dte <= 10:
         return "6-10"
-    return "11+"
+    if dte <= 20:
+        return "11-20"
+    return "21+"
 
 
 @dataclass(frozen=True)
@@ -91,10 +105,11 @@ def lambda_for(
 ) -> tuple[float, bool] | None:
     """(premium %% per index %%, extrapolated) for a contract, or None.
 
-    The extrapolated flag matters and callers should surface it: Bank Nifty
-    currently trades a ~27 DTE monthly while the archive only covers 0-10 DTE,
-    and gamma differs enough across that range that applying the fit silently
-    would misstate every derived number.
+    The extrapolated flag matters and callers should surface it. Elasticity
+    varies by more than 2x across the DTE range actually traded -- Bank Nifty
+    ATM CE measures ~65 at 2-5 DTE against ~25 at 21+ -- so a coefficient
+    borrowed from the wrong bucket does not misstate a derived stop slightly,
+    it misstates it by a factor.
     """
     data = _load()
     if not data:
