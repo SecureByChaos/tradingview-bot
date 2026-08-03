@@ -183,6 +183,11 @@ per cycle either way.
 Run `python -m scripts.collect_option_chain --once --probe` after deploying. Field
 names in `getMarketData` are not stable across SDK versions, and an archive of null
 open interest accumulates silently and looks fine until someone tries to use it.
+Confirmed 3 Aug: OI is `opnInterest`, volume `tradeVolume`, both present.
+
+**`impliedVolatility` from `optionGreek` is stored raw and its units are unverified.**
+The 3 Aug probe read 5.81 on a Bank Nifty 22-DTE contract whose own premium implies
+nearer 15% by a straddle estimate. Reconcile before any analysis leans on it.
 
 ## Live-trading safety (two-key pattern)
 
@@ -338,6 +343,27 @@ Nobody chose that asymmetry, and it persists under any entry rule. **Specify fut
 parameters in index points or ATR multiples, not premium percent** — a "12% stop" is
 2.02 ATR on a Nifty call and 1.27 ATR on a put, which are different bets wearing the
 same label.
+
+The asymmetry shrinks with DTE: Bank Nifty ATM is 1.29 at 2–5 DTE but 1.11 at 21+. So
+the rescale bites hardest on Nifty weeklies (1.59 at 2–5) and barely at all on the Bank
+Nifty monthly.
+
+### Fitted lambda is attenuated at long DTE, and it matters asymmetrically
+
+Measured 3 Aug: ATM CE fits sit below `delta × spot / premium` by −3% (2–5 DTE), −11%
+(6–10) and −20% (21+) on Bank Nifty. Monotonic with DTE and always negative — that is
+the Epps effect, not a units error. A longer-dated contract prints less often, so its
+1-minute close is more often stale against a fresh index close, biasing the slope toward
+zero. `calibrate_premium` now detects and names this pattern.
+
+Consequences differ by consumer, and this is the part to remember:
+
+- `symmetric_premium_percent` uses a **ratio** of PE to CE lambda *within one bucket*.
+  Both legs are attenuated alike, so the CE/PE stop rescale is essentially immune.
+- `to_risk_units` **divides** by lambda. An understated lambda overstates index points
+  and ATR multiples, so reported ATR distances on the longest-dated contracts read wider
+  than they are. Treat Bank Nifty monthly ATR figures as an upper bound — part of the
+  "Bank Nifty 5.16–6.2 ATR vs Nifty 2.5–3.7" gap seen on 3 Aug is measurement, not risk.
 
 ### Days-to-expiry materially affects stop survivability
 

@@ -76,6 +76,11 @@ def theoretical_theta_per_minute(dte: int) -> float:
 # populates it -- rather than an unbounded upper edge.
 DTE_BUCKET_ORDER = ("0-1", "2-5", "6-10", "11-20", "21+")
 DTE_BUCKET_NOMINAL = {"0-1": 1, "2-5": 3, "6-10": 8, "11-20": 15, "21+": 27}
+# Inclusive upper edge of each bucket. Used to decide whether a bucket sits
+# entirely below a trading DTE floor -- which needs the EDGE, not the nominal:
+# with a 5-DTE floor the "2-5" bucket is still reachable at exactly 5, while
+# its nominal 3 would wrongly suggest otherwise.
+DTE_BUCKET_UPPER = {"0-1": 1, "2-5": 5, "6-10": 10, "11-20": 20, "21+": 10**6}
 
 
 def _dte_bucket(dte: int) -> str:

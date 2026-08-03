@@ -28,6 +28,7 @@ from pathlib import Path
 from scripts.backtest.premium import (
     DTE_BUCKET_NOMINAL,
     DTE_BUCKET_ORDER,
+    DTE_BUCKET_UPPER,
     SESSION_MINUTES,
     fit_premium_model,
     select_multiplier,
@@ -58,6 +59,17 @@ ASSUMED_ATM_DELTA = 0.5
 # assuming delta = 0.5 flat costs a few percent at long expiry, where a true
 # ATM call sits nearer 0.53.
 SMOKE_TOLERANCE = 0.25
+
+# Mirrors _MIN_DTE_TO_TRADE in app/ai/originator.py. Buckets entirely below the
+# floor cannot be reached by a live trade, so a missing fit there is a fact
+# about the archive, not a gap worth acting on. Reported as INFO rather than a
+# warning -- warning about something unreachable is how people learn to skim
+# past warnings that matter.
+#
+# It is duplicated rather than imported because app.ai.originator drags the
+# whole live app's import graph in, and this is a numpy script. If the floor
+# changes there, change it here.
+TRADEABLE_MIN_DTE = 5
 
 
 def _load_index_series(db_path: str, table: str) -> dict[str, dict[datetime, float]]:
@@ -224,6 +236,7 @@ def main() -> int:
     # at 2-5 DTE cannot catch a units error in a long-dated bucket, and the
     # long-dated buckets are the ones carrying live Bank Nifty positions.
     suspect_buckets = []
+    deviations: dict[str, list[tuple[str, float]]] = {}
     smoke_candidates = [
         f for f in fits if f.option_type == "CE" and f.moneyness_bucket == "ATM"
     ]
@@ -239,17 +252,65 @@ def main() -> int:
                 fit.index_symbol, fit.dte_bucket,
             )
             continue
-        deviation = abs(fit.multiplier - expected) / expected
+        # SIGNED, not absolute: the direction is diagnostic. A fit above
+        # expectation is the flat-delta assumption; a fit below it, growing
+        # with DTE, is measurement attenuation. See the check below.
+        signed = (fit.multiplier - expected) / expected
+        deviation = abs(signed)
+        deviations.setdefault(fit.index_symbol, []).append((fit.dte_bucket, signed))
         verdict = "OK" if deviation <= SMOKE_TOLERANCE else "SUSPECT"
         logger.info(
             "  %-10s ATM CE dte=%-6s fitted=%6.1f expected=%6.1f "
-            "(spot %.0f / prem %.0f, n=%s) deviation=%2.0f%% -> %s",
+            "(spot %.0f / prem %.0f, n=%s) deviation=%+3.0f%% -> %s",
             fit.index_symbol, fit.dte_bucket, fit.multiplier, expected,
             fit.median_spot or 0.0, fit.median_premium or 0.0, fit.n_samples,
-            deviation * 100, verdict,
+            signed * 100, verdict,
         )
         if verdict == "SUSPECT":
             suspect_buckets.append(fit)
+
+    # NON-SYNCHRONOUS TRADING CHECK.
+    #
+    # If every bucket fits BELOW first principles and the shortfall GROWS with
+    # DTE, that pattern is not a units error and not a market property -- it is
+    # the Epps effect. A longer-dated contract trades less often, so its
+    # 1-minute close is more often a stale print while the index close is not.
+    # Regressing a stale y on a fresh x biases the slope toward zero, and the
+    # bias scales with how stale the option is.
+    #
+    # This matters because it hits the two consumers differently:
+    #   * symmetric_premium_percent uses a RATIO of PE to CE lambda WITHIN one
+    #     bucket. Both legs are attenuated alike, so the ratio -- and therefore
+    #     the CE/PE stop rescale -- is essentially unaffected.
+    #   * to_risk_units divides by lambda to get index points and ATR
+    #     multiples. An understated lambda OVERSTATES those, so reported ATR
+    #     distances on the least liquid contracts read wider than they are.
+    for index_symbol, series in sorted(deviations.items()):
+        ordered = sorted(
+            series,
+            key=lambda pair: DTE_BUCKET_ORDER.index(pair[0])
+            if pair[0] in DTE_BUCKET_ORDER else 99,
+        )
+        if len(ordered) < 3:
+            continue
+        signs = [value for _, value in ordered]
+        if all(value < 0 for value in signs) and signs == sorted(signs, reverse=True):
+            logger.info("")
+            logger.info(
+                "  %s: every bucket fits BELOW first principles and the shortfall grows "
+                "with DTE (%s). That ordering is the signature of non-synchronous "
+                "trading, not a units error -- a longer-dated option prints less often, "
+                "so its 1-minute close is more often stale against a fresh index close, "
+                "which biases the fitted slope toward zero.",
+                index_symbol,
+                ", ".join(f"{bucket} {value * 100:+.0f}%" for bucket, value in ordered),
+            )
+            logger.info(
+                "  Consequence: CE/PE stop rescaling is a RATIO within one bucket, so it "
+                "is largely immune. Index-point and ATR conversions divide by lambda, so "
+                "they are OVERSTATED by roughly this much on the longest-dated contracts. "
+                "Read Bank Nifty monthly ATR figures as an upper bound."
+            )
     if suspect_buckets:
         logger.warning(
             "  %s bucket(s) outside %.0f%%. A gap this size usually means a units error "
@@ -303,13 +364,23 @@ def main() -> int:
             f.dte_bucket for f in fits
             if f.index_symbol == index_symbol and f.moneyness_bucket == "ATM"
         }
-        gaps = [b for b in DTE_BUCKET_ORDER if b not in covered]
+        missing = [b for b in DTE_BUCKET_ORDER if b not in covered]
+        # A bucket whose whole range sits under the trading floor can never
+        # carry a live position, so its absence is not a gap to chase.
+        unreachable = [b for b in missing if DTE_BUCKET_UPPER[b] < TRADEABLE_MIN_DTE]
+        gaps = [b for b in missing if b not in unreachable]
         logger.info(
             "  %-10s covered: %s%s",
             index_symbol,
             ", ".join(b for b in DTE_BUCKET_ORDER if b in covered) or "(none)",
             f"   MISSING: {', '.join(gaps)}" if gaps else "",
         )
+        if unreachable:
+            logger.info(
+                "               (%s not fitted, but below the %s-DTE trading floor -- "
+                "unreachable, so not a gap)",
+                ", ".join(unreachable), TRADEABLE_MIN_DTE,
+            )
         if gaps:
             logger.warning(
                 "  %s has no fit for %s. Any contract landing in those buckets falls back "

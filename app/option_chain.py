@@ -278,6 +278,13 @@ def _fetch_greeks(smartapi: SmartAPIClient, contracts: list[ChainContract]) -> d
     installed SmartAPI SDK has no optionGreek method, or the call fails, the
     snapshot still stores OI, volume, LTP and spot. IV is the one field worth
     having but not worth losing everything else over.
+
+    UNITS ARE UNVERIFIED. Stored exactly as reported, no scaling. A 3 Aug probe
+    read impliedVolatility 5.81 on a Bank Nifty 22-DTE contract whose own
+    premium implies something nearer 15% by a straddle estimate, so the figure
+    is either on a different convention or not what its name suggests. Recorded
+    raw so it can be reconciled later; do NOT treat it as a percentage without
+    checking it against a contract whose premium you can price independently.
     """
     wanted = {(c.index_symbol, c.expiry) for c in contracts}
     greeks: dict[tuple, float] = {}
