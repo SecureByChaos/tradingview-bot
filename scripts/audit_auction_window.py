@@ -79,6 +79,17 @@ def _load(db_path: str, table: str, from_date: str | None) -> dict[tuple[str, st
     return grouped
 
 
+# 15:15..15:29 inclusive at one-minute resolution.
+EXPECTED_WINDOW_BARS = 15
+# Below this fraction of expected, the series is truncated rather than thin.
+MIN_COVERAGE_FRACTION = 0.8
+# Window range this many times the preceding ten minutes is a discontinuity,
+# not volatility. Deliberately blunt: the observed 3 Aug case was ~6x on Bank
+# Nifty across TWO bars, so anything subtle enough to need a tighter threshold
+# is not what this is looking for.
+SPIKE_RATIO = 3.0
+
+
 def _describe(bars: list[tuple]) -> tuple[int, int, float, bool]:
     """(bar count, distinct closes, total range, is_frozen) for a set of bars."""
     if not bars:
@@ -89,9 +100,30 @@ def _describe(bars: list[tuple]) -> tuple[int, int, float, bool]:
     distinct = len(set(closes))
     span = max(highs) - min(lows)
     # "Frozen" means the index did not move at all across the window. One
-    # distinct close over fifteen bars is not a quiet market, it is a feed that
-    # is not updating.
+    # distinct close over many bars is not a quiet market, it is a feed that is
+    # not updating.
     return len(bars), distinct, span, distinct <= 1
+
+
+def _anomalies(n_during: int, span_during: float, frozen: bool, span_before: float) -> list[str]:
+    """What is wrong with this window, if anything.
+
+    Three failure modes, not one. The first version of this script tested only
+    for a freeze -- because that is what NSE's wording implied -- and therefore
+    reported "no frozen windows detected" on a session whose window held two
+    bars instead of fifteen with a 564-point range between them. Checking for
+    the failure you predicted is how you miss the one that happened.
+    """
+    found = []
+    if n_during == 0:
+        found.append("NO BARS")
+    elif n_during < EXPECTED_WINDOW_BARS * MIN_COVERAGE_FRACTION:
+        found.append(f"TRUNCATED ({n_during}/{EXPECTED_WINDOW_BARS} bars)")
+    if frozen and n_during > 1:
+        found.append("FROZEN")
+    if span_before > 0 and span_during > span_before * SPIKE_RATIO:
+        found.append(f"DISCONTINUITY ({span_during:.0f}pts vs {span_before:.0f}pts before)")
+    return found
 
 
 def main() -> int:
@@ -118,7 +150,8 @@ def main() -> int:
     logger.info("CAS effective %s. Sessions found: %s..%s", CAS_EFFECTIVE_DATE, sessions[0], sessions[-1])
     logger.info("=" * 86)
 
-    frozen_by_day: dict[str, list[str]] = defaultdict(list)
+    anomalies_by_day: dict[str, list[str]] = defaultdict(list)
+    closes_at_end: dict[tuple[str, str], tuple[str, float]] = {}
     for (symbol, day), bars in sorted(grouped.items()):
         before = [b for b in bars if b[0].time() < AUCTION_WINDOW_START]
         during = [b for b in bars if AUCTION_WINDOW_START <= b[0].time() < AUCTION_WINDOW_END]
@@ -129,15 +162,22 @@ def main() -> int:
         n_a, d_a, span_a, _ = _describe(after)
 
         post_cas = datetime.fromisoformat(day).date() >= CAS_EFFECTIVE_DATE
+        found = _anomalies(n_d, span_d, frozen, span_b) if post_cas else []
         logger.info(
-            "%-14s %s %s  before[%2db %2dv %6.1fpts]  DURING[%2db %2dv %6.1fpts]%s  after[%2db %2dv %6.1fpts]",
+            "%-14s %s %s  before[%2db %2dv %6.1fpts]  DURING[%2db %2dv %6.1fpts]  after[%2db %2dv %6.1fpts]%s",
             symbol, day, "CAS" if post_cas else "pre",
-            n_b, d_b, span_b, n_d, d_d, span_d,
-            "  <-- FROZEN" if frozen and n_d > 1 else "",
-            n_a, d_a, span_a,
+            n_b, d_b, span_b, n_d, d_d, span_d, n_a, d_a, span_a,
+            "  <-- " + "; ".join(found) if found else "",
         )
-        if frozen and n_d > 1:
-            frozen_by_day[day].append(symbol)
+        if found:
+            anomalies_by_day[day].append(f"{symbol}: {'; '.join(found)}")
+        # The LAST stored bar of the session becomes that session's close, which
+        # market_context reads the next morning as the previous-day close --
+        # feeding CPR classification and the PDH/PDL levels in the prompt. If
+        # the last bar is an auction print, tomorrow's levels inherit it.
+        if bars:
+            last = bars[-1]
+            closes_at_end[(symbol, day)] = (last[0].strftime("%H:%M"), last[4])
         if args.show_bars:
             for ts, open_, high, low, close, volume in bars:
                 logger.info("      %s  O=%.2f H=%.2f L=%.2f C=%.2f V=%.0f",
@@ -178,26 +218,40 @@ def main() -> int:
         )
 
     logger.info("=" * 86)
-    if frozen_by_day:
-        logger.warning("Frozen index windows found on %s session(s):", len(frozen_by_day))
-        for day, symbols in sorted(frozen_by_day.items()):
-            logger.warning("  %s: %s", day, ", ".join(symbols))
+    logger.info("Last stored bar per session -- this value becomes the session CLOSE:")
+    for (symbol, day), (ts, close) in sorted(closes_at_end.items()):
+        flag = " <-- inside the auction window" if AUCTION_WINDOW_START.strftime("%H:%M") <= ts else ""
+        logger.info("  %-14s %s  last bar %s  close %.2f%s", symbol, day, ts, close, flag)
+    logger.info(
+        "  market_context reads the previous session's close the next morning for CPR "
+        "classification and the PDH/PDL levels in the prompt. A close taken from an auction "
+        "print rather than the published CAS closing price propagates into the NEXT day's "
+        "levels -- which is the one way this reaches live entry decisions."
+    )
+
+    logger.info("=" * 86)
+    if anomalies_by_day:
+        logger.warning("Anomalous auction windows on %s session(s):", len(anomalies_by_day))
+        for day, entries in sorted(anomalies_by_day.items()):
+            for entry in entries:
+                logger.warning("  %s  %s", day, entry)
         logger.warning(
-            "These bars are not wrong data to discard -- they are what the exchange publishes. "
-            "The problem is that they enter indicator windows as though they were quiet trading: "
-            "ATR deflates, ADX decays, and any return over a window containing them is diluted. "
-            "Nothing errors and nothing looks wrong on a chart."
+            "NOTE the failure mode before acting on it. A TRUNCATED or NO BARS window means the "
+            "feed stops rather than freezes -- fewer bars, not flat ones. A DISCONTINUITY means "
+            "the few bars that do arrive carry a move far larger than the minutes before them, "
+            "which is consistent with an indicative auction equilibrium price being published as "
+            "the index value. Those have OPPOSITE effects on indicators: truncation removes bars "
+            "from an ATR window, a discontinuity inflates it with one huge true range."
         )
         logger.info(
-            "Live trading is NOT exposed: entries stop at 15:15 and every exit prices off option "
-            "premium, which is continuously traded until 15:40. The exposure is the stored series "
-            "that indicators and backtests read."
+            "Live trading is NOT directly exposed: entries stop at 15:15 and every exit prices "
+            "off option premium, continuously traded to 15:40. The reachable path is the stored "
+            "session close feeding tomorrow's previous-day levels -- see above."
         )
     else:
         logger.info(
-            "No frozen windows detected. If these sessions are post-%s, either the index feed "
-            "does update through the auction or the stored bars come from a source that "
-            "interpolates -- worth knowing which before relying on it.", CAS_EFFECTIVE_DATE,
+            "No anomalies detected in post-%s sessions. Worth confirming against the published "
+            "NSE close before concluding the feed handles CAS correctly.", CAS_EFFECTIVE_DATE,
         )
     return 0
 
