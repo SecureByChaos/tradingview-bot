@@ -398,14 +398,33 @@ class _Decision:
     reasoning: str
 
 
+def _snippet(value: object, limit: int = 400) -> str:
+    """A bounded, single-line excerpt of a provider response, for logs.
+
+    Bounded because a model response can be long and this goes into a log line;
+    single-line because a multi-line JSON blob makes the log unreadable at the
+    exact moment someone is scanning it for a cause.
+    """
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
 def _parse_response(text: str) -> _Decision:
     try:
         data = json.loads(extract_json_object(text)) if isinstance(text, str) else text
         if not isinstance(data, dict):
-            return _Decision("ERROR", None, None, None, "Invalid AI response (not a JSON object).")
+            # Carry the actual payload. "Invalid AI response" with nothing
+            # attached is the message that made today's failures undiagnosable.
+            return _Decision(
+                "ERROR", None, None, None,
+                f"Invalid AI response (not a JSON object): {_snippet(text)}",
+            )
         decision = str(data.get("decision") or "").strip().upper()
         if decision not in {"BUY_CE", "BUY_PE", "NONE"}:
-            decision = "ERROR"
+            return _Decision(
+                "ERROR", None, None, None,
+                f"Unrecognised decision value {decision!r} in response: {_snippet(data)}",
+            )
         confidence = data.get("confidence")
         if confidence is not None:
             try:
@@ -431,8 +450,14 @@ def _parse_response(text: str) -> _Decision:
             _percent(data.get("target_percent")),
             str(data.get("reasoning") or ""),
         )
-    except Exception:
-        return _Decision("ERROR", None, None, None, "Invalid AI response.")
+    except Exception as exc:
+        # The exception type and the text that caused it are the whole
+        # diagnosis. Discarding them, as this used to, turns a fence-wrapped
+        # JSON body and a genuine schema change into the same opaque message.
+        return _Decision(
+            "ERROR", None, None, None,
+            f"Could not parse AI response ({type(exc).__name__}: {exc}): {_snippet(text)}",
+        )
 
 
 def _call_openai(view: _ProviderView, user_prompt: str) -> _Decision:
@@ -456,8 +481,15 @@ def _call_openai(view: _ProviderView, user_prompt: str) -> _Decision:
         return _Decision("ERROR", None, None, None, response.error)
     try:
         content = response.response_body["choices"][0]["message"]["content"]
-    except Exception:
-        return _Decision("ERROR", None, None, None, "Unexpected OpenAI response shape.")
+    except Exception as exc:
+        # HTTP 200 with a body we cannot read is a different problem from an
+        # HTTP error, and needs the body to tell them apart -- a refusal, a
+        # truncated response and a schema change all land here.
+        return _Decision(
+            "ERROR", None, None, None,
+            f"Unexpected OpenAI response shape ({type(exc).__name__}: {exc}), "
+            f"status={response.status}: {_snippet(response.response_body)}",
+        )
     return _parse_response(content)
 
 
@@ -485,8 +517,24 @@ def _call_claude(view: _ProviderView, user_prompt: str) -> _Decision:
     try:
         blocks = response.response_body.get("content") or []
         text = "".join(block.get("text", "") for block in blocks if isinstance(block, dict) and block.get("type") == "text")
-    except Exception:
-        return _Decision("ERROR", None, None, None, "Unexpected Claude response shape.")
+    except Exception as exc:
+        return _Decision(
+            "ERROR", None, None, None,
+            f"Unexpected Claude response shape ({type(exc).__name__}: {exc}), "
+            f"status={response.status}: {_snippet(response.response_body)}",
+        )
+    if not text:
+        # A 200 with no text block is specifically what a max_tokens truncation
+        # or a stop_reason other than end_turn looks like. Naming stop_reason
+        # here is the difference between "Claude failed" and "the 256-token cap
+        # cut the JSON off mid-object".
+        return _Decision(
+            "ERROR", None, None, None,
+            "Claude returned no text content (stop_reason="
+            f"{(response.response_body or {}).get('stop_reason')!r}, "
+            f"usage={(response.response_body or {}).get('usage')!r}): "
+            f"{_snippet(response.response_body)}",
+        )
     return _parse_response(text)
 
 
@@ -977,6 +1025,29 @@ def run_origination_checks(
                     if decision is None:
                         continue
                     logger.info("[AI][ORIGIN] %s -> %s (%s, %s)", index.symbol, decision.action, provider_name, turn)
+                    if decision.action == "ERROR":
+                        # THE cause of a whole week of undiagnosable failures.
+                        # Every ERROR path above already builds a specific
+                        # reason -- an HTTP status from AIClient, a timeout, a
+                        # parse failure with the offending text -- and this log
+                        # line printed only the word "ERROR" and threw the
+                        # reason away. Nothing was swallowed by an except; the
+                        # detail was captured and then simply not written.
+                        #
+                        # Logged at ERROR level and persisted to the event log,
+                        # because a provider failing silently is invisible in
+                        # the dashboard: the cycle just produces no trade,
+                        # which looks identical to the model declining.
+                        logger.error(
+                            "[AI][ORIGIN] %s %s (%s) FAILED: %s",
+                            index.symbol, provider_name, turn, decision.reasoning,
+                        )
+                        log_event(
+                            session, "AI_ORIGIN",
+                            f"[{index.display_name or index.symbol}] {provider_name} call failed: "
+                            f"{decision.reasoning}",
+                            level="ERROR",
+                        )
                     if decision.action == "NONE":
                         # Only forward-facing signal of whether the model is
                         # well-judged-conservative or just quiet -- previously

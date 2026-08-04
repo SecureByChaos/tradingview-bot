@@ -36,8 +36,10 @@ from datetime import datetime
 
 from app.config import get_settings
 from app.option_chain import (
+    _CYCLE_STAMP_PATH,
     _fetch_spots,
     build_contract_list,
+    claim_cycle_slot,
     collect_once,
 )
 from app.option_chain_store import archive_status, resolve_path
@@ -250,14 +252,41 @@ def main() -> int:
     if args.plan:
         return _report_plan(settings)
 
+    # The interval guard runs BEFORE authenticate, deliberately. Login is
+    # itself a rate-limited endpoint on the same API key live trading uses, so
+    # a re-invocation loop is a login storm regardless of whether the sweep
+    # that follows would have been cheap. Authenticating first and checking
+    # afterwards is what turned an over-frequent caller into 2,890
+    # "exceeding access rate" errors in a single day on 4 Aug.
+    if args.once and not claim_cycle_slot(settings.option_chain_interval_minutes):
+        logger.error(
+            "Refusing to run: the previous cycle was too recent. A refusal here means "
+            "something ALREADY ran a cycle within the interval -- find out what before "
+            "overriding. To override once the caller is understood: rm %s",
+            _CYCLE_STAMP_PATH,
+        )
+        return 1
+
     smartapi = SmartAPIClient(settings)
     smartapi.authenticate()
 
     if args.probe:
         return _probe(smartapi, settings)
 
-    stored = collect_once(smartapi, settings, force=args.force, dedicated_client=True)
-    logger.info("Stored %s rows", stored)
+    # dedicated_client reflects whether SEPARATE credentials are configured,
+    # not the fact that this script owns its own session. A second session on
+    # the SAME API key shares the same quota, so claiming dedication here would
+    # skip the yield-to-live-trading check on exactly the setup that most needs
+    # it. This previously passed True unconditionally.
+    is_dedicated = bool(settings.smartapi_analytics_api_key)
+    stored = collect_once(
+        smartapi, settings, force=args.force,
+        dedicated_client=is_dedicated,
+        # Already claimed above, before authenticating. Claiming twice would
+        # have the second check see a stamp zero seconds old and refuse.
+        claim_slot=False,
+    )
+    logger.info("Stored %s rows%s", stored, "" if is_dedicated else " (shared rate-limit budget)")
     if not stored and not args.force:
         logger.info("Nothing stored. Outside market hours this is expected; use --force to test plumbing.")
     return 0

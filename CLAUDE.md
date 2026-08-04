@@ -91,6 +91,26 @@ extrapolated coefficient. Across the real DTE range that is a factor-level error
 (Bank Nifty ATM CE ≈ 65 at 2–5 DTE, ≈ 25 at 21+). `tests/test_premium_buckets.py`
 enforces parity; buckets are `0-1 / 2-5 / 6-10 / 11-20 / 21+`.
 
+**A captured error is not a logged error.** Every AI Origination ERROR path builds a
+specific reason — an HTTP status from `AIClient`, a timeout, a parse failure — into
+`_Decision.reasoning`. For a week the cycle log printed only `-> ERROR (claude,
+secondary)` and dropped the reason, which read exactly like a swallowing `except` but
+wasn't one. Nothing was caught and discarded; the detail was captured and never written.
+Fixed 4 Aug: ERROR now logs the reason at ERROR level and persists an event.
+
+**`data_stale` labels, it does not gate.** `_load_market_context` returns a context built
+from stored history when the candle refresh fails, sets `data_stale=True`, warns, and
+proceeds. The fail-closed rule was implemented for missing ADX/ATR/Supertrend but *not*
+for a failed refresh. So a `Data Stale: YES` trade was opened on old data by design, not
+by accident — `scripts/stale_data_correlation.py` is the check on whether that choice
+costs anything.
+
+**Claude's call path caps output at 256 tokens; OpenAI's has no cap.** `_call_claude`
+sets `max_tokens: 256` while `_call_openai` sets `response_format: json_object` and no
+limit. A longer prompt means a longer `reasoning` field, and truncated JSON fails
+`extract_json_object` — so a prompt change can break one provider and not the other. The
+tell is `stop_reason == "max_tokens"`, now logged explicitly.
+
 **Index tokens are one digit apart and easy to confuse.**
 Nifty 50 spot = `99926000`, Bank Nifty spot = `99926009`, both NSE. A wrong token here
 produces plausible-looking but badly wrong strikes.

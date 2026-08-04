@@ -66,6 +66,70 @@ _MAX_REQUESTS_PER_CYCLE = 20
 # recently. The collector's data is worth nothing next to a missed exit check.
 _YIELD_AFTER_RATE_LIMIT_MINUTES = 15
 
+# Cross-process record of when a cycle last ran. A file, not a module global,
+# because the thing that has to be prevented happens ACROSS processes: a
+# crash-looping systemd unit or an over-frequent cron entry re-invokes the
+# script, and each invocation is a fresh interpreter with a fresh login. In-
+# process state cannot see that; a file can.
+_CYCLE_STAMP_PATH = Path(os.getenv("OPTION_CHAIN_STAMP_PATH", "data/option_chain_last_cycle"))
+# Tolerance so a scheduler firing every N minutes is never blocked by its own
+# cadence. Clock jitter of a second or two between an APScheduler cron fire and
+# this check would otherwise drop every other cycle.
+_CYCLE_SLOT_TOLERANCE_SECONDS = 45
+
+
+def claim_cycle_slot(min_interval_minutes: int, stamp_path: Path | None = None) -> bool:
+    """Whether a collection cycle may start now. Records the claim if so.
+
+    THIS IS A RATE-LIMIT SAFETY DEVICE, not scheduling. The intended cadence is
+    already expressed by the scheduler; this exists because on 4 Aug something
+    outside this code invoked the collector often enough to produce 2,890
+    "exceeding access rate" errors in a day, and each invocation performs a
+    fresh SmartAPI authenticate() before it does anything else. Login is itself
+    rate-limited, so a re-invocation loop is a login storm that degrades the
+    live trading session on the same API key.
+
+    The guard therefore has to sit BEFORE authentication and has to survive
+    process restarts, which is why it is a file. It bounds the damage from any
+    caller -- correct, misconfigured, or crash-looping -- to one login and one
+    sweep per interval.
+
+    Fails OPEN on an unreadable stamp: a permissions or disk problem should not
+    silently stop months of collection. Fails CLOSED on an unwritable one,
+    because a stamp that never updates would let every subsequent invocation
+    through, which is the exact failure this prevents.
+    """
+    path = stamp_path or _CYCLE_STAMP_PATH
+    now = to_ist(utc_now()).replace(tzinfo=None)
+    floor = timedelta(seconds=max(min_interval_minutes * 60 - _CYCLE_SLOT_TOLERANCE_SECONDS, 0))
+
+    try:
+        if path.exists():
+            last = datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
+            elapsed = now - last
+            if elapsed < floor:
+                logger.warning(
+                    "[CHAIN] Cycle refused: last run was %.0fs ago, minimum interval is %.0fs. "
+                    "Something is invoking the collector more often than the intended %s-minute "
+                    "cadence -- check for a crash-looping systemd unit or an over-frequent cron entry.",
+                    elapsed.total_seconds(), floor.total_seconds(), min_interval_minutes,
+                )
+                return False
+    except Exception as exc:
+        logger.info("[CHAIN] Could not read cycle stamp at %s (%s); allowing this cycle", path, exc)
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(now.isoformat(timespec="seconds"), encoding="utf-8")
+    except Exception as exc:
+        logger.error(
+            "[CHAIN] Could not write cycle stamp to %s (%s). Refusing the cycle: an unwritable "
+            "stamp disables the interval guard entirely, and running unguarded is what caused "
+            "the rate-limit storm.", path, exc,
+        )
+        return False
+    return True
+
 
 @dataclass(frozen=True)
 class ChainContract:
@@ -331,6 +395,7 @@ def collect_once(
     settings: Settings | None = None,
     force: bool = False,
     dedicated_client: bool = False,
+    claim_slot: bool = True,
 ) -> int:
     """One sweep. Returns rows stored.
 
@@ -341,6 +406,11 @@ def collect_once(
     settings = settings or get_settings()
 
     if not force and check_market_hours(utc_now()) is not None:
+        return 0
+    # Checked even for a dedicated client: the guard is about invocation
+    # frequency, not about whose budget is being spent. claim_slot=False is for
+    # callers that already claimed before authenticating -- see the CLI.
+    if claim_slot and not claim_cycle_slot(settings.option_chain_interval_minutes):
         return 0
     if not dedicated_client and not force and _should_yield_to_live_trading(smartapi):
         logger.info(
