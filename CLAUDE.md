@@ -209,6 +209,33 @@ Confirmed 3 Aug: OI is `opnInterest`, volume `tradeVolume`, both present.
 The 3 Aug probe read 5.81 on a Bank Nifty 22-DTE contract whose own premium implies
 nearer 15% by a straddle estimate. Reconcile before any analysis leans on it.
 
+## Closing Auction Session (from 3 Aug 2026)
+
+NSE/SEBI added a Closing Auction Session for F&O-eligible **stocks**: continuous
+trading ends 15:15, auction runs 15:15–15:35, replacing the VWAP close. Index
+**derivatives are not auctioned** and trade continuously to 15:40.
+
+**The index value is frozen 15:15–15:30, not volatile.** Every Nifty/Bank Nifty
+constituent is in the auction, so there is no continuous matching underneath the index
+and NSE states the value "is constant as it is based on traded values". The 3 Aug
+spot/futures divergence is the visible signature — futures keep trading while spot sits
+still. `app/market_hours.py` is the single source of truth for these boundaries.
+
+**Live trading is not exposed, by construction.** Entries stop at 15:15
+(`_past_trading_end`), and every exit and the square-off price off *option premium* via
+`get_ltp`, which is continuously quoted until 15:40. Nothing in the trading path reads
+spot during the frozen window.
+
+**The stored candle series is exposed.** Fifteen flat bars per session enter the store
+and read as quiet trading: ATR deflates, ADX decays, Supertrend cannot flip, and any
+return over a window containing them is diluted. The stored session close also becomes
+the frozen 15:15 value rather than the published CAS close. Same class of trap as the
+forward-window truncation artefact — a real mechanism producing plausible numbers.
+`scripts/audit_auction_window.py` measures it, using futures as the control.
+
+Nothing is held to expiry settlement (TIME_EXIT closes everything at 15:15), so the
+CAS-derived settlement value for expiry-day moneyness never applies to a position here.
+
 ## Live-trading safety (two-key pattern)
 
 Real orders require **both**:
