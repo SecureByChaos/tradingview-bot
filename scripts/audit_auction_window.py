@@ -105,14 +105,22 @@ def _describe(bars: list[tuple]) -> tuple[int, int, float, bool]:
     return len(bars), distinct, span, distinct <= 1
 
 
-def _anomalies(n_during: int, span_during: float, frozen: bool, span_before: float) -> list[str]:
+def _anomalies(
+    n_during: int, span_during: float, frozen: bool, span_before: float, gap: float | None
+) -> list[str]:
     """What is wrong with this window, if anything.
 
-    Three failure modes, not one. The first version of this script tested only
-    for a freeze -- because that is what NSE's wording implied -- and therefore
-    reported "no frozen windows detected" on a session whose window held two
-    bars instead of fifteen with a 564-point range between them. Checking for
-    the failure you predicted is how you miss the one that happened.
+    Four checks, arrived at by being wrong twice. The first version tested only
+    for a freeze -- what NSE's wording implied -- and reported "no frozen
+    windows" on a session holding two bars instead of fifteen. The second added
+    an intra-window range check, which then missed Bank Nifty on 4 Aug: a
+    ONE-bar window has zero internal span by construction, so a 447-point move
+    from the last continuous bar registered as nothing at all.
+
+    Hence `gap`, measured ACROSS the boundary rather than inside the window.
+    That is the quantity that actually matters anyway -- it is the difference
+    between the last continuously-traded value and the auction close, which is
+    exactly what propagates into the next session's levels.
     """
     found = []
     if n_during == 0:
@@ -123,6 +131,12 @@ def _anomalies(n_during: int, span_during: float, frozen: bool, span_before: flo
         found.append("FROZEN")
     if span_before > 0 and span_during > span_before * SPIKE_RATIO:
         found.append(f"DISCONTINUITY ({span_during:.0f}pts vs {span_before:.0f}pts before)")
+    if gap is not None and span_before > 0 and abs(gap) > span_before:
+        # Not an error. On a post-CAS session this is the auction doing its job,
+        # and the value below is the one worth watching over time -- a close
+        # that regularly lands hundreds of points from the last continuous
+        # print is a structural change in how every previous-day level is set.
+        found.append(f"CLOSE GAP {gap:+.0f}pts vs last continuous bar")
     return found
 
 
@@ -162,7 +176,11 @@ def main() -> int:
         n_a, d_a, span_a, _ = _describe(after)
 
         post_cas = datetime.fromisoformat(day).date() >= CAS_EFFECTIVE_DATE
-        found = _anomalies(n_d, span_d, frozen, span_b) if post_cas else []
+        # Across the boundary: last continuous close -> last close in the
+        # window. Survives a single-bar window, which an intra-window range
+        # cannot.
+        gap = (during[-1][4] - before[-1][4]) if (before and during) else None
+        found = _anomalies(n_d, span_d, frozen, span_b, gap) if post_cas else []
         logger.info(
             "%-14s %s %s  before[%2db %2dv %6.1fpts]  DURING[%2db %2dv %6.1fpts]  after[%2db %2dv %6.1fpts]%s",
             symbol, day, "CAS" if post_cas else "pre",
