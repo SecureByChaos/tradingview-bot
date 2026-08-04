@@ -28,6 +28,7 @@ from sqlalchemy import func, select
 from app.risk import RiskProtectionService
 from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
 from app.ai.originator import run_origination_checks
+from app.market_data import capture_closing_auction
 from app.option_chain import build_collector_client, run_chain_collection
 from app.scheduler import create_scheduler
 from app.smartapi_client import SmartAPIClient
@@ -78,6 +79,7 @@ scheduler = create_scheduler(
         if chain_client is not None else None
     ),
     option_chain_interval_minutes=settings.option_chain_interval_minutes,
+    closing_auction_job=lambda: capture_closing_auction(smartapi, SessionLocal),
 )
 health_manager.scheduler = scheduler
 

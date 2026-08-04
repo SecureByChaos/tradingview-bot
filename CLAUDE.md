@@ -55,6 +55,7 @@ bug once put AI Origination trades on the AI Alternatives page.
 | `ai-exit-shadow-check` | 3 min |
 | `ai-origination-check` | 5 min |
 | `option-chain-collect` | 5 min, mon-fri 09:00-15:59 IST (archival only) |
+| `closing-auction-capture` | 15:45 IST mon-fri (stores the CAS close) |
 | `daily-square-off` | 15:15 IST cron |
 
 ## Gotchas that have caused real bugs
@@ -226,12 +227,26 @@ still. `app/market_hours.py` is the single source of truth for these boundaries.
 `get_ltp`, which is continuously quoted until 15:40. Nothing in the trading path reads
 spot during the frozen window.
 
-**The stored candle series is exposed.** Fifteen flat bars per session enter the store
-and read as quiet trading: ATR deflates, ADX decays, Supertrend cannot flip, and any
-return over a window containing them is diluted. The stored session close also becomes
-the frozen 15:15 value rather than the published CAS close. Same class of trap as the
-forward-window truncation artefact — a real mechanism producing plausible numbers.
-`scripts/audit_auction_window.py` measures it, using futures as the control.
+**What the candles actually look like** (measured 3–4 Aug, `scripts/audit_auction_window.py`):
+one flat bar at 15:15 at the last continuous value, then *no bars at all* until a single
+bar around 15:29 carrying the auction close. Not fifteen flat bars — the feed emits
+nothing when nothing trades.
+
+| | 15:14 (last continuous) | 15:29 (CAS close) |
+|---|---|---|
+| Bank Nifty 3 Aug | 57,680.90 | **58,247.95** |
+| Nifty 3 Aug | 24,573.55 | **24,774.30** |
+
+Both 15:29 values match NSE's published closes exactly. The 200–567 point gap is real
+market structure, not a bad print.
+
+**The defect was that nothing fetched candles after 15:15.** AI Origination stops there
+and was the only live caller, so the stored session close was the ~15:13 bar and the CAS
+close was never written — 3 Aug has it only by accident, from a manual backfill that
+evening. `market_context` reads the previous close the next morning for CPR
+classification and PDH/PDL levels, and a pivot is (H+L+C)/3, so a close wrong by 567
+points moves every derived level. Fixed by the `closing-auction-capture` job at 15:45
+(`capture_closing_auction`).
 
 Nothing is held to expiry settlement (TIME_EXIT closes everything at 15:15), so the
 CAS-derived settlement value for expiry-day moneyness never applies to a position here.
