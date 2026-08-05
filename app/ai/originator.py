@@ -506,8 +506,17 @@ def _call_claude(view: _ProviderView, user_prompt: str) -> _Decision:
         },
         payload={
             "model": view.model,
-            "max_tokens": 256,
-            "system": SYSTEM_PROMPT + "\n\nRespond with JSON only, no markdown or code fences.",
+            # 256 was observed in production (5 Aug) consuming its entire budget on
+            # extended thinking, leaving zero tokens for the actual JSON -- a 200
+            # with stop_reason='max_tokens' and output_tokens_details.thinking_tokens
+            # == output_tokens. The enriched [CTX] prompt (regime/structure/trend/
+            # extension/drift) runs ~1500 input tokens, comfortably large enough to
+            # trigger real deliberation. 2048 matches the headroom already used by
+            # claude.py's signal-review call for the same reason (see its comment).
+            "max_tokens": 2048,
+            "system": SYSTEM_PROMPT
+            + "\n\nRespond with JSON only, no markdown or code fences. Keep any internal "
+            "reasoning brief -- decide directly without lengthy deliberation.",
             "messages": [{"role": "user", "content": user_prompt}],
         },
         timeout=view.timeout_seconds,

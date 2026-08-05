@@ -461,6 +461,43 @@ Two traps already fallen into once each, both documented in the roadmap: overlap
 forward windows inflate significance by ~√(window/stride), and premium *elasticity* is
 not *delta* (they differ by ~200× for Nifty).
 
+### Two production incidents fixed, 5 Aug 2026
+
+**Claude `max_tokens` truncation.** Live logs showed Claude returning `stop_reason=
+'max_tokens'` on both BANKNIFTY and NIFTY origination cycles, with `output_tokens_
+details.thinking_tokens` equal to the full 256-token cap and zero tokens left for the
+JSON payload — extended thinking was consuming the entire budget before the model could
+answer. `app/ai/originator.py`'s and `app/ai/exit_shadow.py`'s `_call_claude` (identical
+duplicated code, same 256 cap) both raised to `max_tokens: 2048`, matching the headroom
+`app/ai/claude.py`'s signal-review path already used for the same reason. Also added a
+"keep reasoning brief" instruction to both Claude system prompts as a second line of
+defence — raising the cap doesn't stop a verbose model from eventually re-hitting any
+limit.
+
+**Option-chain collector rate-limiting live trading.** Collection cycles at 10:55 and
+11:00 IST were followed within seconds by AI Origination candle-refresh failures
+(`Access denied because of exceeding access rate`) on both indices. `_should_yield_to_
+live_trading()` only reacts *after* the live client has already been rate-limited that
+cycle — it doesn't prevent the collision, only shortens it. This is the third incident
+traced to running the collector in SHARED mode (no `SMARTAPI_ANALYTICS_*` configured):
+31 July's 2,890-error storm, a crash loop the night after, and this one.
+`option_chain_collection_enabled` now **defaults to `False`** (both the `Settings`
+dataclass field and the `get_settings()` env-var fallback — the latter is what actually
+governs runtime behavior, so both had to change). The dedicated-credentials isolation
+path (`SMARTAPI_ANALYTICS_*` → `build_collector_client()` → `as_analytics_credentials()`)
+was already fully implemented, just never provisioned with real second-key credentials.
+**Do not re-enable `OPTION_CHAIN_COLLECTION_ENABLED` without `SMARTAPI_ANALYTICS_*` set
+to a genuinely separate Angel One API key, and a full session run alongside live
+origination showing zero rate-limit errors on either side.**
+
+Neither fix could be verified live from this sandbox — no SmartAPI credentials here, and
+this sandbox is not connected to production. After deploying: confirm the next live
+Claude cycle produces a real decision (not another `max_tokens` stop), confirm no more
+`[CHAIN]` log lines appear, and confirm candle-refresh failures stop. Also still needs
+checking on production: whether `data_stale=True` fired correctly for AI Origination
+decisions made during the 10:56:55–10:57:06 and 11:01:46–11:02:02 IST failure windows,
+and whether any trade opened in those windows is flagged as suspect in the export.
+
 ### Still unconfirmed
 
 - Whether Nifty's spot token was corrected to `99926000` in Settings > Instruments.
