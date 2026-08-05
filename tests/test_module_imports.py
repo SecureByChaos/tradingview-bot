@@ -58,19 +58,55 @@ def test_module_imports(module_name: str):
     importlib.import_module(module_name)
 
 
+# Importing the app and then inspecting sys.modules IN THIS PROCESS does not
+# work, and failing to notice that produced two wrong results in a row.
+#
+# pytest imports every test module during collection. tests/test_premium_buckets.py
+# imports scripts.backtest.premium, which imports numpy. So by the time any
+# assertion here runs, both are already in sys.modules -- put there by a TEST,
+# not by app code. The check then passes or fails depending on which other test
+# files were collected, which makes it worthless: run alone it passed, run as
+# part of the suite it failed, and neither answer was about the app.
+#
+# So the probe runs in a clean subprocess that imports only app modules. Slower,
+# and worth it: this is the only way the question "what does importing the app
+# actually load" gets an answer that does not depend on the test runner.
+_PROBE_SOURCE = """
+import importlib, json, pkgutil, sys
+import app
+for info in pkgutil.walk_packages(list(app.__path__), prefix="app."):
+    if info.name in {excluded!r}:
+        continue
+    importlib.import_module(info.name)
+print(json.dumps(sorted(sys.modules)))
+"""
+
+
+def _app_import_graph() -> set[str]:
+    """Every module loaded by importing the app, measured in a fresh interpreter."""
+    import json
+    import subprocess
+    import sys
+
+    root = Path(app.__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "-c", _PROBE_SOURCE.format(excluded=EXCLUDED)],
+        capture_output=True, text=True, cwd=str(root),
+    )
+    if result.returncode != 0:
+        pytest.fail(f"probe failed to import the app:\n{result.stderr}")
+    return set(json.loads(result.stdout.strip().splitlines()[-1]))
+
+
 def test_backtest_package_is_not_reachable_from_the_app():
-    """The isolation rule that is actually true and actually worth enforcing.
+    """The isolation rule that is actually true and worth enforcing.
 
     scripts/backtest/ must never be imported by app code. It exists to be run
     standalone, and pulling it in would drag the fitting machinery into a live
     trading process for no benefit -- app/premium_model.py reads the fitted
     coefficients from JSON precisely so this boundary holds.
     """
-    import sys
-
-    for module_name in _module_names():
-        importlib.import_module(module_name)
-    leaked = sorted(name for name in sys.modules if name.startswith("scripts."))
+    leaked = sorted(name for name in _app_import_graph() if name.startswith("scripts."))
     assert not leaked, f"app modules imported from scripts/: {leaked}"
 
 
@@ -103,13 +139,12 @@ def test_no_new_heavy_dependency_enters_the_app_graph():
     rather than a cleanup.
 
     Until then, this pins the status quo so the cost does not grow silently.
-    """
-    import sys
 
-    for module_name in _module_names():
-        importlib.import_module(module_name)
+    Measured in a subprocess for the same reason as the test above: another
+    test file importing scipy would otherwise be blamed on the app.
+    """
     heavy = {"pandas", "numpy", "scipy", "matplotlib", "sklearn", "torch"}
-    present = {name for name in heavy if name in sys.modules}
+    present = heavy & _app_import_graph()
     unexpected = present - KNOWN_HEAVY_DEPENDENCIES
     assert not unexpected, (
         f"New heavy dependency in the app import graph: {sorted(unexpected)}. On a 414 MB "
