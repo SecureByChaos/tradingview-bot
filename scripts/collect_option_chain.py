@@ -239,6 +239,10 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="Run a single collection cycle now")
     parser.add_argument("--probe", action="store_true", help="Print a raw quote row and check field names")
     parser.add_argument("--force", action="store_true", help="Ignore the market-hours gate (plumbing check only)")
+    parser.add_argument(
+        "--ignore-disabled", action="store_true",
+        help="Collect even when OPTION_CHAIN_COLLECTION_ENABLED is false (deliberate manual runs only)",
+    )
     args = parser.parse_args()
 
     if not any((args.status, args.plan, args.once, args.probe)):
@@ -251,6 +255,30 @@ def main() -> int:
         return _report_status()
     if args.plan:
         return _report_plan(settings)
+
+    # The kill switch has to work HERE too, not just in the app.
+    #
+    # OPTION_CHAIN_COLLECTION_ENABLED=false stops the in-app scheduler job,
+    # because main.py declines to register it. It does nothing about a cron
+    # entry or a systemd unit invoking this script -- and an external caller is
+    # the leading suspect for the 4 Aug storm (2,890 rate-limit errors, far more
+    # than a 5-minute in-app job could produce). Turning the flag off and
+    # believing collection had stopped, while a crash-looping unit kept
+    # authenticating every few seconds, is exactly the wrong thing to be
+    # confident about.
+    #
+    # --ignore-disabled exists so a deliberate manual run is still possible
+    # without editing config. Diagnostics above this point (--status, --plan,
+    # --probe) are unaffected: they are cheap, manual, and are what you need
+    # WHILE collection is switched off.
+    if args.once and not settings.option_chain_collection_enabled and not args.ignore_disabled:
+        logger.error(
+            "OPTION_CHAIN_COLLECTION_ENABLED is false -- refusing to collect. If you did not "
+            "run this by hand, something is invoking it on a schedule and the env flag alone "
+            "will NOT stop that: find the caller (systemctl list-units | grep -i option; "
+            "crontab -l; sudo crontab -l). For a deliberate one-off, pass --ignore-disabled."
+        )
+        return 1
 
     # The interval guard runs BEFORE authenticate, deliberately. Login is
     # itself a rate-limited endpoint on the same API key live trading uses, so
