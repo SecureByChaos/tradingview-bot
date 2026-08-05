@@ -39,9 +39,32 @@ USAGE
     # widen/narrow the strike band around each traded strike (default 2)
     python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07 --strike-band 3
 
+    # EXPIRY MODE -- archive a named expiry's ATM band regardless of what was
+    # traded. Needed for premium calibration, which requires a DTE RANGE: Bank
+    # Nifty trades a ~27 DTE monthly while the archive only covers 0-10 DTE, so
+    # every Bank Nifty coefficient is currently extrapolated. Trade-driven
+    # pulling cannot fix that, because it only ever reaches the DTE buckets
+    # that happened to be traded -- and with the 5-DTE floor now in place there
+    # may be no Bank Nifty trades to drive a pull from at all.
+    python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07 \
+        --index BANKNIFTY --expiry 28AUG2026 --strike-band 4
+
 Output: data/option_candles/<TRADINGSYMBOL>_<TOKEN>.csv, one file per contract,
-columns timestamp_ist,open,high,low,close,volume. Existing files are skipped so
-the script is safely resumable if it dies partway or hits a rate limit.
+columns timestamp_ist,open,high,low,close,volume.
+
+RE-RUNS EXTEND, THEY DO NOT SKIP
+---------------------------------
+An earlier version skipped any contract whose file already existed. That was
+fine for the original use -- one archive, one deadline, resumable if it died
+partway -- and silently wrong for the use this actually has now, which is
+pulling the SAME contract repeatedly as it ages so its DTE buckets fill in.
+A 25AUG contract has to be pulled near 22 DTE, again near 15, again near 8, and
+skipping on existence means every pull after the first is a no-op that reports
+success. That is how the 11-20 DTE bucket stayed empty.
+
+So a re-run now fetches only the days not already in the file and merges them,
+deduplicating on timestamp. Today's date is always re-fetched, because a file
+written mid-session holds a partial day that would otherwise look complete.
 """
 
 from __future__ import annotations
@@ -63,7 +86,7 @@ from app.database import SessionLocal
 from app.db_models import StrategyTrade
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
-from app.time_utils import utc_now
+from app.time_utils import to_ist, utc_now
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("pull_option_candles")
@@ -101,6 +124,132 @@ def _traded_contracts(start: date, end: date) -> list[dict[str, Any]]:
             "expiry": trade.expiry,
         }
     return list(contracts.values())
+
+
+def _latest_spot(index_symbol: str) -> float | None:
+    """Most recent stored close for an index, used to locate ATM.
+
+    Read from the candle store rather than SmartAPI on purpose: it needs no
+    authentication, costs nothing against the shared rate-limit budget, and
+    works in --dry-run. ATM only needs to be right to the nearest strike
+    interval, so a close from the last session is entirely adequate.
+    """
+    from app.db_models import Candle
+
+    with SessionLocal() as session:
+        return session.scalar(
+            select(Candle.close)
+            .where(Candle.index_symbol == index_symbol)
+            .order_by(Candle.ts_ist.desc())
+            .limit(1)
+        )
+
+
+def _expiry_contracts(
+    index_symbol: str, expiry: str, band: int, scrip: pd.DataFrame,
+    strike_intervals: dict[str, int], exchange: str, spot_override: float | None = None,
+) -> list[dict[str, Any]]:
+    """Contracts around ATM for a NAMED expiry, independent of what was traded.
+
+    The trade-driven path above can only archive contracts AI Origination
+    actually took. That is the wrong tool for calibration, for two reasons:
+
+      * The premium coefficients need a DTE RANGE. Bank Nifty currently trades
+        a ~27 DTE monthly while the archive only covers 0-10 DTE, so every Bank
+        Nifty figure is extrapolated -- and no amount of trade-driven archiving
+        fixes that if the trades keep landing in the same bucket.
+      * With the 5-DTE floor now in place, Bank Nifty may not trade at all on
+        most days, so there may be no trades to drive a pull from.
+    """
+    interval = strike_intervals.get(index_symbol, 100)
+    spot = spot_override if spot_override else _latest_spot(index_symbol)
+    if not spot:
+        raise SystemExit(
+            f"No stored candles for {index_symbol} to locate ATM, and no --spot given. "
+            "Run scripts/backfill_candles.py first, or pass --spot."
+        )
+    atm = round(float(spot) / interval) * interval
+    logger.info(
+        "%s: spot ~%.2f -> ATM %s, band +/-%s x %s points",
+        index_symbol, float(spot), atm, band, interval,
+    )
+
+    wanted_expiry = _angel_expiry(expiry)
+    index_options = scrip[
+        (scrip["exch_seg"] == exchange)
+        & (scrip["name"].astype(str).str.upper() == index_symbol.upper())
+        & (scrip["symbol"].astype(str).str.upper().str.endswith(("CE", "PE")))
+    ]
+    if index_options.empty:
+        raise SystemExit(
+            f"No {index_symbol} options at all on {exchange} in the instrument master. "
+            "Check --index and --exchange."
+        )
+
+    on_expiry = index_options[index_options["expiry"].astype(str).str.upper() == wanted_expiry]
+    if on_expiry.empty:
+        # Guessing an expiry date is the single most likely way to use this
+        # mode wrong, so answer the question rather than restating it.
+        available = sorted(
+            {str(e).upper() for e in index_options["expiry"].dropna().unique()},
+            key=lambda text: (_parse_expiry_sort_key(text), text),
+        )
+        raise SystemExit(
+            f"No {index_symbol} contracts on {exchange} for expiry {wanted_expiry}.\n"
+            f"Available expiries in the instrument master:\n  "
+            + "\n  ".join(available[:20])
+            + ("\n  ..." if len(available) > 20 else "")
+        )
+
+    contracts: dict[str, dict[str, Any]] = {}
+    for step in range(-band, band + 1):
+        target_strike = atm + (step * interval)
+        for option_type in ("CE", "PE"):
+            # Tolerance rather than float equality: strike_normalized is a
+            # divided float, so an exact == against an int can miss.
+            matches = on_expiry[
+                ((on_expiry["strike_normalized"] - target_strike).abs() < 0.5)
+                & (on_expiry["symbol"].astype(str).str.upper().str.endswith(option_type))
+            ]
+            if matches.empty:
+                continue
+            row = matches.iloc[0]
+            symbol = str(row["symbol"])
+            contracts[symbol] = {
+                "tradingsymbol": symbol,
+                "symboltoken": str(row["token"]),
+                "exchange": exchange,
+                "index_symbol": index_symbol,
+                "strike": int(target_strike),
+                "option_type": option_type,
+                "expiry": expiry,
+                # Not traded -- selected by proximity to ATM. Labelled so the
+                # dry-run listing doesn't claim these came from trade history.
+                "atm_band": True,
+            }
+    if not contracts:
+        listed = sorted({float(s) for s in on_expiry["strike_normalized"].dropna().unique()})
+        nearest = min(listed, key=lambda s: abs(s - atm)) if listed else None
+        raise SystemExit(
+            f"{index_symbol} {wanted_expiry} exists but has no strikes within the "
+            f"+/-{band} band around ATM {atm}. Nearest listed strike: {nearest}. "
+            "The strike interval may be wrong for this index -- check Settings > Instruments."
+        )
+    return list(contracts.values())
+
+
+def _parse_expiry_sort_key(text: str) -> datetime:
+    parsed = _parse_expiry_maybe(text)
+    return parsed if parsed else datetime.max
+
+
+def _parse_expiry_maybe(text: str) -> datetime | None:
+    for fmt in ("%d%b%Y", "%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(str(text).strip().upper(), fmt)
+        except ValueError:
+            continue
+    return None
 
 
 def _load_scrip_master(settings: Any) -> pd.DataFrame:
@@ -176,11 +325,77 @@ def _angel_expiry(expiry: str) -> str:
     return raw.upper()
 
 
-def _trading_days(start: date, end: date) -> list[date]:
+# Angel error codes that describe the REQUEST, not a transient condition.
+# Retrying these is guaranteed to fail identically.
+#   AB1012 - from-date is in the future
+#   AB1010 - invalid date format / range
+_PERMANENT_ERROR_CODES = ("AB1012", "AB1010")
+
+
+def _error_code(exc: Exception) -> str | None:
+    text = str(exc)
+    return next((code for code in _PERMANENT_ERROR_CODES if code in text), None)
+
+
+def _is_permanent_error(exc: Exception) -> bool:
+    """Whether the broker rejected the request itself rather than failing to serve it.
+
+    Matched on the error code in the raised message, since SmartAPIError carries
+    the whole response dict as its text. Falls back to the message wording,
+    because the code is what changes between SDK versions, not the prose.
+    """
+    if _error_code(exc):
+        return True
+    return "can't be greater than current datetime" in str(exc)
+
+
+def _row_date(raw: Any) -> date | None:
+    """Session date from an archived timestamp, e.g. '2026-07-27T09:15:00+05:30'."""
+    try:
+        return datetime.fromisoformat(str(raw)).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_existing(path: Path) -> tuple[dict[str, list[Any]], set[date]]:
+    """Rows already archived keyed by timestamp, plus the dates they cover.
+
+    Keying on the timestamp string rather than a parsed datetime keeps the
+    merge exact: rows are rewritten verbatim, so a re-run cannot subtly reformat
+    an archive that a fitted coefficient already depends on.
+    """
+    rows: dict[str, list[Any]] = {}
+    days: set[date] = set()
+    if not path.exists():
+        return rows, days
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)  # header
+        for row in reader:
+            if not row:
+                continue
+            rows[str(row[0])] = row
+            parsed = _row_date(row[0])
+            if parsed is not None:
+                days.add(parsed)
+    return rows, days
+
+
+def _trading_days(start: date, end: date, today: date) -> list[date]:
+    """Weekdays in the range, clamped to today.
+
+    The clamp is not defensive tidiness. The pull calendar for filling DTE
+    buckets is written in FUTURE dates -- "re-run around 14 Aug for the 11-20
+    bucket" -- so running tomorrow's command today is the expected mistake, not
+    an exotic one. Unclamped, every future day becomes an AB1012
+    ("From datetime can't be greater than current datetime") that the retry
+    loop then attempts three times, per day, per contract: a 14-contract pull
+    over 8 future days is 336 pointless requests against a shared rate limit.
+    """
     days = []
     current = start
     while current <= end:
-        if current.weekday() < 5:
+        if current.weekday() < 5 and current <= today:
             days.append(current)
         current += timedelta(days=1)
     return days
@@ -192,9 +407,23 @@ def main() -> int:
     # TIME-CRITICAL" section. A hardcoded fallback window would always be an
     # already-expired one sooner or later, and would fail by silently
     # returning nothing rather than telling the caller their dates are wrong.
-    parser.add_argument("--start", required=True, help="First trade date to include (YYYY-MM-DD)")
-    parser.add_argument("--end", required=True, help="Last trade date to include (YYYY-MM-DD)")
-    parser.add_argument("--strike-band", type=int, default=2, help="Strikes either side of each traded strike")
+    parser.add_argument("--start", required=True, help="First session date to fetch (YYYY-MM-DD)")
+    parser.add_argument("--end", required=True, help="Last session date to fetch (YYYY-MM-DD)")
+    parser.add_argument("--strike-band", type=int, default=2, help="Strikes either side of ATM / each traded strike")
+    parser.add_argument(
+        "--expiry", default="",
+        help=(
+            "Archive a NAMED expiry's ATM band instead of whatever was traded, e.g. "
+            "28AUG2026. Needed for calibration: the coefficients require a DTE range, and "
+            "the trade-driven path can only reach DTE buckets that were actually traded."
+        ),
+    )
+    parser.add_argument("--index", default="", help="Index symbol, required with --expiry (e.g. BANKNIFTY)")
+    parser.add_argument("--exchange", default="NFO", help="Option exchange segment for --expiry mode")
+    parser.add_argument(
+        "--spot", type=float, default=None,
+        help="Override the spot used to locate ATM in --expiry mode. Defaults to the latest stored candle close.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="List contracts without calling the API")
     parser.add_argument(
         "--during-market-hours", action="store_true",
@@ -221,13 +450,11 @@ def main() -> int:
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end = datetime.strptime(args.end, "%Y-%m-%d").date()
 
-    settings = get_settings()
-    contracts = _traded_contracts(start, end)
-    if not contracts:
-        logger.error("No AI Origination trades found between %s and %s", start, end)
+    if args.expiry and not args.index:
+        logger.error("--expiry requires --index (e.g. --index BANKNIFTY)")
         return 1
-    logger.info("Found %s distinct traded contracts", len(contracts))
 
+    settings = get_settings()
     strike_intervals: dict[str, int] = {}
     with SessionLocal() as session:
         from app.db_models import IndexConfig
@@ -236,13 +463,48 @@ def main() -> int:
             strike_intervals[index.symbol] = index.strike_interval or 100
 
     scrip = _load_scrip_master(settings)
-    all_contracts = _expand_strike_band(contracts, scrip, args.strike_band, strike_intervals)
-    logger.info(
-        "Expanded to %s contracts with a +/-%s strike band (%s traded, %s neighbours)",
-        len(all_contracts), args.strike_band, len(contracts), len(all_contracts) - len(contracts),
-    )
 
-    days = _trading_days(start, end)
+    if args.expiry:
+        all_contracts = _expiry_contracts(
+            args.index.upper(), args.expiry, args.strike_band, scrip,
+            strike_intervals, args.exchange.upper(), args.spot,
+        )
+        logger.info(
+            "Expiry mode: %s contracts for %s %s (+/-%s strikes around ATM)",
+            len(all_contracts), args.index.upper(), args.expiry, args.strike_band,
+        )
+    else:
+        contracts = _traded_contracts(start, end)
+        if not contracts:
+            logger.error(
+                "No AI Origination trades found between %s and %s. If you meant to archive a "
+                "specific expiry regardless of what was traded, use --expiry/--index.",
+                start, end,
+            )
+            return 1
+        logger.info("Found %s distinct traded contracts", len(contracts))
+        all_contracts = _expand_strike_band(contracts, scrip, args.strike_band, strike_intervals)
+        logger.info(
+            "Expanded to %s contracts with a +/-%s strike band (%s traded, %s neighbours)",
+            len(all_contracts), args.strike_band, len(contracts), len(all_contracts) - len(contracts),
+        )
+
+    today_ist = to_ist(utc_now()).date()
+    days = _trading_days(start, end, today_ist)
+    if not days:
+        logger.error(
+            "No fetchable trading days between %s and %s. Today is %s, and the broker "
+            "serves no candles for a session that has not happened yet. If you are "
+            "working from the DTE-bucket pull calendar, those dates are future dates -- "
+            "run the command on or after them, not before.",
+            start, end, today_ist,
+        )
+        return 1
+    if end > today_ist:
+        logger.warning(
+            "--end %s is in the future; clamped to %s. Re-run after %s to pick up the "
+            "remaining sessions.", end, days[-1], end,
+        )
     logger.info("Trading days in range: %s", ", ".join(d.isoformat() for d in days))
 
     if args.dry_run:
@@ -250,7 +512,9 @@ def main() -> int:
             logger.info(
                 "  %s token=%s strike=%s %s%s",
                 contract["tradingsymbol"], contract["symboltoken"], contract["strike"],
-                contract["option_type"], " (neighbour)" if contract.get("neighbour") else " (TRADED)",
+                contract["option_type"],
+                " (ATM band)" if contract.get("atm_band")
+                else (" (neighbour)" if contract.get("neighbour") else " (TRADED)"),
             )
         logger.info("Dry run -- %s contracts x %s days = %s API calls would be made",
                     len(all_contracts), len(days), len(all_contracts) * len(days))
@@ -260,15 +524,26 @@ def main() -> int:
     smartapi = SmartAPIClient(settings)
     smartapi.authenticate()
 
+    today = today_ist
     ok, skipped, failed = 0, 0, 0
     for contract in sorted(all_contracts, key=lambda c: c["tradingsymbol"]):
         out_path = OUTPUT_DIR / f"{contract['tradingsymbol']}_{contract['symboltoken']}.csv"
-        if out_path.exists():
+        existing_rows, covered_days = _load_existing(out_path)
+        # Today is always re-fetched: a file written mid-session holds a partial
+        # day, and a partial day that looks complete is worse than no day, since
+        # it silently biases the sample toward morning bars.
+        missing_days = [day for day in days if day not in covered_days or day >= today]
+        if not missing_days:
             skipped += 1
             continue
+        if existing_rows:
+            logger.info(
+                "  %s: %s day(s) already archived, fetching %s more",
+                contract["tradingsymbol"], len(covered_days), len(missing_days),
+            )
         rows: list[list[Any]] = []
         contract_failed = False
-        for day in days:
+        for day in missing_days:
             # One call per contract per day. Fetching the whole range in a
             # single call would be fewer requests, but a single failure would
             # then lose every day rather than one -- and with an immovable
@@ -286,6 +561,15 @@ def main() -> int:
                     )
                     break
                 except Exception as exc:
+                    if _is_permanent_error(exc):
+                        # Retrying a deterministic rejection just spends the
+                        # shared rate-limit budget to get the same answer.
+                        logger.warning(
+                            "  %s %s rejected and will not succeed on retry: %s",
+                            contract["tradingsymbol"], day, _error_code(exc) or exc,
+                        )
+                        contract_failed = True
+                        break
                     if attempt == 2:
                         logger.warning("  %s %s failed after 3 attempts: %s", contract["tradingsymbol"], day, exc)
                         contract_failed = True
@@ -293,21 +577,42 @@ def main() -> int:
                         logger.info("  %s %s attempt %s failed (%s), retrying", contract["tradingsymbol"], day, attempt + 1, exc)
         if not rows:
             failed += 1
-            logger.warning("No candles returned for %s -- contract may already have expired", contract["tradingsymbol"])
+            logger.warning(
+                "No candles returned for %s -- contract may already have expired%s",
+                contract["tradingsymbol"],
+                f" (keeping the {len(existing_rows)} rows already archived)" if existing_rows else "",
+            )
             continue
+
+        # Merge, newest reading wins on a duplicate timestamp. That matters for
+        # the always-refetched current day: the second pull of a session
+        # supersedes the partial first one rather than sitting alongside it.
+        merged = dict(existing_rows)
+        added = 0
+        for row in rows:
+            key = str(row[0])
+            if key not in merged:
+                added += 1
+            merged[key] = row
+
         with out_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             writer.writerow(["timestamp_ist", "open", "high", "low", "close", "volume"])
-            writer.writerows(rows)
+            # Sorted on the raw ISO timestamp, which is lexicographically
+            # ordered for a fixed offset -- and NSE is always +05:30.
+            writer.writerows(merged[key] for key in sorted(merged))
         ok += 1
         logger.info(
-            "%s -> %s rows%s%s",
-            contract["tradingsymbol"], len(rows),
+            "%s -> %s rows total (+%s new)%s%s",
+            contract["tradingsymbol"], len(merged), added,
             " (TRADED)" if not contract.get("neighbour") else "",
             " [PARTIAL - some days failed]" if contract_failed else "",
         )
 
-    logger.info("Done. %s written, %s already present, %s returned nothing.", ok, skipped, failed)
+    logger.info(
+        "Done. %s written or extended, %s already complete for this range, %s returned nothing.",
+        ok, skipped, failed,
+    )
     if failed:
         logger.warning(
             "Contracts returning nothing are most likely already expired and unrecoverable. "

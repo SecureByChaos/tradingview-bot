@@ -28,6 +28,8 @@ from sqlalchemy import func, select
 from app.risk import RiskProtectionService
 from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
 from app.ai.originator import run_origination_checks
+from app.market_data import capture_closing_auction
+from app.option_chain import build_collector_client, run_chain_collection
 from app.scheduler import create_scheduler
 from app.smartapi_client import SmartAPIClient
 from app.telegram_service import TelegramService
@@ -51,10 +53,33 @@ v7_manager = V7Manager(settings, smartapi, option_finder, telegram)
 risk_service = RiskProtectionService(multi_strategy_manager, telegram)
 monitor = MultiStrategyMonitor(multi_strategy_manager, risk_service, v7_manager)
 health_manager = HealthManager(smartapi, engine, telegram)
+
+# Option-chain archival. Collection only: nothing in the trading path reads it,
+# and it is months away from being evaluable. It is wired in now because the
+# data cannot be backfilled -- Angel serves no chain history, so the archive can
+# only ever start from the day it starts.
+chain_client, chain_dedicated = (
+    build_collector_client(settings, smartapi)
+    if settings.option_chain_collection_enabled
+    else (None, False)
+)
+if chain_client is not None and not chain_dedicated:
+    logger.info(
+        "[CHAIN] Collector is SHARING the live SmartAPI rate-limit budget. It yields to "
+        "live trading after a rate limit, but this is not isolation -- set "
+        "SMARTAPI_ANALYTICS_* to a second API key for a genuinely separate budget."
+    )
+
 scheduler = create_scheduler(
     monitor,
     health_manager,
     originator_job=lambda: run_origination_checks(smartapi, option_finder),
+    option_chain_job=(
+        (lambda: run_chain_collection(chain_client, dedicated=chain_dedicated))
+        if chain_client is not None else None
+    ),
+    option_chain_interval_minutes=settings.option_chain_interval_minutes,
+    closing_auction_job=lambda: capture_closing_auction(smartapi, SessionLocal),
 )
 health_manager.scheduler = scheduler
 
@@ -71,6 +96,17 @@ async def lifespan(_: FastAPI):
         logger.exception("SmartAPI authentication failed during startup")
         if settings.live_trading:
             raise
+    if chain_dedicated and chain_client is not None:
+        # Never fatal, whatever live_trading says. This client only reads market
+        # data for an archive; failing startup over it would let a data-
+        # collection problem stop trading, which is backwards.
+        try:
+            chain_client.authenticate()
+        except Exception:
+            logger.exception(
+                "[CHAIN] Analytics SmartAPI authentication failed; option-chain "
+                "collection will retry on its next cycle"
+            )
     scheduler.start()
     logger.info("Scheduler started")
     try:

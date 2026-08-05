@@ -27,6 +27,74 @@ Status as of 30 Jul 2026.
 > DO show a replicated positive edge, but only in a specific time window. See "Indicator
 > setup results" below. That is the live thread; the drift premise remains dead.
 
+## Walk-forward (31 Jul 2026) — the conclusion shifts from ENTRY to EXIT
+
+`scripts/walk_forward.py`, six consecutive session-aligned windows over two years,
+60-minute horizon, 11:00–14:00 regime.
+
+### The edge is not concentrated in one period
+
+Nearly every setup reads MOSTLY POSITIVE or better. Selected examples:
+
+| | windows positive | significant | mean edge | spread |
+|---|---|---|---|---|
+| NIFTY `ST_ALIGNED` | 6/6 | 2 | +3.96pp | 5.36pp |
+| NIFTY `EMA_STACK` | 6/6 | 1 | +3.60pp | 3.90pp |
+| NIFTY `ORB_BREAK[hold=2]` | 5/6 | 4 | +4.41pp | 7.84pp |
+| BANKNIFTY `ST_ALIGNED` | 5/6 | 1 | +2.15pp | 6.44pp |
+
+So the earlier hypothesis that the fit-window result was noise dressed up by a large
+sample is **not** what the data shows. The sign is consistent across time.
+
+### Three things that temper it
+
+1. **These four setups were SELECTED on this same data.** Sixteen were declared up
+   front, but the four passed to `--setups` are the ones that replicated. Setups chosen
+   for looking good pooled will tend to look positive per-window by construction. The
+   honest reading is *conditional on that selection*, the edge isn't period-specific.
+2. **Per-window significance is low** — typically 1–2 of 6, despite consistent signs.
+3. **W6 (2026-03-27 to 2026-07-28) CONTAINS the holdout** (2026-05-29 onward), and is
+   among the weakest windows almost everywhere: Nifty `EMA_STACK` +1.68pp, its lowest;
+   `PDH_PDL_BREAK` −3.00pp. The holdout landed in a genuinely weak stretch. Consistent,
+   not contradictory.
+
+### Reconciling a stable edge with a failed holdout
+
+Both are true, and the arithmetic shows how. Taking Nifty `ORB_BREAK[hold=2]` at its
++4.41pp mean, with symmetric ±12% payoffs:
+
+```
+gross   12% x 2 x 0.0441   =  +1.06%
+costs                       =  -0.56%
+theta   60 min, 5-8 DTE     =  -1.00%
+                              --------
+net                         =  -0.50%
+```
+
+**A 4pp directional edge does not survive costs plus decay under the current exit
+configuration.** The holdout showed the mechanism in more detail: hit rates were fine at
+52–59%, but average win ~6% against average loss ~9–11% — a win/loss ratio of 0.53–0.68.
+
+An average win of 6% against a 20% target means almost nothing reaches target: the 8%/5%
+trailing stop exits first while losers run the full 12% stop.
+
+### What this changes
+
+The conclusion moves from **"intraday direction is unpredictable"** to **"there may be a
+small, real, stable entry edge, and the current risk construction spends more than it is
+worth."**
+
+That is a materially different problem, and it points at the exit rather than the entry.
+
+**What must NOT be done:** tune exits against the holdout or against this two-year data.
+The holdout is spent literally; this data is spent by selection. Optimising the trail on
+the numbers that revealed the problem is exactly the overfitting this whole apparatus
+exists to prevent.
+
+The test that settles it needs data nobody has looked at yet — which is what the live
+paper system accumulates. That makes "keep paper running" the highest-value standing
+item, not a footnote.
+
 ## Existing-strategy comparison (31 Jul 2026) — and it inverts the premise
 
 The assumption throughout has been that the rule-based strategies are the profitable

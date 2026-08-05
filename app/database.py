@@ -169,6 +169,9 @@ def _ensure_columns() -> None:
             "target_index_points": "ALTER TABLE strategy_trades ADD COLUMN target_index_points FLOAT",
             "target_atr_multiple": "ALTER TABLE strategy_trades ADD COLUMN target_atr_multiple FLOAT",
             "risk_units_extrapolated": "ALTER TABLE strategy_trades ADD COLUMN risk_units_extrapolated BOOLEAN",
+            "calibration_bucket_matched": "ALTER TABLE strategy_trades ADD COLUMN calibration_bucket_matched BOOLEAN",
+            "trail_activate_percent": "ALTER TABLE strategy_trades ADD COLUMN trail_activate_percent FLOAT",
+            "trail_width_percent": "ALTER TABLE strategy_trades ADD COLUMN trail_width_percent FLOAT",
             "data_stale": "ALTER TABLE strategy_trades ADD COLUMN data_stale BOOLEAN",
         }
         with engine.begin() as connection:

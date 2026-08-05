@@ -116,6 +116,73 @@ def store_bars(db: Session, index_symbol: str, interval: str, bars: list[Bar]) -
     return len(payload)
 
 
+def capture_closing_auction(smartapi, session_factory) -> dict[str, float]:
+    """Re-fetch today's candles after the Closing Auction Session has settled.
+
+    WHY THIS JOB HAS TO EXIST
+    -------------------------
+    From 3 Aug 2026 the official closing value is determined by an auction that
+    concludes around 15:35, and it is published as a single bar near 15:29-15:30
+    after fifteen minutes with no bars at all. Measured on 3 Aug: Bank Nifty's
+    last continuous bar was 57,680.90 at 15:14 and the published close was
+    58,247.95 -- 567 points higher. Nifty: 24,573.55 against a 24,774.30 close.
+
+    Nothing in this system was fetching candles after 15:15, because AI
+    Origination stops there and it was the only live caller. So the last stored
+    bar of each session was the ~15:13-15:15 value and the CAS close was never
+    written. 3 Aug only has it by accident, from a manual backfill run that
+    evening; 4 Aug's stored close is the 15:13 bar.
+
+    That is not a cosmetic gap. market_context reads the previous session's
+    close the next morning to classify CPR and to place the previous-day levels
+    in the entry prompt, and a pivot is (H + L + C) / 3 -- so a close wrong by
+    567 points moves every derived level. This is the one route by which the
+    auction reaches live entry decisions, and it is silent: no error, no gap,
+    just a slightly wrong number.
+
+    Returns {index_symbol: stored close} for logging. Never raises -- a failure
+    here leaves the previous behaviour (a 15:13 close) rather than breaking
+    anything downstream.
+    """
+    from app.db_models import IndexConfig
+    from app.time_utils import to_ist, utc_now
+
+    captured: dict[str, float] = {}
+    now_ist = to_ist(utc_now())
+    with session_factory() as db:
+        indexes = [
+            index for index in db.scalars(select(IndexConfig))
+            if index.enabled and index.spot_token
+        ]
+        for index in indexes:
+            try:
+                rows = smartapi.get_candles(
+                    exchange=index.spot_exchange,
+                    symboltoken=index.spot_token,
+                    interval=ONE_MINUTE,
+                    # Today only. The auction bar is the sole reason for this
+                    # call, so there is no case for a wider window and every
+                    # reason not to spend the rate-limit budget on one.
+                    from_dt=now_ist.strftime("%Y-%m-%d 09:15"),
+                    to_dt=now_ist.strftime("%Y-%m-%d 15:45"),
+                )
+            except Exception as exc:
+                logger.warning("[CAS] %s: post-auction candle refresh failed: %s", index.symbol, exc)
+                continue
+            if not rows:
+                logger.warning("[CAS] %s: post-auction refresh returned no candles", index.symbol)
+                continue
+            bars = [parse_smartapi_row(row) for row in rows]
+            store_bars(db, index.symbol, ONE_MINUTE, bars)
+            last = max(bars, key=lambda bar: bar.ts_ist)
+            captured[index.symbol] = last.close
+            logger.info(
+                "[CAS] %s: session close captured as %.2f from the %s bar (%s bars refreshed)",
+                index.symbol, last.close, last.ts_ist.strftime("%H:%M"), len(bars),
+            )
+    return captured
+
+
 def load_bars(
     db: Session,
     index_symbol: str,

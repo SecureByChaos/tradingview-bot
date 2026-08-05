@@ -14,6 +14,7 @@ from app.option_finder import OptionFinder
 from app.platform import get_index_config, log_event, update_strategy_stats_after_close
 from app.signal_validation import check_premium_sanity, check_spot_price_deviation
 from app.smartapi_client import SmartAPIClient
+from app.premium_model import days_to_expiry, symmetric_premium_percent
 from app.telegram_service import TelegramService
 from app.trade_costs import estimate_round_trip_cost
 from app.time_utils import IST, format_ist, to_ist, utc_now
@@ -177,8 +178,19 @@ class MultiStrategyTradeManager:
         if mode == TradingMode.LIVE:
             order_id = self.smartapi.place_market_order(contract, "SELL" if is_short else "BUY", quantity)
 
-        stoploss = round(entry_price * (1 + strategy.sl_percent / 100), 2) if is_short else round(entry_price * (1 - strategy.sl_percent / 100), 2)
-        target = round(entry_price * (1 - strategy.tp_percent / 100), 2) if is_short else round(entry_price * (1 + strategy.tp_percent / 100), 2)
+        # Same CE/PE asymmetry as AI Origination: an identical percentage is a
+        # tighter index distance on a put. Rescale so both sides are the same
+        # bet. Falls through unchanged when no fitted coefficient covers the
+        # contract, rather than borrowing an unrelated bucket's.
+        dte = days_to_expiry(contract.expiry, to_ist(utc_now()).date())
+        sl_percent, bucket_matched = symmetric_premium_percent(
+            strategy.sl_percent, strategy.index_symbol, contract.option_type, dte
+        )
+        tp_percent, _ = symmetric_premium_percent(
+            strategy.tp_percent, strategy.index_symbol, contract.option_type, dte
+        )
+        stoploss = round(entry_price * (1 + sl_percent / 100), 2) if is_short else round(entry_price * (1 - sl_percent / 100), 2)
+        target = round(entry_price * (1 - tp_percent / 100), 2) if is_short else round(entry_price * (1 + tp_percent / 100), 2)
         now = utc_now()
         trade = StrategyTrade(
             trade_id=uuid4().hex,
@@ -192,6 +204,7 @@ class MultiStrategyTradeManager:
             expiry=contract.expiry,
             option_type=contract.option_type,
             quantity=quantity,
+            calibration_bucket_matched=bucket_matched,
             investment_amount=required_capital,
             entry_price=round(entry_price, 2),
             current_premium=round(entry_price, 2),
@@ -370,18 +383,24 @@ class MultiStrategyTradeManager:
                         # their original order with their original meaning and
                         # behaviour is unchanged.
                         if trade.origin.startswith("AI_ORIGIN_"):
-                            activation_price = trade.entry_price * (1 + _AI_ORIGIN_TRAIL_ACTIVATION_PERCENT / 100)
+                            # Per-trade values when present: they were rescaled
+                            # at entry so a CE and a PE get the same INDEX
+                            # distance rather than the same premium percentage
+                            # (puts are 1.28-1.53x more sensitive). Falls back
+                            # to the shared nominals for trades opened before
+                            # that rescale existed.
+                            activate_pct = trade.trail_activate_percent or _AI_ORIGIN_TRAIL_ACTIVATION_PERCENT
+                            width_pct = trade.trail_width_percent or _AI_ORIGIN_TRAIL_OFFSET_PERCENT
+                            activation_price = trade.entry_price * (1 + activate_pct / 100)
                             if not trade.trailing_active and premium >= activation_price:
                                 trade.trailing_active = True
                                 logger.info(
                                     "[TRAIL] %s armed at %.2f (entry %.2f, +%.1f%%)",
-                                    trade.trade_id, premium, trade.entry_price, _AI_ORIGIN_TRAIL_ACTIVATION_PERCENT,
+                                    trade.trade_id, premium, trade.entry_price, activate_pct,
                                 )
                             if trade.trailing_active:
                                 trade.trailing_stop = round(
-                                    trade.highest_price
-                                    - (trade.entry_price * (_AI_ORIGIN_TRAIL_OFFSET_PERCENT / 100)),
-                                    2,
+                                    trade.highest_price - (trade.entry_price * (width_pct / 100)), 2
                                 )
                         if trade.trailing_active and trade.trailing_stop is not None and premium <= trade.trailing_stop:
                             reason = ExitReason.TRAIL_EXIT

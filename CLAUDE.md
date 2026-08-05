@@ -54,6 +54,8 @@ bug once put AI Origination trades on the AI Alternatives page.
 | `trade-monitor` | 30s |
 | `ai-exit-shadow-check` | 3 min |
 | `ai-origination-check` | 5 min |
+| `option-chain-collect` | 5 min, mon-fri 09:00-15:59 IST (archival only) |
+| `closing-auction-capture` | 15:45 IST mon-fri (stores the CAS close) |
 | `daily-square-off` | 15:15 IST cron |
 
 ## Gotchas that have caused real bugs
@@ -79,6 +81,36 @@ zeros. Handle the `None`.
 instruments still in the live scrip master. Once a contract expires its intraday history
 is gone permanently — there is no archive. Any historical option pull is deadline-bound
 by expiry.
+
+**The DTE bucket function is deliberately duplicated and must not diverge.**
+`_dte_bucket` exists in both `scripts/backtest/premium.py` (numpy, fits the
+coefficients) and `app/premium_model.py` (stdlib, reads them at runtime). It cannot be
+imported across that boundary — nothing in `app.main`'s graph may pull numpy in.
+Divergence fails silently: the calibration writes one bucket name, the live lookup asks
+for another, no bucket ever matches, and every contract quietly falls back to an
+extrapolated coefficient. Across the real DTE range that is a factor-level error
+(Bank Nifty ATM CE ≈ 65 at 2–5 DTE, ≈ 25 at 21+). `tests/test_premium_buckets.py`
+enforces parity; buckets are `0-1 / 2-5 / 6-10 / 11-20 / 21+`.
+
+**A captured error is not a logged error.** Every AI Origination ERROR path builds a
+specific reason — an HTTP status from `AIClient`, a timeout, a parse failure — into
+`_Decision.reasoning`. For a week the cycle log printed only `-> ERROR (claude,
+secondary)` and dropped the reason, which read exactly like a swallowing `except` but
+wasn't one. Nothing was caught and discarded; the detail was captured and never written.
+Fixed 4 Aug: ERROR now logs the reason at ERROR level and persists an event.
+
+**`data_stale` labels, it does not gate.** `_load_market_context` returns a context built
+from stored history when the candle refresh fails, sets `data_stale=True`, warns, and
+proceeds. The fail-closed rule was implemented for missing ADX/ATR/Supertrend but *not*
+for a failed refresh. So a `Data Stale: YES` trade was opened on old data by design, not
+by accident — `scripts/stale_data_correlation.py` is the check on whether that choice
+costs anything.
+
+**Claude's call path caps output at 256 tokens; OpenAI's has no cap.** `_call_claude`
+sets `max_tokens: 256` while `_call_openai` sets `response_format: json_object` and no
+limit. A longer prompt means a longer `reasoning` field, and truncated JSON fails
+`extract_json_object` — so a prompt change can break one provider and not the other. The
+tell is `stop_reason == "max_tokens"`, now logged explicitly.
 
 **Index tokens are one digit apart and easy to confuse.**
 Nifty 50 spot = `99926000`, Bank Nifty spot = `99926009`, both NSE. A wrong token here
@@ -144,6 +176,81 @@ track record. It does not know which strike or premium its decision will produce
 does not know it already has positions open. Diagnosed failure mode: it reads *being at
 an extreme* as directional evidence ("price at session highs, therefore bullish").
 
+## Option-chain archive (collection only)
+
+`app/option_chain.py` snapshots OI, IV, volume, LTP and spot every 5 minutes for both
+indices, ATM ± 10 strikes, across the nearest two expiries plus the monthly if the
+nearest two missed it (Bank Nifty's already are monthlies; Nifty's usually are not).
+
+**Nothing live reads it and nothing in it is interpreted.** No PCR column — it is a
+ratio of summed OI, derivable at query time, and storing it would bake in a strike
+range a future analysis may not want. It exists because chain history cannot be
+backfilled: Angel serves none, so the archive can only start from the day it starts.
+Evaluating it needs months and the same significance machinery the price setups went
+through — do not wire it into a signal before that.
+
+It writes to **`data/option_chain.db`, a separate SQLite file**, not the trading DB.
+At ~210 rows per snapshot it accumulates on the order of 500 MB/year, which must not
+land in the file order placement and risk locks depend on. `--status` projects growth
+from measured bytes per row.
+
+**The rate-limit separation is partial and the code says so.** Angel limits per API
+key, so a second client on the same credentials buys no budget and merely drops the
+process-wide throttle. Set `SMARTAPI_ANALYTICS_*` for a real second key; without it the
+collector shares the live budget and stays subordinate — hard per-cycle call cap, and a
+full skip for 15 minutes after any rate limit on the live client. Cost is ~7 requests
+per cycle either way.
+
+Run `python -m scripts.collect_option_chain --once --probe` after deploying. Field
+names in `getMarketData` are not stable across SDK versions, and an archive of null
+open interest accumulates silently and looks fine until someone tries to use it.
+Confirmed 3 Aug: OI is `opnInterest`, volume `tradeVolume`, both present.
+
+**`impliedVolatility` from `optionGreek` is stored raw and its units are unverified.**
+The 3 Aug probe read 5.81 on a Bank Nifty 22-DTE contract whose own premium implies
+nearer 15% by a straddle estimate. Reconcile before any analysis leans on it.
+
+## Closing Auction Session (from 3 Aug 2026)
+
+NSE/SEBI added a Closing Auction Session for F&O-eligible **stocks**: continuous
+trading ends 15:15, auction runs 15:15–15:35, replacing the VWAP close. Index
+**derivatives are not auctioned** and trade continuously to 15:40.
+
+**The index value is frozen 15:15–15:30, not volatile.** Every Nifty/Bank Nifty
+constituent is in the auction, so there is no continuous matching underneath the index
+and NSE states the value "is constant as it is based on traded values". The 3 Aug
+spot/futures divergence is the visible signature — futures keep trading while spot sits
+still. `app/market_hours.py` is the single source of truth for these boundaries.
+
+**Live trading is not exposed, by construction.** Entries stop at 15:15
+(`_past_trading_end`), and every exit and the square-off price off *option premium* via
+`get_ltp`, which is continuously quoted until 15:40. Nothing in the trading path reads
+spot during the frozen window.
+
+**What the candles actually look like** (measured 3–4 Aug, `scripts/audit_auction_window.py`):
+one flat bar at 15:15 at the last continuous value, then *no bars at all* until a single
+bar around 15:29 carrying the auction close. Not fifteen flat bars — the feed emits
+nothing when nothing trades.
+
+| | 15:14 (last continuous) | 15:29 (CAS close) |
+|---|---|---|
+| Bank Nifty 3 Aug | 57,680.90 | **58,247.95** |
+| Nifty 3 Aug | 24,573.55 | **24,774.30** |
+
+Both 15:29 values match NSE's published closes exactly. The 200–567 point gap is real
+market structure, not a bad print.
+
+**The defect was that nothing fetched candles after 15:15.** AI Origination stops there
+and was the only live caller, so the stored session close was the ~15:13 bar and the CAS
+close was never written — 3 Aug has it only by accident, from a manual backfill that
+evening. `market_context` reads the previous close the next morning for CPR
+classification and PDH/PDL levels, and a pivot is (H+L+C)/3, so a close wrong by 567
+points moves every derived level. Fixed by the `closing-auction-capture` job at 15:45
+(`capture_closing_auction`).
+
+Nothing is held to expiry settlement (TIME_EXIT closes everything at 15:15), so the
+CAS-derived settlement value for expiry-day moneyness never applies to a position here.
+
 ## Live-trading safety (two-key pattern)
 
 Real orders require **both**:
@@ -180,6 +287,10 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000   # run
 pytest                                                      # tests
 python -m scripts.reconcile_origination                     # trade population split
 python -m scripts.pull_option_candles --dry-run             # option candle pull
+python -m scripts.calibrate_premium --db data/trading.db --write   # refit coefficients
+python -m scripts.collect_option_chain --status             # chain archive size/coverage
+python -m scripts.collect_option_chain --plan               # what would be collected
+python -m scripts.collect_option_chain --once --probe       # check broker field names
 ```
 
 ## Current state / open items
@@ -233,6 +344,30 @@ run is logged permanently. Any new hypothesis needs genuinely fresh out-of-sampl
 Net position: two years of candles, three independent signal constructions and a locked
 holdout have not demonstrated a tradeable edge in intraday index direction.
 
+### Walk-forward revised this: the problem is likely the EXIT, not the entry (31 Jul 2026)
+
+Six consecutive windows over two years show the midday setups are **MOSTLY POSITIVE or
+better almost everywhere** — Nifty `ST_ALIGNED` 6/6 windows positive (mean +3.96pp),
+`ORB_BREAK[hold=2]` 5/6 with 4 significant (mean +4.41pp). The edge is *not* concentrated
+in one period.
+
+Caveat: those setups were selected on this same data, so read it as "conditional on that
+selection, the edge isn't period-specific" rather than independent confirmation.
+
+The reconciliation with the failed holdout is arithmetic, not contradiction. At +4.41pp
+with symmetric ±12% payoffs: gross +1.06%, costs −0.56%, theta −1.00% → **net −0.50%**.
+A 4pp edge does not survive costs plus decay under the current exit configuration.
+
+The holdout showed the mechanism: hit rates were fine (52–59%), but average win ~6%
+against average loss ~9–11%. Almost nothing reaches the 20% target because the 8%/5%
+trail exits first, while losers run the full 12% stop.
+
+**So the working conclusion is now: a small, real, stable entry edge exists, and the risk
+construction spends more than it is worth.** Do NOT tune exits on the holdout (spent) or
+on the two-year data (spent by selection). That needs fresh out-of-sample data, which is
+what the live paper system accumulates — making "keep paper running" the highest-value
+standing item.
+
 ### Indicator setups showed a fit-window edge — but only midday, and it did not hold up (30 Jul 2026)
 
 Separate from drift, and this is the current live thread. Momentum and breakout setups
@@ -271,15 +406,50 @@ parameters in index points or ATR multiples, not premium percent** — a "12% st
 2.02 ATR on a Nifty call and 1.27 ATR on a put, which are different bets wearing the
 same label.
 
+The asymmetry shrinks with DTE: Bank Nifty ATM is 1.29 at 2–5 DTE but 1.11 at 21+. So
+the rescale bites hardest on Nifty weeklies (1.59 at 2–5) and barely at all on the Bank
+Nifty monthly.
+
+### Fitted lambda is attenuated at long DTE, and it matters asymmetrically
+
+Measured 3 Aug: ATM CE fits sit below `delta × spot / premium` by −3% (2–5 DTE), −11%
+(6–10) and −20% (21+) on Bank Nifty. Monotonic with DTE and always negative — that is
+the Epps effect, not a units error. A longer-dated contract prints less often, so its
+1-minute close is more often stale against a fresh index close, biasing the slope toward
+zero. `calibrate_premium` now detects and names this pattern.
+
+Consequences differ by consumer, and this is the part to remember:
+
+- `symmetric_premium_percent` uses a **ratio** of PE to CE lambda *within one bucket*.
+  Both legs are attenuated alike, so the CE/PE stop rescale is essentially immune.
+- `to_risk_units` **divides** by lambda. An understated lambda overstates index points
+  and ATR multiples, so reported ATR distances on the longest-dated contracts read wider
+  than they are. Treat Bank Nifty monthly ATR figures as an upper bound — part of the
+  "Bank Nifty 5.16–6.2 ATR vs Nifty 2.5–3.7" gap seen on 3 Aug is measurement, not risk.
+
 ### Days-to-expiry materially affects stop survivability
 
 Same 12% stop, breached by noise within 60 min: Bank Nifty calls 36.5% at 2–5 DTE versus
 23.4% at 6–10 DTE. Longer-dated contracts carry higher premium, so the same percentage
 is a wider index distance.
 
-AI Origination calls `find_atm_contract(signal, index, 0)` — nearest expiry, no offset,
-always. An expiry offset is the cheapest structural improvement identified so far and is
-independent of whether any entry signal works. Untested; see the roadmap.
+**Resolved 3 Aug.** AI Origination now passes a 5-DTE floor that *rolls forward* to the
+next listed expiry rather than skipping the trade, and stop/target/trail percentages are
+rescaled through `symmetric_premium_percent()` so a CE and a PE at the same nominal
+setting are the same index distance. Confirmed holding in live data — all trades at 8 or
+22 DTE, nothing under 5.
+
+Coefficient coverage is the constraint on that rescale, and it is now a first-class
+check: `calibrate_premium` reports covered vs missing DTE buckets per index and names the
+`pull_option_candles` command to fill a gap. A missing bucket is not a rounding error
+there; elasticity varies more than 2× across the traded range.
+
+**Filling a DTE bucket means pulling the same contract more than once, as it ages.**
+One pull only ever reaches the DTE the contract happened to be at. For a 25 Aug expiry:
+pull around 27 Jul–3 Aug for `21+`, around 5–14 Aug for `11-20`, around 15–20 Aug for
+`6-10`. `pull_option_candles` merges on re-run (it used to skip any contract whose file
+existed, which made every pull after the first a silent no-op — that is why `11-20` was
+empty). Today's date is always re-fetched, since a mid-session file holds a partial day.
 
 ### Backtest tooling
 

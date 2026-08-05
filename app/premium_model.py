@@ -42,6 +42,18 @@ COEFFICIENTS_PATH = Path("data/premium_coefficients.json")
 
 
 def _dte_bucket(dte: int) -> str:
+    """DTE -> bucket label.
+
+    MIRRORED from scripts/backtest/premium.py, which this module deliberately
+    does not import -- that module is numpy-based and nothing in app.main's
+    import graph may pull numpy in. tests/test_premium_buckets.py asserts the
+    two copies agree.
+
+    Divergence is the failure mode worth guarding against, because it is
+    silent: the calibration would write "21+" while this lookup asked for
+    "11+", no bucket would ever match, and every contract would quietly fall
+    back to an extrapolated coefficient with nothing in the logs to say why.
+    """
     if dte < 0:
         return "unknown"
     if dte <= 1:
@@ -50,7 +62,9 @@ def _dte_bucket(dte: int) -> str:
         return "2-5"
     if dte <= 10:
         return "6-10"
-    return "11+"
+    if dte <= 20:
+        return "11-20"
+    return "21+"
 
 
 @dataclass(frozen=True)
@@ -91,10 +105,11 @@ def lambda_for(
 ) -> tuple[float, bool] | None:
     """(premium %% per index %%, extrapolated) for a contract, or None.
 
-    The extrapolated flag matters and callers should surface it: Bank Nifty
-    currently trades a ~27 DTE monthly while the archive only covers 0-10 DTE,
-    and gamma differs enough across that range that applying the fit silently
-    would misstate every derived number.
+    The extrapolated flag matters and callers should surface it. Elasticity
+    varies by more than 2x across the DTE range actually traded -- Bank Nifty
+    ATM CE measures ~65 at 2-5 DTE against ~25 at 21+ -- so a coefficient
+    borrowed from the wrong bucket does not misstate a derived stop slightly,
+    it misstates it by a factor.
     """
     data = _load()
     if not data:
@@ -162,6 +177,64 @@ def to_risk_units(
         atr_multiple=round(atr_multiple, 2) if atr_multiple is not None else None,
         extrapolated=extrapolated,
     )
+
+
+def symmetric_premium_percent(
+    proposed_percent: float,
+    index_symbol: str,
+    option_type: str,
+    dte: int,
+    moneyness: str = "ATM",
+) -> tuple[float, bool]:
+    """Rescale a premium-percent risk level so CE and PE are the SAME bet.
+
+    THE PROBLEM THIS SOLVES
+    -----------------------
+    A "12% stop" is not one setting, it is two different bets wearing one
+    label. ATM puts are 1.28x (Bank Nifty) to 1.53x (Nifty) more sensitive to
+    index movement than calls, so the identical percentage is a much tighter
+    index distance on a put:
+
+        Nifty, 2-5 DTE, nominal 12% stop -> CE 43 index points (2.02 ATR)
+                                         -> PE 27 index points (1.27 ATR)
+
+    Puts were therefore being stopped by materially smaller moves than calls
+    under the same nominal setting, and nobody chose that.
+
+    THE FIX
+    -------
+    Interpret the proposed percentage against a CALL reference, convert it to
+    an index distance, then convert back using the ACTUAL contract's
+    sensitivity:
+
+        index_pct   = proposed_percent / |lambda_call|
+        premium_pct = index_pct * |lambda_actual|
+
+    For a call that is a no-op. For a put it WIDENS the premium stop by the
+    sensitivity ratio, so the index distance matches. A 12% call stop becomes
+    an ~18% put stop -- same bet, honestly labelled.
+
+    Returns (adjusted_percent, bucket_matched). When no fitted coefficient
+    covers this contract, returns the input unchanged with matched=False --
+    deliberately NOT silently borrowing an unrelated bucket's coefficient,
+    which would produce a confident wrong distance.
+    """
+    if not proposed_percent:
+        return proposed_percent, False
+    actual = lambda_for(index_symbol, option_type, dte, moneyness)
+    reference = lambda_for(index_symbol, "CE", dte, moneyness)
+    if actual is None or reference is None:
+        logger.info(
+            "[RISK] %s %s dte=%s: no fitted coefficient, keeping premium-percent behaviour",
+            index_symbol, option_type, dte,
+        )
+        return proposed_percent, False
+    lam_actual, _ = actual
+    lam_reference, _ = reference
+    if not lam_reference or not lam_actual:
+        return proposed_percent, False
+    adjusted = proposed_percent / abs(lam_reference) * abs(lam_actual)
+    return round(adjusted, 2), True
 
 
 def days_to_expiry(expiry: str, as_of_date) -> int:

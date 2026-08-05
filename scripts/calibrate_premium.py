@@ -26,6 +26,9 @@ from datetime import datetime
 from pathlib import Path
 
 from scripts.backtest.premium import (
+    DTE_BUCKET_NOMINAL,
+    DTE_BUCKET_ORDER,
+    DTE_BUCKET_UPPER,
     SESSION_MINUTES,
     fit_premium_model,
     select_multiplier,
@@ -35,32 +38,38 @@ from scripts.backtest.premium import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("calibrate_premium")
 
-# First-principles expectation, NOT a single observed fill.
+# First-principles expectation, NOT a single observed fill:
 #
 #     lambda = delta * spot / premium
 #
-# The premium term is why a single trade is a bad reference: elasticity scales
-# inversely with premium, so a cheap 0-DTE contract and a 6-DTE contract on the
-# same index have very different lambdas. An earlier version hardcoded 105 from
-# one 29-July fill (Rs 115.35 -> Rs 137.20, +18.94% on 0.181% index) and then
-# flagged a perfectly good 6-10 DTE fit as 44% off, because that fill was a
-# cheaper contract than the archive holds.
+# The premium term is why both a single trade AND a fixed reference are bad
+# baselines: elasticity scales inversely with premium, so a cheap 0-DTE
+# contract and a 27-DTE monthly on the same index have very different lambdas.
+# Two earlier versions were wrong in exactly this way -- one hardcoded 105 from
+# a single 29-July fill, the next hardcoded ATM premiums from the 20-24 July
+# archive -- and both flagged perfectly good fits as suspect whenever the
+# bucket under test held different contracts than the reference did.
 #
-# Reference premiums below are ATM levels observed in the 20-24 July archive
-# period, so the expectation matches the data actually being fitted.
-SMOKE_REFERENCE = {
-    # index: (spot, atm_premium, dte_bucket)
-    "NIFTY": (23950.0, 160.0, "2-5"),
-    "BANKNIFTY": (56900.0, 420.0, "2-5"),
-}
+# So the expectation is now rebuilt per bucket from that bucket's own median
+# premium and spot (PremiumFit.expected_lambda). Delta is the only thing still
+# assumed, and it is the only thing that legitimately can be.
 ASSUMED_ATM_DELTA = 0.5
-# Tightened from 60%: with a correct reference, a good fit lands inside ~15%.
-# Anything past 25% is worth investigating rather than waving through.
+# A good fit lands inside ~15% of expectation. Past 25% is worth investigating
+# rather than waving through -- though see the long-dated note in the output:
+# assuming delta = 0.5 flat costs a few percent at long expiry, where a true
+# ATM call sits nearer 0.53.
 SMOKE_TOLERANCE = 0.25
 
-
-def _expected_lambda(spot: float, premium: float) -> float:
-    return ASSUMED_ATM_DELTA * spot / premium * 1.0
+# Mirrors _MIN_DTE_TO_TRADE in app/ai/originator.py. Buckets entirely below the
+# floor cannot be reached by a live trade, so a missing fit there is a fact
+# about the archive, not a gap worth acting on. Reported as INFO rather than a
+# warning -- warning about something unreachable is how people learn to skim
+# past warnings that matter.
+#
+# It is duplicated rather than imported because app.ai.originator drags the
+# whole live app's import graph in, and this is a numpy script. If the floor
+# changes there, change it here.
+TRADEABLE_MIN_DTE = 5
 
 
 def _load_index_series(db_path: str, table: str) -> dict[str, dict[datetime, float]]:
@@ -175,12 +184,13 @@ def main() -> int:
 
     logger.info("")
     logger.info("  Stated-assumption decay (ATM, ~1/(2*DTE) per day over a %s-minute session):", SESSION_MINUTES)
-    for dte in (1, 3, 8, 27):
+    for bucket in DTE_BUCKET_ORDER:
+        dte = DTE_BUCKET_NOMINAL[bucket]
         per_min = theoretical_theta_per_minute(dte)
         logger.info(
-            "    %2d DTE -> %+.4f%%/min, %+.2f%% over a 45-minute hold%s",
-            dte, per_min, per_min * 45,
-            "  (Bank Nifty monthly)" if dte == 27 else "",
+            "    dte=%-6s (nominal %2d) -> %+.4f%%/min, %+.2f%% over a 45-minute hold%s",
+            bucket, dte, per_min, per_min * 45,
+            "  (Bank Nifty monthly)" if bucket == "21+" else "",
         )
     logger.info(
         "  At 3 DTE that is -2.0%% over 45 minutes -- a sixth of a 12%% stop, and the "
@@ -190,15 +200,23 @@ def main() -> int:
     # Sign alone is not sufficient. Real theta is MORE negative at shorter
     # expiry; if a bucket that came out negative still orders backwards against
     # its longer-dated sibling, it is negative by accident and equally unusable.
+    # Checked across EVERY adjacent pair of buckets present, not just 2-5 vs
+    # 6-10. With 11-20 and 21+ now fitted, a check hardcoded to the two
+    # shortest buckets would pass while the long end ordered backwards.
     ordering_ok = True
-    for index_symbol in ("BANKNIFTY", "NIFTY"):
+    for index_symbol in sorted({f.index_symbol for f in fitted_theta}):
         for option_type in ("CE", "PE"):
-            short = next((f for f in fitted_theta if f.index_symbol == index_symbol
-                          and f.option_type == option_type and f.dte_bucket == "2-5"), None)
-            long = next((f for f in fitted_theta if f.index_symbol == index_symbol
-                         and f.option_type == option_type and f.dte_bucket == "6-10"), None)
-            if short and long and short.theta_per_minute >= long.theta_per_minute:
-                ordering_ok = False
+            present = [
+                next((f for f in fitted_theta if f.index_symbol == index_symbol
+                      and f.option_type == option_type and f.dte_bucket == bucket), None)
+                for bucket in DTE_BUCKET_ORDER
+            ]
+            ladder = [f for f in present if f is not None]
+            for shorter, longer in zip(ladder, ladder[1:]):
+                # Real theta is MORE negative at shorter expiry, so walking the
+                # ladder outward theta must strictly increase.
+                if shorter.theta_per_minute >= longer.theta_per_minute:
+                    ordering_ok = False
     theta_usable = ordering_ok and all(f.theta_is_plausible for f in fitted_theta)
     logger.info("")
     logger.info(
@@ -210,59 +228,169 @@ def main() -> int:
     )
 
     logger.info("=" * 78)
-    logger.info("Smoke check against first principles (delta * spot / premium):")
-    for index_symbol, (spot, premium, dte_bucket) in SMOKE_REFERENCE.items():
-        expected = _expected_lambda(spot, premium)
-        matching = [
-            f for f in fits
-            if f.index_symbol == index_symbol
-            and f.option_type == "CE"
-            and f.moneyness_bucket == "ATM"
-            and f.dte_bucket == dte_bucket
-        ]
-        if not matching:
-            logger.warning("  %s: no ATM CE fit in the %s DTE bucket", index_symbol, dte_bucket)
+    logger.info(
+        "Smoke check against first principles (delta %.2f * median spot / median premium,"
+        " both measured per bucket):", ASSUMED_ATM_DELTA,
+    )
+    # EVERY ATM CE bucket, not a hand-picked pair. A check that only ever looks
+    # at 2-5 DTE cannot catch a units error in a long-dated bucket, and the
+    # long-dated buckets are the ones carrying live Bank Nifty positions.
+    suspect_buckets = []
+    deviations: dict[str, list[tuple[str, float]]] = {}
+    smoke_candidates = [
+        f for f in fits if f.option_type == "CE" and f.moneyness_bucket == "ATM"
+    ]
+    for fit in sorted(
+        smoke_candidates,
+        key=lambda f: (f.index_symbol, DTE_BUCKET_ORDER.index(f.dte_bucket)
+                       if f.dte_bucket in DTE_BUCKET_ORDER else 99),
+    ):
+        expected = fit.expected_lambda(ASSUMED_ATM_DELTA)
+        if expected is None or expected <= 0:
+            logger.warning(
+                "  %-10s ATM CE dte=%-6s no premium levels recorded, cannot check",
+                fit.index_symbol, fit.dte_bucket,
+            )
             continue
-        fit = matching[0]
-        deviation = abs(fit.multiplier - expected) / expected
+        # SIGNED, not absolute: the direction is diagnostic. A fit above
+        # expectation is the flat-delta assumption; a fit below it, growing
+        # with DTE, is measurement attenuation. See the check below.
+        signed = (fit.multiplier - expected) / expected
+        deviation = abs(signed)
+        deviations.setdefault(fit.index_symbol, []).append((fit.dte_bucket, signed))
         verdict = "OK" if deviation <= SMOKE_TOLERANCE else "SUSPECT"
         logger.info(
-            "  %-10s ATM CE dte=%s fitted=%6.1f expected=%6.1f (spot %.0f / prem %.0f) "
-            "deviation=%.0f%% -> %s",
-            index_symbol, dte_bucket, fit.multiplier, expected, spot, premium,
-            deviation * 100, verdict,
+            "  %-10s ATM CE dte=%-6s fitted=%6.1f expected=%6.1f "
+            "(spot %.0f / prem %.0f, n=%s) deviation=%+3.0f%% -> %s",
+            fit.index_symbol, fit.dte_bucket, fit.multiplier, expected,
+            fit.median_spot or 0.0, fit.median_premium or 0.0, fit.n_samples,
+            signed * 100, verdict,
         )
         if verdict == "SUSPECT":
-            logger.warning(
-                "  A coefficient this far off usually means a units error (delta vs "
-                "elasticity) or timestamp misalignment between the two series, not a "
-                "real market property. Resolve before trusting backtest output."
+            suspect_buckets.append(fit)
+
+    # NON-SYNCHRONOUS TRADING CHECK.
+    #
+    # If every bucket fits BELOW first principles and the shortfall GROWS with
+    # DTE, that pattern is not a units error and not a market property -- it is
+    # the Epps effect. A longer-dated contract trades less often, so its
+    # 1-minute close is more often a stale print while the index close is not.
+    # Regressing a stale y on a fresh x biases the slope toward zero, and the
+    # bias scales with how stale the option is.
+    #
+    # This matters because it hits the two consumers differently:
+    #   * symmetric_premium_percent uses a RATIO of PE to CE lambda WITHIN one
+    #     bucket. Both legs are attenuated alike, so the ratio -- and therefore
+    #     the CE/PE stop rescale -- is essentially unaffected.
+    #   * to_risk_units divides by lambda to get index points and ATR
+    #     multiples. An understated lambda OVERSTATES those, so reported ATR
+    #     distances on the least liquid contracts read wider than they are.
+    for index_symbol, series in sorted(deviations.items()):
+        ordered = sorted(
+            series,
+            key=lambda pair: DTE_BUCKET_ORDER.index(pair[0])
+            if pair[0] in DTE_BUCKET_ORDER else 99,
+        )
+        if len(ordered) < 3:
+            continue
+        signs = [value for _, value in ordered]
+        if all(value < 0 for value in signs) and signs == sorted(signs, reverse=True):
+            logger.info("")
+            logger.info(
+                "  %s: every bucket fits BELOW first principles and the shortfall grows "
+                "with DTE (%s). That ordering is the signature of non-synchronous "
+                "trading, not a units error -- a longer-dated option prints less often, "
+                "so its 1-minute close is more often stale against a fresh index close, "
+                "which biases the fitted slope toward zero.",
+                index_symbol,
+                ", ".join(f"{bucket} {value * 100:+.0f}%" for bucket, value in ordered),
             )
+            logger.info(
+                "  Consequence: CE/PE stop rescaling is a RATIO within one bucket, so it "
+                "is largely immune. Index-point and ATR conversions divide by lambda, so "
+                "they are OVERSTATED by roughly this much on the longest-dated contracts. "
+                "Read Bank Nifty monthly ATR figures as an upper bound."
+            )
+    if suspect_buckets:
+        logger.warning(
+            "  %s bucket(s) outside %.0f%%. A gap this size usually means a units error "
+            "(delta vs elasticity) or timestamp misalignment between the two series, not "
+            "a real market property. Resolve before trusting backtest output.",
+            len(suspect_buckets), SMOKE_TOLERANCE * 100,
+        )
+        logger.warning(
+            "  One benign exception: at long expiry a true ATM call's delta is nearer "
+            "0.53 than 0.50, so a 21+ bucket reading a few percent ABOVE expectation is "
+            "the flat-delta assumption showing, not a broken fit. A bucket reading far "
+            "BELOW, or any short-dated bucket off by this much, is not."
+        )
 
     # Put/call asymmetry is a real property, not an artefact, and it matters for
     # risk sizing: an identical percentage stop on a PE corresponds to a smaller
     # index move than on a CE.
-    for index_symbol in SMOKE_REFERENCE:
-        ce = [f for f in fits if f.index_symbol == index_symbol and f.option_type == "CE" and f.moneyness_bucket == "ATM"]
-        pe = [f for f in fits if f.index_symbol == index_symbol and f.option_type == "PE" and f.moneyness_bucket == "ATM"]
-        if ce and pe:
-            ce_mean = sum(f.multiplier for f in ce) / len(ce)
-            pe_mean = sum(abs(f.multiplier) for f in pe) / len(pe)
+    #
+    # Reported PER DTE BUCKET as well as pooled, because the asymmetry is not
+    # constant: Bank Nifty ATM runs ~1.29 at 2-5 DTE but ~1.12 at 21+. Pooling
+    # across buckets averages those into a number that describes neither, and
+    # the rescale in app/premium_model.py applies per bucket, so the per-bucket
+    # figures are the ones that describe what live trading actually does.
+    for index_symbol in sorted({f.index_symbol for f in fits}):
+        atm = [f for f in fits if f.index_symbol == index_symbol and f.moneyness_bucket == "ATM"]
+        ce = [f for f in atm if f.option_type == "CE"]
+        pe = [f for f in atm if f.option_type == "PE"]
+        if not (ce and pe):
+            continue
+        ce_mean = sum(f.multiplier for f in ce) / len(ce)
+        pe_mean = sum(abs(f.multiplier) for f in pe) / len(pe)
+        logger.info(
+            "  %-10s ATM |PE|/CE sensitivity ratio = %.2f (PE %.1f vs CE %.1f), pooled",
+            index_symbol, pe_mean / ce_mean if ce_mean else 0.0, pe_mean, ce_mean,
+        )
+        for bucket in DTE_BUCKET_ORDER:
+            ce_b = next((f for f in ce if f.dte_bucket == bucket), None)
+            pe_b = next((f for f in pe if f.dte_bucket == bucket), None)
+            if not (ce_b and pe_b and ce_b.multiplier):
+                continue
             logger.info(
-                "  %-10s ATM |PE|/CE sensitivity ratio = %.2f (PE %.1f vs CE %.1f)",
-                index_symbol, pe_mean / ce_mean if ce_mean else 0.0, pe_mean, ce_mean,
+                "               dte=%-6s ratio = %.2f (PE %.1f vs CE %.1f)",
+                bucket, abs(pe_b.multiplier) / abs(ce_b.multiplier),
+                abs(pe_b.multiplier), ce_b.multiplier,
             )
 
     logger.info("=" * 78)
-    banknifty = [f for f in fits if f.index_symbol == "BANKNIFTY"]
-    if banknifty and all(f.dte_bucket in ("0-1", "2-5", "6-10") for f in banknifty):
-        logger.warning(
-            "Bank Nifty fits cover 0-8 DTE only. Bank Nifty now trades the ~27 DTE "
-            "monthly, which is outside this range -- gamma differs substantially. "
-            "Either archive fresh option candles for the current monthly, or flag "
-            "every Bank Nifty backtest result as extrapolated. Do not apply an "
-            "8-DTE coefficient to a 27-DTE contract silently."
+    logger.info("DTE coverage per index (ATM CE, which is what the rescale keys off):")
+    for index_symbol in sorted({f.index_symbol for f in fits}):
+        covered = {
+            f.dte_bucket for f in fits
+            if f.index_symbol == index_symbol and f.moneyness_bucket == "ATM"
+        }
+        missing = [b for b in DTE_BUCKET_ORDER if b not in covered]
+        # A bucket whose whole range sits under the trading floor can never
+        # carry a live position, so its absence is not a gap to chase.
+        unreachable = [b for b in missing if DTE_BUCKET_UPPER[b] < TRADEABLE_MIN_DTE]
+        gaps = [b for b in missing if b not in unreachable]
+        logger.info(
+            "  %-10s covered: %s%s",
+            index_symbol,
+            ", ".join(b for b in DTE_BUCKET_ORDER if b in covered) or "(none)",
+            f"   MISSING: {', '.join(gaps)}" if gaps else "",
         )
+        if unreachable:
+            logger.info(
+                "               (%s not fitted, but below the %s-DTE trading floor -- "
+                "unreachable, so not a gap)",
+                ", ".join(unreachable), TRADEABLE_MIN_DTE,
+            )
+        if gaps:
+            logger.warning(
+                "  %s has no fit for %s. Any contract landing in those buckets falls back "
+                "to the best-sampled bucket and is flagged extrapolated -- which across "
+                "this DTE range is a factor-level error, not a rounding one. Archive "
+                "option candles covering those DTEs before trusting derived stops there: "
+                "python -m scripts.pull_option_candles --index %s --expiry <DDMMMYYYY> "
+                "--start <date> --end <date> --strike-band 3",
+                index_symbol, ", ".join(gaps), index_symbol,
+            )
 
     if args.write:
         out_path = Path("data/premium_coefficients.json")
@@ -298,9 +426,14 @@ def main() -> int:
                     "theta_is_plausible": f.theta_is_plausible,
                     "theta_assumed_per_minute": round(
                         theoretical_theta_per_minute(
-                            {"0-1": 1, "2-5": 3, "6-10": 8}.get(f.dte_bucket, 27)
+                            DTE_BUCKET_NOMINAL.get(f.dte_bucket, 27)
                         ), 6,
                     ),
+                    # Levels the bucket was fitted on. Carried so the smoke
+                    # check is reproducible from the JSON alone, without
+                    # re-reading the option archive.
+                    "median_premium": None if f.median_premium is None else round(f.median_premium, 2),
+                    "median_spot": None if f.median_spot is None else round(f.median_spot, 2),
                     "multiplier_joint": None if f.multiplier_joint is None else round(f.multiplier_joint, 4),
                     "r_squared_joint": None if f.r_squared_joint is None else round(f.r_squared_joint, 4),
                 }

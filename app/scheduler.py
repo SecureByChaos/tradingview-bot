@@ -18,6 +18,9 @@ def create_scheduler(
     monitor: TradeMonitor,
     health_manager: object | None = None,
     originator_job: Callable[[], None] | None = None,
+    option_chain_job: Callable[[], None] | None = None,
+    option_chain_interval_minutes: int = 5,
+    closing_auction_job: Callable[[], None] | None = None,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(
@@ -45,6 +48,30 @@ def create_scheduler(
             max_instances=1,
             coalesce=True,
         )
+    if option_chain_job is not None:
+        # Archival only -- nothing live reads what this writes. Restricted to
+        # weekdays and roughly session hours by cron as a first gate; the job
+        # itself re-checks market hours, so a holiday costs one no-op call
+        # rather than a wasted sweep.
+        #
+        # coalesce + max_instances=1 matter more here than elsewhere: if the
+        # process is paused or the broker is slow, a backlog of chain sweeps
+        # firing at once is exactly the burst that would contend with live
+        # trading's rate-limit budget.
+        scheduler.add_job(
+            option_chain_job,
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour="9-15",
+                minute=f"*/{max(option_chain_interval_minutes, 1)}",
+                timezone=IST,
+            ),
+            id="option-chain-collect",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
     scheduler.add_job(
         monitor.square_off,
         trigger=CronTrigger(hour=15, minute=15, timezone=IST),
@@ -53,6 +80,20 @@ def create_scheduler(
         max_instances=1,
         coalesce=True,
     )
+    if closing_auction_job is not None:
+        # 15:45, after the auction concludes (~15:35) and after derivatives
+        # stop at 15:40. Deliberately NOT at 15:35 -- the closing bar has to be
+        # published and served by the historical API before it can be fetched,
+        # and this job runs once a day, so ten minutes of slack costs nothing
+        # while being early costs the whole point of the job.
+        scheduler.add_job(
+            closing_auction_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=45, timezone=IST),
+            id="closing-auction-capture",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     if health_manager is not None:
         scheduler.add_job(
             health_manager.run,

@@ -78,7 +78,9 @@ class OptionFinder:
         self.settings = settings
         self.smartapi = smartapi
 
-    def find_atm_contract(self, signal: Signal, index: Any = None, expiry_itm_strikes: int = 0) -> OptionContract:
+    def find_atm_contract(
+        self, signal: Signal, index: Any = None, expiry_itm_strikes: int = 0, min_dte: int = 0
+    ) -> OptionContract:
         index = index or self._default_index()
         spot_price = self.smartapi.get_index_spot(index)
         strike_interval = index.strike_interval or 100
@@ -88,6 +90,31 @@ class OptionFinder:
         matches = self._filter_index_options(instruments, index, option_type)
         if matches.empty:
             raise ValueError(f"No {index.symbol} {option_type} contracts found in instrument master")
+
+        # min_dte ROLLS FORWARD to the next listed expiry rather than declining
+        # to trade. Skipping would silence origination entirely on the days
+        # where the nearest expiry is close -- for a weekly-expiry index that
+        # is most of the week -- which is a much larger behavioural change than
+        # the DTE finding calls for. The finding is that a given percentage
+        # stop survives noise better at longer DTE (36.5% breach at 2-5 DTE
+        # versus 23.4% at 6-10 on Bank Nifty calls), so the fix is to trade a
+        # later contract, not to stop trading.
+        today = datetime.now(IST).date()
+        eligible = matches
+        if min_dte > 0:
+            eligible = matches[(matches["expiry_dt"] - today).apply(lambda d: d.days) >= min_dte]
+            if eligible.empty:
+                logger.info(
+                    "No %s %s expiry at least %s DTE out; falling back to nearest available",
+                    index.symbol, option_type, min_dte,
+                )
+                eligible = matches
+            elif eligible["expiry_dt"].min() != matches["expiry_dt"].min():
+                logger.info(
+                    "%s: rolled from %s to %s to satisfy the %s-DTE floor",
+                    index.symbol, matches["expiry_dt"].min(), eligible["expiry_dt"].min(), min_dte,
+                )
+        matches = eligible
 
         nearest_expiry = matches["expiry_dt"].min()
         is_expiry_day = nearest_expiry == datetime.now(IST).date()
