@@ -1144,17 +1144,6 @@ def run_origination_checks(
                     sorted(k for k, v in market_context.setups.items() if v),
                 )
 
-                user_prompt = _build_user_prompt(index, price, market_context, now_ist)
-                if _prompt_has_defect(user_prompt):
-                    logger.error(
-                        "[AI][ORIGIN] %s: malformed prompt (contains None/nan/0.00 pts), skipping cycle", index.symbol
-                    )
-                    log_event(
-                        session, "AI_ORIGIN",
-                        f"[{index.display_name or index.symbol}] Malformed prompt detected, cycle skipped",
-                        level="ERROR",
-                    )
-                    continue
                 for turn, provider_name, view in provider_order:
                     # Each provider gets its own independent trade slot per
                     # index -- Claude and OpenAI can each hold their own open
@@ -1163,6 +1152,38 @@ def run_origination_checks(
                     # other out entirely.
                     if _has_open_origination(session, index.symbol, provider_name):
                         continue
+
+                    # Refreshed PER PROVIDER, not once per cycle. Both providers
+                    # are evaluated inside the same cycle seconds apart, so a
+                    # count taken before the loop would tell the second provider
+                    # "0 entries today" even though the first had just opened
+                    # one. That is exactly the case this field exists to expose
+                    # -- the 5 Aug 13:48 Nifty PE stacking -- so computing it
+                    # once outside the loop would have made it blind to the
+                    # thing it was added for.
+                    #
+                    # The prompt is rebuilt for the same reason: it is pure
+                    # string formatting over an already-built context, so the
+                    # cost is nil, and it means market_context_json records what
+                    # this provider actually saw rather than what the cycle
+                    # started with.
+                    market_context.same_direction_entries_today = _same_direction_entries_today(
+                        session, index.symbol
+                    )
+                    user_prompt = _build_user_prompt(index, price, market_context, now_ist)
+                    if _prompt_has_defect(user_prompt):
+                        logger.error(
+                            "[AI][ORIGIN] %s: malformed prompt (contains None/nan/0.00 pts), "
+                            "skipping %s this cycle", index.symbol, provider_name,
+                        )
+                        log_event(
+                            session, "AI_ORIGIN",
+                            f"[{index.display_name or index.symbol}] Malformed prompt detected, "
+                            f"{provider_name} skipped",
+                            level="ERROR",
+                        )
+                        continue
+
                     decision = _call_provider(provider_name, view, user_prompt)
                     if decision is None:
                         continue
