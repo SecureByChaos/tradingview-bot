@@ -61,6 +61,19 @@ class Pair:
     signal_pnl: float
     alt_pnl: float
     entry_day: str
+    # The source SIGNAL trade. Both providers produce an alternative for the
+    # SAME rejected signal, so pairs are CLUSTERED on this -- two rows sharing
+    # a source_id are not two independent observations, and a sign test that
+    # treats them as such is anti-conservative.
+    source_id: str
+    # Configured stop distance on each arm, as a percent of entry. Recorded
+    # because the arms do not use the same risk construction: alternatives
+    # default to 10% SL / 20% target while the signal trade runs its
+    # strategy's own. If those differ, the comparison confounds "was the
+    # alternative a better trade" with "was the stop tighter", and the second
+    # explains a lot of what the first appears to show.
+    signal_sl_percent: float | None
+    alt_sl_percent: float | None
 
     @property
     def difference(self) -> float:
@@ -86,20 +99,23 @@ def _load(db_path: str, use_net: bool) -> list[Pair]:
         rows = connection.execute(
             """
             SELECT
-                a.origin        AS alt_origin,
-                a.ai_action     AS action,
-                a.ai_confidence AS confidence,
-                a.index_symbol  AS index_symbol,
-                a.strategy_name AS strategy,
-                a.entry_time    AS alt_entry_time,
-                a.profit_loss   AS alt_gross,
-                a.net_pnl       AS alt_net,
-                a.entry_price   AS alt_entry,
-                a.quantity      AS alt_qty,
-                s.profit_loss   AS sig_gross,
-                s.net_pnl       AS sig_net,
-                s.entry_price   AS sig_entry,
-                s.quantity      AS sig_qty
+                a.origin          AS alt_origin,
+                a.ai_action       AS action,
+                a.ai_confidence   AS confidence,
+                a.index_symbol    AS index_symbol,
+                a.strategy_name   AS strategy,
+                a.entry_time      AS alt_entry_time,
+                a.profit_loss     AS alt_gross,
+                a.net_pnl         AS alt_net,
+                a.entry_price     AS alt_entry,
+                a.quantity        AS alt_qty,
+                a.stoploss        AS alt_sl,
+                a.source_trade_id AS source_id,
+                s.profit_loss     AS sig_gross,
+                s.net_pnl         AS sig_net,
+                s.entry_price     AS sig_entry,
+                s.quantity        AS sig_qty,
+                s.stoploss        AS sig_sl
             FROM strategy_trades a
             JOIN strategy_trades s ON s.trade_id = a.source_trade_id
             WHERE a.origin LIKE 'AI_ALT_%'
@@ -122,6 +138,12 @@ def _load(db_path: str, use_net: bool) -> list[Pair]:
         )
         if alt is None or sig is None:
             continue
+
+        def _sl_percent(stoploss, entry) -> float | None:
+            if not stoploss or not entry:
+                return None
+            return (entry - stoploss) / entry * 100.0
+
         pairs.append(
             Pair(
                 provider=str(row["alt_origin"]).replace("AI_ALT_", ""),
@@ -132,6 +154,9 @@ def _load(db_path: str, use_net: bool) -> list[Pair]:
                 signal_pnl=sig,
                 alt_pnl=alt,
                 entry_day=str(row["alt_entry_time"])[:10],
+                source_id=str(row["source_id"]),
+                signal_sl_percent=_sl_percent(row["sig_sl"], row["sig_entry"]),
+                alt_sl_percent=_sl_percent(row["alt_sl"], row["alt_entry"]),
             )
         )
     return pairs
@@ -219,15 +244,72 @@ def main() -> int:
     for action in sorted({p.action for p in pairs if p.action}):
         _report(f"  action={action}", [p for p in pairs if p.action == action])
 
+    # CLUSTER on the source signal. Both providers review the same rejected
+    # signal, so two rows can share a source_trade_id -- and they share its
+    # entire market context, not just its identity. Treating them as two
+    # independent observations overstates n and makes the sign test
+    # anti-conservative. Collapsed by averaging the alternatives' differences
+    # against their common source, so each rejected signal counts once.
+    by_source: dict[str, list[float]] = {}
+    for pair in pairs:
+        by_source.setdefault(pair.source_id, []).append(pair.difference)
+    clustered = [sum(values) / len(values) for values in by_source.values()]
+
     differences = [p.difference for p in pairs]
     wins = sum(1 for d in differences if d > 0)
     p_value = _sign_test(wins, len(differences))
-    low, high = _bootstrap(differences, BOOTSTRAP_ROUNDS)
+    c_wins = sum(1 for d in clustered if d > 0)
+    c_p = _sign_test(c_wins, len(clustered))
+    low, high = _bootstrap(clustered, BOOTSTRAP_ROUNDS)
 
     logger.info("")
-    logger.info("  Paired sign test: alt better in %s of %s -> p = %.4f (exact, two-sided)",
+    if len(clustered) < len(pairs):
+        logger.info(
+            "  %s pairs come from %s distinct rejected signals (%s reviewed by both providers).",
+            len(pairs), len(clustered), len(pairs) - len(clustered),
+        )
+    logger.info("  Naive per-pair sign test:  alt better %s/%s -> p = %.4f  [OVERSTATES n if clustered]",
                 wins, len(differences), p_value)
-    logger.info("  Mean paired difference 95%% CI: [%+.2f%%, %+.2f%%]", low, high)
+    logger.info("  CLUSTERED sign test:       alt better %s/%s -> p = %.4f  <-- the one to read",
+                c_wins, len(clustered), c_p)
+    logger.info("  Mean paired difference 95%% CI (clustered): [%+.2f%%, %+.2f%%]", low, high)
+
+    # THE CONFOUND. Report it before any verdict, because it can generate the
+    # entire apparent effect on its own.
+    sig_sls = [p.signal_sl_percent for p in pairs if p.signal_sl_percent is not None]
+    alt_sls = [p.alt_sl_percent for p in pairs if p.alt_sl_percent is not None]
+    if sig_sls and alt_sls:
+        sig_mean = sum(sig_sls) / len(sig_sls)
+        alt_mean = sum(alt_sls) / len(alt_sls)
+        logger.info("")
+        logger.info("  Configured stop distance: signal %.1f%% vs alternative %.1f%%", sig_mean, alt_mean)
+        if abs(sig_mean - alt_mean) > 1.0:
+            logger.warning(
+                "  THE TWO ARMS DO NOT USE THE SAME RISK CONSTRUCTION. Alternatives default to "
+                "10%% SL / 20%% target (alternative_trader.py); the signal trade runs its "
+                "strategy's own. A tighter stop caps losses AND clips winners, which produces "
+                "exactly the pattern of 'better on losing signals, worse on winning ones' -- "
+                "with no difference in judgment required."
+            )
+            logger.warning(
+                "  So this does NOT cleanly measure whether the model picks better trades. What "
+                "it DOES measure, on matched setups in matched regimes, is one risk construction "
+                "against another -- which is the open question the walk-forward analysis "
+                "landed on. Read it as an exit experiment, not a selection experiment."
+            )
+        by_outcome = [
+            ("signal LOST", [p for p in pairs if p.signal_pnl < 0]),
+            ("signal WON", [p for p in pairs if p.signal_pnl >= 0]),
+        ]
+        for label, subset in by_outcome:
+            if subset:
+                sub_wins = sum(1 for p in subset if p.difference > 0)
+                logger.info(
+                    "    %-12s n=%-3s alt better %s/%s  mean diff %+.2f%%",
+                    label, len(subset), sub_wins, len(subset),
+                    sum(p.difference for p in subset) / len(subset),
+                )
+    p_value = c_p
 
     logger.info("")
     if p_value < 0.05 and wins > len(differences) / 2:
@@ -245,14 +327,15 @@ def main() -> int:
     else:
         # The honest framing at n=17: what would it have taken.
         needed = next(
-            (w for w in range(len(differences), 0, -1) if _sign_test(w, len(differences)) >= 0.05),
-            len(differences),
+            (w for w in range(len(clustered), 0, -1) if _sign_test(w, len(clustered)) >= 0.05),
+            len(clustered),
         )
         logger.info(
-            "  Not distinguishable from chance. At n=%s the sign test needs %s+ wins to clear "
-            "p<0.05; this has %s. That is a sample-size statement, not a verdict -- the pairing "
-            "means each additional trade is worth more here than in any unpaired comparison.",
-            len(differences), needed + 1, wins,
+            "  Not distinguishable from chance. At n=%s distinct signals the sign test needs %s+ "
+            "wins to clear p<0.05; this has %s. That is a sample-size statement, not a verdict -- "
+            "the pairing means each additional signal is worth more here than in any unpaired "
+            "comparison.",
+            len(clustered), needed + 1, c_wins,
         )
 
     days = {p.entry_day for p in pairs}
