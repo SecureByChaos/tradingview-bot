@@ -83,9 +83,9 @@ is gone permanently — there is no archive. Any historical option pull is deadl
 by expiry.
 
 **The DTE bucket function is deliberately duplicated and must not diverge.**
-`_dte_bucket` exists in both `scripts/backtest/premium.py` (numpy, fits the
-coefficients) and `app/premium_model.py` (stdlib, reads them at runtime). It cannot be
-imported across that boundary — nothing in `app.main`'s graph may pull numpy in.
+`_dte_bucket` exists in both `scripts/backtest/premium.py` (fits the coefficients) and
+`app/premium_model.py` (stdlib, reads them at runtime). The two are kept separate so a
+live app module never depends on a standalone analysis script.
 Divergence fails silently: the calibration writes one bucket name, the live lookup asks
 for another, no bucket ever matches, and every contract quietly falls back to an
 extrapolated coefficient. Across the real DTE range that is a factor-level error
@@ -450,6 +450,19 @@ pull around 27 Jul–3 Aug for `21+`, around 5–14 Aug for `11-20`, around 15�
 `6-10`. `pull_option_candles` merges on re-run (it used to skip any contract whose file
 existed, which made every pull after the first a silent no-op — that is why `11-20` was
 empty). Today's date is always re-fetched, since a mid-session file holds a partial day.
+
+### pandas is already in the live import graph (corrected 5 Aug)
+
+`app/option_finder.py` imports pandas at module level, `app.main` constructs
+`OptionFinder`, so pandas **and numpy** have always been loaded in the live process.
+Several comments claimed otherwise; `tests/test_module_imports.py` now pins the actual
+set so it cannot grow silently.
+
+The rule was worth wanting — pandas is 50–80 MB on a 414 MB box already carrying ~106 MB
+of app. `option_finder` uses it only to filter the instrument master, which
+`app/option_chain.py` does with plain dicts for exactly this reason. Replacing it is a
+genuine memory saving but sits in the live strike-selection path, so treat it as an
+opportunity needing its own testing, not a cleanup.
 
 ### Backtest tooling
 

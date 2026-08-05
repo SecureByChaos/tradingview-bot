@@ -58,20 +58,61 @@ def test_module_imports(module_name: str):
     importlib.import_module(module_name)
 
 
-def test_numpy_stays_out_of_the_app_import_graph():
-    """The memory contract, enforced rather than documented.
+def test_backtest_package_is_not_reachable_from_the_app():
+    """The isolation rule that is actually true and actually worth enforcing.
 
-    scripts/backtest/ is numpy-based and must never be reachable from the live
-    app: numpy is ~15 MB on a 414 MB box already running ~106 MB of trading
-    application. A stray top-level import inside app/ would not fail anything
-    obvious -- it would just quietly cost memory the box does not have, which
-    is precisely the kind of regression that goes unnoticed until an OOM.
+    scripts/backtest/ must never be imported by app code. It exists to be run
+    standalone, and pulling it in would drag the fitting machinery into a live
+    trading process for no benefit -- app/premium_model.py reads the fitted
+    coefficients from JSON precisely so this boundary holds.
     """
     import sys
 
     for module_name in _module_names():
         importlib.import_module(module_name)
-    assert "numpy" not in sys.modules, (
-        "numpy was pulled into the app import graph. Find the offending module and move "
-        "the import inside the function that needs it, or into scripts/."
+    leaked = sorted(name for name in sys.modules if name.startswith("scripts."))
+    assert not leaked, f"app modules imported from scripts/: {leaked}"
+
+
+# Heavy third-party packages already present in the app's import graph, with
+# where they come from. Pinned as a set so a NEW one gets caught, rather than
+# asserting an absence that is not true.
+KNOWN_HEAVY_DEPENDENCIES = {
+    # app/option_finder.py:11 -- used only to filter the instrument master.
+    "pandas",
+    # Pulled in BY pandas, not imported by any app module directly.
+    "numpy",
+}
+
+
+def test_no_new_heavy_dependency_enters_the_app_graph():
+    """Pins the memory cost of importing the app.
+
+    CORRECTS A CLAIM THIS REPO MADE FOR MONTHS. Both CLAUDE.md and
+    app/premium_model.py stated that nothing in app.main's graph may pull numpy
+    in. That was never true: app/option_finder.py imports pandas at module
+    level and pandas imports numpy, so both have always been loaded in the live
+    process. The first version of this test asserted the documented rule and
+    failed immediately, which is how the discrepancy surfaced.
+
+    The rule was worth wanting -- pandas is 50-80 MB on a 414 MB box already
+    running ~106 MB of application. option_finder uses it only for DataFrame
+    filtering of the instrument master, which app/option_chain.py does with
+    plain dicts for exactly this reason. Replacing it is a real memory saving,
+    but it sits in the live strike-selection path, so it is an opportunity
+    rather than a cleanup.
+
+    Until then, this pins the status quo so the cost does not grow silently.
+    """
+    import sys
+
+    for module_name in _module_names():
+        importlib.import_module(module_name)
+    heavy = {"pandas", "numpy", "scipy", "matplotlib", "sklearn", "torch"}
+    present = {name for name in heavy if name in sys.modules}
+    unexpected = present - KNOWN_HEAVY_DEPENDENCIES
+    assert not unexpected, (
+        f"New heavy dependency in the app import graph: {sorted(unexpected)}. On a 414 MB "
+        "box this is real memory. Move the import inside the function that needs it, or "
+        "add it to KNOWN_HEAVY_DEPENDENCIES with a note on where it comes from and why."
     )

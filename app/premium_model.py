@@ -15,10 +15,21 @@ multiples; premium percent is a label that hides the actual bet.
 
 WHY IT LOADS FROM JSON RATHER THAN IMPORTING THE FIT
 ----------------------------------------------------
-The coefficients are fitted in scripts/backtest/premium.py, which is numpy-
-based. Nothing in app.main's import graph may pull numpy in -- that is ~15 MB
-on a 414 MB box already running ~106 MB of live app. So the calibration script
-writes its results to a data file and this module reads them with the stdlib.
+The coefficients are fitted in scripts/backtest/premium.py. This module reads
+the results from a data file with the stdlib instead of importing that code, so
+the live process never loads the fitting machinery.
+
+An earlier version of this note claimed the reason was keeping numpy out of
+app.main's import graph entirely. That was never true and is worth correcting
+rather than deleting: app/option_finder.py imports pandas at module level,
+pandas imports numpy, and OptionFinder is constructed in app.main -- so both
+have always been loaded in the live process. tests/test_module_imports.py
+pins that so the cost cannot grow silently.
+
+The separation is still worth keeping on its own terms -- an app module should
+not depend on a standalone analysis script, and the JSON file is also what
+lets coefficients be regenerated without a redeploy -- but it does not buy the
+memory saving it was once described as buying.
 
 Regenerate with:
     python -m scripts.calibrate_premium --db data/trading.db --write
