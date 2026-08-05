@@ -62,6 +62,14 @@ _TRADING_START_MINUTE = 45
 _TRADING_END_HOUR = 15
 _TRADING_END_MINUTE = 15
 
+# How recently the other provider must have opened the same strike and side for
+# the two to count as one correlated bet. Both providers are queried inside the
+# same 5-minute cycle, seconds apart, so this only needs to cover one cycle plus
+# slack. Widening it would start labelling genuinely independent decisions made
+# later in the session as correlated, which would dilute exactly the measurement
+# it exists to take.
+_CORRELATED_ENTRY_WINDOW_MINUTES = 10
+
 
 def _still_observing(now_ist) -> bool:
     return (now_ist.hour, now_ist.minute) < (_TRADING_START_HOUR, _TRADING_START_MINUTE)
@@ -96,6 +104,15 @@ SYSTEM_PROMPT = (
     "to continue, and extremes are more likely to reverse than extend. Between "
     "20 and 25 a trend is developing. Above 25 continuation is better "
     "supported.\n\n"
+    "Weigh how long the current trend has already run, and how many times "
+    "this same thesis has already been traded today. A trend that has already "
+    "produced several same-direction entries today, or that has been running "
+    "for most of the session, carries higher reversal risk even while its "
+    "indicators still look intact -- continuation and exhaustion are "
+    "indistinguishable on ADX and Supertrend alone, because both describe "
+    "whether a trend exists, not how much of it is left. Treat trend age and "
+    "repeat count as a caution against the current reading, not as separate "
+    "facts to note alongside it.\n\n"
     "On a wide-CPR day, expect range-bound conditions and treat breakout "
     "signals with particular scepticism. On a narrow-CPR day, trending "
     "conditions are more likely.\n\n"
@@ -299,6 +316,28 @@ def _build_user_prompt(index: IndexConfig, current_price: float, ctx: MarketCont
     if ctx.atr_value is not None:
         atr_pct_txt = f" ({ctx.atr_percent:.2f}% of price)" if ctx.atr_percent is not None else ""
         lines.append(f"  ATR(14): {ctx.atr_value:.2f} pts{atr_pct_txt}")
+
+    # TREND AGE. Answers "how long has this already been running and how many
+    # times has it already been traded today" -- the two things ADX and
+    # Supertrend cannot express, because continuation and exhaustion look
+    # identical on both. Same omit-don't-fabricate rule as every other section.
+    age_lines: list[str] = []
+    if ctx.trend_duration_bars is not None:
+        pct_txt = (
+            f" (~{ctx.trend_duration_pct_of_session:.0f}% of session elapsed)"
+            if ctx.trend_duration_pct_of_session is not None else ""
+        )
+        age_lines.append(f"  Current trend duration: {ctx.trend_duration_bars} bars{pct_txt}")
+    if ctx.same_direction_entries_today:
+        ce = ctx.same_direction_entries_today.get("BUY_CE", 0)
+        pe = ctx.same_direction_entries_today.get("BUY_PE", 0)
+        age_lines.append(f"  Same-direction entries already taken today: CE {ce}, PE {pe}")
+    if ctx.move_extent_atr is not None:
+        age_lines.append(f"  Cumulative move since trend start: {ctx.move_extent_atr:.2f} ATR")
+    if age_lines:
+        lines.append("")
+        lines.append("TREND AGE")
+        lines.extend(age_lines)
 
     levels = ctx.levels
     structure_lines: list[str] = []
@@ -594,6 +633,78 @@ def _build_provider_order(settings: AISettings, cycle_toggle: int) -> list[tuple
     return order
 
 
+def _same_direction_entries_today(db: Session, index_symbol: str) -> dict[str, int]:
+    """{"BUY_CE": n, "BUY_PE": n} for today, ACROSS providers.
+
+    Across providers deliberately. The question the model needs answered is
+    "how many times has this thesis already been traded today", and a thesis
+    traded once by Claude and once by OpenAI has been traded twice -- the
+    market does not care which one placed it. Counting per-provider would
+    report 1 and 1 for what is really 2 bets on the same idea.
+
+    Counts ENTRIES, open or closed. A trade that already opened and stopped out
+    still consumed the opportunity and still says the thesis has been tried.
+    """
+    today = to_ist(utc_now()).date()
+    counts = {"BUY_CE": 0, "BUY_PE": 0}
+    rows = db.scalars(
+        select(StrategyTrade).where(
+            StrategyTrade.origin.like("AI_ORIGIN_%"),
+            StrategyTrade.index_symbol == index_symbol,
+        )
+    )
+    for trade in rows:
+        entry_ist = to_ist(trade.entry_time)
+        if entry_ist is None or entry_ist.date() != today:
+            continue
+        if trade.signal in counts:
+            counts[trade.signal] += 1
+    return counts
+
+
+def _find_correlated_entry(
+    db: Session, index_symbol: str, signal: str, strike: int, provider: str, window_minutes: int
+) -> StrategyTrade | None:
+    """The other provider's trade on the same strike and side, opened recently.
+
+    WHY THIS IS WORTH RECORDING
+    ---------------------------
+    Claude and OpenAI are queried independently and neither knows what the
+    other decided. They reason over the SAME computed context, so agreement is
+    common -- and when they agree and are wrong, one misread becomes two
+    full-size losing positions rather than one. That pattern shows up in most
+    of the losing sessions this cycle (Nifty 24500 PE on 5 Aug, Bank Nifty
+    56700 CE on 24 Jul).
+
+    Running both in parallel was a deliberate choice, to compare them
+    head-to-head, and that comparison still has value. So this only OBSERVES.
+    It changes no sizing and blocks no entry -- it records that the two arms
+    agreed, so the frequency and outcome of agreement can be measured before
+    anyone decides whether to act on it.
+    """
+    cutoff = utc_now() - timedelta(minutes=window_minutes)
+    candidates = db.scalars(
+        select(StrategyTrade).where(
+            StrategyTrade.origin.like("AI_ORIGIN_%"),
+            StrategyTrade.index_symbol == index_symbol,
+            StrategyTrade.signal == signal,
+            StrategyTrade.strike == strike,
+        )
+    )
+    for trade in candidates:
+        if trade.origin == f"AI_ORIGIN_{provider.strip().upper()}":
+            continue
+        entry_time = trade.entry_time
+        if entry_time is None:
+            continue
+        # Both normalised through to_ist before comparison: SQLite does not
+        # round-trip tzinfo, so entry_time can come back offset-naive and a
+        # raw subtraction against an aware utc_now() raises.
+        if to_ist(entry_time) >= to_ist(cutoff):
+            return trade
+    return None
+
+
 def _has_open_origination(db: Session, index_symbol: str, provider: str | None = None) -> bool:
     """Whether there's already an open AI Origination trade on this index.
     provider=None checks across any provider (used to decide whether it's even
@@ -697,6 +808,9 @@ def _load_market_context(
         spot=spot,
         as_of=now_ist.replace(tzinfo=None),
     )
+    # Attached here rather than inside build_market_context, which is a pure
+    # function over bars and has no business reading the trade table.
+    context.same_direction_entries_today = _same_direction_entries_today(db, index.symbol)
     return context, data_stale
 
 
@@ -796,6 +910,23 @@ def _open_trade(
     origin = f"AI_ORIGIN_{provider.strip().upper()}"
     strategy_name = f"AI Origination - {index.display_name or index.symbol}"
 
+    # Did the other provider independently reach the same conclusion? Recorded,
+    # not acted on -- see _find_correlated_entry. The two arms are queried in
+    # the same cycle seconds apart, so the window only has to cover one cycle
+    # plus slack; a wider one would start catching genuinely separate decisions
+    # made later in the session and call them correlated.
+    correlated = _find_correlated_entry(
+        db, index.symbol, signal.value, contract.strike, provider,
+        _CORRELATED_ENTRY_WINDOW_MINUTES,
+    )
+    if correlated is not None:
+        logger.warning(
+            "[AI][ORIGIN] %s %s %s: CORRELATED with %s (%s) opened %s -- two full-size "
+            "positions on one thesis, no sizing change applied",
+            index.symbol, provider, signal.value, correlated.origin,
+            correlated.trade_id, format_ist(correlated.entry_time),
+        )
+
     # Risk in comparable units. The premium percentages above are what the
     # engine acts on and nothing here changes that -- but they are not
     # comparable across option types, since an identical percentage is a much
@@ -855,6 +986,8 @@ def _open_trade(
         tick_sample_count=tick_sample_count,
         market_context_json=json.dumps(market_context.as_dict()) if market_context else None,
         data_stale=data_stale,
+        concurrent_correlated_entry=correlated is not None,
+        correlated_with_trade_id=correlated.trade_id if correlated else None,
         calibration_bucket_matched=bucket_matched,
         trail_activate_percent=trail_activate,
         trail_width_percent=trail_width,

@@ -173,6 +173,12 @@ def _ensure_columns() -> None:
             "trail_activate_percent": "ALTER TABLE strategy_trades ADD COLUMN trail_activate_percent FLOAT",
             "trail_width_percent": "ALTER TABLE strategy_trades ADD COLUMN trail_width_percent FLOAT",
             "data_stale": "ALTER TABLE strategy_trades ADD COLUMN data_stale BOOLEAN",
+            # Forward-only, like data_stale: whether the other provider held the
+            # same strike and side at entry is not reconstructible for trades
+            # that predate the column, and a fabricated False would read as an
+            # observed fact.
+            "concurrent_correlated_entry": "ALTER TABLE strategy_trades ADD COLUMN concurrent_correlated_entry BOOLEAN",
+            "correlated_with_trade_id": "ALTER TABLE strategy_trades ADD COLUMN correlated_with_trade_id VARCHAR(64)",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():

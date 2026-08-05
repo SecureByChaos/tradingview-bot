@@ -122,6 +122,24 @@ class MarketContext:
     setup_strength: dict[str, float] = field(default_factory=dict)
     regime: str = "UNKNOWN"
 
+    # TREND AGE. ADX and Supertrend describe whether a trend EXISTS; nothing
+    # previously described how long it had already run. Continuation and
+    # exhaustion look identical on those two indicators, so a move that began
+    # at 09:57 and one that began at 13:40 presented to the model as the same
+    # setup. The 5 Aug 13:48 Nifty 24500 PE entries -- both providers, both
+    # -16% to -18%, at what turned out to be the reversal of a multi-hour
+    # decline -- are the clearest instance.
+    #
+    # These are DESCRIPTIVE only. Nothing here gates an entry; they are inputs
+    # the model is asked to weigh. See the note on whether a hard gate should
+    # follow.
+    trend_duration_bars: int | None = None
+    trend_duration_pct_of_session: float | None = None
+    move_extent_atr: float | None = None
+    # Filled by the caller, not by build_market_context -- it needs the trade
+    # table, and this module is deliberately pure over bars.
+    same_direction_entries_today: dict[str, int] = field(default_factory=dict)
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "index_symbol": self.index_symbol,
@@ -167,6 +185,10 @@ class MarketContext:
             "drift_180m": self.drift_180m,
             "drift_since_open": self.drift_since_open,
             "regime": self.regime,
+            "trend_duration_bars": self.trend_duration_bars,
+            "trend_duration_pct_of_session": self.trend_duration_pct_of_session,
+            "move_extent_atr": self.move_extent_atr,
+            "same_direction_entries_today": self.same_direction_entries_today,
             "setups": {k: v for k, v in self.setups.items() if v},
             "setup_strength": self.setup_strength,
         }
@@ -319,6 +341,82 @@ def _compute_drifts(
     return drifts
 
 
+def compute_trend_age(
+    bars_5m: list[Bar],
+    st_series: list[Any],
+    atr_value: float | None,
+    as_of: datetime,
+) -> tuple[int | None, float | None, float | None]:
+    """(duration_bars, pct_of_session_elapsed, move_extent_atr).
+
+    Duration is how many consecutive 5-minute bars the Supertrend direction has
+    held, counted backwards from the most recent bar that has one.
+
+    WHY PERCENT OF SESSION AND NOT JUST BARS
+    ----------------------------------------
+    "Two hours into a move" is a different statement at 10:00 than at 14:00. At
+    10:00 the move is most of a young session and could easily be the start of
+    a trend day; at 14:00 it has run most of the day and has an hour left to
+    pay off. The raw bar count cannot distinguish those, so both are reported.
+
+    WHY MOVE EXTENT AND NOT distance_from_ema21_atr
+    -----------------------------------------------
+    That existing field measures where the LAST bar sits relative to a moving
+    average -- an instantaneous position. It says nothing about how far price
+    has travelled in total since the move began, which is the quantity that
+    matters for "how much of this move is already spent". A trend can have run
+    6 ATR and still sit close to its own EMA21 if the EMA has caught up.
+
+    Returns Nones rather than zeros where the data does not support an answer.
+    A zero here would read as "brand new trend", which is the opposite of
+    "unknown" and is the more dangerous of the two to get wrong.
+    """
+    if not bars_5m or not st_series:
+        return None, None, None
+
+    last_index = None
+    for i in range(len(st_series) - 1, -1, -1):
+        if st_series[i] is not None:
+            last_index = i
+            break
+    if last_index is None:
+        return None, None, None
+
+    direction = st_series[last_index].direction
+    start_index = last_index
+    while start_index > 0:
+        previous = st_series[start_index - 1]
+        if previous is None or previous.direction != direction:
+            break
+        start_index -= 1
+    duration_bars = last_index - start_index + 1
+
+    # Session elapsed in 5-minute bars, from the open to now. Uses wall clock
+    # rather than len(bars_5m) because the bar list is a rolling window whose
+    # length reflects the load limit, not how much of the session has passed.
+    session_open = as_of.replace(
+        hour=OPENING_RANGE_START.hour, minute=OPENING_RANGE_START.minute,
+        second=0, microsecond=0,
+    )
+    elapsed_minutes = max((as_of - session_open).total_seconds() / 60.0, 0.0)
+    elapsed_bars = elapsed_minutes / 5.0
+    pct_of_session = (
+        round(min(duration_bars / elapsed_bars, 1.0) * 100, 1) if elapsed_bars >= 1 else None
+    )
+
+    # Cumulative travel since the trend began, in ATR units. Signed by the
+    # trend direction so a positive value always means "moved as far as the
+    # trend claims" -- a negative one would mean the Supertrend direction and
+    # the actual price change disagree, which is worth being able to see.
+    move_extent = None
+    if atr_value:
+        start_close = bars_5m[start_index].close if start_index < len(bars_5m) else None
+        end_close = bars_5m[last_index].close if last_index < len(bars_5m) else None
+        if start_close is not None and end_close is not None:
+            move_extent = round((end_close - start_close) * direction / atr_value, 2)
+    return duration_bars, pct_of_session, move_extent
+
+
 def build_market_context(
     index_symbol: str,
     bars_1m: list[Bar],
@@ -444,6 +542,9 @@ def build_market_context(
         strength["supertrend_fast_direction"] = float(st_fast_point.direction)
 
     drifts = _compute_drifts(bars_1m, as_of, spot, levels.day_open)
+    # Computed off the SAME st_5m series the supertrend_5m field reports, so
+    # "trend duration" always describes the trend the model is being shown.
+    trend_bars, trend_pct, move_atr = compute_trend_age(bars_5m, st_5m, atr_value, as_of)
 
     return MarketContext(
         index_symbol=index_symbol,
@@ -475,4 +576,7 @@ def build_market_context(
         setups=setups,
         setup_strength=strength,
         regime=regime,
+        trend_duration_bars=trend_bars,
+        trend_duration_pct_of_session=trend_pct,
+        move_extent_atr=move_atr,
     )

@@ -387,6 +387,18 @@ class StrategyTrade(Base):
     # observed fact rather than an assumed default. See
     # app/ai/originator.py's _load_market_context.
     data_stale: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # True when the OTHER provider already opened the same strike and side
+    # within a short window -- i.e. Claude and OpenAI independently reached the
+    # same conclusion and the account now holds two full-size positions on one
+    # idea. Observation only: nothing reads this to change sizing or block an
+    # entry. It exists so the frequency and outcome of agreement can be
+    # measured before anyone decides whether the doubled exposure is worth the
+    # head-to-head comparison it buys. Null for trades predating the column.
+    concurrent_correlated_entry: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # trade_id of the other provider's trade, when the above is True. Kept so a
+    # correlated pair can be reconstructed and scored together rather than
+    # only counted.
+    correlated_with_trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # origin distinguishes the original TradingView signal ("SIGNAL") from a paper
     # trade opened because an AI reviewer proposed an alternative call after
     # rejecting the original signal ("AI_ALT_OPENAI", "AI_ALT_CLAUDE", etc). Lets

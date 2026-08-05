@@ -262,6 +262,41 @@ def history_export(
         mae = ((worst - trade.entry_price) / trade.entry_price) * 100 * direction
         return f"{mfe:.2f}", f"{mae:.2f}"
 
+    def _trend_age(trade: StrategyTrade) -> tuple[str, str, str, str]:
+        """Trend-age fields, read back out of the stored market context.
+
+        Read from market_context_json rather than duplicated onto their own
+        columns: the context is already persisted per trade in full, and a
+        second copy would be one more thing that can silently disagree with
+        the snapshot the decision was actually made on.
+
+        Returns blanks for any trade whose context predates these fields --
+        which is every trade before 5 Aug -- rather than zeros. A zero here
+        would read as "brand new trend, no repeats", the opposite of unknown.
+        """
+        raw = trade.market_context_json
+        if not raw:
+            return "", "", "", ""
+        try:
+            context = json.loads(raw)
+        except (TypeError, ValueError):
+            return "", "", "", ""
+        counts = context.get("same_direction_entries_today") or {}
+        same_direction = ""
+        if counts:
+            # The count for THIS trade's own direction is the one that matters:
+            # how many times this thesis had already been taken when it fired.
+            same_direction = str(counts.get(trade.signal, ""))
+        def _text(key: str) -> str:
+            value = context.get(key)
+            return "" if value is None else str(value)
+        return (
+            _text("trend_duration_bars"),
+            _text("trend_duration_pct_of_session"),
+            _text("move_extent_atr"),
+            same_direction,
+        )
+
     def _configured_percent(trade: StrategyTrade) -> tuple[str, str]:
         """(SL %, Target %) as actually configured at entry, recovered from the
         stored absolute stoploss/target levels. AI Origination sets these from
@@ -299,6 +334,16 @@ def history_export(
         # and the entry decision was made on stale stored history rather than
         # a fresh pull -- see app/ai/originator.py's _load_market_context.
         "Data Stale",
+        # Tier 7 -- correlated entries (forward-only). YES means the OTHER
+        # provider opened the same strike and side within minutes, so the
+        # account held two full-size positions on one thesis. Observation only;
+        # nothing changes sizing. Also blank for trades before the column.
+        "Correlated Entry", "Correlated With",
+        # Trend age at entry, from the market context the decision was made on.
+        # Recorded per trade rather than only in market_context_json so the
+        # repeat-thesis pattern is filterable in a spreadsheet.
+        "Trend Bars", "Trend % Session", "Move Since Trend Start (ATR)",
+        "Same-Dir Entries Today",
     ])
     for trade in trades:
         mfe, mae = _excursion(trade)
@@ -341,6 +386,10 @@ def history_export(
             trade.target_atr_multiple if trade.target_atr_multiple is not None else "",
             "" if trade.risk_units_extrapolated is None else ("YES" if trade.risk_units_extrapolated else "NO"),
             "" if trade.data_stale is None else ("YES" if trade.data_stale else "NO"),
+            "" if trade.concurrent_correlated_entry is None
+            else ("YES" if trade.concurrent_correlated_entry else "NO"),
+            trade.correlated_with_trade_id or "",
+            *_trend_age(trade),
         ])
     buffer.seek(0)
 
