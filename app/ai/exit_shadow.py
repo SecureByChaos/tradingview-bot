@@ -125,8 +125,17 @@ def _call_claude(view: _ProviderView, user_prompt: str) -> tuple[str, float | No
         },
         payload={
             "model": view.model,
-            "max_tokens": 256,
-            "system": SYSTEM_PROMPT + "\n\nRespond with JSON only, no markdown or code fences.",
+            # Same 256-token truncation bug diagnosed in app/ai/originator.py's
+            # identical _call_claude (5 Aug production incident): a 200 with
+            # stop_reason='max_tokens' whose entire budget went to extended
+            # thinking, none left for the JSON. This prompt is much smaller than
+            # originator's enriched [CTX] one, but thinking-token consumption
+            # isn't strictly proportional to input size, so the same cap carries
+            # the same latent risk. Matching originator.py's fix for consistency.
+            "max_tokens": 2048,
+            "system": SYSTEM_PROMPT
+            + "\n\nRespond with JSON only, no markdown or code fences. Keep any internal "
+            "reasoning brief -- decide directly without lengthy deliberation.",
             "messages": [{"role": "user", "content": user_prompt}],
         },
         timeout=view.timeout_seconds,

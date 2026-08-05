@@ -44,7 +44,18 @@ class Settings:
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     # --- Option-chain archival (collection only, no live trading effect) ---
-    option_chain_collection_enabled: bool = True
+    # Defaults OFF as of 5 Aug. Three incidents traced to running this in SHARED
+    # mode (no SMARTAPI_ANALYTICS_* set) while AI Origination is live: 31 July's
+    # 2,890-error storm, a crash loop the following night, and confirmed
+    # candle-refresh rate-limiting on 5 Aug (both indices, within seconds of a
+    # collection cycle -- 10:56:55/11:01:46/11:01:53 following 10:55/11:00
+    # collections). _should_yield_to_live_trading() only reacts after the live
+    # client has already been rate-limited that cycle; it does not prevent the
+    # collision. Do not flip this back on without SMARTAPI_ANALYTICS_* wired to
+    # a genuinely separate API key (see smartapi_analytics_* below and
+    # build_collector_client()), and a full session run alongside live
+    # origination showing zero rate-limit errors on either side.
+    option_chain_collection_enabled: bool = False
     # Strikes either side of ATM. 10 gives a 21-strike chain per expiry per
     # side, which is the minimum useful width for an IV skew or OI-wall study.
     # Raising this raises storage roughly linearly -- see the volume note in
@@ -129,7 +140,7 @@ def get_settings() -> Settings:
         secure_cookies=_get_bool("SECURE_COOKIES", False),
         default_strategy_name=os.getenv("DEFAULT_STRATEGY_NAME", "V5.1"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),  # type: ignore[arg-type]
-        option_chain_collection_enabled=_get_bool("OPTION_CHAIN_COLLECTION_ENABLED", True),
+        option_chain_collection_enabled=_get_bool("OPTION_CHAIN_COLLECTION_ENABLED", False),
         option_chain_strike_band=_get_int("OPTION_CHAIN_STRIKE_BAND", 10),
         option_chain_expiry_count=_get_int("OPTION_CHAIN_EXPIRY_COUNT", 2),
         option_chain_interval_minutes=_get_int("OPTION_CHAIN_INTERVAL_MINUTES", 5),
