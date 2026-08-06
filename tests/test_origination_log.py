@@ -133,7 +133,7 @@ def test_error_populates_error_detail_with_the_real_cause(session):
     assert row.decision == "ERROR"
     assert row.error_detail == cause
     assert row.latency_ms == 1830.5
-    assert row.data_stale is True
+    assert row.data_stale
 
 
 def test_only_active_setups_are_stored(session):
@@ -147,15 +147,25 @@ def test_only_active_setups_are_stored(session):
     assert _only_row(session).setups == '["EMA_STACK_UP", "ORB_BREAK_UP"]'
 
 
+class ExplodingContext(FakeContext):
+    """A context whose serialisation fails, standing in for any write-time
+    fault -- schema drift, a locked database, a disk full."""
+
+    def as_dict(self):
+        raise ValueError("context blew up")
+
+
 def test_a_failed_write_does_not_raise_into_the_trading_cycle(session):
-    """A logging table must never be able to stop a cycle. regime is NOT NULL,
-    so a context missing it would violate the constraint -- and that must
-    surface as a swallowed error, not an exception escaping into the caller."""
-    broken = FakeContext(cpr=FakeCPR(), setups={}, same_direction_entries_today={})
-    broken.as_dict = lambda: (_ for _ in ()).throw(ValueError("context blew up"))
+    """A logging table must never be able to stop a cycle.
+
+    This is the one place in the codebase where catching broadly and carrying
+    on is correct, so it is asserted rather than left to a code comment: the
+    caller must see no exception, and no partial row must be left behind.
+    """
     record_decision(
         session, index_symbol="NIFTY", provider="openai", provider_role="primary",
         decision=FakeDecision("NONE", None, None, None, ""),
-        market_context=broken, data_stale=False, trade=None,
+        market_context=ExplodingContext(cpr=FakeCPR(), setups={}, same_direction_entries_today={}),
+        data_stale=False, trade=None,
     )
     assert list(session.scalars(select(AIOriginationLog))) == []
