@@ -511,6 +511,26 @@ checking on production: whether `data_stale=True` fired correctly for AI Origina
 decisions made during the 10:56:55–10:57:06 and 11:01:46–11:02:02 IST failure windows,
 and whether any trade opened in those windows is flagged as suspect in the export.
 
+### STALL_EXIT is protective — do not loosen it (tested 6 Aug 2026)
+
+Prompted by three Bank Nifty trades on 6 Aug that stalled out while the index carried on
+~360 points. `scripts/stall_exit_backtest.py` replays every STALL_EXIT forward against
+the **real archived option premium** of the actual contract:
+
+- 14/19 would have hit STOPLOSS (mean −12.75%), 3/19 TIME_EXIT, 2/19 TRAIL_EXIT
+- holding on was better in **2 of 19**, mean **−8.54%** per trade, sign test p ≈ 0.0007
+- the three 6 Aug trades that triggered the question all reconstruct as **STOPLOSS**
+
+**Conditioning on ADX is refuted, not merely unsupported.** Every one of the 8 trades with
+ADX ≥ 25 was worse held; the only winner sat at ADX 24.3. A "skip STALL_EXIT when ADX ≥ 25"
+rule would have hurt in 8 of 8 applicable cases.
+
+The lesson generalises past this rule: **index continuation is not premium continuation.**
+A stall means the option was already failing to convert index movement into premium.
+Holding extends the theta bleed rather than resuming the conversion, and a 10% stop is
+reachable on an ordinary pullback inside a continuing trend. A chart-based read of
+"the trend kept going, so we exited early" is exactly the intuition this measures against.
+
 ### Still unconfirmed
 
 - Whether Nifty's spot token was corrected to `99926000` in Settings > Instruments.
