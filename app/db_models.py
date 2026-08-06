@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Float, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, DateTime, Float, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 from typing import Optional
 
@@ -482,6 +482,88 @@ class Candle(Base):
     low: Mapped[float] = mapped_column(Float, nullable=False)
     close: Mapped[float] = mapped_column(Float, nullable=False)
     volume: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+
+
+class AIOriginationLog(Base):
+    """One row per AI Origination decision, including the ones that never trade.
+
+    WHY THIS EXISTS
+    ---------------
+    AI Origination's most common output is NONE, and until now NONE left no
+    queryable trace -- only a `logger.info` line that journalctl eventually
+    rotates away. Every other strategy path writes to ai_context_logs; this one
+    did not, so "why did it decline" was answerable only for as long as the
+    journal happened to retain it.
+
+    That gap became concrete on 6 Aug: Bank Nifty held a genuine TREND regime
+    from 14:54 to 15:09 with four setups active, and Claude returned NONE every
+    cycle. The plausible explanation is the trend-age caution shipped days
+    earlier doing its job -- but the trend-age values at those moments were
+    never stored, so it cannot be confirmed or refuted. That specific question
+    is permanently unanswerable; this table exists so the next one is not.
+
+    It matters most right now because the two-week observation window on the
+    trend-age fix has just started, and the whole question is whether behaviour
+    changed. Judging that from trades alone would sample only the decisions that
+    said yes.
+
+    PURE INSTRUMENTATION. Nothing reads this to make a decision.
+    """
+
+    __tablename__ = "ai_origination_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    index_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider_role: Mapped[str] = mapped_column(String(16), nullable=False)
+    decision: Mapped[str] = mapped_column(String(16), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Null unless the decision actually opened a trade -- which is correct, not
+    # a gap: NONE and ERROR have no trade to point at.
+    trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    regime: Mapped[str] = mapped_column(String(16), nullable=False)
+    adx: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cpr: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    setups: Mapped[str] = mapped_column(Text, nullable=False)
+
+    trend_duration_bars: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trend_duration_pct_of_session: Mapped[float | None] = mapped_column(Float, nullable=True)
+    move_extent_atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # SPLIT BY SIDE rather than the single integer the spec asked for. At
+    # decision time the direction is not yet known -- the decision is what
+    # determines it -- so a single "same direction" count is undefined for
+    # exactly the NONE rows this table was built to capture. Both are stored so
+    # a declined cycle can still be read against how many entries the prevailing
+    # direction had already taken.
+    same_direction_entries_ce: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    same_direction_entries_pe: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    concurrent_correlated_entry: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    correlated_with_trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    context_json: Mapped[str] = mapped_column(Text, nullable=False)
+    # The PARSED decision, not the raw HTTP body. Retaining full bodies for
+    # every cycle of every provider would grow without bound for data that is
+    # only diagnostic on failure -- and on failure the raw payload is already
+    # preserved in error_detail, which carries a bounded excerpt of it.
+    model_response_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    data_stale: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    risk_units_extrapolated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_ai_origination_logs_index_provider", "index_name", "provider", "timestamp"),
+    )
 
 
 class TradeRecord(Base):

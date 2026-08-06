@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.client import AIClient
 from app.ai.json_utils import extract_json_object
+from app.ai.origination_log import record_decision
 from app.ai.repository import get_settings
 from app.database import SessionLocal
 from app.db_models import AISettings, IndexConfig, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
@@ -435,6 +436,11 @@ class _Decision:
     sl_percent: float | None
     target_percent: float | None
     reasoning: str
+    # Round-trip time for the provider call. AIClient already measures this and
+    # every caller then dropped it. Carried purely so the decision log can
+    # record it -- nothing reads it to decide anything. Defaults to None so the
+    # many _Decision(...) constructions that predate it are unaffected.
+    latency_ms: float | None = None
 
 
 def _snippet(value: object, limit: int = 400) -> str:
@@ -517,7 +523,7 @@ def _call_openai(view: _ProviderView, user_prompt: str) -> _Decision:
         timeout=view.timeout_seconds,
     )
     if response.error:
-        return _Decision("ERROR", None, None, None, response.error)
+        return _Decision("ERROR", None, None, None, response.error, response.latency_ms)
     try:
         content = response.response_body["choices"][0]["message"]["content"]
     except Exception as exc:
@@ -528,8 +534,9 @@ def _call_openai(view: _ProviderView, user_prompt: str) -> _Decision:
             "ERROR", None, None, None,
             f"Unexpected OpenAI response shape ({type(exc).__name__}: {exc}), "
             f"status={response.status}: {_snippet(response.response_body)}",
+            response.latency_ms,
         )
-    return _parse_response(content)
+    return _with_latency(_parse_response(content), response)
 
 
 def _call_claude(view: _ProviderView, user_prompt: str) -> _Decision:
@@ -561,7 +568,7 @@ def _call_claude(view: _ProviderView, user_prompt: str) -> _Decision:
         timeout=view.timeout_seconds,
     )
     if response.error:
-        return _Decision("ERROR", None, None, None, response.error)
+        return _Decision("ERROR", None, None, None, response.error, response.latency_ms)
     try:
         blocks = response.response_body.get("content") or []
         text = "".join(block.get("text", "") for block in blocks if isinstance(block, dict) and block.get("type") == "text")
@@ -570,6 +577,7 @@ def _call_claude(view: _ProviderView, user_prompt: str) -> _Decision:
             "ERROR", None, None, None,
             f"Unexpected Claude response shape ({type(exc).__name__}: {exc}), "
             f"status={response.status}: {_snippet(response.response_body)}",
+            response.latency_ms,
         )
     if not text:
         # A 200 with no text block is specifically what a max_tokens truncation
@@ -582,8 +590,19 @@ def _call_claude(view: _ProviderView, user_prompt: str) -> _Decision:
             f"{(response.response_body or {}).get('stop_reason')!r}, "
             f"usage={(response.response_body or {}).get('usage')!r}): "
             f"{_snippet(response.response_body)}",
+            response.latency_ms,
         )
-    return _parse_response(text)
+    return _with_latency(_parse_response(text), response)
+
+
+def _with_latency(decision: _Decision, response: Any) -> _Decision:
+    """Attach the call's measured latency without touching anything else.
+
+    replace() rather than mutation because _Decision is frozen, and frozen is
+    worth keeping -- a decision object that cannot be edited after the fact is
+    one less way for a logging change to alter a trading one.
+    """
+    return replace(decision, latency_ms=getattr(response, "latency_ms", None))
 
 
 def _call_provider(provider: str, view: _ProviderView, user_prompt: str) -> Optional[_Decision]:
@@ -1219,8 +1238,9 @@ def run_origination_checks(
                         logger.debug(
                             "[AI][ORIGIN] %s NONE reasoning (%s): %s", index.symbol, provider_name, decision.reasoning
                         )
+                    opened = None
                     if decision.action in ("BUY_CE", "BUY_PE") and (decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT:
-                        _open_trade(
+                        opened = _open_trade(
                             session, index, provider_name, decision, smartapi, option_finder,
                             # Snapshot of the prompt inputs this specific
                             # decision was made on -- see StrategyTrade's
@@ -1236,6 +1256,23 @@ def run_origination_checks(
                             market_context=market_context,
                             data_stale=data_stale,
                         )
+
+                    # Persist the decision -- BUY, NONE and ERROR alike. Placed
+                    # after the open attempt so a trade's own fields (id,
+                    # correlation flags, extrapolation) are available; they stay
+                    # null for the decisions that did not trade, which is most
+                    # of them and exactly the population that previously left no
+                    # queryable trace at all.
+                    record_decision(
+                        session,
+                        index_symbol=index.symbol,
+                        provider=provider_name,
+                        provider_role=turn,
+                        decision=decision,
+                        market_context=market_context,
+                        data_stale=data_stale,
+                        trade=opened,
+                    )
             except Exception as exc:
                 logger.exception("[AI][ORIGIN] Check failed for index %s", index.symbol)
                 # Previously silent beyond the server log file (not reachable from the
