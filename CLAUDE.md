@@ -474,6 +474,33 @@ Two traps already fallen into once each, both documented in the roadmap: overlap
 forward windows inflate significance by ~√(window/stride), and premium *elasticity* is
 not *delta* (they differ by ~200× for Nifty).
 
+### Dashboard-driven SmartAPI rate exhaustion, 7 Aug 2026
+
+`get_index_live_figures()` called `smartapi.get_index_spot()` fresh on every dashboard
+render, sharing the same process-wide 1 req/sec quote throttle as AI Origination's own
+candle-refresh calls (`_throttle_quote_call()` in `app/smartapi_client.py`). A burst of
+dashboard requests could starve live trading of that budget for no reason -- the spot
+price is already kept current independently by the 5-min origination cycle and the 30s
+trade monitor, so the dashboard doesn't need a fresh broker call per view.
+`_live_dashboard_data()` (`app/dashboard_routes.py`) now caches the result behind a 5s
+in-process TTL (`_live_figures_cache`), safe because uvicorn runs this app single-process
+(no `--workers`). Verified locally: 5 uncached requests took 4.22s (~0.84s/request, one
+throttle hit each); 20 cached requests took 0.22s total.
+
+**Correction to the incident report that prompted this:** the report's stated root cause
+was "zero authentication on any route in `app/dashboard_routes.py`." That's wrong for
+this codebase as it stands -- `app/auth.py`'s session-based admin auth
+(`require_admin_page`/`require_admin_api`) has existed since the first commit and is
+wired onto every route including `/` and `/api/live-dashboard`, confirmed by reading
+every route in the file and by live `curl`: unauthenticated `GET /` returns 303 to
+`/login`, `GET /api/live-dashboard` returns 401, neither reaches
+`get_index_live_figures()` or SmartAPI. If the reported traffic (170 requests, 10+ IPs,
+no login) really did trigger real broker calls, the deployed server is very likely
+running older code than this repo -- **check what's actually live before assuming this
+gap needs closing again.** The caching fix above is worth having regardless of that
+question, since it also protects against a burst of *authenticated* dashboard traffic
+(several tabs, a monitoring script) doing the same thing.
+
 ### Two production incidents fixed, 5 Aug 2026
 
 **Claude `max_tokens` truncation.** Live logs showed Claude returning `stop_reason=
