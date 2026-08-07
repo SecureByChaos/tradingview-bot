@@ -501,6 +501,32 @@ gap needs closing again.** The caching fix above is worth having regardless of t
 question, since it also protects against a burst of *authenticated* dashboard traffic
 (several tabs, a monitoring script) doing the same thing.
 
+**Same "zero auth" claim resurfaced a second time, same day, after the caching fix
+shipped and measurably worked (Nifty candle-refresh failures 24→8 across equivalent
+windows).** The follow-up request's own suggested check --
+`grep -rn "HTTPBasic\|Depends(get_current_user)\|verify_credentials\|APIKeyHeader"
+app/*.py` -- returns nothing, which is exactly why it keeps reading as "zero auth": that
+grep doesn't match this codebase's actual pattern name
+(`require_admin_page`/`require_admin_api`). **If a future investigation reports missing
+dashboard auth, check whether its grep included those two names before trusting it.**
+Re-verified live with a fresh local run: `/` → 303, `/ops` → 303, `/ai-origination` →
+303, `/api/live-dashboard` → 401, all unauthenticated; all four return 200 with a valid
+session cookie. Also: **`/dashboard` is not a route this app has** -- the live dashboard
+is `/`, a separate summary page is `/ops`. A `curl .../dashboard` in any verification
+step will 404 regardless of auth state, which is itself a sign the check wasn't run
+against this app's real routes.
+
+Did not add a second (HTTPBasic) auth layer on top of the existing session-based one --
+that would be exactly the "second, inconsistent auth pattern" the task itself said to
+avoid if something already exists. The 8 residual candle-refresh failures post-caching
+are more consistent with ordinary contention (a legitimate authenticated session polling
+right as the cache expires, colliding with AI Origination's own cycle) than with bots
+still getting through -- roughly one every 7 minutes, not the sustained hammering 170
+blocked requests would produce. If this needs resolving further, the next real
+diagnostic step is checking the live server's own access logs for the status codes on
+those 170 requests (303/401 would confirm auth is doing its job and the traffic is
+harmless noise), not adding more auth code.
+
 ### Two production incidents fixed, 5 Aug 2026
 
 **Claude `max_tokens` truncation.** Live logs showed Claude returning `stop_reason=
