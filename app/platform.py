@@ -517,13 +517,23 @@ def record_index_tick_if_stale(db: Session, index_symbol: str, price: float) -> 
         db.commit()
 
 
-def get_index_live_figures(db: Session, smartapi: Any) -> list[dict[str, Any]]:
+def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -> list[dict[str, Any]]:
     """Live index figures (Nifty/Sensex/Bank Nifty) for the live dashboards --
     figures only, no per-index chart by design. Change and day range are
     computed from our own recorded ticks, using today's first tick as the
     reference point, rather than a broker "previous close" field -- the
     current SmartAPI client wrapper only exposes LTP, not a reliable
-    previous-close, so inventing one would be dishonest."""
+    previous-close, so inventing one would be dishonest.
+
+    Price source: prefers feed_store (app/live_feed.py's persistent WebSocket
+    feed) when given and it has a value -- zero SmartAPI calls, whether this
+    is called once or a thousand times. Falls back to a direct smartapi call
+    ONLY when feed_store is None (feed feature not wired in, e.g. tests) or
+    hasn't produced a first tick yet for a newly-enabled index. Deliberately
+    does NOT fall back to smartapi on an ordinary feed disconnect/staleness --
+    that would reintroduce the exact per-request SmartAPI cost the feed
+    exists to eliminate; a stale feed entry is still used, just flagged via
+    is_live=False."""
     figures: list[dict[str, Any]] = []
     indexes = list(db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)))
     today = today_ist().isoformat()
@@ -536,11 +546,21 @@ def get_index_live_figures(db: Session, smartapi: Any) -> list[dict[str, Any]]:
             "change_percent": None,
             "day_low": None,
             "day_high": None,
+            "is_live": None,
         }
-        try:
-            price = round(smartapi.get_index_spot(index), 2)
-        except Exception as exc:
-            entry["error"] = str(exc)
+        feed_entry = feed_store.get(index.symbol) if feed_store is not None else None
+        if feed_entry is not None:
+            price = round(feed_entry["price"], 2)
+            entry["is_live"] = feed_entry["is_live"]
+        elif feed_store is None:
+            try:
+                price = round(smartapi.get_index_spot(index), 2)
+            except Exception as exc:
+                entry["error"] = str(exc)
+                figures.append(entry)
+                continue
+        else:
+            entry["error"] = "Live feed has not produced a price for this index yet"
             figures.append(entry)
             continue
 

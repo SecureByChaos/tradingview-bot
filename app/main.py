@@ -17,7 +17,7 @@ from app import api_routes, dashboard_routes
 from app.config import get_settings
 from app.database import SessionLocal, engine, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
-from app.db_models import StrategyConfig, StrategyTrade, TradeResult, TradeStatus
+from app.db_models import IndexConfig, StrategyConfig, StrategyTrade, TradeResult, TradeStatus
 from app.models import WebhookPayload, WebhookResponse
 from app.ai.shadow import run_shadow_review
 from app.multi_strategy import MultiStrategyTradeManager
@@ -28,6 +28,7 @@ from sqlalchemy import func, select
 from app.risk import RiskProtectionService
 from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
 from app.ai.originator import run_origination_checks
+from app.live_feed import IndexFeed, LiveFeedStore
 from app.market_data import capture_closing_auction
 from app.option_chain import build_collector_client, run_chain_collection
 from app.scheduler import create_scheduler
@@ -53,6 +54,15 @@ v7_manager = V7Manager(settings, smartapi, option_finder, telegram)
 risk_service = RiskProtectionService(multi_strategy_manager, telegram)
 monitor = MultiStrategyMonitor(multi_strategy_manager, risk_service, v7_manager)
 health_manager = HealthManager(smartapi, engine, telegram)
+
+# Persistent index-spot WebSocket feed. Replaces per-request/cached SmartAPI
+# calls from the dashboard entirely -- see CLAUDE.md, "Dashboard-driven
+# SmartAPI rate exhaustion", and app/live_feed.py's module docstring for why
+# and for what's NOT been verified against the real feed from this sandbox.
+# Never fatal to start (see lifespan below): a feed problem should degrade
+# the dashboard to "unavailable", never block trading, which doesn't depend
+# on this feed at all.
+live_feed_store = LiveFeedStore()
 
 # Option-chain archival. Collection only: nothing in the trading path reads it,
 # and it is months away from being evaluable. It is wired in now because the
@@ -107,11 +117,23 @@ async def lifespan(_: FastAPI):
                 "[CHAIN] Analytics SmartAPI authentication failed; option-chain "
                 "collection will retry on its next cycle"
             )
+    index_feed = None
+    try:
+        with SessionLocal() as db:
+            enabled_indexes = list(db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True))))
+        index_feed = IndexFeed(smartapi, live_feed_store, enabled_indexes)
+        index_feed.start()
+    except Exception:
+        # Same reasoning as the option-chain collector above: a feed problem
+        # degrades the dashboard, it must never stop trading from starting.
+        logger.exception("[LIVEFEED] Failed to start index live feed; dashboard prices will read unavailable")
     scheduler.start()
     logger.info("Scheduler started")
     try:
         yield
     finally:
+        if index_feed is not None:
+            index_feed.stop()
         scheduler.shutdown(wait=False)
         logger.info("Scheduler stopped")
 
@@ -141,6 +163,7 @@ api_routes.router.trade_logger = trade_logger  # type: ignore[attr-defined]
 dashboard_routes.router.trade_manager = trade_manager  # type: ignore[attr-defined]
 dashboard_routes.router.multi_strategy_manager = multi_strategy_manager  # type: ignore[attr-defined]
 dashboard_routes.router.smartapi = smartapi  # type: ignore[attr-defined]
+dashboard_routes.router.live_feed_store = live_feed_store  # type: ignore[attr-defined]
 dashboard_routes.router.health_manager = health_manager  # type: ignore[attr-defined]
 
 app.include_router(dashboard_routes.router)

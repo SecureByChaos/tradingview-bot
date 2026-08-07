@@ -2,8 +2,6 @@
 
 import csv
 import io
-import logging
-import time as time_module
 from datetime import date, datetime, time, timezone
 import json
 from typing import Annotated
@@ -46,8 +44,6 @@ from app.smartapi_client import SmartAPIError
 from app.time_utils import IST, duration_label, format_ist, to_ist
 from app.trade_manager import TradeManager
 
-logger = logging.getLogger(__name__)
-
 
 def origin_label(origin: str | None) -> str:
     if not origin or origin == "SIGNAL":
@@ -74,6 +70,10 @@ def get_trade_manager() -> TradeManager:
 
 def get_smartapi() -> object:
     return router.smartapi  # type: ignore[attr-defined]
+
+
+def get_live_feed_store() -> object:
+    return router.live_feed_store  # type: ignore[attr-defined]
 
 
 def get_health_manager() -> object:
@@ -122,31 +122,19 @@ def dashboard(
     )
 
 
-# get_index_live_figures() makes a real SmartAPI call per enabled index
-# (get_index_spot, throttled through the same process-wide 1 req/sec budget
-# get_ltp/get_candles share -- see CLAUDE.md). Every dashboard render used to
-# pay that cost even though the underlying spot price is already being kept
-# current independently by AI Origination's 5-min cycle and the 30s trade
-# monitor -- a burst of dashboard requests (many browser tabs, a monitoring
-# script, or unauthenticated scanner traffic hammering "/" before hitting the
-# login redirect) could starve those live-trading callers of rate-limit
-# budget. Single in-process cache is sufficient: uvicorn runs this app with no
-# --workers, so there's exactly one process to share state in.
-_LIVE_FIGURES_CACHE_TTL_SECONDS = 5.0
-_live_figures_cache: dict[str, object] = {"data": None, "fetched_at": 0.0}
-
-
-def _live_dashboard_data(db: Session, smartapi: object) -> dict[str, object]:
-    now = time_module.monotonic()
-    age = now - _live_figures_cache["fetched_at"]
-    if _live_figures_cache["data"] is None or age >= _LIVE_FIGURES_CACHE_TTL_SECONDS:
-        logger.debug("[DASHBOARD] Live figures cache miss (age=%.1fs); calling SmartAPI", age)
-        _live_figures_cache["data"] = get_index_live_figures(db, smartapi)
-        _live_figures_cache["fetched_at"] = now
-    else:
-        logger.debug("[DASHBOARD] Live figures cache hit (age=%.1fs)", age)
+# get_index_live_figures() used to make a real SmartAPI call per enabled
+# index on every dashboard render (get_index_spot, throttled through the same
+# process-wide 1 req/sec budget get_ltp/get_candles share -- see CLAUDE.md).
+# A short TTL cache reduced that but didn't eliminate it: any request landing
+# outside the TTL window still paid the SmartAPI cost, and under real
+# afternoon dashboard traffic (7 Aug) that kept happening often enough to
+# keep starving AI Origination's own candle-refresh calls. app/live_feed.py's
+# persistent WebSocket feed replaces this entirely -- the price is already
+# fresh in memory by the time any request arrives, so there's nothing left to
+# cache. See CLAUDE.md, "Dashboard-driven SmartAPI rate exhaustion".
+def _live_dashboard_data(db: Session, smartapi: object, live_feed_store: object) -> dict[str, object]:
     return {
-        "indices": _live_figures_cache["data"],
+        "indices": get_index_live_figures(db, smartapi, live_feed_store),
         "trades": get_open_trades_with_ticks(db),
         "activity": get_today_activity(db),
     }
@@ -157,9 +145,10 @@ def live_dashboard(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
     smartapi: Annotated[object, Depends(get_smartapi)],
+    live_feed_store: Annotated[object, Depends(get_live_feed_store)],
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    data = _live_dashboard_data(db, smartapi)
+    data = _live_dashboard_data(db, smartapi, live_feed_store)
     return templates.TemplateResponse(
         "live_dashboard.html",
         {"request": request, **data},
@@ -170,9 +159,10 @@ def live_dashboard(
 def live_dashboard_api(
     db: Annotated[Session, Depends(get_db)],
     smartapi: Annotated[object, Depends(get_smartapi)],
+    live_feed_store: Annotated[object, Depends(get_live_feed_store)],
     _: Annotated[None, Depends(require_admin_api)] = None,
 ) -> dict[str, object]:
-    return _live_dashboard_data(db, smartapi)
+    return _live_dashboard_data(db, smartapi, live_feed_store)
 
 
 @router.post("/health-check")

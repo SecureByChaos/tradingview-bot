@@ -527,6 +527,46 @@ diagnostic step is checking the live server's own access logs for the status cod
 those 170 requests (303/401 would confirm auth is doing its job and the traffic is
 harmless noise), not adding more auth code.
 
+**Candle-refresh failures then jumped sharply within the same day (22 → 128 in the same
+14:00-15:15 window, re-checked), and the fix escalated to a persistent WebSocket feed
+replacing per-request/cached calls entirely.** `app/live_feed.py` (new) wraps
+`SmartWebSocketV2` (from the already-installed `smartapi-python` package) in a single
+background thread, started once at app startup (`app/main.py`'s lifespan) and subscribed
+to every enabled index's spot token. `LiveFeedStore` is the in-memory result --
+thread-safe, one instance per process (uvicorn runs with no `--workers`, same reasoning
+as the caching fix it replaces). `get_index_live_figures()` (`app/platform.py`) now reads
+from this store instead of calling `smartapi.get_index_spot()`; it does NOT fall back to
+a fresh SmartAPI call on a stale/disconnected feed, only on a feed that has never
+produced a value for that index at all (still-fail-closed, matches this codebase's usual
+philosophy) -- a real disconnect is served as the last-known price with `is_live: false`,
+shown on the dashboard as a "stale" badge, and the reconnect loop handles recovery on its
+own. `SmartAPIClient` gained two small read-only properties (`jwt_token`, `feed_token`)
+so the feed can read them fresh on every reconnect attempt without reaching into private
+state, since `_call_with_reauth` can rotate them independently while the feed runs.
+
+**Not verified against the real Angel One feed** -- no network path to Angel One from
+this sandbox (proxied HTTPS/WSS is blocked) and no real credentials, so this was built by
+reading the installed SDK's actual source (`SmartApi==1.5.5`) rather than against a live
+tick stream. Two assumptions specifically need confirming once deployed: (1) the WS
+binary tick's `last_traded_price` is paise (Angel's documented convention) and gets
+divided by 100 -- if wrong, every price reads exactly 100x off; (2) the outer reconnect
+loop actually recovers from a real disconnect, not just from the fake `SmartWebSocketV2`
+substitute the unit tests use. Verified locally with a running instance (dummy
+credentials, no real feed reachable): the app starts cleanly with the feed unable to
+connect, logs `[LIVEFEED] Waiting for SmartAPI authentication before connecting` rather
+than crashing, and the dashboard renders "Live feed has not produced a price for this
+index yet" rather than a stale guess. Confirmed the actual point of this change with 20
+rapid authenticated dashboard requests producing **zero** `SmartAPI ltpData` log lines
+(the caching fix above still produced roughly one call per 5s TTL window under the same
+test; this produces none, ever, regardless of traffic volume).
+
+**Found but out of scope for this change:** `/active-trade-page`
+(`app/dashboard_routes.py`) calls `smartapi.get_ltp()` once per open trade, uncached, on
+every render -- a separate, still-live uncached SmartAPI call path from the dashboard,
+for option premiums rather than index spot. Not touched here since it's a different data
+need (per-trade LTP, not index spot) and the task explicitly scoped this fix to index
+prices; worth its own look if rate-limit contention continues after this ships.
+
 ### Two production incidents fixed, 5 Aug 2026
 
 **Claude `max_tokens` truncation.** Live logs showed Claude returning `stop_reason=
