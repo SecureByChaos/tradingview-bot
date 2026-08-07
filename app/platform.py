@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
@@ -10,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 from app.db_models import AIExitCall, AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.time_utils import duration_label, format_ist, iso_utc, to_ist, utc_now
+
+logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -556,7 +559,14 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
             try:
                 price = round(smartapi.get_index_spot(index), 2)
             except Exception as exc:
-                entry["error"] = str(exc)
+                # Full detail server-side only. This dict is returned
+                # verbatim as JSON by /api/live-dashboard -- str(exc) on a
+                # SmartAPIError can embed Angel's raw response body, which
+                # isn't meant to leave the process even to an authenticated
+                # dashboard viewer (CodeQL: information exposure through an
+                # exception, PR #9).
+                logger.warning("get_index_live_figures: spot fetch failed for %s: %s", index.symbol, exc)
+                entry["error"] = "Live price temporarily unavailable"
                 figures.append(entry)
                 continue
         else:

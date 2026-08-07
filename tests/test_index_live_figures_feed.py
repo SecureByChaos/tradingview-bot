@@ -68,6 +68,25 @@ def test_falls_back_to_smartapi_when_no_feed_store_given():
     assert figures[0]["price"] == 12345.0
 
 
+def test_smartapi_exception_detail_is_not_returned_to_caller():
+    """Regression test for CodeQL's "information exposure through an
+    exception" finding on PR #9: str(exc) used to flow straight into this
+    dict, which /api/live-dashboard returns verbatim as JSON."""
+
+    class RaisingSmartAPI:
+        def get_index_spot(self, index):
+            raise RuntimeError("internal detail: raw broker response body, not for API clients")
+
+    db = _make_session()
+    _seed_index(db)
+
+    figures = get_index_live_figures(db, RaisingSmartAPI(), feed_store=None)
+
+    assert figures[0]["price"] is None
+    assert "internal detail" not in figures[0]["error"]
+    assert figures[0]["error"] == "Live price temporarily unavailable"
+
+
 def test_does_not_call_smartapi_when_feed_store_present_but_has_no_entry_yet():
     db = _make_session()
     _seed_index(db)
