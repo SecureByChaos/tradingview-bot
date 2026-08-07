@@ -35,8 +35,11 @@ function renderIndices(indices) {
     }
     const cls = (idx.change_abs || 0) >= 0 ? 'profit' : 'loss';
     const sign = (idx.change_abs || 0) >= 0 ? '+' : '';
+    const staleBadge = idx.is_live === false
+      ? ' <span class="badge text-bg-warning" title="Live feed disconnected -- showing last known price">stale</span>'
+      : '';
     return '<div class="metric">' +
-      '<div class="label">' + idx.display_name + '</div>' +
+      '<div class="label">' + idx.display_name + staleBadge + '</div>' +
       '<div class="value">' + idx.price.toLocaleString() + '</div>' +
       '<div class="' + cls + '" style="font-size:.85rem; margin-top:.2rem;">' + sign + idx.change_abs + ' (' + sign + idx.change_percent + '%)</div>' +
       '</div>';

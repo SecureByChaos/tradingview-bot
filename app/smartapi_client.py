@@ -84,6 +84,22 @@ class SmartAPIClient:
         self._rate_limit_hits_today = 0
         self._rate_limit_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
 
+    @property
+    def jwt_token(self) -> Optional[str]:
+        """Current session JWT, or None if not (yet) authenticated. Read-only
+        access for callers outside this class -- app/live_feed.py's
+        reconnect loop reads this fresh on every attempt rather than caching
+        it, since _call_with_reauth can rotate it independently while a feed
+        connection is running."""
+        return self._jwt_token
+
+    @property
+    def feed_token(self) -> Optional[str]:
+        """Current market-data feed token, or None if not (yet) authenticated.
+        Required by SmartWebSocketV2 alongside jwt_token -- see jwt_token's
+        docstring."""
+        return self._feed_token
+
     @staticmethod
     def _now_ist() -> datetime:
         return datetime.now(ZoneInfo("Asia/Kolkata"))
