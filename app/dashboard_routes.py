@@ -2,6 +2,8 @@
 
 import csv
 import io
+import logging
+import time as time_module
 from datetime import date, datetime, time, timezone
 import json
 from typing import Annotated
@@ -43,6 +45,9 @@ from sqlalchemy import case, func, select
 from app.smartapi_client import SmartAPIError
 from app.time_utils import IST, duration_label, format_ist, to_ist
 from app.trade_manager import TradeManager
+
+logger = logging.getLogger(__name__)
+
 
 def origin_label(origin: str | None) -> str:
     if not origin or origin == "SIGNAL":
@@ -117,9 +122,31 @@ def dashboard(
     )
 
 
+# get_index_live_figures() makes a real SmartAPI call per enabled index
+# (get_index_spot, throttled through the same process-wide 1 req/sec budget
+# get_ltp/get_candles share -- see CLAUDE.md). Every dashboard render used to
+# pay that cost even though the underlying spot price is already being kept
+# current independently by AI Origination's 5-min cycle and the 30s trade
+# monitor -- a burst of dashboard requests (many browser tabs, a monitoring
+# script, or unauthenticated scanner traffic hammering "/" before hitting the
+# login redirect) could starve those live-trading callers of rate-limit
+# budget. Single in-process cache is sufficient: uvicorn runs this app with no
+# --workers, so there's exactly one process to share state in.
+_LIVE_FIGURES_CACHE_TTL_SECONDS = 5.0
+_live_figures_cache: dict[str, object] = {"data": None, "fetched_at": 0.0}
+
+
 def _live_dashboard_data(db: Session, smartapi: object) -> dict[str, object]:
+    now = time_module.monotonic()
+    age = now - _live_figures_cache["fetched_at"]
+    if _live_figures_cache["data"] is None or age >= _LIVE_FIGURES_CACHE_TTL_SECONDS:
+        logger.debug("[DASHBOARD] Live figures cache miss (age=%.1fs); calling SmartAPI", age)
+        _live_figures_cache["data"] = get_index_live_figures(db, smartapi)
+        _live_figures_cache["fetched_at"] = now
+    else:
+        logger.debug("[DASHBOARD] Live figures cache hit (age=%.1fs)", age)
     return {
-        "indices": get_index_live_figures(db, smartapi),
+        "indices": _live_figures_cache["data"],
         "trades": get_open_trades_with_ticks(db),
         "activity": get_today_activity(db),
     }
