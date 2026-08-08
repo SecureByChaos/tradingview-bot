@@ -474,6 +474,50 @@ Two traps already fallen into once each, both documented in the roadmap: overlap
 forward windows inflate significance by ~√(window/stride), and premium *elasticity* is
 not *delta* (they differ by ~200× for Nifty).
 
+### "Shared candle store" proposal declined, real fix was the /active-trade-page LTP cache, 7 Aug 2026
+
+A follow-up to the WebSocket feed asked for a single background job to refresh
+`index_candle` on a fixed interval (recommended ≤1 min), replacing what it described as
+"historical candle fetches... fetched independently by whichever consumer needs them,
+whenever they need them."
+
+**That premise is false. There is exactly one live candle-fetch call site in the entire
+app**: `_load_market_context()` in `app/ai/originator.py`, called once per enabled index
+per 5-minute origination cycle (confirmed by grepping every `.get_candles(` call site --
+the only other two, `market_data.py`'s `capture_closing_auction` and the three
+`scripts/*.py` backfill tools, run once a day at 15:45 IST or are market-hours-guarded,
+neither contends live). Both AI providers share the one `market_context` built per index
+per cycle; it is not re-fetched per provider. At two enabled indexes that is at most 2
+candle calls per 5 minutes -- roughly 24/hour, already light, and `get_candles()`
+already deliberately shares `_throttle_quote_call()` with every `get_ltp`/
+`get_index_spot` call (see that method's own docstring), so it was never a separate,
+uncoordinated contention channel to begin with.
+
+**Building the proposal as specified would have made SmartAPI candle-call volume worse,
+not better.** A background refresher at the recommended ≤1-minute interval, for 2
+indexes, is up to 2 calls/minute -- roughly 120/hour, a 5x increase over origination's
+current ~24/hour, competing for the exact same throttle bucket real trading's `get_ltp`
+calls depend on. The proposal's own stated goal (call volume dropping to "a small, fixed
+number independent of dashboard or origination activity") would not have been met by its
+own design, because there was only ever one consumer for candles to share among.
+
+**What actually still causes contention, identified in the previous PR and confirmed
+here**: `app/dashboard_routes.py`'s `/active-trade-page` calls `smartapi.get_ltp()` once
+per open trade, uncached, on every render -- a real, still-live, traffic-scaling
+SmartAPI call path the WebSocket feed doesn't cover (that feed is index spot only, on a
+small static token set; option premium per open trade is a different and dynamic
+instrument set). This is the actual remaining dashboard-driven contention source, not
+candles. Fixed with the same proven TTL-cache pattern used for `get_index_live_figures`
+before the WebSocket feed replaced it: a 5s in-process cache keyed per contract
+(`symboltoken`), so distinct trades don't collide. `trade.current_premium`/`pnl_percent`
+writes on this route were already display-only -- `get_db()` never commits, so this
+changes no persistence behavior, only which requests pay a fresh SmartAPI cost.
+
+A genuinely shared, persistent option-premium feed (mirroring `app/live_feed.py` but for
+a dynamic per-trade token set rather than 2 static index tokens) is a legitimate future
+upgrade if TTL caching turns out insufficient under real load -- meaningfully bigger
+scope than this fix, deliberately not bundled in here.
+
 ### Dashboard-driven SmartAPI rate exhaustion, 7 Aug 2026
 
 `get_index_live_figures()` called `smartapi.get_index_spot()` fresh on every dashboard

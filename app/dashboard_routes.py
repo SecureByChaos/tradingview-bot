@@ -2,6 +2,7 @@
 
 import csv
 import io
+import time as time_module
 from datetime import date, datetime, time, timezone
 import json
 from typing import Annotated
@@ -174,6 +175,28 @@ def run_health_check(
     return RedirectResponse("/ops", status_code=303)
 
 
+# get_ltp() used to be called fresh per open trade on every render of this
+# page -- a separate, uncached SmartAPI call path from the index-figures one
+# app/live_feed.py's WebSocket feed replaced (that feed only covers index
+# spot; this is option premium per open trade, a materially bigger and
+# dynamic set of instruments a static-token feed doesn't cover). Same fix
+# shape as the index-figures cache before it was replaced: a short in-process
+# TTL, keyed per contract so different trades don't collide. See CLAUDE.md,
+# "Dashboard-driven SmartAPI rate exhaustion" / candle-refresh investigation.
+_TRADE_LTP_CACHE_TTL_SECONDS = 5.0
+_trade_ltp_cache: dict[str, tuple[float, float]] = {}  # symboltoken -> (price, fetched_at)
+
+
+def _cached_ltp(smartapi: object, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
+    now = time_module.monotonic()
+    cached = _trade_ltp_cache.get(symboltoken)
+    if cached is not None and now - cached[1] < _TRADE_LTP_CACHE_TTL_SECONDS:
+        return cached[0]
+    price = smartapi.get_ltp(exchange, tradingsymbol, symboltoken)
+    _trade_ltp_cache[symboltoken] = (price, now)
+    return price
+
+
 @router.get("/active-trade-page", response_class=HTMLResponse)
 def active_trade_page(
     request: Request,
@@ -185,7 +208,7 @@ def active_trade_page(
     open_trades = list(db.scalars(select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN, StrategyTrade.origin == "SIGNAL").order_by(StrategyTrade.entry_time.desc())))
     for trade in open_trades:
         try:
-            current_premium = smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
+            current_premium = _cached_ltp(smartapi, trade.exchange, trade.tradingsymbol, trade.symboltoken)
             trade.current_premium = round(current_premium, 2)
             trade.pnl_percent = round(((current_premium - trade.entry_price) / trade.entry_price) * 100, 2)
         except Exception:
