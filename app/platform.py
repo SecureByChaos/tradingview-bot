@@ -9,7 +9,8 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import AIExitCall, AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.db_models import AIExitCall, AIOriginationLog, AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.market_context import ADX_NO_TREND, ADX_TRENDING
 from app.time_utils import duration_label, format_ist, iso_utc, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
@@ -596,6 +597,71 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
             entry["day_high"] = round(max(all_prices), 2)
         figures.append(entry)
     return figures
+
+
+def _classify_tradability(adx: float | None) -> str:
+    """Three-band read of the same ADX thresholds app/market_context.py's
+    regime classification and the AI Origination system prompt already use
+    (ADX_NO_TREND=20, ADX_TRENDING=25) -- not a new, independently-invented
+    line. Matches the model's own prompt wording: below 20 "no established
+    trend", 20-25 "a trend is developing", above 25 "continuation is better
+    supported"."""
+    if adx is None:
+        return "UNKNOWN"
+    if adx >= ADX_TRENDING:
+        return "TRENDING"
+    if adx >= ADX_NO_TREND:
+        return "MARGINAL"
+    return "NOT_TRADABLE"
+
+
+def get_market_conditions(db: Session) -> list[dict[str, Any]]:
+    """Latest AI Origination market-condition snapshot per enabled index --
+    a read-only view over app/ai/origination_log.py's persisted rows.
+
+    Zero new computation, zero new SmartAPI calls: this reads exactly what
+    _load_market_context() already computed and record_decision() already
+    wrote on origination's own 5-min cycle -- the same regime/ADX/CPR/setups
+    values the [AI][ORIGIN][CTX] log line prints and the model's own prompt
+    is built from. Both providers share one market_context per index per
+    cycle (see originator.py), so picking the single latest row regardless
+    of which provider wrote it is correct, not an arbitrary choice.
+
+    `tradability` is informational only -- see _classify_tradability. Nothing
+    in the trading path reads this; it exists so "is this index trending
+    right now" is answerable from the dashboard instead of grepping logs."""
+    conditions: list[dict[str, Any]] = []
+    for index in db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)):
+        entry: dict[str, Any] = {
+            "symbol": index.symbol,
+            "display_name": index.display_name or index.symbol,
+            "regime": None,
+            "adx": None,
+            "cpr": None,
+            "setups": [],
+            "data_stale": None,
+            "last_updated": None,
+            "tradability": "UNKNOWN",
+        }
+        latest = db.scalar(
+            select(AIOriginationLog)
+            .where(AIOriginationLog.index_name == index.symbol)
+            .order_by(AIOriginationLog.timestamp.desc())
+            .limit(1)
+        )
+        if latest is not None:
+            entry["regime"] = latest.regime
+            entry["adx"] = latest.adx
+            entry["cpr"] = latest.cpr
+            try:
+                entry["setups"] = json.loads(latest.setups) if latest.setups else []
+            except (TypeError, ValueError):
+                entry["setups"] = []
+            entry["data_stale"] = latest.data_stale
+            entry["last_updated"] = iso_utc(latest.timestamp)
+            entry["tradability"] = _classify_tradability(latest.adx)
+        conditions.append(entry)
+    return conditions
 
 
 def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[str, Any]]:

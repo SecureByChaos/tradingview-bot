@@ -27,6 +27,7 @@ from app.platform import (
     get_dashboard_summary,
     get_exit_shadow_summary,
     get_index_live_figures,
+    get_market_conditions,
     get_origination_summary,
     get_open_trades_with_ticks,
     get_or_create_strategy_stats,
@@ -138,6 +139,10 @@ def _live_dashboard_data(db: Session, smartapi: object, live_feed_store: object)
         "indices": get_index_live_figures(db, smartapi, live_feed_store),
         "trades": get_open_trades_with_ticks(db),
         "activity": get_today_activity(db),
+        # Pure DB read of what AI Origination already computed and persisted
+        # on its own 5-min cycle (app/ai/origination_log.py) -- no new
+        # SmartAPI calls, no new computation. See get_market_conditions.
+        "conditions": get_market_conditions(db),
     }
 
 
