@@ -6,6 +6,12 @@
 </div>
 
 <div class="section-header">
+  <h4 class="mb-0">Market conditions</h4>
+  <span class="text-body-secondary" style="font-size:.8rem;">Informational -- reflects AI Origination's own regime read, not a second trading gate</span>
+</div>
+<div class="metric-grid mb-4" id="condition-cards"></div>
+
+<div class="section-header">
   <h4 class="mb-0">Active trades</h4>
   <span class="badge text-bg-secondary" id="trade-count">0</span>
 </div>
@@ -23,7 +29,8 @@
 const initialData = {
   indices: {{ indices | tojson }},
   trades: {{ trades | tojson }},
-  activity: {{ activity | tojson }}
+  activity: {{ activity | tojson }},
+  conditions: {{ conditions | tojson }}
 };
 const tradeCharts = {};
 
@@ -42,6 +49,43 @@ function renderIndices(indices) {
       '<div class="label">' + idx.display_name + staleBadge + '</div>' +
       '<div class="value">' + idx.price.toLocaleString() + '</div>' +
       '<div class="' + cls + '" style="font-size:.85rem; margin-top:.2rem;">' + sign + idx.change_abs + ' (' + sign + idx.change_percent + '%)</div>' +
+      '</div>';
+  }).join('');
+}
+
+const TRADABILITY_LABEL = {
+  TRENDING: { emoji: '\u{1F7E2}', text: 'Trending' },
+  MARGINAL: { emoji: '\u{1F7E1}', text: 'Marginal' },
+  NOT_TRADABLE: { emoji: '\u{1F534}', text: 'Not tradable' },
+  UNKNOWN: { emoji: '⚪', text: 'No data yet' }
+};
+
+function timeAgoLabel(isoTimestamp) {
+  if (!isoTimestamp) { return 'never'; }
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(isoTimestamp).getTime()) / 1000));
+  if (seconds < 60) { return seconds + 's ago'; }
+  const minutes = Math.round(seconds / 60);
+  return minutes + 'm ago';
+}
+
+function renderConditions(conditions) {
+  const container = document.getElementById('condition-cards');
+  container.innerHTML = (conditions || []).map(function (c) {
+    const status = TRADABILITY_LABEL[c.tradability] || TRADABILITY_LABEL.UNKNOWN;
+    const adxText = c.adx === null || c.adx === undefined ? '--' : c.adx.toFixed(1);
+    const setups = (c.setups || []).map(function (s) {
+      return '<span class="badge text-bg-secondary" style="margin:.15rem .25rem .15rem 0;">' + s + '</span>';
+    }).join('');
+    const staleBadge = c.data_stale
+      ? ' <span class="badge text-bg-warning" title="Built from stale stored history -- the last candle refresh failed">stale data</span>'
+      : '';
+    return '<div class="metric">' +
+      '<div class="label">' + c.display_name + staleBadge + '</div>' +
+      '<div class="value">' + status.emoji + ' ' + status.text + '</div>' +
+      '<div style="font-size:.85rem; margin-top:.2rem;">Regime: ' + (c.regime || '--') +
+      ' &middot; ADX: ' + adxText + ' &middot; CPR: ' + (c.cpr || '--') + '</div>' +
+      '<div style="margin-top:.4rem;">' + (setups || '<span class="text-body-secondary" style="font-size:.8rem;">No active setups</span>') + '</div>' +
+      '<div class="text-body-secondary" style="font-size:.75rem; margin-top:.4rem;">Last snapshot: ' + timeAgoLabel(c.last_updated) + '</div>' +
       '</div>';
   }).join('');
 }
@@ -106,6 +150,7 @@ let lastUpdatedAt = Date.now();
 
 function renderAll(data) {
   renderIndices(data.indices);
+  renderConditions(data.conditions);
   renderTrades(data.trades);
   renderActivity(data.activity);
   lastUpdatedAt = Date.now();

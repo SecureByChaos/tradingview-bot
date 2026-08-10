@@ -474,6 +474,39 @@ Two traps already fallen into once each, both documented in the roadmap: overlap
 forward windows inflate significance by ~√(window/stride), and premium *elasticity* is
 not *delta* (they differ by ~200× for Nifty).
 
+### Dashboard "Market Conditions" panel -- read-only, zero new calls, 10 Aug 2026
+
+Added a per-index panel to `/` showing the same regime/ADX/CPR/setups snapshot the
+`[AI][ORIGIN][CTX]` log line already prints, plus a 🟢/🟡/🔴 tradability read -- until
+now the only way to see "is Bank Nifty trending right now" was grepping that log line.
+
+`app/platform.py`'s `get_market_conditions()` is a pure read of the **most recent**
+`AIOriginationLog` row per enabled index (Friday's per-decision persistence work) --
+zero new computation, zero new SmartAPI calls, confirmed by log grep during local
+testing. Both AI providers share one `market_context` per index per cycle (see the
+originator.py loop structure), so picking the single latest row regardless of which
+provider wrote it is correct, not an arbitrary choice.
+
+**Tradability reuses `ADX_NO_TREND`/`ADX_TRENDING` directly from `app/market_context.py`
+(imported, not re-declared)** -- TRENDING at ADX ≥ 25, MARGINAL at 20-25, NOT_TRADABLE
+below 20, UNKNOWN when ADX hasn't warmed up yet. Deliberately keyed on the ADX bands
+alone rather than the stored `regime` field: `regime` only reads TREND when CPR is
+*also* NARROW (see `compute_cpr`'s classification in `market_context.py`), so a
+wide-CPR day with ADX 30 would show MIXED even though the model's own system prompt
+("Above 25 continuation is better supported") treats that ADX as meaningful on its own.
+Showing `regime` alongside as separate data avoids losing that distinction while still
+answering "is there a trend" primarily from the same numeric threshold the prompt itself
+states in as many words. Labeled "Informational -- reflects AI Origination's own regime
+read, not a second trading gate" in the template; nothing in the trading path reads it.
+
+Verified live (seeded rows directly, no real SmartAPI/network needed for this one): a
+NARROW/ADX 28.4 row renders TRENDING, a WIDE/ADX 14.2 row renders NOT_TRADABLE, a
+MODERATE/ADX 22.5 + `data_stale=true` row renders MARGINAL with the stale badge, and the
+panel correctly picks up the *latest* row when multiple exist for the same index rather
+than the first. The panel rides the dashboard's existing 10s `/api/live-dashboard` poll
+(pre-existing, not a new refresh cycle) -- the underlying content just doesn't change
+until origination's own 5-min cycle writes a new row, same as the log line it replaces.
+
 ### "Shared candle store" proposal declined, real fix was the /active-trade-page LTP cache, 7 Aug 2026
 
 A follow-up to the WebSocket feed asked for a single background job to refresh
