@@ -148,6 +148,58 @@ def build_signals(arrays: IndexArrays, setup: Setup) -> np.ndarray:
         direction[aligned_up] = LONG
         direction[aligned_down] = SHORT
 
+    elif name == "EMA_RSI_CROSS":
+        # A CROSSOVER event (EMA9 crosses EMA21 at this exact bar), distinct
+        # from EMA_STACK's level check (EMA9>EMA21>EMA50, true for as long as
+        # the stack holds). RSI(14) confirms direction at the same bar.
+        #
+        # entry_offset controls same-bar-close vs next-bar entry as an
+        # explicit look-ahead-bias control (scalping-horizon roadmap item
+        # 1a): entering on the same bar's close as the signal that confirms
+        # it is a common source of unrealistic backtest results, since real
+        # order placement happens after the close is already known.
+        # compute_outcomes() (scripts/backtest/outcomes.py) always enters at
+        # close[i] for whichever bar i carries the signal, so shifting the
+        # SIGNAL itself forward by one bar (rather than patching the
+        # simulator) is sufficient: offset=0 leaves the signal at the
+        # detection bar (entry = that bar's own close); offset=1 moves it to
+        # the following bar (entry = the NEXT bar's close), the closest
+        # approximation to "wait for confirmation, enter next" this array
+        # representation supports without a separate open-price entry path.
+        rsi_bull = float(setup.params.get("rsi_bull", 55.0))
+        rsi_bear = float(setup.params.get("rsi_bear", 45.0))
+        entry_offset = int(setup.params.get("entry_offset", 0))
+        ema9 = arrays.ema9.astype(np.float64)
+        ema21 = arrays.ema21.astype(np.float64)
+        rsi14 = arrays.rsi14.astype(np.float64)
+        warm = ~np.isnan(ema9) & ~np.isnan(ema21) & ~np.isnan(rsi14)
+
+        prev_below = np.zeros(n, dtype=bool)
+        prev_above = np.zeros(n, dtype=bool)
+        same_session = np.zeros(n, dtype=bool)
+        same_session[1:] = session[1:] == session[:-1]
+        prev_below[1:] = ema9[:-1] <= ema21[:-1]
+        prev_above[1:] = ema9[:-1] >= ema21[:-1]
+
+        cross_up = warm & same_session & (ema9 > ema21) & prev_below & (rsi14 > rsi_bull)
+        cross_down = warm & same_session & (ema9 < ema21) & prev_above & (rsi14 < rsi_bear)
+        direction[cross_up] = LONG
+        direction[cross_down & ~cross_up] = SHORT
+
+        if entry_offset:
+            shifted = np.zeros(n, dtype=np.int8)
+            if entry_offset < n:
+                shifted[entry_offset:] = direction[: n - entry_offset]
+                # Drop any signal whose shifted entry bar lands in a
+                # different session than where it was detected -- the
+                # holding period must start fresh in its own session, not
+                # carry a Friday-close cross into Monday's open.
+                source_session = np.zeros(n, dtype=arrays.session_id.dtype)
+                source_session[entry_offset:] = arrays.session_id[: n - entry_offset]
+                crossed_boundary = source_session != arrays.session_id
+                shifted[crossed_boundary] = 0
+            direction = shifted
+
     elif name == "EMA_STACK":
         up = (arrays.ema9 > arrays.ema21) & (arrays.ema21 > arrays.ema50)
         down = (arrays.ema9 < arrays.ema21) & (arrays.ema21 < arrays.ema50)
@@ -448,6 +500,12 @@ def default_setups() -> list[Setup]:
     for adx_min in (20, 22, 25, 28):
         setups.append(Setup("ST_ALIGNED_ADX", {"adx_min": adx_min}))
     setups.append(Setup("EMA_STACK"))
+    # Scalping-horizon roadmap, item 1a. Both entry-timing variants declared
+    # up front, same discipline as everything else in this list -- the
+    # comparison between them IS the look-ahead-bias control, so both must
+    # exist before either result is inspected.
+    setups.append(Setup("EMA_RSI_CROSS", {"entry_offset": 0}))
+    setups.append(Setup("EMA_RSI_CROSS", {"entry_offset": 1}))
     for lookback in (3, 6):
         setups.append(Setup("FAILED_BREAKOUT", {"lookback": lookback}))
     for atr_mult in (1.5, 2.0):
@@ -478,6 +536,21 @@ def assert_causal(arrays: IndexArrays, setup: Setup, signals: np.ndarray) -> Non
     if setup.name in ("ST_ALIGNED_ADX", "EXTENDED_FADE", "BNV7", "NV1"):
         cold = np.isnan(arrays.adx14)
         assert not np.any(signals[cold] != 0), f"{setup.label} fired before ADX warmed up"
+
+    # EMA_RSI_CROSS cannot fire before EMA9/21/RSI14 have warmed up, and (for
+    # the offset=1 variant) cannot fire on the first bar of a session, since
+    # that would mean the detection bar was in the PREVIOUS session.
+    if setup.name == "EMA_RSI_CROSS":
+        cold = np.isnan(arrays.ema9) | np.isnan(arrays.ema21) | np.isnan(arrays.rsi14)
+        assert not np.any(signals[cold] != 0), f"{setup.label} fired before EMA9/21/RSI14 warmed up"
+        if setup.params.get("entry_offset"):
+            first_of_session = np.zeros(n, dtype=bool)
+            first_of_session[0] = True
+            first_of_session[1:] = arrays.session_id[1:] != arrays.session_id[:-1]
+            assert not np.any(signals[first_of_session] != 0), (
+                f"{setup.label} fired on the first bar of a session, which cannot be a "
+                "shifted-forward entry from the previous session"
+            )
 
     # NV1 requires the 15-minute HTF EMAs; it cannot fire before they exist.
     if setup.name == "NV1":
