@@ -220,7 +220,7 @@ _SYMBOL_RE = re.compile(
 )
 
 
-def _parse_symbol_filename(stem: str) -> dict | None:
+def parse_symbol_filename(stem: str) -> dict | None:
     """Recover contract metadata from the archived filename.
 
     Needed because the scrip master only lists LIVE instruments. Once a
@@ -260,7 +260,7 @@ def _parse_expiry(raw: str) -> datetime | None:
     return None
 
 
-def _load_option_series(path: Path) -> list[tuple[datetime, float]]:
+def load_option_series(path: Path) -> list[tuple[datetime, float]]:
     series: list[tuple[datetime, float]] = []
     with path.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
@@ -300,7 +300,7 @@ def fit_premium_model(
             # Expected, not exceptional: an expired contract is absent from the
             # scrip master by design, and every archive worth calibrating on is
             # of expired contracts. Fall back to the filename.
-            meta = _parse_symbol_filename(path.stem)
+            meta = parse_symbol_filename(path.stem)
             if meta is None:
                 logger.warning("Skipping %s: not in scrip master and filename unparseable", path.name)
                 continue
@@ -316,7 +316,7 @@ def fit_premium_model(
         strike = strike_raw / 100 if strike_raw > 100000 else strike_raw
         interval = strike_intervals.get(index_symbol, 100)
 
-        series = _load_option_series(path)
+        series = load_option_series(path)
         for k in range(1, len(series)):
             ts, premium = series[k]
             prev_ts, prev_premium = series[k - 1]

@@ -474,6 +474,93 @@ Two traps already fallen into once each, both documented in the roadmap: overlap
 forward windows inflate significance by ~√(window/stride), and premium *elasticity* is
 not *delta* (they differ by ~200× for Nifty).
 
+### Scalping-horizon backtest tooling built, but NOT run -- no historical data in this sandbox, 10 Aug 2026
+
+Built the tooling for the scalping-horizon roadmap (deliverables 1, 1a/1b, 2, 2b), but
+**could not produce a single real result.** This sandbox's `data/trading.db` doesn't
+exist, the checked-in dev DB's `candles` table has 0 rows, and `data/option_candles/`
+doesn't exist either -- there is no historical candle data or option-premium archive
+anywhere in this environment, and (as throughout this whole session) no SmartAPI
+credentials or network path to fetch any. Everything below was built against
+`scripts/backtest/`'s real machinery and verified with synthetic data
+(`tests/test_ema_rsi_cross.py`, `tests/test_scalp_stop_sweep.py`,
+`tests/test_scalp_breakeven.py`, 25 tests total) -- **run the commands below on the
+machine that actually has `data/trading.db` and `data/option_candles/` for real numbers.**
+
+**What got built:**
+
+- **`EMA_RSI_CROSS`** (`scripts/backtest/setups.py`) -- EMA9/EMA21 crossover confirmed by
+  RSI(14), a genuine crossover EVENT (fires once, on the bar the cross happens), distinct
+  from `EMA_STACK`'s level check (true for as long as the stack holds). Two variants
+  registered in `default_setups()`, `entry_offset=0` (same-bar close) and `entry_offset=1`
+  (next-bar close) -- the explicit look-ahead-bias control the roadmap asked for. The
+  offset variant is implemented by shifting the SIGNAL array forward one bar rather than
+  patching the simulator, since `compute_outcomes()` already enters at `close[i]` for
+  whichever bar carries the signal -- shifting the signal is sufficient and required no
+  changes to the shared simulator. Dropped at session boundaries (a Friday-close cross
+  cannot become a Monday-open entry).
+- **`scripts/scalp_stop_sweep.py`** (new) -- the target/stop sweep, reusing
+  `scripts/backtest/outcomes.py`'s `compute_outcomes()`/`RiskCombo` (the same target/stop/
+  trail simulator other backtests already trust) rather than a second parallel one, masked
+  to whichever bars a setup actually signals on. Sweeps the exact grid specified (target
+  3% x stops 1/1.5/2/2.5/3%, target 5% x stops 1.5/2/2.5/3/4%) at configurable holding-
+  period caps, reporting win rate, a noise-hit rate on stop-outs specifically (MFE within
+  20% of the stop distance -- a documented judgment call, not a measured threshold),
+  realized (not nominal) reward:risk, and net expectancy using the real fitted premium
+  multiplier and `app/trade_costs.py`'s cost model against the archive's own median
+  premium.
+- **`scripts/scalp_breakeven.py`** (new) -- deliverable 1, meant to be run and read FIRST.
+  Computes round-trip cost %% from the real cost model against the archive's own median
+  premium (not the flat ~0.56-0.6%% figure quoted elsewhere -- that number should fall out
+  of this, not be assumed into it), and the empirical distribution of NON-OVERLAPPING
+  absolute premium moves at each holding period from the real archived 1-minute option
+  data. Reports the fraction of windows where the move alone (regardless of direction)
+  would clear costs -- an upper bound no directional signal can beat.
+- **`scripts/walk_forward.py`**: added `--horizon-bars` (previously a hardcoded 60-minute
+  constant) so it can validate the new setups at scalping horizons without a second
+  walk-forward implementation -- `--setups EMA_RSI_CROSS --interval ONE_MINUTE
+  --horizon-bars 5`, for instance.
+- **`scripts/setup_significance.py`'s existing `--horizons` flag already covers the
+  ORB_BREAK re-test** (roadmap item 1b) -- no new code needed. It takes forward-bar
+  counts at whatever `--interval` is loaded; at the default `FIVE_MINUTE` that's
+  `--horizons 1,2,3` for 5/10/15-min forward windows, or load `--interval ONE_MINUTE` for
+  genuine 1-minute resolution including the 3-minute case. Its Bonferroni correction
+  already scales the comparison count automatically with whatever `--setups`/`--horizons`
+  are actually run, so including `EMA_RSI_CROSS` inflates it correctly with no extra work.
+- **`scripts/holdout_test.py`** already takes an arbitrary `--candidate` label -- no new
+  code needed there either, just a fresh holdout window (see caution below).
+
+**Run in this order** (on the machine with real data):
+
+```bash
+python -m scripts.scalp_breakeven --candles data/option_candles
+python -m scripts.setup_significance --setups ORB_BREAK --interval FIVE_MINUTE --horizons 1,2,3
+python -m scripts.setup_significance --setups EMA_RSI_CROSS --interval ONE_MINUTE --horizons 3,5,10,15
+python -m scripts.scalp_stop_sweep --db data/trading.db --setups EMA_RSI_CROSS
+python -m scripts.walk_forward --db data/trading.db --setups EMA_RSI_CROSS --interval ONE_MINUTE --horizon-bars 5
+python -m scripts.holdout_test --db data/trading.db --candidate "EMA_RSI_CROSS[entry_offset=0]" --holdout-start <fresh date>
+```
+
+**Real constraint worth flagging before any of this runs**: SmartAPI serves roughly 28
+days of 1-minute history per request (see the option-candle-pull gotcha above), unlike
+the two-year `FIVE_MINUTE` archive the 30/60-min work ran against. Genuine 1-minute
+scalping analysis is therefore bounded to whatever rolling ~28-30 day window has actually
+been backfilled at `ONE_MINUTE` resolution -- a much smaller sample than the two-year
+history, which affects both statistical power and how tight a fit/holdout split can be.
+Check actual `ONE_MINUTE` coverage in `data/trading.db` before trusting a "no edge"
+verdict at this resolution the way the two-year 30/60-min verdict is trusted.
+
+**Also flagged, not modeled**: a signal firing 30+ times a day has 30x the slippage/
+execution-risk exposure of one firing once, and nothing in `compute_outcomes()` or this
+sweep models that -- it's a real gap in what this tooling can answer, not something
+papered over with an assumption.
+
+**Scope respected**: no changes to entry/exit logic, risk parameters, the AI Origination
+prompt, or the trend-age observation window. `EMA_RSI_CROSS` and the two new scripts are
+backtest-only, never imported by `app.*` (confirmed by `tests/test_module_imports.py`'s
+existing `scripts.` isolation check, which already fails the whole suite if that boundary
+is ever crossed).
+
 ### Dashboard "Market Conditions" panel -- read-only, zero new calls, 10 Aug 2026
 
 Added a per-index panel to `/` showing the same regime/ADX/CPR/setups snapshot the

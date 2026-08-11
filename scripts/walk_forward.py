@@ -110,12 +110,12 @@ def _edge(wins: float, ups: float, longs: float, n: float) -> float:
     return (wins / n - base) * 100.0
 
 
-def _evaluate_window(arrays, mask, direction, rng) -> tuple[int, float, float, float]:
+def _evaluate_window(arrays, mask, direction, rng, horizon_bars: int = HORIZON_BARS) -> tuple[int, float, float, float]:
     n_bars = len(arrays)
     close = arrays.close.astype(np.float64)
     positions = np.arange(n_bars)
-    bounds = forward_window_bounds(arrays, HORIZON_BARS)
-    target = np.minimum(positions + HORIZON_BARS, bounds)
+    bounds = forward_window_bounds(arrays, horizon_bars)
+    target = np.minimum(positions + horizon_bars, bounds)
 
     valid = mask & (direction != 0) & (target > positions)
     idx = np.flatnonzero(valid)
@@ -153,6 +153,15 @@ def main() -> int:
     parser.add_argument("--windows", type=int, default=6, help="Number of consecutive periods")
     parser.add_argument("--regime", default="1100_1400", choices=sorted(REGIME_WINDOWS))
     parser.add_argument("--setups", default="ST_ALIGNED,EMA_STACK,ORB_BREAK,PDH_PDL_BREAK")
+    parser.add_argument(
+        "--horizon-bars", type=int, default=HORIZON_BARS,
+        help=(
+            f"Forward bars per window, at whatever --interval is loaded (default {HORIZON_BARS} "
+            "bars = 60 min at the default FIVE_MINUTE interval). Scalping-horizon roadmap item 4: "
+            "override for a shorter holding period, e.g. --interval ONE_MINUTE --horizon-bars 5 "
+            "for a 5-minute scalp window."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=20260731)
     args = parser.parse_args()
 
@@ -195,7 +204,7 @@ def main() -> int:
             assert_causal(arrays, setup, signals)
             for w, chunk in enumerate(chunks, start=1):
                 in_window = np.isin(arrays.session_id, chunk)
-                n, edge, lo, hi = _evaluate_window(arrays, eligible & in_window, signals, rng)
+                n, edge, lo, hi = _evaluate_window(arrays, eligible & in_window, signals, rng, args.horizon_bars)
                 if n < MIN_SIGNALS_PER_WINDOW:
                     continue
                 dates = arrays.ts[in_window].astype("datetime64[D]").astype(object)
@@ -212,7 +221,7 @@ def main() -> int:
         by_series[(r.index_symbol, r.setup)].append(r)
 
     logger.info("=" * 100)
-    logger.info("PER-WINDOW EDGE (60-minute horizon, regime=%s)", args.regime)
+    logger.info("PER-WINDOW EDGE (%s-bar horizon at %s, regime=%s)", args.horizon_bars, args.interval, args.regime)
     logger.info("  '+' CI above zero, '-' CI below, '.' straddles")
     for (symbol, setup), rows in sorted(by_series.items()):
         rows.sort(key=lambda r: r.window)
