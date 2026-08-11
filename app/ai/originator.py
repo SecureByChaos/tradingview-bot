@@ -156,6 +156,31 @@ _MAX_SL_TARGET_PERCENT = 50.0
 # bucket rather than "6-10" -- raise to 6 here if the intent was to exclude
 # that bucket entirely rather than approximately.
 _MIN_DTE_TO_TRADE = 5
+# 11 Aug 2026: hard gate, not a prompt change. The soft trend-age caution
+# added to SYSTEM_PROMPT (~7 Aug) was explicitly an observation window --
+# "if trades keep firing with same_direction_entries_today: 5+ and no change
+# in behavior, that's the evidence needed to justify the harder gate". 11 Aug
+# produced that evidence: 7 same-direction BUY_PE entries across two indices,
+# same_direction_entries_today already at 1 or 2 before four of them opened,
+# the model naming the exact risk in its own reasoning each time and trading
+# anyway. The model consistently identifies the risk in language and then
+# acts as if it hadn't -- soft caution doesn't reliably translate to
+# behavior, so this is a deterministic rule outside its discretion, same
+# category as _MIN_DTE_TO_TRADE above. Threshold of 2 is the one concrete
+# number the incident review gave (today's losing entries were already at 1
+# and 2 same-direction entries on the books) -- NOT backtested. This blocks
+# the 3rd+ same-direction entry per index+direction per day; it does not
+# touch the 1st or 2nd.
+#
+# Deliberately does NOT also gate on trend_duration_pct_of_session (today's
+# entries were uniformly at 96-100%, and the incident review flagged it as
+# possibly the more robust signal of the two) -- that review gave a sweep
+# range to validate (80/90/95%), not a committed number, and picking one from
+# a single day's anecdote is exactly the overfitting error this project has
+# repeatedly guarded against elsewhere. See scripts/trend_age_gate_backtest.py
+# and CLAUDE.md's "Move Trend-Age Caution to a Hard Gate" entry -- run that
+# script for real before adding a second threshold here.
+_MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK = 2
 # Trailing fallback's own parameters -- these aren't "correcting" the AI's
 # entry/exit judgment, they're the same trailing-engine knobs every other
 # trailing-mode strategy in this app already uses (StrategyConfig.trailing_*),
@@ -846,6 +871,23 @@ def _open_trade(
     market_context: MarketContext | None = None,
     data_stale: bool = False,
 ) -> Optional[StrategyTrade]:
+    # Trend-age hard gate, checked first and before any quote/contract-resolution
+    # cost is spent: a thesis already traded this many times today for this
+    # index+direction is blocked outright, regardless of confidence or how sane
+    # the AI's own sl/target numbers are. See _MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK's
+    # comment for why this exists and why trend_duration_pct_of_session is not
+    # also gated here yet.
+    if market_context is not None:
+        same_direction_today = market_context.same_direction_entries_today or {}
+        same_direction_count = same_direction_today.get(decision.action, 0)
+        if same_direction_count >= _MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK:
+            logger.info(
+                "[AI][ORIGIN] %s: Skipped: same_direction_entries_today[%s]=%s exceeds threshold %s",
+                index.symbol, decision.action, same_direction_count,
+                _MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK,
+            )
+            return None
+
     def _is_sane(value: float | None) -> bool:
         return value is not None and _MIN_SL_TARGET_PERCENT <= value <= _MAX_SL_TARGET_PERCENT
 

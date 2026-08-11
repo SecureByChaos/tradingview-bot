@@ -295,6 +295,92 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Trend-age caution moved to a hard gate — partially, pending backtest (11 Aug 2026)
+
+The soft trend-age caution added to `SYSTEM_PROMPT`/`_build_user_prompt` (~7 Aug) was
+explicitly an observation window: *"if trades keep firing with
+`same_direction_entries_today: 5+` and no change in behavior, that's the evidence needed
+to justify the harder gate."* 11 Aug produced that evidence — 7 same-direction `BUY_PE`
+entries across two indices, `same_direction_entries_today` already at 1 or 2 before four
+of them opened, the model naming the exact risk in its own reasoning each time and trading
+anyway. Soft caution doesn't reliably translate to behavior.
+
+**Shipped:** `app/ai/originator.py`'s `_open_trade` now hard-blocks a new entry when
+`same_direction_entries_today[decision.action] >= 2` (`_MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK`),
+checked first, before any contract resolution or quote-budget spend — same position in the
+function as the DTE floor, same log-and-`return None` pattern, so the skip shows up in
+`ai_origination_logs` the same way every other declined/blocked decision already does
+(no new plumbing needed; `record_decision()` is already called unconditionally regardless
+of why `_open_trade` returned `None`). Threshold of 2 is the one concrete number the
+incident review gave (today's losing entries were already at 1 and 2 same-direction
+entries on the books) — **not backtested**, an anecdote-derived starting point, same
+caution this project applies to every other single-day threshold choice.
+
+**Deliberately NOT shipped:** a `trend_duration_pct_of_session` gate. Today's entries were
+uniformly at 96–100%, and the incident review flagged trend duration as possibly the more
+robust of the two signals — but it only gave a sweep range to validate (80/90/95%), never
+a committed number, and picking one from a single day's data is exactly the overfitting
+error this project has repeatedly guarded against elsewhere (see the holdout-discipline
+entries below). The field is still fully computed, logged, and shown to the model — this
+only withholds a second hard-coded threshold pending real validation.
+
+**Validation tooling built, not run — same constraint as every backtest this cycle.** This
+sandbox has no `data/trading.db` and no real candle history (confirmed again this session:
+`sqlite3.OperationalError: no such table: candles`, identical to how every other backtest
+script in `scripts/` already fails here). `scripts/trend_age_gate_backtest.py` computes two
+proxies from the existing 2-year archive rather than needing new data: `same_direction_count_today`
+(how many times a given setup already fired the same direction earlier that session, against
+its own signal history) and `trend_duration_pct` (an exact re-derivation of
+`app/market_context.py`'s `compute_trend_age`, run-length of the 5-min Supertrend direction
+over bars elapsed since session open). Sweeps entries-thresholds 1/2/3/4 and trend-duration
+80/90/95%, reports the full parameter surface (never picks one cell) on both an in-sample
+slice and a chronological out-of-sample tail — **not** the locked holdout
+(`data/holdout_record.json`); this is risk-control validation, not a search for a new
+directional edge, so per the roadmap it doesn't spend that scarce resource. Run on the
+machine with real data:
+
+```bash
+python -m scripts.trend_age_gate_backtest --db data/trading.db
+```
+
+Read the "PROTECTIVE-THRESHOLD CHECK" section first — it names any (setup, threshold) cell
+where the at-or-above bucket is reliably worse than the below bucket in *both* the
+in-sample slice and the untouched out-of-sample tail. If nothing clears that bar, that
+doesn't necessarily mean the shipped gate is wrong: it protects against a rare,
+high-severity pattern (7 correlated entries in one day) that a 2-year archive of ordinary
+setup re-fires may not reproduce at a testable sample size — read alongside each cell's
+`n` before concluding either way.
+
+**Scope respected:** confirmed via `git diff` that this touched only `_open_trade` (42
+insertions, 0 deletions) — `SYSTEM_PROMPT` and `_build_user_prompt` are byte-for-byte
+unchanged, so the model's own trend-age reasoning still runs exactly as before; the gate is
+a backstop, not a replacement. This ends the "soft-only" phase of the trend-age fix
+specifically — it does not end the broader two-week observation window for anything else
+(correlated-entry flag data collection continues).
+
+**Cross-strategy correlation — flagged, not built.** The trigger evidence described BNV11
+and AI Origination taking the same Bank Nifty PE thesis 40 minutes apart. **Could not
+corroborate "BNV11" anywhere in this repository** — code, tests, or `CLAUDE.md`'s own
+strategy list, which names only BNV5.1, BNV6, BNV7, and NV1 (see "The shared-FIXED-branch
+hazard" above). It may be a live strategy configured directly via the TradingView
+webhook/admin UI with no corresponding code (structurally possible — `StrategyTrade.strategy_name`
+is just a label, nothing in Python requires a matching branch), or a name mismatch in the
+review — this sandbox has no live trade data to check either way. Confirm which before
+trusting that specific data point.
+
+That said, the underlying question stands regardless of the name: the existing
+`concurrent_correlated_entry` flag only tracks Claude-vs-OpenAI agreement *within* AI
+Origination (`_find_correlated_entry` in `app/ai/originator.py`, scoped to
+`origin.like("AI_ORIGIN_%")`). Every rule-based strategy (BNV5.1/BNV6/BNV7/NV1) and AI
+Origination independently trade the same underlying instruments and the same CE/PE
+direction space, with no shared view of each other's open positions or recent entries —
+so the same failure mode this gate addresses (multiple independent systems reaching the
+same conclusion and compounding exposure rather than diversifying it) is structurally
+possible across strategies, not just within AI Origination's two providers. Worth a
+follow-up gate if real trade data shows it happening with any frequency — deliberately not
+built here, since it is a materially bigger change (touching strategy systems that are
+currently profitable and under their own freeze) than this one's scope.
+
 ### AI Origination's entry signal does not work (30 Jul 2026)
 
 A two-year backtest over ~37,000 five-minute bars per index found **no positive
