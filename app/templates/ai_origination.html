@@ -20,7 +20,7 @@
     {% for row in live %}
       <tr>
         <td data-label="Provider"><span class="badge text-bg-info">{{ row.provider }}</span></td>
-        <td data-label="Position">{{ row.index_display_name }} · {{ row.position_label }}</td>
+        <td data-label="Position">{{ row.index_display_name }} {{ row.strike }} · {{ row.position_label }}</td>
         <td data-label="Mode"><span class="badge {% if row.mode == 'LIVE' %}text-bg-danger{% else %}text-bg-secondary{% endif %}">{{ row.mode }}</span></td>
         <td data-label="Entry">{{ row.entry_price }}</td>
         <td data-label="Capital (₹)">₹{{ "%.2f"|format(row.investment_amount or 0) }}</td>
@@ -47,7 +47,7 @@
     {% for row in history %}
       <tr>
         <td data-label="Provider"><span class="badge text-bg-info">{{ row.provider }}</span></td>
-        <td data-label="Position">{{ row.index_display_name }} · {{ row.position_label }}</td>
+        <td data-label="Position">{{ row.index_display_name }} {{ row.strike }} · {{ row.position_label }}</td>
         <td data-label="Mode"><span class="badge {% if row.mode == 'LIVE' %}text-bg-danger{% else %}text-bg-secondary{% endif %}">{{ row.mode }}</span></td>
         <td data-label="Entry">{{ row.entry_price }}</td>
         <td data-label="Capital (₹)">₹{{ "%.2f"|format(row.investment_amount or 0) }}</td>

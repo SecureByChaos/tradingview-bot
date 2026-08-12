@@ -225,7 +225,7 @@ class MultiStrategyTradeManager:
         log_event(
             db,
             "TRADE",
-            f"[{strategy.name}] {signal.value} opened",
+            f"[{strategy.name}] {signal.value} opened @ strike {trade.strike}",
             payload={"trade_id": trade.trade_id, "entry_time_ist": format_ist(trade.entry_time)},
         )
         self.telegram.send(db, f"Trade Opened\n[{strategy.name}] {signal.value}\nEntry: {trade.entry_price}")
@@ -489,7 +489,7 @@ class MultiStrategyTradeManager:
         log_event(
             db,
             "TRADE",
-            f"[{trade.strategy_name}] trade closed: {reason.value}",
+            f"[{trade.strategy_name}] trade closed: {reason.value} (strike {trade.strike})",
             payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time), "origin": trade.origin},
         )
         if is_ai_alternative:

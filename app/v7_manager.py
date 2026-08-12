@@ -164,7 +164,7 @@ class V7Manager:
         log_event(
             db,
             "TRADE",
-            f"[V7] {signal.value} opened",
+            f"[V7] {signal.value} opened @ strike {trade.strike}",
             payload={"trade_id": trade.trade_id, "entry_time_ist": format_ist(trade.entry_time)},
         )
         self.telegram.send(db, f"Trade Opened\n[V7] {signal.value}\nEntry: {trade.entry_price}")
@@ -381,7 +381,7 @@ class V7Manager:
         log_event(
             db,
             "TRADE",
-            f"[V7] {trade.option_type} trade closed: {reason.value}",
+            f"[V7] {trade.option_type} {trade.strike} trade closed: {reason.value}",
             payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "exit_time_ist": format_ist(trade.exit_time), "origin": trade.origin},
         )
         # AI_ALT_* trades are evaluation-only side-by-side comparisons -- no

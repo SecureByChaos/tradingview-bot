@@ -695,6 +695,7 @@ def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[s
                 "strategy_name": trade.strategy_name,
                 "index_symbol": trade.index_symbol,
                 "option_type": trade.option_type,
+                "strike": trade.strike,
                 "index_display_name": _index_display_name(trade.index_symbol),
                 "position_label": "Long call" if trade.option_type == "CE" else "Long put",
                 "entry_price": trade.entry_price,
@@ -884,6 +885,7 @@ def get_origination_summary(db: Session, limit: int = 30) -> dict[str, Any]:
             "trade_id": trade.trade_id,
             "provider": trade.origin[len("AI_ORIGIN_"):].title() if trade.origin else "",
             "index_display_name": _index_display_name(trade.index_symbol),
+            "strike": trade.strike,
             "position_label": "Long call" if trade.option_type == "CE" else "Long put",
             "mode": trade.mode,
             "entry_price": trade.entry_price,
@@ -946,7 +948,7 @@ def get_today_activity(db: Session, limit: int = 20) -> list[dict[str, Any]]:
             {
                 "timestamp": trade.entry_time,
                 "time_label": to_ist(trade.entry_time).strftime("%I:%M %p") if to_ist(trade.entry_time) else "",
-                "message": f"[{trade.strategy_name}] Entered {_index_display_name(trade.index_symbol)} {position}",
+                "message": f"[{trade.strategy_name}] Entered {_index_display_name(trade.index_symbol)} {trade.strike} {position}",
             }
         )
     for trade in closed_today:
@@ -956,7 +958,7 @@ def get_today_activity(db: Session, limit: int = 20) -> list[dict[str, Any]]:
             {
                 "timestamp": trade.exit_time,
                 "time_label": to_ist(trade.exit_time).strftime("%I:%M %p") if to_ist(trade.exit_time) else "",
-                "message": f"[{trade.strategy_name}] Closed {_index_display_name(trade.index_symbol)} {position}, {sign}{trade.pnl_percent:.1f}%",
+                "message": f"[{trade.strategy_name}] Closed {_index_display_name(trade.index_symbol)} {trade.strike} {position}, {sign}{trade.pnl_percent:.1f}%",
             }
         )
     events.sort(key=lambda event: event["timestamp"], reverse=True)
