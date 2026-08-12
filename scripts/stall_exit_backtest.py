@@ -121,7 +121,7 @@ class Coverage:
     no_bars_after: list[str] = field(default_factory=list)
 
 
-def _load_premium_series(tradingsymbol: str, symboltoken: str) -> list[tuple[datetime, float, float, float]]:
+def load_premium_series(tradingsymbol: str, symboltoken: str) -> list[tuple[datetime, float, float, float]]:
     """(ts, high, low, close) per minute for one contract, or []."""
     path = OPTION_CANDLE_DIR / f"{tradingsymbol}_{symboltoken}.csv"
     if not path.exists():
@@ -135,6 +135,34 @@ def _load_premium_series(tradingsymbol: str, symboltoken: str) -> list[tuple[dat
             except (KeyError, ValueError):
                 continue
     return sorted(series)
+
+
+_IST_OFFSET = datetime(2000, 1, 1, 5, 30) - datetime(2000, 1, 1, 0, 0)
+
+
+def db_timestamp_to_ist(raw: str) -> datetime:
+    """Convert a strategy_trades UTC timestamp, as actually read back through
+    plain sqlite3, to a naive IST datetime matching the option-candle
+    archive's own timestamps.
+
+    Confirmed empirically (not just per the DateTime(timezone=True) docs):
+    writing utc_now() (tzinfo=utc) through this app's models and reading it
+    back with plain sqlite3 -- not the SQLAlchemy ORM, which normalizes on
+    read -- yields a bare 'YYYY-MM-DD HH:MM:SS.ffffff' string with NO 'Z' or
+    offset marker at all. So the wall-clock numbers in the raw string are
+    always the UTC value, regardless of whether fromisoformat happens to
+    parse a tzinfo out of them. A prior version of this function only added
+    the +5:30 IST shift when the parsed value carried a tzinfo -- which never
+    happens against this app's real data -- so every comparison against the
+    archive silently used UN-shifted UTC numbers as if they were IST, off by
+    5.5 hours. Handled here for both cases: an aware value is normalized to
+    UTC first (in case a future write path ever includes an offset), a naive
+    one is trusted as already being the UTC value -- either way, +5:30 is
+    always applied.
+    """
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    naive_utc = parsed.replace(tzinfo=None) if parsed.tzinfo is None else (parsed - parsed.utcoffset()).replace(tzinfo=None)
+    return naive_utc + _IST_OFFSET
 
 
 def _replay_forward(
@@ -302,15 +330,11 @@ def main() -> int:
 
     for row in rows:
         label = f"{row['trade_id'][:8]} {row['index_symbol']} {row['tradingsymbol']}"
-        series = _load_premium_series(row["tradingsymbol"], row["symboltoken"])
+        series = load_premium_series(row["tradingsymbol"], row["symboltoken"])
         if not series:
             coverage.no_archive.append(label)
             continue
-        exit_ts = datetime.fromisoformat(str(row["exit_time"]).replace("Z", "+00:00"))
-        # Stored UTC-aware; the archive is naive IST.
-        exit_ist = exit_ts.replace(tzinfo=None) + (
-            datetime(2000, 1, 1, 5, 30) - datetime(2000, 1, 1, 0, 0)
-        ) if exit_ts.tzinfo else exit_ts.replace(tzinfo=None)
+        exit_ist = db_timestamp_to_ist(str(row["exit_time"]))
         after = [bar for bar in series if bar[0] > exit_ist and bar[0].date() == exit_ist.date()]
         if not after:
             coverage.no_bars_after.append(label)
