@@ -1068,7 +1068,7 @@ def _open_trade(
     log_event(
         db,
         "AI_ORIGIN",
-        f"[{strategy_name}] {origin} originated: {signal.value}",
+        f"[{strategy_name}] {origin} originated: {signal.value} @ strike {trade.strike}",
         payload={
             "trade_id": trade.trade_id,
             "confidence": decision.confidence,

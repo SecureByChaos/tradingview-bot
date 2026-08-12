@@ -105,7 +105,7 @@ function renderTrades(trades) {
     const cls = (trade.pnl_percent || 0) >= 0 ? 'profit' : 'loss';
     const sign = (trade.pnl_percent || 0) >= 0 ? '+' : '';
     return '<div class="trade-card">' +
-      '<div class="trade-card-header"><strong>' + trade.index_display_name + ' · ' + trade.position_label + '</strong>' +
+      '<div class="trade-card-header"><strong>' + trade.index_display_name + ' ' + trade.strike + ' · ' + trade.position_label + '</strong>' +
       '<span class="badge text-bg-success">Open</span></div>' +
       '<div class="trade-card-strategy">Strategy: ' + trade.strategy_name + '</div>' +
       '<div class="trade-card-figures">' +

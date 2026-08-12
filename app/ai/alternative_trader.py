@@ -152,7 +152,7 @@ def maybe_open_alternative_trade(
     log_event(
         db,
         "AI_ALT",
-        f"[{original_trade.strategy_name}] {origin} alternative opened: {signal.value}",
+        f"[{original_trade.strategy_name}] {origin} alternative opened: {signal.value} @ strike {trade.strike}",
         payload={
             "trade_id": trade.trade_id,
             "source_trade_id": original_trade.trade_id,
