@@ -295,7 +295,7 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
-### Break-confirmation gate for continuation entries — backtest tooling built, gate NOT shipped (12 Aug 2026)
+### Break-confirmation gate for continuation entries — run for real, NOT SUPPORTED (12 Aug 2026)
 
 **Trigger, one trade, not evidence on its own:** Bank Nifty 57700 CE, AI Origination/OpenAI,
 lost -10.61% (STOPLOSS), MFE only 1.78%. `same_direction_entries_today` was 0, so the
@@ -374,6 +374,58 @@ landed — 0.66, no break active). Both are a real design decision — how much 
 per 0.1 confidence, or what floor value — that this pass deliberately leaves to the user
 rather than picking a number with the same single-trade sample the rest of this entry
 argues against. Worth its own dated follow-up once decided.
+
+**Run for real, same day.** Both parts ran against production `data/trading.db`:
+
+PART 1 (real history): 13 confirmed entries (win rate 38.5%, mean P&L −1.91%), **1**
+unconfirmed entry (win rate 100%, +3.55%) — both explicitly flagged below the trust
+threshold, no bootstrap computed (unconfirmed n=1 < 2 is not a comparison). The confirmed
+bucket's own numbers are not good (well under 50% win rate, negative mean), but with
+essentially no unconfirmed population to compare against, PART 1 cannot support or refute
+the hypothesis either way, exactly as anticipated. It does surface something the spec
+didn't ask about but is worth flagging: **13 of 14 closed AI Origination entries already
+had some break setup active at decision time.** If that ratio holds, a hard gate requiring
+break confirmation would rarely fire going forward — the population it would actually
+filter is small by historical rate, independent of whether the trades in it are worse.
+
+PART 2 (2-year fallback), the deciding read given PART 1's thinness:
+
+- **BankNifty**: neither bucket clears zero, in either setup, and the point estimates
+  actually run **backward** from the hypothesis — unconfirmed's edge is higher than
+  confirmed's in both `ST_ALIGNED` (+1.80 vs +0.62pp) and `EMA_STACK` (+1.51 vs +0.48pp).
+  Both CIs are wide and overlapping, so this isn't a reliable negative either — just not
+  supportive.
+- **Nifty**: confirmed clears zero (`ST_ALIGNED` +2.40pp `[+0.72,+3.88]`, `EMA_STACK`
+  +2.62pp `[+1.13,+4.05]`), unconfirmed does not. But "confirmed is POSITIVE and
+  unconfirmed is not significant" is a different, weaker claim than "confirmed is reliably
+  better than unconfirmed" — unconfirmed's CI (`[-1.38,+3.90]` / `[-1.02,+3.91]`) overlaps
+  confirmed's almost entirely, so the difference between the two buckets is not itself
+  established.
+
+**Verdict: NOT SUPPORTED.** This project's own stated standard for treating an effect as
+real rather than noise is replication across both indices (`setup_significance.py`'s
+docstring: *"consistency across partitions... beats any single low p-value... the only
+defence that does not depend on a threshold"*). That fails here outright — BankNifty shows
+no effect and leans the wrong way, Nifty shows a same-direction-only signal that doesn't
+clear the higher bar of beating its own unconfirmed bucket. Per this task's own deliverable
+3, reporting that plainly: **the gate is not being built.** The 12 Aug trade stays a single
+flagged anecdote. `app/ai/originator.py` remains untouched by this investigation.
+
+**One loose end, unresolved and worth checking directly**: the trigger trade itself
+(-10.61%, 12 Aug) does not appear to be the one PART 1 counts as "unconfirmed" — that
+bucket's single entry is a **win** (+3.55%), not the trigger trade's loss. Two
+explanations, and this sandbox has no way to tell which: either the trigger trade hadn't
+closed yet when this ran (unlikely, given it's reported closed above) or it actually *was*
+classified `confirmed` — meaning some other break setup (e.g. `PDH_BREAK`) was active
+alongside the opening-range containment its own reasoning cited, which would mean the
+proposed gate, exactly as specified, would **not** have blocked its own trigger case. Worth
+running directly against that trade before treating the incident as fully understood:
+
+```sql
+SELECT l.decision, l.setups, t.pnl_percent, t.entry_time
+FROM ai_origination_logs l JOIN strategy_trades t ON t.trade_id = l.trade_id
+WHERE t.index_symbol = 'BANKNIFTY' AND t.strike = 57700 AND date(t.entry_time) = '2026-08-12';
+```
 
 ### Trend-age caution moved to a hard gate — partially, pending backtest (11 Aug 2026)
 
