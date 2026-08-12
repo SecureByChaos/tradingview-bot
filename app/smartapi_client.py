@@ -39,8 +39,19 @@ BROKER_FAILED = "FAILED"
 # the same moment -- the 30s trade monitor (once per open trade, including
 # AI_ALT_*/AI_ORIGIN_* shadow trades), the 5-min AI origination check (once
 # per enabled index), webhook-triggered entries/exits, and manual dashboard
-# actions. A small margin above 1.0s avoids edge-of-window rejections.
-_MIN_QUOTE_INTERVAL_SECONDS = 1.05
+# actions.
+#
+# 12 Aug incident: a get_ltp and a get_candles call landed 1.073s apart --
+# already ABOVE the 1.05 margin this constant used to hold -- and Angel still
+# rejected the second one with "exceeding access rate". Confirmed this isn't
+# a scheduling gap: get_candles already goes through this same throttle
+# (_throttle_quote_call, below), and every caller shares the ONE SmartAPIClient
+# instance built in app/main.py, so the lock/last-call-timestamp here is
+# already process-wide, not per-call-site. The margin itself was just too
+# thin -- 50ms of headroom over Angel's nominal 1.0s window doesn't survive
+# real network/processing jitter. Widened with real room to spare rather than
+# nudged to the exact number that would have avoided one specific incident.
+_MIN_QUOTE_INTERVAL_SECONDS = 1.3
 
 # Rate-limit recovery backoff. Deliberately much more patient than the
 # generic 3-attempt/~3.5s retry used elsewhere in this file for auth/token
