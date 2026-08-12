@@ -295,6 +295,52 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Peak-relative STALL_EXIT exemption — backtest built, not run for real (12 Aug 2026)
+
+Follow-up to the trailing-stop false alarm above. Measured against real production data
+(query in chat, not repeated here): winning `STALL_EXIT` trades give back **~63% of their
+peak MFE** on average, worse than `TRAIL_EXIT`'s ~50% — and because `STALL_EXIT` is gated on
+`not trade.trailing_active`, **100% of that giveback happens on trades that never armed
+trailing at all**. `STALL_EXIT`'s band (`abs(pnl_percent) <= 5%`, 60 minutes) is measured
+against entry price with no awareness of how far a trade actually ran — a trade that peaked
+at +8% and eased back to +4% reads identically to one that never moved, and both get closed
+the same way.
+
+**Hypothesis:** exempt a trade from `STALL_EXIT` once its own peak (MFE at the moment it
+would stall) clears a floor well below full trailing activation, instead of the current
+entry-relative-only band. Different question from the existing 6 Aug finding ("would
+holding on unconditionally have been better" — no, net -8.54%/trade, protective) — this
+asks whether a narrower, peak-conditioned subset behaves differently from the population as
+a whole.
+
+**Built**: extended `scripts/stall_exit_backtest.py` (not a new script — it already
+reconstructs every `STALL_EXIT` trade's forward path from real archived option premium,
+exactly the machinery this needs) with a `mfe_at_stall_percent` field on each reconstructed
+`Replay` and a new `PEAK-MFE-CONDITIONED EXEMPTION SWEEP` section: for each candidate floor
+(default 3/4/5/6/7%), buckets trades into "would be exempted" (uses the real-premium
+counterfactual already computed) vs "still stalls" (keeps its real outcome), and reports
+both the exempted subgroup's own delta and the whole population's mean P&L under that floor
+vs. today's baseline. Every trade in the `STALL_EXIT` population has `mfe_at_stall` below
+*its own* `trail_activate_percent` by construction, so these floors are real headroom below
+each trade's individual activation, not an arbitrary constant. Reports the full surface,
+picks no winning floor. 5 new tests (`tests/test_stall_exit_backtest.py`) cover the
+exempt/non-exempt split, the portfolio-mean blending logic, and both boundary floors (0%
+exempts everyone, above-every-peak exempts no one).
+
+**Not run.** Same constraint as every backtest this cycle — no `data/trading.db`, no real
+option-candle archive in this sandbox. Run on the machine with real data:
+
+```bash
+python -m scripts.stall_exit_backtest --db data/trading.db
+python -m scripts.stall_exit_backtest --db data/trading.db --peak-floors 2,3,4,5,6,7,8
+```
+
+Read the sweep's own trust rule before acting on any floor: **positive portfolio delta AND
+`n_exempt` at or above the trust minimum (5)** — a positive number from 2-3 trades is
+exactly the single-anecdote error the break-confirmation-gate investigation earlier today
+was written to avoid. If every floor comes back thin, that's itself the answer: the
+`STALL_EXIT` population (tens of trades) may simply not support slicing this finely yet.
+
 ### AI Origination trailing stop "never activates on PE trades" — false alarm, not a bug (12 Aug 2026)
 
 A report claimed the AI-Origination-specific trailing block in `monitor_open_trades`

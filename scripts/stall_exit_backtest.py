@@ -4,6 +4,32 @@ STEP 1 (and 2) OF THE STALL_EXIT QUESTION, AND DELIBERATELY NOT 3-5.
 See the blockers section below for why the walk-forward and holdout steps of
 the spec cannot be run as written.
 
+PEAK-MFE-CONDITIONED EXEMPTION SWEEP (added 12 Aug)
+----------------------------------------------------
+Prompted by a real giveback measurement: winning STALL_EXIT trades give back
+~63% of their peak MFE on average, worse than TRAIL_EXIT's ~50% -- and by
+construction (STALL_EXIT requires `not trade.trailing_active`), 100% of that
+giveback happens on trades that never armed the full trailing mechanism, so
+none of it is trailing's doing. STALL_EXIT's band is measured against ENTRY
+price, with no awareness of how far a trade actually ran before settling
+back -- a trade that peaked at +8% and eased to +4% reads identically to one
+that never moved, and both get closed on the same 60-minute/+-5% rule.
+
+The baseline analysis above answers "what if STALL_EXIT never fired at all,
+unconditionally" (6 Aug finding: net -8.54%/trade, protective). This is a
+different, narrower question: what if STALL_EXIT still fires for trades that
+genuinely went nowhere, but is EXEMPTED once a trade's own peak (MFE at the
+moment it would have stalled) already cleared some floor below full trailing
+activation? Reuses the exact same real-premium replay this file already does
+for every STALL_EXIT trade -- the only new thing is bucketing the results
+that were already being computed by whether each trade's own `highest_price`
+at exit cleared a candidate floor, and reporting the net effect of adopting
+each floor as an exemption threshold. Every trade in the STALL_EXIT
+population has mfe_at_stall below ITS OWN trail_activate_percent by
+construction (arming exempts a trade from stalling in the first place), so
+the floors swept here are meaningful headroom below whatever each trade's
+own activation happened to be, not an arbitrary constant.
+
 THE COUNTERFACTUAL IS RECONSTRUCTED FROM REAL PREMIUM, NOT SIMULATED
 --------------------------------------------------------------------
 Knowing what a stalled-out position would have done requires its premium path
@@ -32,6 +58,7 @@ high-water mark carried from the live portion.
 Usage:
     python -m scripts.stall_exit_backtest --db data/trading.db
     python -m scripts.stall_exit_backtest --db data/trading.db --verbose
+    python -m scripts.stall_exit_backtest --db data/trading.db --peak-floors 2,3,4,5,6,7,8
 """
 
 from __future__ import annotations
@@ -75,6 +102,11 @@ class Replay:
     adx: float | None
     cpr: str | None
     minutes_held_after: int
+    # Peak reached (highest_price vs entry) as of the moment STALL_EXIT
+    # actually fired -- what a peak-relative exemption floor would compare
+    # against. Always below this trade's own trail_activate_percent, since
+    # arming trailing exempts a trade from stalling in the first place.
+    mfe_at_stall_percent: float
 
     @property
     def delta(self) -> float:
@@ -168,11 +200,72 @@ def _regime(context_json: str | None) -> tuple[float | None, str | None]:
     return data.get("adx"), cpr
 
 
+DEFAULT_PEAK_FLOORS = (3.0, 4.0, 5.0, 6.0, 7.0)
+# Thin at this population size, but always reported with its n rather than
+# hidden -- the STALL_EXIT population itself is small (tens of trades), so a
+# per-floor exemption bucket is smaller still. Below the existing
+# MIN_SAMPLE_FOR_SPLIT deliberately: that gate protects a 2-way regime split,
+# this is a single count meant to be read alongside its own n, not treated as
+# pass/fail.
+MIN_SAMPLE_FOR_FLOOR_CELL = 5
+
+
+@dataclass
+class FloorResult:
+    floor: float
+    n_exempt: int
+    n_total: int
+    exempt_mean_actual: float
+    exempt_mean_counterfactual: float
+    portfolio_mean_baseline: float
+    portfolio_mean_if_adopted: float
+
+    @property
+    def exempt_mean_delta(self) -> float:
+        return self.exempt_mean_counterfactual - self.exempt_mean_actual
+
+    @property
+    def portfolio_delta(self) -> float:
+        return self.portfolio_mean_if_adopted - self.portfolio_mean_baseline
+
+
+def _sweep_peak_floors(replays: list[Replay], floors: tuple[float, ...]) -> list[FloorResult]:
+    """For each candidate floor, split the SAME reconstructed replays into
+    "would be exempted from STALL_EXIT" (mfe_at_stall >= floor -- outcome
+    becomes the real-premium counterfactual already computed above) and
+    "still stalls" (outcome unchanged, the real actual_pnl_percent). Reports
+    both the exempted subgroup's own delta and the whole population's mean
+    P&L under that floor versus today's actual baseline. No new premium
+    reconstruction -- this only re-buckets results _replay_forward already
+    produced."""
+    baseline_mean = sum(r.actual_pnl_percent for r in replays) / len(replays)
+    results: list[FloorResult] = []
+    for floor in floors:
+        exempt = [r for r in replays if r.mfe_at_stall_percent >= floor]
+        still_stalls = [r for r in replays if r.mfe_at_stall_percent < floor]
+        if_adopted = [r.counterfactual_pnl_percent for r in exempt] + [r.actual_pnl_percent for r in still_stalls]
+        results.append(FloorResult(
+            floor=floor,
+            n_exempt=len(exempt),
+            n_total=len(replays),
+            exempt_mean_actual=(sum(r.actual_pnl_percent for r in exempt) / len(exempt)) if exempt else 0.0,
+            exempt_mean_counterfactual=(sum(r.counterfactual_pnl_percent for r in exempt) / len(exempt)) if exempt else 0.0,
+            portfolio_mean_baseline=baseline_mean,
+            portfolio_mean_if_adopted=(sum(if_adopted) / len(if_adopted)) if if_adopted else baseline_mean,
+        ))
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default="data/trading.db")
     parser.add_argument("--verbose", action="store_true", help="Print every reconstructed trade")
+    parser.add_argument(
+        "--peak-floors", default=",".join(str(f) for f in DEFAULT_PEAK_FLOORS),
+        help="Comma-separated candidate peak-MFE exemption floors to sweep, in percent.",
+    )
     args = parser.parse_args()
+    peak_floors = tuple(float(f.strip()) for f in args.peak_floors.split(",") if f.strip())
 
     connection = sqlite3.connect(args.db)
     connection.row_factory = sqlite3.Row
@@ -235,6 +328,7 @@ def main() -> int:
         )
         adx, cpr = _regime(row["market_context_json"])
         coverage.reconstructed += 1
+        highest_price = float(row["highest_price"] or entry_price)
         replays.append(
             Replay(
                 trade_id=row["trade_id"],
@@ -247,6 +341,7 @@ def main() -> int:
                 adx=adx,
                 cpr=cpr,
                 minutes_held_after=int((after[-1][0] - exit_ist).total_seconds() // 60),
+                mfe_at_stall_percent=(highest_price - entry_price) / entry_price * 100,
             )
         )
 
@@ -304,6 +399,31 @@ def main() -> int:
             "  Negative or flat: STALL_EXIT protected P&L on this sample. Conditioning it away "
             "would make results worse, and 6 Aug was a non-representative session."
         )
+
+    logger.info("")
+    logger.info("=" * 84)
+    logger.info("PEAK-MFE-CONDITIONED EXEMPTION SWEEP")
+    logger.info(
+        "  Exempt a STALL_EXIT trade once ITS OWN peak (mfe_at_stall, i.e. highest_price at the "
+        "moment it actually stalled) clears the floor -- exempted trades take the real-premium "
+        "counterfactual computed above, everything else keeps its real STALL_EXIT outcome. Full "
+        "surface below; no floor is picked as a winner here."
+    )
+    for result in _sweep_peak_floors(replays, peak_floors):
+        flag = "" if result.n_exempt >= MIN_SAMPLE_FOR_FLOOR_CELL else "  [THIN -- below trust minimum, read as anecdote]"
+        logger.info(
+            "  floor=%4.1f%%  exempt=%2d/%-2d  exempt-only: actual %+6.2f%% vs held %+6.2f%% (delta %+6.2f%%)  "
+            "portfolio: %+6.2f%% -> %+6.2f%% (%+.2f%%)%s",
+            result.floor, result.n_exempt, result.n_total,
+            result.exempt_mean_actual, result.exempt_mean_counterfactual, result.exempt_mean_delta,
+            result.portfolio_mean_baseline, result.portfolio_mean_if_adopted, result.portfolio_delta,
+            flag,
+        )
+    logger.info(
+        "  A floor is only worth taking seriously if its portfolio delta is positive AND its "
+        "exempt-only n clears the trust minimum -- a positive delta from 2-3 trades is exactly "
+        "the single-anecdote error this whole investigation started from."
+    )
 
     if args.verbose:
         logger.info("")
