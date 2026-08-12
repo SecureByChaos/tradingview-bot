@@ -295,6 +295,86 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Break-confirmation gate for continuation entries — backtest tooling built, gate NOT shipped (12 Aug 2026)
+
+**Trigger, one trade, not evidence on its own:** Bank Nifty 57700 CE, AI Origination/OpenAI,
+lost -10.61% (STOPLOSS), MFE only 1.78%. `same_direction_entries_today` was 0, so the
+repeat-entry gate from 11 Aug had nothing to catch here — this is a different failure mode.
+The model's own reasoning: *"the move has already run for most of the session... price is
+still inside the opening range."* Those two facts are close to contradictory — a move that
+genuinely trended for 49 bars (`trend_duration_pct_of_session=100.0`) should, near-
+definitionally, be outside the range that measures its own first 15-30 minutes. The model
+stated both and didn't act on the tension.
+
+**Hypothesis:** require a completed close beyond a structural level (opening range
+high/low, or previous-day high/low — `app/market_context.py`'s already-computed
+`ORB_BREAK_UP`/`ORB_BREAK_DOWN`/`PDH_BREAK`/`PDL_BREAK`) before a continuation entry is
+allowed.
+
+**Not shipped.** The task spec's own first instruction was explicit and unqualified: *"Do
+not ship this without backtesting first... this trade is one data point."* Unlike the
+11 Aug trend-age gate — which had a concrete, spec-endorsed anecdotal starting number
+("start with 2") — this spec gave no such override and named the acceptable negative
+outcome directly: *"If not supported... report that plainly... the 12 Aug trade stays a
+single flagged anecdote."* This sandbox cannot run the backtest (same constraint as every
+other backtest this cycle — no `data/trading.db`, no real candle history), so "supported or
+not" cannot be answered here, and shipping the gate anyway would be exactly the single-day
+overfitting error the spec was written to prevent. `app/ai/originator.py` is unchanged in
+this pass.
+
+**What was built:** `scripts/break_confirmation_backtest.py`, two independent parts, both
+run automatically:
+
+1. **Real AI Origination history** (`ai_origination_logs JOIN strategy_trades`) — the
+   primary source, since it's the actual population the gate would act on. For every closed
+   AI Origination entry, classifies `confirmed` (a direction-matched break setup was in the
+   logged `setups` list at decision time — `ORB_BREAK_UP`/`PDH_BREAK` for `BUY_CE`,
+   `ORB_BREAK_DOWN`/`PDL_BREAK` for `BUY_PE`) vs `unconfirmed`, and reports n / win rate /
+   mean P&L / mean MFE per bucket (MFE derived from the already-stored `highest_price` vs
+   `entry_price` — no new column), with a bootstrap CI on the P&L difference, overall and
+   per index. At ~2 months of history as of 12 Aug, expect this bucket to be thin
+   (`MIN_BUCKET_LIVE = 20`) — the script flags it explicitly rather than reporting a false
+   CI on too few observations, and says so plainly rather than silently proceeding.
+2. **2-year index-level fallback** — reuses the already-registered `ORB_BREAK`/
+   `PDH_PDL_BREAK` setups from `scripts/backtest/setups.py` (no new setup code) as a
+   direction-matched break signal, intersected with two continuation-style setups
+   (`ST_ALIGNED`, `EMA_STACK` — the closest existing analogs to "ADX says trend, ignore
+   duration") to ask a related question at a much larger sample: does forward edge differ
+   between bars where the continuation setup fires WITH vs WITHOUT a same-direction
+   structural break also active. Same `_edge`/session-block-bootstrap machinery as
+   `setup_significance.py`/`trend_age_gate_backtest.py` (duplicated per this project's
+   established per-script convention, not shared). This is index-direction-only — it
+   cannot see AI Origination's actual entries or real premium P&L, the same limitation
+   every setup-significance-style script in this project already has.
+
+Both parts report full buckets, never pick a winning cell. 7 new tests
+(`tests/test_break_confirmation_backtest.py`) cover the confirmed/unconfirmed
+classification (including that a `BUY_PE` with only up-direction break setups active must
+NOT count as confirmed), the MFE derivation against the trigger trade's own numbers
+(101.78 vs entry 100 → 1.78% MFE, matching the incident report), the bootstrap helper, and
+the break/continuation direction-matching mask. Run on the machine with real data:
+
+```bash
+python -m scripts.break_confirmation_backtest --db data/trading.db
+```
+
+Read PART 1 first — it's the actual population the gate would act on. Only fall back to
+reading PART 2's verdict if PART 1's buckets are too thin to trust (expected at ~2 months
+of history). If PART 1 alone shows a real, sample-adequate difference, that's sufficient to
+act on without waiting on PART 2 to agree — they measure related but not identical
+questions (real trades and real premium vs. index-direction-only proxies), so treat PART 2
+as corroboration when available, not a requirement.
+
+**Confidence-sizing (spec section 3) — flagged, not decided, explicitly not blocking.** The
+trigger trade's own confidence (0.66) was already a discount ("cautious... rather than a
+strong breakout") that changed nothing about stop, target, or size. Two options, not
+mutually exclusive: tie position sizing to confidence, or set a confidence floor
+specifically for entries lacking break confirmation (precisely where the 12 Aug trade
+landed — 0.66, no break active). Both are a real design decision — how much size scales
+per 0.1 confidence, or what floor value — that this pass deliberately leaves to the user
+rather than picking a number with the same single-trade sample the rest of this entry
+argues against. Worth its own dated follow-up once decided.
+
 ### Trend-age caution moved to a hard gate — partially, pending backtest (11 Aug 2026)
 
 The soft trend-age caution added to `SYSTEM_PROMPT`/`_build_user_prompt` (~7 Aug) was
