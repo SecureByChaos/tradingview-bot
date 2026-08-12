@@ -295,6 +295,33 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination trailing stop "never activates on PE trades" — false alarm, not a bug (12 Aug 2026)
+
+A report claimed the AI-Origination-specific trailing block in `monitor_open_trades`
+(`app/multi_strategy.py`) only lives inside the long/CE branch, so `BUY_PE` trades fall
+through to a bare stop/target check with no trailing at all. **Not what the code does.**
+
+`is_short = trade.signal.startswith("SELL")` is unreachable-true for every trade this
+function ever processes, PE or CE: `handle_signal` only opens a trade on `BUY_CE`/`BUY_PE`
+(`SELL_CE`/`SELL_PE` are observation-only, never open a row — see the comment at
+`multi_strategy.py` ~line 93), and a bought put is still long the premium, not short
+anything. So CE and PE AI Origination trades already run through the exact same code path
+(the `else` branch, `sl_mode == FIXED`, `trade.origin.startswith("AI_ORIGIN_")` block) —
+there is no direction-keyed branch in this function to fix.
+
+The report's own evidence table was the tell, once checked against real data
+(`SELECT ... trail_activate_percent, trail_width_percent FROM strategy_trades WHERE
+origin LIKE 'AI_ORIGIN%' ...`): every trade it flagged as "MFE exceeded activation, should
+have armed" had in fact read `trail_width_percent` as if it were `trail_activate_percent`
+— two adjacent, similarly-named columns. Real MFE was below the real activation threshold
+in every single row; `trailing_active=0` was correct in each case, and the one row where it
+correctly armed (MFE 29.13% vs. activate 11.59%, `trailing_active=1`, `trailing_stop`
+populated) confirms the mechanism works as designed. No code change made.
+
+**Watch this specifically when reading `strategy_trades` ad hoc**: `trail_activate_percent`
+and `trail_width_percent` sit next to each other, sound similar, and swapping them makes a
+perfectly healthy trade look like a stuck one.
+
 ### Break-confirmation gate for continuation entries — run for real, NOT SUPPORTED (12 Aug 2026)
 
 **Trigger, one trade, not evidence on its own:** Bank Nifty 57700 CE, AI Origination/OpenAI,
