@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from scripts.stall_exit_backtest import Replay, _sweep_peak_floors
+from datetime import datetime
+
+from scripts.stall_exit_backtest import Replay, _sweep_peak_floors, db_timestamp_to_ist
 
 
 def _replay(mfe_at_stall: float, actual: float, counterfactual: float) -> Replay:
@@ -62,3 +64,34 @@ def test_sweep_reports_full_surface_for_every_requested_floor():
     floors = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
     results = _sweep_peak_floors(replays, floors)
     assert [r.floor for r in results] == list(floors)
+
+
+def test_db_timestamp_to_ist_shifts_naive_string_by_5h30m():
+    # This is the ONLY case real data ever hits: plain sqlite3 reads a
+    # DateTime(timezone=True) column written from utc_now() back as a bare
+    # string with no offset marker at all (confirmed empirically against a
+    # real StrategyTrade row -- see this function's docstring). The raw
+    # number IS the UTC value; it must always be shifted, not left as-is.
+    result = db_timestamp_to_ist("2026-08-12 05:36:48.641115")
+    assert result == datetime(2026, 8, 12, 11, 6, 48, 641115)
+
+
+def test_db_timestamp_to_ist_matches_the_real_trade_from_this_conversation():
+    # 12 Aug BUY_PE trade discussed earlier: raw entry_time 05:36:48 UTC,
+    # independently reported as ~11:06 IST in the same conversation's own
+    # evidence table -- cross-check against a second, independent source.
+    result = db_timestamp_to_ist("2026-08-12 05:36:48.641115")
+    assert result.hour == 11 and result.minute == 6
+
+
+def test_db_timestamp_to_ist_normalizes_an_aware_offset_first():
+    # Defensive case: a value that DOES carry an explicit UTC offset (not
+    # what this app's real data does today, but the function must not
+    # double-shift or mis-handle it if a future write path changes).
+    result = db_timestamp_to_ist("2026-08-12T05:36:48+00:00")
+    assert result == datetime(2026, 8, 12, 11, 6, 48)
+
+
+def test_db_timestamp_to_ist_handles_literal_z_suffix():
+    result = db_timestamp_to_ist("2026-08-12T05:36:48Z")
+    assert result == datetime(2026, 8, 12, 11, 6, 48)

@@ -295,6 +295,90 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### `stall_exit_backtest.py` had a real timezone bug — retroactively affects two already-reported results (12 Aug 2026)
+
+Found while building the stop-distance backtest below, which needed the same UTC-to-IST
+conversion `stall_exit_backtest.py` already did for `exit_time`. That existing conversion
+was wrong, confirmed empirically (not just from reading the code):
+
+```python
+exit_ts = datetime.fromisoformat(str(row["exit_time"]).replace("Z", "+00:00"))
+exit_ist = exit_ts.replace(tzinfo=None) + (five_thirty) if exit_ts.tzinfo else exit_ts.replace(tzinfo=None)
+```
+
+The `+5:30` shift only applied when the parsed value carried a `tzinfo`. Writing a real
+`StrategyTrade` row with `entry_time=utc_now()` (genuinely `tzinfo=utc`) through this app's
+actual models, then reading it back with plain `sqlite3` (not the SQLAlchemy ORM, which
+normalizes on read), produces a bare `'2026-08-12 12:42:01.118664'` string — **no `Z`, no
+offset, ever**. `fromisoformat` parses that as naive, `tzinfo` is `None`, and the shift
+never fires. Cross-checked against a real row from this session's own trailing-stop
+discussion: raw `entry_time` `05:36:48`, independently reported as IST `~11:06` in the same
+conversation — `05:36 + 5:30 = 11:06`, confirming the raw string is naive UTC text and the
+existing code silently used it un-shifted.
+
+**Consequence:** `bar[0] > exit_ist` was comparing the archive's real-IST bar timestamps
+against a value still holding UTC numbers. Since UTC clock time is always earlier than IST
+market hours (09:15–15:40), that threshold was satisfied by nearly every bar of the trading
+day, not just the ones after the real exit — every `STALL_EXIT` counterfactual replay this
+file has ever produced started from something close to market open, not from the actual
+stall moment.
+
+**This affects two already-reported findings**: the 6 Aug "STALL_EXIT is protective, net
+-8.54%/trade" result, and the 12 Aug peak-MFE-conditioned exemption sweep (PR #17, "every
+floor tested comes back negative"). Both need to be treated as unconfirmed until re-run —
+the *sign* of the STALL_EXIT finding might still hold (holding on being worse matches the
+general "index continuation is not premium continuation" pattern found elsewhere this
+project), but the exact magnitudes were computed against the wrong starting point.
+
+**Fixed**: added `db_timestamp_to_ist()` (`scripts/stall_exit_backtest.py`), which always
+applies the shift — normalizing to UTC first if a value ever does carry an offset, trusting
+the raw numbers as UTC when it doesn't (the only case real data hits) — replacing the old
+conditional. 4 new tests including a direct cross-check against the real trade example
+above. `load_premium_series` (the CSV loader) was unaffected — its timestamps come from the
+archive itself, already naive IST, no conversion involved.
+
+**Re-run both affected backtests** on the machine with real data before trusting their
+numbers again:
+
+```bash
+python -m scripts.stall_exit_backtest --db data/trading.db
+python -m scripts.stall_exit_backtest --db data/trading.db --peak-floors 2,3,4,5,6,7,8
+```
+
+### Stop-distance backtest (5% stop proposal) — built, not run for real (12 Aug 2026)
+
+Proposal under discussion: tighten AI Origination's stop to 5%. Two pieces of existing
+evidence already pointed against it before this ran — `stop_survivability.py`'s ~55-62%
+noise-breach rate at a 10% stop (46-55% at 12%), and `scalp_stop_sweep.py`'s finding that
+1-4% stops were net-negative after costs at every tested combination. Neither tested exactly
+5% at AI Origination's own holding style (no fixed horizon — runs until stop/target/time-exit).
+
+**Built**: `scripts/stop_distance_backtest.py`. Every closed AI Origination trade with
+`sl_mode=FIXED` is replayed from its own real `entry_price`/`entry_time`, using its own real
+target held fixed, against swept stop distances (5/7/8/10/12%, plus the trade's own actual
+stop as the baseline row) — same real-premium-archive approach as `stall_exit_backtest.py`
+(reuses its `load_premium_series` and the new `db_timestamp_to_ist`), not the elasticity
+model, for the same reason: the model's own error margin is comparable to the effect being
+measured at this distance. Trailing and `STALL_EXIT` are deliberately not simulated — this
+isolates the stop-distance question from the trailing-width question investigated above,
+rather than conflating them. Reports noise-hit rate, win rate, and net expectancy (real
+entry/exit premium and real quantity through `app/trade_costs.py`, no coefficient needed)
+per stop distance, CE and PE separately, on a chronological in-sample/out-of-sample split.
+17 new tests (`tests/test_stop_distance_backtest.py`) cover the pessimistic intrabar
+ordering, noise-hit classification, aggregation, and the SQL population filter (FIXED-mode
+AI Origination trades only).
+
+**Not run** — no `data/trading.db` or option-candle archive in this sandbox. Run after
+deploying, and after re-running the two `STALL_EXIT` backtests above (unrelated code path,
+but re-establishing confidence in the same archive/timestamp handling first is worth it):
+
+```bash
+python -m scripts.stop_distance_backtest --db data/trading.db
+```
+
+Per the task spec: if nothing clears both the net-expectancy and noise-hit-rate bars —
+including 5% itself — that is the expected, useful answer, not a failure to find something.
+
 ### Peak-relative STALL_EXIT exemption — backtest built, not run for real (12 Aug 2026)
 
 Follow-up to the trailing-stop false alarm above. Measured against real production data
