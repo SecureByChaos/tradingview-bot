@@ -295,6 +295,50 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### SmartAPI quote-throttle margin widened, 1.05s → 1.3s (12 Aug 2026)
+
+**Trigger:** 12 Aug 14:04, a `get_ltp` and a `get_candles` call landed 1.073s apart and Angel
+One still rejected the second with "exceeding access rate" — 38 hits that session, sustained,
+not a one-off. The incident report proposed either staggering the colliding jobs' schedules or
+adding a shared global throttle inside `smartapi_client.py`.
+
+**Investigated before building either.** Both of the report's own "check this first" items
+came back negative — the gaps they were worried about don't exist:
+
+- `get_candles` already calls `_throttle_quote_call()`, same as `get_ltp`/`get_market_data`/
+  `get_option_greeks` (`smartapi_client.py:598`).
+- The throttle's lock and last-call timestamp are already `self.` instance attributes, and
+  `app/main.py:48` constructs exactly **one** `SmartAPIClient`, threaded into every consumer —
+  `multi_strategy_manager`, `trade_manager`, and `originator_job` all share the same object. So
+  the gate was already process-wide, not per-call-site, contrary to what "Option B" assumed
+  needed building.
+
+The real cause: the measured 1.073s gap was already *above* the old 1.05s margin — the
+throttle had already done its job spacing the calls out, and Angel rejected the second one
+anyway. 50ms of headroom over a nominal 1.0s/req limit doesn't survive real network/processing
+jitter. That's a margin problem, not a missing-mechanism problem, and neither proposed option
+(schedule staggering, a new lock) would have fixed it — staggering doesn't help once calls
+already funnel through one shared gate regardless of which job triggered them, and the lock it
+asked for already exists.
+
+**Fixed**: `_MIN_QUOTE_INTERVAL_SECONDS` in `app/smartapi_client.py`, `1.05 → 1.3`. Widened
+with real room to spare rather than tuned to the exact number that would have avoided one
+specific incident. 4 new tests (`tests/test_smartapi_throttle.py`) cover the enforced minimum
+spacing, the no-extra-wait case when calls are already spaced out, that the lock/timestamp are
+shared instance state (the actual mechanism the 12 Aug incident depended on), and that the
+margin clears the measured 1.073s rejection with room to spare.
+
+**Not verified live** — this sandbox has no network path to Angel One and no real trading
+traffic to reproduce the collision against. After deploying, per the task's own verification
+steps:
+
+```bash
+sudo journalctl -u tradingview-bot --since today | grep -c "Access denied because of exceeding access rate"
+```
+
+should drop meaningfully from the 38/day baseline (not necessarily to zero — Angel's own side
+can still throttle for reasons outside this app's control).
+
 ### `stall_exit_backtest.py` had a real timezone bug — retroactively affects two already-reported results (12 Aug 2026)
 
 Found while building the stop-distance backtest below, which needed the same UTC-to-IST
@@ -345,7 +389,16 @@ python -m scripts.stall_exit_backtest --db data/trading.db
 python -m scripts.stall_exit_backtest --db data/trading.db --peak-floors 2,3,4,5,6,7,8
 ```
 
-### Stop-distance backtest (5% stop proposal) — built, not run for real (12 Aug 2026)
+**Re-run for real, same day.** The fix mattered, but didn't reverse the conclusion. Baseline
+`NET` moved from the buggy -8.54%/trade to a corrected **-4.03%/trade** — smaller effect, same
+sign, `STALL_EXIT` still protective. Bucket composition shifted too (`STOPLOSS` 8/19 vs the old
+14/19, `TRAIL_EXIT` 6/19 vs 2/19), confirming the fix changed which bars were actually being
+replayed, not just cosmetics. The peak-floor sweep moved the same way: every floor 2-8% still
+comes back with a negative portfolio delta, just smaller in magnitude (-2.03% to -3.55%, was
+-4.98% to -7.58%). **Verdict unchanged**: peak-conditioned exemption is still not supported,
+and the corrected numbers are what's now trustworthy going forward.
+
+### Stop-distance backtest (5% stop proposal) — run for real, 5% does not clear the bar (12 Aug 2026)
 
 Proposal under discussion: tighten AI Origination's stop to 5%. Two pieces of existing
 evidence already pointed against it before this ran — `stop_survivability.py`'s ~55-62%
@@ -379,7 +432,25 @@ python -m scripts.stop_distance_backtest --db data/trading.db
 Per the task spec: if nothing clears both the net-expectancy and noise-hit-rate bars —
 including 5% itself — that is the expected, useful answer, not a failure to find something.
 
-### Peak-relative STALL_EXIT exemption — backtest built, not run for real (12 Aug 2026)
+**Run for real, same day.** Coverage was thin: 56 of 166 closed FIXED-mode trades
+reconstructed (40 uncovered by the archive, 70 with no bars after entry same-day).
+
+- **5% does not clear the bar on either side**, matching the pre-registered expectation. CE:
+  every swept stop (5-12%) is net-negative in-sample, and gets *worse* as the stop widens
+  (5% -1.46% → 12% -4.69%) — 5% is the least-bad CE option tested, but still negative. PE: 5%
+  is the *worst* of everything tested (-1.33%, worse than the +1.01% actual baseline).
+- **A real wrinkle, not a clean "no" for PE**: 7/8/10/12% all show positive net expectancy for
+  PE, best at 8% (+1.66%, beating actual). But PE has **no out-of-sample split at all** — every
+  PE trade landed in the same chronological bucket, so the script's own "CLEARS both bars"
+  verdict for those levels rests on one slice, not genuine walk-forward confirmation. Read as a
+  hypothesis worth a second look once more data accumulates, not a validated result — the same
+  overreach this project has repeatedly guarded against elsewhere.
+- CE's out-of-sample bucket (n=4) is correctly flagged `[THIN]` and excluded from any verdict.
+
+**Bottom line: don't ship 5%.** Whether PE's stop should move toward 7-8% is a separate, still-open
+question this run could not properly validate.
+
+### Peak-relative STALL_EXIT exemption — run for real, still NOT SUPPORTED (12 Aug 2026)
 
 Follow-up to the trailing-stop false alarm above. Measured against real production data
 (query in chat, not repeated here): winning `STALL_EXIT` trades give back **~63% of their
@@ -424,6 +495,12 @@ Read the sweep's own trust rule before acting on any floor: **positive portfolio
 exactly the single-anecdote error the break-confirmation-gate investigation earlier today
 was written to avoid. If every floor comes back thin, that's itself the answer: the
 `STALL_EXIT` population (tens of trades) may simply not support slicing this finely yet.
+
+**Run for real, same day — after the timezone fix above.** Every floor from 2% to 8% still
+comes back with a negative portfolio delta (-2.03% to -3.55%), sample sizes comfortably above
+the trust minimum (9-16 of 19). Smaller in magnitude than the pre-fix numbers, same verdict:
+peak-conditioned exemption is not supported. See the timezone-bug entry above for why the
+magnitudes moved.
 
 ### AI Origination trailing stop "never activates on PE trades" — false alarm, not a bug (12 Aug 2026)
 
