@@ -295,6 +295,64 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Real root cause of the throttle rejections found: retries bypassed the gate entirely (13 Aug 2026)
+
+The 12 Aug margin widening (1.05s → 1.3s, below) did not fix production. The next full session
+came back at **55 rejections — worse than the original 38/day baseline**, despite confirming the
+fix was correctly deployed and live the whole time. Multi-process deployment, `get_candles`
+skipping the throttle, timestamp resets, lock races, and a sibling app (`~/tradingbot`, since
+stopped and disabled — unrelated, no `SMARTAPI_API_KEY` of its own and didn't run that day) were
+each investigated and ruled out in turn. None explained calls landing under 1.3s apart when the
+throttle, read statically, should have prevented that unconditionally.
+
+**Found by reading `_call_with_reauth`/`_retry_rate_limited`, not by the diagnostic logging this
+entry was originally going to be about.** Angel One's rate-limit rejection is not itself an
+exception — it's a normal-looking response dict `_call_with_reauth` detects and hands to
+`_retry_rate_limited`, which retries with exponential backoff (0.5/1/2/4/8/15s). Every one of
+those retries is a **real HTTP dispatch to the same rate-limited endpoint**, fired straight after
+its backoff sleep with no relation at all to `_throttle_quote_call`'s shared lock/timestamp —
+it neither waited on that gate nor updated it. So a retry from one rate-limited call could land
+inside another thread's legitimately-throttled window at any moment: that other thread computes
+its wait from `_last_quote_call_monotonic`, a timestamp the retry never touches. The 12 Aug fix
+widened the margin on the gate itself, which does nothing for a dispatch that was never routed
+through the gate to begin with — this is exactly why the numbers got *worse*, not better: a wider
+minimum interval means more calls sitting in a longer retry backoff at any given moment, which is
+more opportunity for one of those ungated retries to collide with a properly-throttled call from
+another thread. The post-reauth retry path (a second, separate retry branch in
+`_call_with_reauth` for expired-token recovery) had the identical bypass.
+
+**Fixed**: `_call_with_reauth` and `_retry_rate_limited` now take an optional `throttle` callable,
+invoked before every retry dispatch (backoff retries and the post-reauth retry alike) — not just
+the initial call. The four quote-family call sites (`get_ltp`, `get_index_ohlc`'s and
+`get_market_data`'s `getMarketData` calls, `get_option_greeks`, `get_candles`) now pass
+`throttle=self._throttle_quote_call`, so a retry both waits its turn on the shared gate and
+records itself as the last call, closing the gap for anything queued behind it. `place_market_order`
+(the only non-quote-family caller of `_call_with_reauth`) passes no throttle and retries exactly
+as before — order calls are a different rate-limit bucket and were never part of this problem.
+
+**Also shipped, not superseded by the above**: the originally-planned temporary diagnostic log
+line. `_throttle_quote_call()` now logs the measured gap and computed wait at INFO level
+(`[THROTTLE] gap=...`) on every call, both the "sleeping" and "no wait needed" branches. This is
+what would have surfaced the bypass directly instead of needing static analysis to find it — kept
+deployed for a few sessions after this ships as confirmation the fix actually closes the gap
+(gaps should never fall meaningfully under 1.3s once every dispatch is gated), then removed once
+that's established. 6 new tests in `tests/test_smartapi_throttle.py` cover: the log line's two
+branches, that `_retry_rate_limited` invokes `throttle` before every dispatch (including the
+final successful one), that omitting `throttle` still works (the order-placement path), and that
+`_call_with_reauth` threads `throttle` through to the retry it triggers.
+
+**Not verified live** — same constraint as the 12 Aug fix: no network path to Angel One from this
+sandbox, no way to reproduce the collision here. After deploying, watch for `[THROTTLE]` log
+lines with `gap=` meaningfully under `1.30s` — if none appear, the bypass really was the whole
+story and gaps should now consistently clear the minimum. If short gaps still show up in the log,
+that would mean a further, still-unidentified path is dispatching quote-family calls outside
+`_throttle_quote_call()` entirely (not just retrying around it), which would be the next thing to
+grep for. Also re-run the rejection count check:
+
+```bash
+sudo journalctl -u tradingview-bot --since today | grep -c "Access denied because of exceeding access rate"
+```
+
 ### SmartAPI quote-throttle margin widened, 1.05s → 1.3s (12 Aug 2026)
 
 **Trigger:** 12 Aug 14:04, a `get_ltp` and a `get_candles` call landed 1.073s apart and Angel
