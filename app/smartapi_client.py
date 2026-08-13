@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
 import pyotp
@@ -300,7 +300,14 @@ class SmartAPIClient:
             self._mark_failed(last_error)
             raise SmartAPIError(last_error)
 
-    def _retry_rate_limited(self, func, method_name: str | None, *args, **kwargs):
+    def _retry_rate_limited(
+        self,
+        func,
+        method_name: str | None,
+        *args,
+        throttle: Callable[[], None] | None = None,
+        **kwargs,
+    ):
         """Retries a rate-limited call with capped exponential backoff and
         never marks the broker FAILED on exhaustion.
 
@@ -318,12 +325,30 @@ class SmartAPIClient:
         leaving self._status untouched, so the very next call (30s/5min
         later, whatever the caller's own cadence is) gets a clean attempt
         instead of a bricked connection.
+
+        13 Aug: each retry attempt is a real HTTP dispatch to the same
+        rate-limited endpoint, but until now it fired straight after the
+        backoff sleep with no relation at all to _throttle_quote_call's
+        shared lock/timestamp -- neither waiting on it nor updating it. A
+        quote-family retry could therefore land inside another thread's
+        legitimately-throttled 1.3s window (that thread computes its wait
+        from a timestamp this retry never touched), and the collision
+        produces exactly the "still rejected despite the widened margin"
+        symptom seen in production after the 12 Aug fix: widening
+        _MIN_QUOTE_INTERVAL_SECONDS does nothing for a dispatch this loop
+        never gates through it. `throttle`, when the caller is part of the
+        quote family, is now invoked before every retry dispatch so it both
+        waits its turn and records itself as the last call, closing that
+        gap. Callers outside the quote family (order placement) pass no
+        throttle and are unaffected.
         """
         total_wait = 0.0
         for attempt in range(_RATE_LIMIT_MAX_ATTEMPTS):
             delay = min(0.5 * (2 ** attempt), _RATE_LIMIT_BACKOFF_CAP_SECONDS)
             total_wait += delay
             time.sleep(delay)
+            if throttle is not None:
+                throttle()
             retry_func = getattr(self._client, method_name, func) if method_name and self._client is not None else func
             logger.info("[AUTH] Retrying rate-limited request (attempt %s/%s)", attempt + 1, _RATE_LIMIT_MAX_ATTEMPTS)
             retry_response = retry_func(*args, **kwargs)
@@ -346,7 +371,13 @@ class SmartAPIClient:
             "SmartAPI rate limit recovery failed for this call; broker session left active for retry"
         )
 
-    def _call_with_reauth(self, func, *args, **kwargs):
+    def _call_with_reauth(self, func, *args, throttle: Callable[[], None] | None = None, **kwargs):
+        """throttle, when passed, is a quote-family caller's own
+        _throttle_quote_call bound method. It gates and records every retry
+        dispatch below (rate-limit backoff and post-reauth alike), not just
+        the initial call above -- see _retry_rate_limited's docstring for why
+        that matters. Non-quote callers (order placement) pass none and
+        retry exactly as before."""
         if self._status == BROKER_FAILED:
             raise SmartAPIError(f"Broker in FAILED state: {self._last_error}")
         response = func(*args, **kwargs)
@@ -375,7 +406,7 @@ class SmartAPIClient:
             # propagate as-is rather than folding it into the generic except
             # below -- callers that care can distinguish "try again shortly"
             # from a real recovery failure.
-            return self._retry_rate_limited(func, method_name, *args, **kwargs)
+            return self._retry_rate_limited(func, method_name, *args, throttle=throttle, **kwargs)
 
         try:
             self._refresh_session()
@@ -383,6 +414,8 @@ class SmartAPIClient:
             logger.exception("[AUTH] Recovery failed")
             raise
 
+        if throttle is not None:
+            throttle()
         retry_func = getattr(self._client, method_name, func) if method_name and self._client is not None else func
         logger.info("[AUTH] Retrying original request")
         retry_response = retry_func(*args, **kwargs)
@@ -390,7 +423,7 @@ class SmartAPIClient:
             # The freshly-refreshed session is itself being rate-limited --
             # still the same transient, non-fatal condition, so it gets the
             # same patient backoff rather than an immediate _mark_failed.
-            return self._retry_rate_limited(func, method_name, *args, **kwargs)
+            return self._retry_rate_limited(func, method_name, *args, throttle=throttle, **kwargs)
         if self._token_expired(retry_response):
             self._mark_failed(f"Recovery failed: {retry_response}")
             logger.error("[AUTH] Recovery failed; API response: %s", retry_response)
@@ -416,11 +449,33 @@ class SmartAPIClient:
         """Serializes every ltpData call (from any thread) to at least
         _MIN_QUOTE_INTERVAL_SECONDS apart, process-wide -- see the constant's
         comment for why this matters now that several independent loops share
-        this one rate-limited endpoint."""
+        this one rate-limited endpoint.
+
+        13 Aug: logs the measured gap and computed wait on every call, at
+        INFO level. Temporary ground-truth instrumentation -- production
+        kept rejecting calls (55/day, worse than the pre-fix 38/day
+        baseline) after the 12 Aug margin widening, which should have been
+        impossible if every quote-family dispatch actually went through this
+        gate. It didn't: _retry_rate_limited's own retries bypassed it
+        entirely (fixed in this same change, see its docstring). This log
+        line is what would have made that visible directly instead of by
+        static analysis -- keep it deployed for a few sessions after the fix
+        ships to confirm gaps never fall meaningfully under the 1.3s
+        minimum, then remove it once that's established."""
         with self._quote_rate_lock:
-            wait = _MIN_QUOTE_INTERVAL_SECONDS - (time.monotonic() - self._last_quote_call_monotonic)
+            gap = time.monotonic() - self._last_quote_call_monotonic
+            wait = _MIN_QUOTE_INTERVAL_SECONDS - gap
             if wait > 0:
+                logger.info(
+                    "[THROTTLE] gap=%.3fs since last quote call, sleeping %.3fs to reach %.2fs minimum",
+                    gap, wait, _MIN_QUOTE_INTERVAL_SECONDS,
+                )
                 time.sleep(wait)
+            else:
+                logger.info(
+                    "[THROTTLE] gap=%.3fs since last quote call, no wait needed (minimum %.2fs)",
+                    gap, _MIN_QUOTE_INTERVAL_SECONDS,
+                )
             self._last_quote_call_monotonic = time.monotonic()
 
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
@@ -435,6 +490,7 @@ class SmartAPIClient:
     	    exchange,
     	    tradingsymbol,
     	    symboltoken,
+    	    throttle=self._throttle_quote_call,
 	)
         if not response or response.get("status") is False:
             self._ltp_status = "FAILED"
@@ -481,6 +537,7 @@ class SmartAPIClient:
                 self.client.getMarketData,
                 "OHLC",
                 {index.spot_exchange: [index.spot_token]},
+                throttle=self._throttle_quote_call,
             )
         except Exception as exc:
             logger.info("SmartAPI getMarketData(OHLC) failed for %s: %s", index.symbol, exc)
@@ -530,6 +587,7 @@ class SmartAPIClient:
                 self.client.getMarketData,
                 mode,
                 {exchange: [str(token) for token in tokens] for exchange, tokens in exchange_tokens.items()},
+                throttle=self._throttle_quote_call,
             )
         except Exception as exc:
             logger.info("SmartAPI getMarketData(%s) failed: %s", mode, exc)
@@ -572,7 +630,9 @@ class SmartAPIClient:
             return []
         self._throttle_quote_call()
         try:
-            response = self._call_with_reauth(method, {"name": name, "expirydate": expirydate})
+            response = self._call_with_reauth(
+                method, {"name": name, "expirydate": expirydate}, throttle=self._throttle_quote_call
+            )
         except Exception as exc:
             logger.info("SmartAPI optionGreek failed for %s %s: %s", name, expirydate, exc)
             return []
@@ -614,7 +674,7 @@ class SmartAPIClient:
             "fromdate": from_dt,
             "todate": to_dt,
         }
-        response = self._call_with_reauth(self.client.getCandleData, params)
+        response = self._call_with_reauth(self.client.getCandleData, params, throttle=self._throttle_quote_call)
         if not response or response.get("status") is False:
             raise SmartAPIError(f"getCandleData failed for {symboltoken}: {response}")
         data = response.get("data") or []
