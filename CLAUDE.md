@@ -408,6 +408,15 @@ that happened to be pre-specified in the script. Worth its own dated follow-up o
 python -m scripts.confidence_sizing_backtest --db data/trading.db
 ```
 
+**MAE fix verified live, and it adds a second line of evidence for the same floor.** Re-run
+after deploying the fix: `mean_mae` is now real and negative everywhere (was `+0.00%`
+everywhere before), and it scales with confidence the same direction as win rate and P&L --
+`<0.60` averages **-8.57%** adverse excursion versus -4.67% to -5.49% for every bucket at 0.60+.
+Low-confidence AI Origination trades don't just lose more often, they draw down close to twice
+as deep before failing. Every other number (win rates, P&L, the floor bootstrap CI, the
+hedging check, the cross-tab) reproduced byte-identical to the pre-fix run, as expected since
+none of it read the buggy column.
+
 ### 13 Aug retry-bypass fix was real but not the cause of the actual production rejections (14 Aug 2026)
 
 The 13 Aug fix (below) shipped and was live all of 14 Aug. Verified via the new `[THROTTLE]`
