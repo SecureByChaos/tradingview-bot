@@ -148,3 +148,95 @@ def test_call_with_reauth_without_throttle_is_unaffected(monkeypatch):
 
     assert result == OK_RESPONSE
     assert calls["n"] == 2
+
+
+# 14 Aug: confirmed live that Angel's rate-limit rejection for getCandleData
+# comes back as a raw non-JSON body, which the SmartApi SDK turns into a
+# raised DataException rather than a response dict -- so _rate_limited()'s
+# dict-based check never saw it, and neither did any of the retry/throttle
+# machinery above. This is the exact text observed in production.
+RATE_LIMIT_EXCEPTION_TEXT = "Couldn't parse the JSON response received from the server: b'Access denied because of exceeding access rate'"
+
+
+def _raise_rate_limit_exception():
+    raise RuntimeError(RATE_LIMIT_EXCEPTION_TEXT)
+
+
+def test_is_rate_limit_error_text_matches_the_real_sdk_exception():
+    client = _make_client()
+    assert client._is_rate_limit_error_text(RATE_LIMIT_EXCEPTION_TEXT) is True
+
+
+def test_is_rate_limit_error_text_does_not_match_unrelated_errors():
+    client = _make_client()
+    assert client._is_rate_limit_error_text("Couldn't parse the JSON response received from the server: b'<html>502</html>'") is False
+
+
+def test_call_with_reauth_routes_a_raised_rate_limit_exception_into_retry(monkeypatch):
+    # The confirmed production bug: the initial dispatch doesn't return a
+    # dict at all, it raises. Must still reach _retry_rate_limited and
+    # eventually succeed, not propagate straight past all of it.
+    monkeypatch.setattr("app.smartapi_client.time.sleep", lambda _seconds: None)
+    client = _make_client()
+    calls = {"n": 0}
+
+    def fake_func():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            _raise_rate_limit_exception()
+        return OK_RESPONSE
+
+    fake_func.__name__ = "fakeMethod"
+    throttle_calls = []
+    result = client._call_with_reauth(fake_func, throttle=lambda: throttle_calls.append(1))
+
+    assert result == OK_RESPONSE
+    assert calls["n"] == 2
+    assert len(throttle_calls) == 1
+
+
+def test_call_with_reauth_reraises_a_genuine_non_rate_limit_exception():
+    client = _make_client()
+
+    def fake_func():
+        raise RuntimeError("Couldn't parse the JSON response received from the server: b'<html>502 Bad Gateway</html>'")
+
+    fake_func.__name__ = "fakeMethod"
+    try:
+        client._call_with_reauth(fake_func)
+        assert False, "expected the unrelated exception to propagate"
+    except RuntimeError as exc:
+        assert "502" in str(exc)
+
+
+def test_retry_rate_limited_treats_a_raised_rate_limit_exception_as_still_limited(monkeypatch):
+    # A retry attempt can hit the same raised-exception shape as the initial
+    # call -- must be treated as "still rate-limited, keep retrying", not as
+    # an unrelated crash that aborts the whole backoff loop.
+    monkeypatch.setattr("app.smartapi_client.time.sleep", lambda _seconds: None)
+    client = _make_client()
+    calls = {"n": 0}
+
+    def fake_func():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            _raise_rate_limit_exception()
+        return OK_RESPONSE
+
+    result = client._retry_rate_limited(fake_func, None)
+    assert result == OK_RESPONSE
+    assert calls["n"] == 3
+
+
+def test_retry_rate_limited_reraises_a_genuine_non_rate_limit_exception(monkeypatch):
+    monkeypatch.setattr("app.smartapi_client.time.sleep", lambda _seconds: None)
+    client = _make_client()
+
+    def fake_func():
+        raise RuntimeError("connection reset by peer")
+
+    try:
+        client._retry_rate_limited(fake_func, None)
+        assert False, "expected the unrelated exception to propagate"
+    except RuntimeError as exc:
+        assert "connection reset" in str(exc)
