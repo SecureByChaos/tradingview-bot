@@ -295,6 +295,70 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI confidence / hedging-language sizing backtest -- tooling built, NOT run (14 Aug 2026)
+
+**Trigger, a repeat pattern across three trades this cycle, not a single anecdote:**
+
+- 12 Aug, Bank Nifty CE (confidence 0.66, "cautious... rather than a strong breakout") --
+  trend already ran full session, still inside opening range. Lost.
+- 14 Aug, Nifty CE (confidence 0.55) -- 5-min breakout but 15-min Supertrend still down,
+  extended from EMA21. Lost, `STALL_EXIT` at -0.42% after only 3.84% MFE.
+- 14 Aug, Bank Nifty PE (confidence 0.77) -- "the move is already extended and the trend
+  is mature," `trend_duration_pct_of_session=100.0`. Lost.
+
+Contrast with 14 Aug's one clean winner (Bank Nifty PE, confidence 0.71, developing ADX, no
+self-flagged conflict in the reasoning). All three losses had the model naming a real
+conflict in its own reasoning and trading at full size anyway -- confidence and hedging
+language both look like they're carrying real signal that currently has zero effect on
+position size.
+
+**Not shipped without a backtest first**, same discipline as every other change this cycle --
+three trades is a repeat pattern (stronger than the single-trade break-confirmation case tested
+11 days ago, which came back NOT SUPPORTED from similarly compelling anecdotal grounds) but
+still not the ~2 months of history that would let this be tested properly.
+
+**Built**: `scripts/confidence_sizing_backtest.py`, two checks against the same population
+(every closed AI Origination trade with a recorded `ai_confidence`):
+
+1. Confidence-bucketed (`<0.6`, `0.6-0.75`, `0.75-0.85`, `>0.85`): win rate, mean P&L, mean
+   MFE, mean MAE per bucket (MFE/MAE derived from `highest_price`/`lowest_price` vs
+   `entry_price`, no new columns), plus a bootstrap 90% CI on the Pearson correlation between
+   the raw confidence score and `pnl_percent` across all trades -- the direct test of "does
+   confidence predict outcome."
+2. Reasoning-text hedging-language check, meant to be read alongside part 1, not only as a
+   fallback: does `ai_reasoning` containing any of the roadmap's own five keywords
+   ("cautious," "moderate," "extended," "already run," "mature") correlate with worse
+   outcomes independent of the confidence number, plus a cross-tab reporting how often the
+   score and the text actually disagree (the 14 Aug Bank Nifty PE loss -- confidence 0.77,
+   hedged reasoning -- is exactly such a case). Same bootstrap-CI/`MIN_BUCKET_LIVE=20`
+   pattern as `break_confirmation_backtest.py`, duplicated per this project's per-script
+   convention rather than shared.
+
+14 new tests (`tests/test_confidence_sizing_backtest.py`) cover the population filter
+(AI Origination only, closed only, confidence required), MFE/MAE derivation, each of the
+five hedge keywords matching case-insensitively, the Pearson helper's edge cases (zero
+variance, too few points), and that both bootstrap helpers detect a real synthetic
+effect when one is deliberately constructed.
+
+**Not run** -- `data/trading.db` in this sandbox is a 0-byte file with no schema at all
+(confirmed: `sqlite3.OperationalError: no such table: strategy_trades`, the same failure
+every other backtest script in this project already hits here). No sizing mechanism (section
+2 of the roadmap: scale-to-confidence vs. a hedged-reasoning floor) has been implemented --
+that decision explicitly depends on which of the two checks above turns out more predictive,
+which cannot be answered without real data. Run on the machine with real history:
+
+```bash
+python -m scripts.confidence_sizing_backtest --db data/trading.db
+```
+
+Read part 1's bucket sizes first. If every bucket clears `MIN_BUCKET_LIVE=20`, the confidence
+bucketing and correlation CI are trustworthy on their own. If not (likely, given the same
+~2-month-history constraint every other live-history check in this project has hit), read
+part 2's hedging check as the primary signal -- it pools the whole population into two
+buckets instead of four, so it reaches the trust minimum sooner. Per the roadmap's own
+deliverable 3: if neither check clears its bar, "insufficient evidence, keep watching" is the
+correct thing to report, not a reason to ship a sizing curve fit to three trades.
+
 ### 13 Aug retry-bypass fix was real but not the cause of the actual production rejections (14 Aug 2026)
 
 The 13 Aug fix (below) shipped and was live all of 14 Aug. Verified via the new `[THROTTLE]`
