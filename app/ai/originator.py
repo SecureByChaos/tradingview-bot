@@ -30,6 +30,7 @@ from app.models import Signal
 from app.option_finder import OptionFinder
 from app.premium_model import days_to_expiry, symmetric_premium_percent, to_risk_units
 from app.platform import list_index_configs, log_event, record_index_tick_if_stale
+from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
 from app.time_utils import format_ist, to_ist, utc_now
 
@@ -1123,6 +1124,28 @@ def run_origination_checks(
     this module has no app-context access of its own."""
     if smartapi is None or option_finder is None:
         logger.info("[AI][ORIGIN] Skipped: no smartapi/option_finder available in this context")
+        return
+    # 14 Aug 2026: this job is on a bare 5-min IntervalTrigger with no
+    # day/time constraint (see app/scheduler.py -- IntervalTrigger doesn't
+    # support one), so before this gate it fired every 5 minutes 24/7,
+    # weekends and holidays included. Confirmed live: 96 [AI][ORIGIN]/
+    # SmartAPI log lines between 16:00-18:00 IST on 13 Aug, hours after the
+    # 15:15 square-off. Worse than just noise: the real SmartAPI cost
+    # (get_index_spot below, once per enabled index) fired BEFORE the
+    # existing _still_observing/_past_trading_end checks further down ever
+    # ran -- those only gate the entry DECISION, not the network call that
+    # happens regardless. This gate is checked once, before that call, using
+    # the shared NSE_HOLIDAYS calendar (app/signal_validation.py) rather than
+    # inventing a second one -- option_chain.py's collector already
+    # establishes this exact reuse pattern for the same reason. Deliberately
+    # wider (09:15-15:30) than _still_observing/_past_trading_end's own
+    # 09:45-15:15 entry window -- it only needs to rule out evenings/nights/
+    # weekends/holidays, not replace the finer-grained window those checks
+    # already own; the pre-open tick recording between 09:15-09:45 must keep
+    # working exactly as before.
+    closed_reason = check_market_hours(utc_now())
+    if closed_reason is not None:
+        logger.info("[AI][ORIGIN] Skipped: %s", closed_reason)
         return
     owns_session = db is None
     session = db or SessionLocal()

@@ -295,6 +295,83 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### SmartAPI calls stopped outside market hours -- root cause was scheduling order, not missing logic (14 Aug 2026)
+
+**Confirmed**: 96 `[AI][ORIGIN]`/`SmartAPI` log lines between 16:00-18:00 IST on 13 Aug, hours
+after the 15:15 square-off. Both scheduled jobs (`ai-origination-check` every 5 min,
+`trade-monitor` every 30s) are on bare `IntervalTrigger`s with no day/time constraint --
+`IntervalTrigger` doesn't support one -- so both fire 24/7 by construction.
+
+**AI Origination was the real, confirmed cost.** `run_origination_checks` already has
+`_still_observing`/`_past_trading_end` (09:45-15:15), but those only gate the entry *decision*.
+`smartapi.get_index_spot(index)` -- a real SmartAPI call, once per enabled index -- fired
+**before** either check, every single 5-min cycle, unconditionally. The existing market-hours
+logic was there; it just wasn't applied early enough to stop the network call it was meant to
+gate. No weekday/holiday check existed anywhere in this file either.
+
+**`trade-monitor` (30s job) turned out to already be near-zero-cost outside hours, on inspection
+-- not by design, incidentally.** `MultiStrategyTradeManager.monitor_open_trades` and
+`V7Manager.monitor_open_trades` both query for open trades first and return immediately if
+there are none, before touching SmartAPI at all. As long as every trade actually closes at the
+15:15 square-off, there is nothing left to iterate after hours and the job is already free. This
+is a *consequence* of that code's structure, not a market-hours gate -- confirmed by reading, not
+by log volume, since the 96-line count doesn't distinguish real SmartAPI calls from apscheduler's
+own "Running job"/"executed successfully" announcement lines, which also match the grep pattern
+in the trigger's own diagnostic command and fire unconditionally every 30s regardless of whether
+any real work happened.
+
+**Fixed, with two deliberately different gates, not one applied uniformly to both jobs**:
+
+- `app/signal_validation.py` already had a real 2026 `NSE_HOLIDAYS` calendar and
+  `check_market_hours()` (weekday + holiday + 09:15-15:30 window), used for flagging incoming
+  TradingView signals -- `option_chain.py`'s collector already reuses it as a scheduling gate the
+  same way. Refactored out `trading_day_reason()` (weekday + holiday only, no hour component) so
+  both existing and new callers share one calendar rather than each re-deriving it -- exactly the
+  kind of duplication CLAUDE.md's own DTE-bucket entry warns can silently drift apart. Verified
+  `check_market_hours`'s exact original wording is unchanged (`tests/test_signal_validation.py`).
+- **AI Origination**: `check_market_hours(utc_now())` checked once, at the very top of
+  `run_origination_checks`, before `get_index_spot` or any other work. Deliberately the *wider*
+  09:15-15:30 window, not the narrower 09:45-15:15 entry window `_still_observing`/
+  `_past_trading_end` already own further down -- this gate only needs to rule out evenings,
+  nights, weekends and holidays; the pre-open tick-recording behaviour between 09:15-09:45 must
+  keep working exactly as before, and does.
+- **`trade-monitor`**: `trading_day_reason()` only (no hour-of-day component) at the top of
+  `MultiStrategyMonitor.tick()`. Deliberately *not* also gated by time-of-day the way AI
+  Origination is -- this job carries ongoing exit-safety responsibility for real open positions
+  and must keep running through every hour of an actual trading day, including right up to and
+  past 15:15, so it can still catch a trade that the square-off missed for some reason rather
+  than going silent on it. The existing empty-open-trades early return already makes the
+  intraday-hours cost zero in the normal case; this is a second, independent line of defence for
+  the abnormal one, not a replacement for it. `square_off()` itself is untouched, per scope.
+
+16 new tests (`tests/test_signal_validation.py`, `tests/test_market_hours_gate.py`): the
+weekday/holiday helper's boundaries (an unknown year skips the holiday check rather than
+guessing, matching the module's own stated failure-mode preference), both scheduler gates
+skipping entirely on a weekend/holiday with SmartAPI/manager stand-ins that raise if touched at
+all, AI Origination's gate correctly firing on an ordinary weekday evening (reproducing the 13
+Aug incident), and `trade-monitor`'s gate deliberately *not* firing at the same evening hour on
+an ordinary weekday (confirming the two jobs' gates are intentionally asymmetric, not a
+copy-paste of the same check).
+
+**Also noticed, not touched (out of scope)**: `daily-square-off`'s own `CronTrigger` in
+`app/scheduler.py` has no `day_of_week="mon-fri"` restriction, unlike every other cron job in
+that file -- it technically fires at 15:15 on Saturday/Sunday too. Almost certainly harmless
+(`square_off_all` has the same empty-open-trades early return), and the task explicitly scoped
+this fix to not touch square-off logic. Worth a one-line fix if anyone's looking at that file
+again, not urgent enough to justify touching it here.
+
+**Not verified live** -- this sandbox has no journalctl/production access. After deploying, the
+task's own verification commands are the right ones to run:
+
+```bash
+sudo journalctl -u tradingview-bot --since "<today> 15:30:00" --until "<tomorrow> 09:15:00" | grep -c "SmartAPI"
+```
+
+should drop to ~zero (a brief tail right at the 15:30 boundary is expected and fine). Confirm the
+jobs still fire and make real calls normally the next trading day, and check whether the daily
+rate-limit hit count moved at all now that the AI Origination job isn't adding after-hours
+call volume on top of the collision issue already being investigated separately.
+
 ### AI Origination confidence floor raised 0.55 -> 0.60, backtested (14 Aug 2026)
 
 Implements the decision from the confidence-sizing backtest below. Three metrics (win rate,
