@@ -249,6 +249,32 @@ class SmartAPIClient:
         message = str(response.get("message", "")).lower()
         return "access rate" in message or "rate limit" in message
 
+    @staticmethod
+    def _is_rate_limit_error_text(text: str) -> bool:
+        """14 Aug: Angel's rate-limit rejection is not always the well-formed
+        {"status": false, "message": "..."} dict _rate_limited() checks --
+        confirmed live, getCandleData rejections come back as a plain-text
+        body ("Access denied because of exceeding access rate") that isn't
+        valid JSON at all. The SDK's own _request() then raises
+        SmartApi.smartExceptions.DataException("Couldn't parse the JSON
+        response received from the server: b'...'") instead of returning a
+        dict -- which _call_with_reauth's response = func(*args, **kwargs)
+        never caught, so this exception sailed straight past _rate_limited/
+        _retry_rate_limited to whichever caller's generic except Exception
+        happened to be waiting (originator.py's candle-refresh fallback, in
+        the confirmed case) and silently fell back to stale data instead of
+        ever being retried. This is why _retry_rate_limited's own "Retrying
+        rate-limited request" log line never appeared despite the daily
+        rejection count being unchanged by two earlier fixes to the throttle
+        margin and the retry-bypass -- neither could matter for a failure
+        that never reached the code they touched. Checked against the raw
+        exception text for the same substrings _rate_limited checks in the
+        dict case, so a genuine unrelated JSON-parse failure (a real outage,
+        a malformed response for some other reason) still propagates as
+        before rather than being misrouted into the rate-limit retry path."""
+        lowered = text.lower()
+        return "access rate" in lowered or "rate limit" in lowered
+
     def _refresh_session(self) -> None:
         with self._auth_lock:
             if self._status == BROKER_FAILED:
@@ -351,8 +377,20 @@ class SmartAPIClient:
                 throttle()
             retry_func = getattr(self._client, method_name, func) if method_name and self._client is not None else func
             logger.info("[AUTH] Retrying rate-limited request (attempt %s/%s)", attempt + 1, _RATE_LIMIT_MAX_ATTEMPTS)
-            retry_response = retry_func(*args, **kwargs)
-            if not self._rate_limited(retry_response):
+            try:
+                retry_response = retry_func(*args, **kwargs)
+                still_limited = self._rate_limited(retry_response)
+            except Exception as exc:
+                # A retry can hit the same non-JSON rejection shape as the
+                # initial call (see _is_rate_limit_error_text) -- treat it as
+                # "still rate-limited, keep retrying" rather than aborting the
+                # loop. Anything else re-raises, same as an uncaught exception
+                # always has here.
+                if not self._is_rate_limit_error_text(str(exc)):
+                    raise
+                retry_response = None
+                still_limited = True
+            if not still_limited:
                 logger.info("[AUTH] Rate limit recovered after %s attempt(s)", attempt + 1)
                 return retry_response
             today = self._now_ist().date()
@@ -380,7 +418,20 @@ class SmartAPIClient:
         retry exactly as before."""
         if self._status == BROKER_FAILED:
             raise SmartAPIError(f"Broker in FAILED state: {self._last_error}")
-        response = func(*args, **kwargs)
+        method_name = getattr(func, "__name__", None)
+        try:
+            response = func(*args, **kwargs)
+        except Exception as exc:
+            # See _is_rate_limit_error_text's docstring: a non-JSON rate-limit
+            # rejection surfaces as an exception, not a response dict, and
+            # must be routed into the same retry path a dict-shaped rejection
+            # gets below -- otherwise it never reaches _retry_rate_limited at
+            # all. Anything else (a real parse failure, a network error)
+            # re-raises unchanged.
+            if not self._is_rate_limit_error_text(str(exc)):
+                raise
+            logger.warning("[AUTH] Access rate limit detected (non-JSON rejection): %s", exc)
+            return self._retry_rate_limited(func, method_name, *args, throttle=throttle, **kwargs)
         auth_error = self._token_expired(response)
         rate_limited = self._rate_limited(response)
         if not auth_error and not rate_limited:
@@ -397,8 +448,6 @@ class SmartAPIClient:
                 logger.info("[AUTH] AB8050 detected")
             elif rate_limited:
                 logger.warning("[AUTH] Access rate limit detected")
-
-        method_name = getattr(func, "__name__", None)
 
         if rate_limited and not auth_error:
             # Pure rate limiting: handled entirely by the backoff retry above,

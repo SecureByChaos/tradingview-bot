@@ -295,6 +295,67 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### 13 Aug retry-bypass fix was real but not the cause of the actual production rejections (14 Aug 2026)
+
+The 13 Aug fix (below) shipped and was live all of 14 Aug. Verified via the new `[THROTTLE]`
+log line that the throttle itself is working correctly -- `gap=0.04x` entries are the expected
+shape (a call arriving right behind another gets logged, then sleeps to the 1.3s minimum before
+dispatching), not evidence of a bug. But the rejection count was unchanged: **39, statistically the
+same as the original 38/day baseline**, not better. The 13 Aug fix, though a real and correct fix
+for the bug it targeted, was fixing a bug that turned out not to be causing the counted rejections.
+
+**Found by reading the actual log context around a rejection, not by more static analysis.**
+`sudo journalctl ... | grep -B5 "Access denied because of exceeding access rate"` showed the
+failure is logged from `app/ai/originator.py`'s `_load_market_context`, not from anywhere inside
+`smartapi_client.py`'s throttle/retry code -- and it fires on essentially every 5-minute
+origination cycle, immediately (~1.3s, correctly throttled) after a preceding `get_ltp` call, not
+intermittently. Traced into the installed `SmartApi` SDK
+(`.venv/lib/python3.11/site-packages/SmartApi/smartConnect.py:229-234`): Angel's rate-limit
+rejection for `getCandleData` does not always come back as the well-formed
+`{"status": false, "message": "..."}` dict `_rate_limited()` checks -- it can come back as a
+**raw non-JSON text body** (`b'Access denied because of exceeding access rate'`). The SDK's own
+`_request()` then raises `DataException("Couldn't parse the JSON response received from the
+server: {content}")` instead of returning anything `_rate_limited()`/`_token_expired()` can
+inspect. That exception sailed straight past `_call_with_reauth`'s unguarded
+`response = func(*args, **kwargs)` -- never reaching `_retry_rate_limited` at all -- through
+`get_candles()` (no try/except there either), and was only ever caught four frames later by
+`_load_market_context`'s own broad `except Exception`, which logs and silently falls back to
+stale stored history. This is exactly why `"Retrying rate-limited request"` never appeared in
+production logs despite dozens of daily rejections: `_retry_rate_limited` was never invoked for
+this failure shape, so neither the 12 Aug margin widening nor the 13 Aug retry-bypass fix could
+possibly have mattered -- both are real fixes to a code path this specific failure never reaches.
+
+**Fixed**: `_call_with_reauth`'s initial dispatch and `_retry_rate_limited`'s own retry dispatches
+are now wrapped in `try/except`, checking the raised exception's text for the same
+`"access rate"`/`"rate limit"` substrings `_rate_limited()` already checks in the dict case (new
+`_is_rate_limit_error_text` static method). A match routes into the exact same retry path a
+dict-shaped rejection already used; anything else (a real parse failure, a genuine outage)
+re-raises unchanged rather than being misrouted. This is deliberately narrow -- it does not touch
+the post-reauth (token-expiry) retry branch, which is only reachable when the initial response
+already parsed as a dict, so it was never part of this failure mode. 8 new tests in
+`tests/test_smartapi_throttle.py` cover: the text-matcher against the exact production exception
+string and against an unrelated parse failure (must not match), that `_call_with_reauth` routes a
+raised rate-limit exception into retry and recovers, that a genuinely unrelated exception still
+propagates through both `_call_with_reauth` and `_retry_rate_limited` unchanged, and that a retry
+attempt hitting the same raised-exception shape is treated as "still limited" rather than
+aborting the loop.
+
+**Not verified live** -- same sandbox constraint as every round of this investigation. After
+deploying, the meaningful signals are: `"Retrying rate-limited request"` should finally start
+appearing in the logs (proof this code path is now actually being exercised), followed by
+`"Rate limit recovered after N attempt(s)"` on most of them; the daily rejection-adjacent count to
+now watch is `grep -c "candle refresh failed"` in `[AI][ORIGIN]` logs, which should drop sharply
+if most of these now succeed on retry within a few seconds instead of failing outright every
+cycle. If `"Retrying rate-limited request"` still doesn't appear, or the candle-refresh-failed
+count doesn't drop, that means this exception-shaped rejection still isn't the whole story and
+there's a third, still-undiscovered path -- worth re-running the same `grep -B5` context check
+before guessing again.
+
+```bash
+sudo journalctl -u tradingview-bot --since today | grep -c "Retrying rate-limited request"
+sudo journalctl -u tradingview-bot --since today | grep -c "candle refresh failed"
+```
+
 ### Real root cause of the throttle rejections found: retries bypassed the gate entirely (13 Aug 2026)
 
 The 12 Aug margin widening (1.05s → 1.3s, below) did not fix production. The next full session
