@@ -23,17 +23,34 @@ MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 30)
 
 
+def trading_day_reason(ist: datetime) -> str | None:
+    """Weekday + NSE holiday check only -- no hour-of-day component. Callers
+    that need their own intraday window (the AI Origination entry window is
+    09:45-15:15, not this module's 09:15-15:30) should check that separately;
+    this exists so every caller shares one holiday calendar instead of each
+    re-deriving "is today a trading day" and risking the two drifting apart.
+    Takes an already-IST datetime, unlike check_market_hours below, since
+    callers of this one already have one on hand. Returned text includes its
+    own leading article ("a"/"an") so callers can drop it straight into a
+    "... on {reason}" sentence without a grammar mismatch between the two
+    reason shapes."""
+    if ist.weekday() >= 5:
+        return f"a {ist:%A} (market closed)"
+    holidays = NSE_HOLIDAYS.get(ist.year)
+    if holidays is not None and ist.date().isoformat() in holidays:
+        return f"an NSE trading holiday ({ist.date().isoformat()})"
+    return None
+
+
 def check_market_hours(timestamp: datetime) -> str | None:
     """Independent of whatever session TradingView's own chart thinks it's in --
     flags any signal that arrives outside real NSE trading hours/days."""
     ist = to_ist(timestamp)
     if ist is None:
         return None
-    if ist.weekday() >= 5:
-        return f"Signal received on a {ist:%A} (market closed)"
-    holidays = NSE_HOLIDAYS.get(ist.year)
-    if holidays is not None and ist.date().isoformat() in holidays:
-        return f"Signal received on an NSE trading holiday ({ist.date().isoformat()})"
+    day_reason = trading_day_reason(ist)
+    if day_reason is not None:
+        return f"Signal received on {day_reason}"
     open_time = ist.replace(hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0)
     close_time = ist.replace(hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1], second=0, microsecond=0)
     if not (open_time <= ist <= close_time):
