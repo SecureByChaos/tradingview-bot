@@ -359,6 +359,55 @@ buckets instead of four, so it reaches the trust minimum sooner. Per the roadmap
 deliverable 3: if neither check clears its bar, "insufficient evidence, keep watching" is the
 correct thing to report, not a reason to ship a sizing curve fit to three trades.
 
+**Run for real, same day -- found and fixed a real bug in the script before trusting the
+numbers.** First run against production `data/trading.db` (185 closed AI Origination trades
+with a recorded confidence) reported `mean_mae=+0.00%` in literally every bucket of both PART 1
+and PART 2 -- not close to zero, exactly zero, which is the signature of a bug rather than a
+coincidence of real trading outcomes. Cause: the script read MAE from
+`StrategyTrade.lowest_price`, which `dashboard_routes.py` already documents (and works around,
+in its own CSV export) as only maintained on the side `monitor_open_trades` needs for the
+trailing-stop engine -- for a long trade (every AI Origination trade is `BUY_CE`/`BUY_PE`)
+`lowest_price` stays pinned at its entry-time seed value forever, so a lowest_price-derived MAE
+is deterministically 0.00% for every trade, never a real adverse excursion. `highest_price` (and
+therefore MFE) was unaffected -- it's the side that *is* maintained for a long trade. Fixed by
+reading real extremes from `strategy_trade_ticks` (30s premium samples) instead, mirroring
+`dashboard_routes.py`'s own established `_excursion` helper rather than inventing a second way
+to compute this. 2 new tests confirm ticks are used and that a misleadingly-seeded
+`highest_price`/`lowest_price` pair is ignored even when populated.
+
+The bug did not affect win rate, mean P&L, or the confidence/pnl correlation -- none of those
+read `lowest_price` -- so the real headline numbers from the same run stand:
+
+- **No smooth scaling relationship.** `Pearson r(confidence, pnl_percent) = +0.072`, bootstrap
+  90% CI `[-0.046, +0.187]` -- crosses zero, not reliable. A continuous confidence-to-size curve
+  (roadmap option 2a as a linear/tiered scale) is NOT supported by this correlation.
+- **But a real, sample-adequate floor effect.** The `<0.60` bucket (n=28, clears
+  `MIN_BUCKET_LIVE=20`) stood apart on point estimates: 25.0% win rate, -5.35% mean P&L, versus
+  roughly breakeven (-0.70% to +0.25%) for every bucket at 0.60 and above. The script had no way
+  to say whether that gap was reliable rather than eyeballed -- **fixed in the same pass**, added
+  a bootstrap 90% CI comparing `<0.60` against everything else (mirrors PART 2's existing
+  hedged-vs-not comparison). 2 new tests cover a detected floor effect and a null case.
+- **Hedging language: directional but not reliable.** Hedged mean P&L -2.08% (n=77) vs not-hedged
+  -0.09% (n=108) -- the point estimate matches the trigger's intuition, but the bootstrap 90% CI
+  on the difference is `[-4.68, +0.68]`, crossing zero.
+- **The score and the text really do disagree, often.** 26 of 185 trades (14%) had high
+  confidence (>=0.75) *with* hedged reasoning -- the 14 Aug Bank Nifty PE loss (confidence 0.77,
+  "already extended... mature") is exactly this shape, not a one-off. 20 more had low confidence
+  (<0.60) with no hedging language. ~25% of the population has the two signals disagreeing, so
+  neither can stand in for the other.
+
+**Verdict: a hard confidence floor around 0.60 has real, sample-adequate support (roadmap option
+2a's floor variant specifically, not a scaling curve). A hedged-reasoning gate (option 2b) does
+NOT clear its bar yet** -- directionally consistent with the trigger, but the CI is not reliable
+at n=77/108. Not shipped this pass: the floor threshold itself (exactly 0.60, vs. a value chosen
+with more margin) and its behavior (skip entirely vs. downsize) are a real design decision the
+task deliberately leaves to the user rather than picking unilaterally from one bucket boundary
+that happened to be pre-specified in the script. Worth its own dated follow-up once decided.
+
+```bash
+python -m scripts.confidence_sizing_backtest --db data/trading.db
+```
+
 ### 13 Aug retry-bypass fix was real but not the cause of the actual production rejections (14 Aug 2026)
 
 The 13 Aug fix (below) shipped and was live all of 14 Aug. Verified via the new `[THROTTLE]`
