@@ -85,6 +85,20 @@ class Entry:
 
 
 def _load_entries(db_path: str) -> list[Entry]:
+    """MFE/MAE come from strategy_trade_ticks (real 30s premium samples), not
+    from StrategyTrade.highest_price/lowest_price. Those two stored columns
+    feed the trailing-stop engine and are only maintained on the side the
+    trailing logic needs: for a long trade (every AI Origination trade is
+    BUY_CE/BUY_PE, i.e. long) monitor_open_trades updates highest_price but
+    never touches lowest_price -- it stays pinned at its entry-time seed
+    value forever, making a lowest_price-derived MAE deterministically 0.00%
+    for every single trade, not a real adverse excursion. Confirmed 14 Aug:
+    the first version of this script used lowest_price directly and every
+    bucket in both PART 1 and PART 2 reported mean_mae=+0.00% -- not close to
+    zero, exactly zero, which is the signature of this exact bug rather than
+    a coincidence of real trading outcomes. dashboard_routes.py's CSV export
+    already solved this the same way (its own _excursion helper); mirrored
+    here rather than reading the stored columns."""
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     try:
@@ -92,7 +106,7 @@ def _load_entries(db_path: str) -> list[Entry]:
             """
             SELECT
                 trade_id, index_symbol, ai_confidence, ai_reasoning,
-                entry_price, highest_price, lowest_price, pnl_percent, result
+                entry_price, pnl_percent, result
             FROM strategy_trades
             WHERE origin LIKE 'AI_ORIGIN_%'
               AND status = 'CLOSED'
@@ -100,18 +114,36 @@ def _load_entries(db_path: str) -> list[Entry]:
               AND pnl_percent IS NOT NULL
             """
         ).fetchall()
+        tick_extremes = {
+            row["trade_id"]: (row["low"], row["high"])
+            for row in connection.execute(
+                """
+                SELECT trade_id, MIN(premium) AS low, MAX(premium) AS high
+                FROM strategy_trade_ticks
+                GROUP BY trade_id
+                """
+            ).fetchall()
+        }
     finally:
         connection.close()
 
     entries: list[Entry] = []
     for row in rows:
+        trade_id = str(row["trade_id"])
         entry_price = row["entry_price"]
-        highest = row["highest_price"]
-        lowest = row["lowest_price"]
-        mfe = (highest - entry_price) / entry_price * 100.0 if entry_price and highest is not None else None
-        mae = (lowest - entry_price) / entry_price * 100.0 if entry_price and lowest is not None else None
+        extremes = tick_extremes.get(trade_id)
+        mfe = mae = None
+        if extremes and entry_price:
+            low, high = extremes
+            if low is not None and high is not None:
+                # Every AI Origination trade is long (BUY_CE/BUY_PE), so
+                # favourable == high and adverse == low -- unlike
+                # dashboard_routes.py's _excursion this population never
+                # needs the SELL-direction flip.
+                mfe = (high - entry_price) / entry_price * 100.0
+                mae = (low - entry_price) / entry_price * 100.0
         entries.append(Entry(
-            trade_id=str(row["trade_id"]),
+            trade_id=trade_id,
             index_symbol=str(row["index_symbol"]),
             confidence=float(row["ai_confidence"]),
             reasoning=str(row["ai_reasoning"] or ""),
@@ -215,6 +247,31 @@ def run_confidence_buckets(entries: list[Entry]) -> None:
         )
     else:
         logger.info("Too few observations (n=%d) for a correlation estimate.", len(entries))
+
+    # The correlation above tests a smooth, continuous relationship across the
+    # whole range. A floor is a different, discrete claim ("below X is
+    # unusually bad", not "less confidence is gradually worse throughout") and
+    # needs its own comparison -- the two can disagree, and did in practice on
+    # 14 Aug: the correlation CI included zero while the lowest bucket still
+    # stood out sharply against every other bucket on point estimates alone.
+    floor = CONFIDENCE_BUCKETS[0][1]
+    below_floor = [e for e in entries if e.confidence < floor]
+    at_or_above_floor = [e for e in entries if e.confidence >= floor]
+    if len(below_floor) >= 2 and len(at_or_above_floor) >= 2:
+        lo, hi = _bootstrap_mean_diff(
+            [e.pnl_percent for e in below_floor], [e.pnl_percent for e in at_or_above_floor],
+        )
+        verdict = (
+            f"reliably WORSE below {floor:.2f}" if hi < 0
+            else f"reliably BETTER below {floor:.2f}" if lo > 0
+            else "no reliable difference at this sample size"
+        )
+        logger.info(
+            "bootstrap 90%% CI on mean_pnl(<%.2f) - mean_pnl(>=%.2f): [%+.2f, %+.2f] -> %s  (n=%d vs n=%d)",
+            floor, floor, lo, hi, verdict, len(below_floor), len(at_or_above_floor),
+        )
+    else:
+        logger.info("Too few observations below/above the %.2f floor for a bootstrap comparison.", floor)
 
     if bucket_sizes and min(bucket_sizes) < MIN_BUCKET_LIVE:
         logger.info(
