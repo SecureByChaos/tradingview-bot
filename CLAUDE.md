@@ -295,6 +295,55 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination confidence floor raised 0.55 -> 0.60, backtested (14 Aug 2026)
+
+Implements the decision from the confidence-sizing backtest below. Three metrics (win rate,
+mean P&L, mean MAE) all independently agreed the `<0.60` bucket (n=28) is reliably worse than
+every bucket at 0.60+, which is itself roughly flat -- a step function, not a gradient. A
+scaled-by-confidence position size was therefore rejected in favor of a hard floor: there is no
+evidence more confidence above 0.60 deserves more size, since P&L does not improve further in
+that range (0.60-0.75 is in fact the single best-performing bucket, largest sample too).
+
+**Implemented as a threshold change, not a new gate.** `_MIN_CONFIDENCE_TO_ACT` already existed
+in `app/ai/originator.py` -- a confidence floor checked in `run_origination_checks` before
+`_open_trade` is even called, one layer above the trend-age/`same_direction_entries_today` gate
+that lives inside `_open_trade` itself. Adding a second, separate 0.60 check inside `_open_trade`
+(as the task spec's suggested location implied, apparently unaware this constant already existed)
+would have been redundant with -- and strictly shadowed by -- the existing 0.55 gate one layer up,
+since anything below 0.60 already fails to reach `_open_trade` at 0.55. Raised the existing
+constant instead: smaller diff, no duplicate/overlapping threshold for a future reader to puzzle
+over. All 185 trades in the backtest population already had confidence >= 0.55 by construction
+(the pre-existing floor), consistent with this being the correct single point of control.
+
+**Also added**: an explicit skip log at the confidence-check site
+(`[AI][ORIGIN] {symbol}: Skipped: ai_confidence={value} below floor {floor}`), matching the
+pattern DTE-floor and `same_direction_entries_today` skips already use -- previously this
+condition fell through silently with no INFO-level line of its own. The confidence check was
+also pulled into a small `_clears_confidence_floor()` helper (mirrors `_open_trade`'s existing
+`_is_sane()` pattern) purely so it's unit-testable without needing `run_origination_checks`'s
+full AI-client/DB/market-context machinery -- `_open_trade`'s own gates already have this kind
+of isolated test coverage (`tests/test_trend_age_gate.py`), this one didn't.
+
+**Auditability confirmed, not just assumed**: `record_decision()` is called unconditionally
+after this check regardless of which branch fires (same as every other decision outcome), so a
+skipped BUY_CE/BUY_PE with its real confidence value is queryable in `ai_origination_logs` via
+`decision IN ('BUY_CE','BUY_PE') AND trade_id IS NULL AND confidence < 0.60` -- distinguishable
+from a genuine model-chosen NONE, which records `decision='NONE'` instead.
+
+7 new tests (`tests/test_confidence_floor.py`) cover the exact boundary (0.59 blocked, 0.60
+allowed), missing confidence treated as failing the floor, and the two trigger trades' own
+confidence values (0.55, 0.55) landing on the correct side. Scope respected: only
+`app/ai/originator.py` touched, no changes to exit logic, stop/target construction, the
+trailing mechanism, or the model prompt -- confirmed via `git diff --stat`.
+
+**Not verified live** -- this sandbox cannot run the origination cycle end-to-end (no SmartAPI
+credentials, no real AI provider calls). After deploying, per the task's own verification steps:
+spot-check the first live session for any `ai_confidence < 0.60` row in `ai_origination_logs`
+and confirm it shows `trade_id IS NULL` rather than an opened trade; over the following one to
+two weeks, re-run `scripts/confidence_sizing_backtest.py` against fresh post-deployment data and
+confirm the `<0.60` bucket has stopped accumulating new closed trades (since none should be
+opening there anymore).
+
 ### AI confidence / hedging-language sizing backtest -- tooling built, NOT run (14 Aug 2026)
 
 **Trigger, a repeat pattern across three trades this cycle, not a single anecdote:**

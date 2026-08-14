@@ -39,7 +39,22 @@ logger = logging.getLogger(__name__)
 # adjusting a setup TradingView/the AI already flagged, this is fabricating a
 # brand-new position from momentum data alone, with nothing else to anchor
 # it -- a materially bigger claim, so it should clear a materially higher bar.
-_MIN_CONFIDENCE_TO_ACT = 0.55
+#
+# Raised 0.55 -> 0.60, 14 Aug 2026, backtested first -- scripts/confidence_sizing_
+# backtest.py against 185 closed AI Origination trades. A scaled-by-confidence
+# position size was considered and rejected: the data is a step function, not a
+# gradient. Every bucket at 0.60+ is roughly flat to mildly positive (0.60-0.75 is
+# in fact the single best-performing bucket, largest sample too), so there is no
+# evidence more confidence above 0.60 deserves more size. <0.60 (n=28, clears the
+# trust minimum) is the one bucket that stands apart on every metric at once --
+# 25.0% win rate vs 33.9-38.9% elsewhere, -5.35% mean P&L vs -0.70% to +0.25%,
+# -8.57% mean adverse excursion vs -4.67% to -5.49% -- and the floor-vs-rest
+# bootstrap 90% CI on mean P&L, [-8.77, -1.39], excludes zero. 0.60 is therefore
+# both the most relaxed defensible floor and the correct one -- raising it further
+# would cut into the best-performing segment for no measured benefit. See
+# CLAUDE.md's "AI confidence / hedging-language sizing backtest" entry for the
+# full numbers.
+_MIN_CONFIDENCE_TO_ACT = 0.60
 # Applies to every index (Bank Nifty, Nifty, and Sensex whenever it's added) --
 # the first 15 minutes after the 9:15 open are the noisiest, whippiest part of
 # the session. Origination keeps recording price ticks during this window so
@@ -466,6 +481,14 @@ class _Decision:
     # record it -- nothing reads it to decide anything. Defaults to None so the
     # many _Decision(...) constructions that predate it are unaffected.
     latency_ms: float | None = None
+
+
+def _clears_confidence_floor(decision: _Decision) -> bool:
+    """True if this decision's confidence clears _MIN_CONFIDENCE_TO_ACT -- see
+    that constant's own comment for the backtest behind the threshold. Missing
+    confidence is treated as 0 (fails the floor), same as the pre-existing
+    (decision.confidence or 0) pattern this replaces at the call site."""
+    return (decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT
 
 
 def _snippet(value: object, limit: int = 400) -> str:
@@ -1281,7 +1304,20 @@ def run_origination_checks(
                             "[AI][ORIGIN] %s NONE reasoning (%s): %s", index.symbol, provider_name, decision.reasoning
                         )
                     opened = None
-                    if decision.action in ("BUY_CE", "BUY_PE") and (decision.confidence or 0) >= _MIN_CONFIDENCE_TO_ACT:
+                    wants_to_trade = decision.action in ("BUY_CE", "BUY_PE")
+                    if wants_to_trade and not _clears_confidence_floor(decision):
+                        # Explicit, same pattern as every other skip condition
+                        # (DTE floor, same_direction_entries_today) rather than
+                        # silently falling through to the generic NONE-shaped
+                        # record_decision call below -- the model DID want to
+                        # trade here, this is StrikeVault overriding that on
+                        # confidence grounds, and that distinction matters when
+                        # reading ai_origination_logs after the fact.
+                        logger.info(
+                            "[AI][ORIGIN] %s: Skipped: ai_confidence=%.2f below floor %.2f",
+                            index.symbol, decision.confidence or 0, _MIN_CONFIDENCE_TO_ACT,
+                        )
+                    if wants_to_trade and _clears_confidence_floor(decision):
                         opened = _open_trade(
                             session, index, provider_name, decision, smartapi, option_finder,
                             # Snapshot of the prompt inputs this specific
