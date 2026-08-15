@@ -15,7 +15,6 @@ from app.ai.context_repository import get_latest_context_log
 from app.database import get_db
 from app.db_models import BotStatus, LogEvent, StrategyConfig, StrategyTrade, TradeStatus
 from app.platform import (
-    ai_reviews_query_for_filter,
     api_status,
     daily_stats_query_for_filter,
     get_or_create_strategy_stats,
@@ -199,59 +198,6 @@ def logs_export(
     )
 
 
-@router.get("/ai-reviews/export")
-def ai_reviews_export(
-    db: Annotated[Session, Depends(get_db)],
-    review_date: str = "",
-    strategy: str = "",
-    provider: str = "",
-    decision: str = "",
-    trade_result: str = "",
-    _: Annotated[None, Depends(require_admin_api)] = None,
-) -> StreamingResponse:
-    query = ai_reviews_query_for_filter(review_date, strategy, provider, decision, trade_result)
-    output = StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=[
-            "Time (IST)",
-            "Strategy",
-            "Signal",
-            "Review Type",
-            "Provider",
-            "Model",
-            "Decision",
-            "Confidence",
-            "Trade Result",
-            "Actual P&L",
-            "AI Correct",
-            "Summary",
-        ],
-    )
-    writer.writeheader()
-    for review in db.scalars(query):
-        writer.writerow(
-            {
-                "Time (IST)": format_ist(review.created_at),
-                "Strategy": review.strategy,
-                "Signal": review.signal,
-                "Review Type": "ENTRY" if review.signal.startswith("BUY") else "EXIT",
-                "Provider": review.provider,
-                "Model": review.model,
-                "Decision": review.decision,
-                "Confidence": review.confidence,
-                "Trade Result": review.actual_result or "",
-                "Actual P&L": review.actual_pnl if review.actual_pnl is not None else "",
-                "AI Correct": "" if review.ai_correct is None else ("YES" if review.ai_correct else "NO"),
-                "Summary": review.summary,
-            }
-        )
-    output.seek(0)
-    return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=ai_reviews_ist.csv"},
-    )
 
 
 @router.get("/daily-stats/export")

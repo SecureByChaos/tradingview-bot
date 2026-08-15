@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import AIExitCall, AIOriginationLog, AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.db_models import AIOriginationLog, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.market_context import ADX_NO_TREND, ADX_TRENDING
 from app.signal_validation import check_market_hours
 from app.time_utils import duration_label, format_ist, iso_utc, to_ist, utc_now
@@ -400,41 +400,6 @@ def strategy_trades_query_for_filter(
     return query.order_by(StrategyTrade.entry_time.desc())
 
 
-def origin_comparison_metrics(db: Session, filter_name: str, start: date | None, end: date | None) -> list[dict[str, Any]]:
-    """Side-by-side evaluation view: for each origin (SIGNAL, AI_ALT_OPENAI,
-    AI_ALT_CLAUDE, ...) seen in the selected date range, closed-trade win
-    rate and net P&L, so the AI alternative-call evaluation can actually be
-    judged against the real signal instead of guessed at."""
-    trades = list(db.scalars(strategy_trades_query_for_filter(filter_name, start, end)))
-    closed_by_origin: dict[str, list[StrategyTrade]] = {}
-    for trade in trades:
-        if trade.status != TradeStatus.CLOSED:
-            continue
-        closed_by_origin.setdefault(trade.origin, []).append(trade)
-
-    def sort_key(name: str) -> tuple[int, str]:
-        return (0, "") if name == "SIGNAL" else (1, name)
-
-    metrics: list[dict[str, Any]] = []
-    for origin_name in sorted(closed_by_origin, key=sort_key):
-        rows = closed_by_origin[origin_name]
-        wins = sum(1 for row in rows if row.result == TradeResult.WIN)
-        losses = sum(1 for row in rows if row.result == TradeResult.LOSS)
-        total = len(rows)
-        metrics.append(
-            {
-                "origin": origin_name,
-                "trade_count": total,
-                "wins": wins,
-                "losses": losses,
-                "win_rate": round((wins / total) * 100, 2) if total else 0.0,
-                "net_pnl": round(sum(row.profit_loss for row in rows), 2),
-                "avg_pnl_percent": round(sum(row.pnl_percent for row in rows) / total, 2) if total else 0.0,
-            }
-        )
-    return metrics
-
-
 _INDEX_TICK_THROTTLE_SECONDS = 25
 _INDEX_DISPLAY_NAMES = {"BANKNIFTY": "Bank Nifty", "NIFTY": "Nifty", "SENSEX": "Sensex"}
 
@@ -778,155 +743,6 @@ def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[s
     return result
 
 
-def get_exit_shadow_summary(db: Session) -> dict[str, Any]:
-    """Data for the AI Exit Calls page -- a read-only view over app/ai/exit_shadow.py's
-    output. Never influences the real trade; this only ever reads AIExitCall +
-    StrategyTrade rows for display."""
-    open_trades = list(
-        db.scalars(
-            select(StrategyTrade).where(
-                StrategyTrade.status == TradeStatus.OPEN,
-                StrategyTrade.origin == "SIGNAL",
-            ).order_by(StrategyTrade.entry_time.desc())
-        )
-    )
-    live: list[dict[str, Any]] = []
-    for trade in open_trades:
-        calls = list(
-            db.scalars(
-                select(AIExitCall)
-                .where(AIExitCall.trade_id == trade.trade_id)
-                .order_by(AIExitCall.checked_at.desc())
-            )
-        )
-        latest_by_provider: dict[str, AIExitCall] = {}
-        for call in calls:
-            latest_by_provider.setdefault(call.provider, call)
-        holding_minutes = None
-        if trade.entry_time is not None:
-            entry_ist = to_ist(trade.entry_time)
-            now_ist = to_ist(utc_now())
-            if entry_ist is not None and now_ist is not None:
-                holding_minutes = max(int((now_ist - entry_ist).total_seconds() // 60), 0)
-        live.append({
-            "trade_id": trade.trade_id,
-            "strategy_name": trade.strategy_name,
-            "index_display_name": _index_display_name(trade.index_symbol),
-            "position_label": "Long call" if trade.option_type == "CE" else "Long put",
-            "entry_price": trade.entry_price,
-            "current_premium": trade.current_premium,
-            "pnl_percent": trade.pnl_percent,
-            "holding_minutes": holding_minutes,
-            "calls": [
-                {
-                    "provider": call.provider,
-                    "decision": call.decision,
-                    "confidence": call.confidence,
-                    "reasoning": call.reasoning,
-                    "checked_at": format_ist(call.checked_at),
-                }
-                for call in latest_by_provider.values()
-            ],
-            "checks_run": len(calls),
-        })
-
-    exit_trade_ids = list(
-        db.scalars(select(AIExitCall.trade_id).where(AIExitCall.decision == "EXIT").distinct())
-    )
-    comparisons_with_time: list[tuple[datetime, dict[str, Any]]] = []
-    if exit_trade_ids:
-        trades_by_id = {
-            trade.trade_id: trade
-            for trade in db.scalars(select(StrategyTrade).where(StrategyTrade.trade_id.in_(exit_trade_ids)))
-        }
-        for trade_id in exit_trade_ids:
-            trade = trades_by_id.get(trade_id)
-            if trade is None:
-                continue
-            exit_call = db.scalar(
-                select(AIExitCall)
-                .where(AIExitCall.trade_id == trade_id, AIExitCall.decision == "EXIT")
-                .order_by(AIExitCall.checked_at.asc())
-                .limit(1)
-            )
-            if exit_call is None:
-                continue
-            shadow_pnl = exit_call.pnl_percent_at_check
-            comparisons_with_time.append((exit_call.checked_at, {
-                "trade_id": trade_id,
-                "strategy_name": trade.strategy_name,
-                "index_display_name": _index_display_name(trade.index_symbol),
-                "position_label": "Long call" if trade.option_type == "CE" else "Long put",
-                "ai_called_at": format_ist(exit_call.checked_at),
-                "ai_provider": exit_call.provider,
-                "ai_reasoning": exit_call.reasoning,
-                "shadow_pnl_percent": shadow_pnl,
-                "real_status": trade.status,
-                "real_pnl_percent": trade.pnl_percent if trade.status == TradeStatus.CLOSED else None,
-                "real_exit_reason": trade.exit_reason if trade.status == TradeStatus.CLOSED else None,
-            }))
-        comparisons_with_time.sort(key=lambda item: item[0], reverse=True)
-    comparisons = [row for _, row in comparisons_with_time]
-
-    # Closed SIGNAL trades that got shadow-checked (AIExitCall rows exist)
-    # but where the AI never actually called EXIT -- every check said HOLD
-    # (or errored). Before this, that history had nowhere to surface: the
-    # "live" table above only covers trades still OPEN, and "comparisons"
-    # only ever included a trade once the AI called EXIT on it specifically.
-    # The checks still ran and wrote rows the whole time -- they just sat in
-    # the database with no page ever reading them back for a HOLD-only trade.
-    checked_trade_ids = list(db.scalars(select(AIExitCall.trade_id).distinct()))
-    held_only: list[dict[str, Any]] = []
-    if checked_trade_ids:
-        held_conditions = [
-            StrategyTrade.trade_id.in_(checked_trade_ids),
-            StrategyTrade.status == TradeStatus.CLOSED,
-            StrategyTrade.origin == "SIGNAL",
-        ]
-        if exit_trade_ids:
-            held_conditions.append(StrategyTrade.trade_id.notin_(exit_trade_ids))
-        held_trades = list(
-            db.scalars(
-                select(StrategyTrade).where(*held_conditions).order_by(StrategyTrade.exit_time.desc()).limit(30)
-            )
-        )
-        for trade in held_trades:
-            calls = list(
-                db.scalars(
-                    select(AIExitCall)
-                    .where(AIExitCall.trade_id == trade.trade_id)
-                    .order_by(AIExitCall.checked_at.desc())
-                )
-            )
-            if not calls:
-                continue
-            latest_by_provider: dict[str, AIExitCall] = {}
-            for call in calls:
-                latest_by_provider.setdefault(call.provider, call)
-            held_only.append({
-                "trade_id": trade.trade_id,
-                "strategy_name": trade.strategy_name,
-                "index_display_name": _index_display_name(trade.index_symbol),
-                "position_label": "Long call" if trade.option_type == "CE" else "Long put",
-                "calls": [
-                    {
-                        "provider": call.provider,
-                        "decision": call.decision,
-                        "confidence": call.confidence,
-                        "reasoning": call.reasoning,
-                        "checked_at": format_ist(call.checked_at),
-                    }
-                    for call in latest_by_provider.values()
-                ],
-                "checks_run": len(calls),
-                "real_pnl_percent": trade.pnl_percent,
-                "real_result": trade.result,
-                "real_exit_reason": trade.exit_reason,
-                "exit_time": format_ist(trade.exit_time),
-            })
-
-    return {"live": live, "comparisons": comparisons, "held_only": held_only}
-
 
 def get_today_activity(db: Session, limit: int = 20) -> list[dict[str, Any]]:
     """Plain-language, strategy-attributed activity feed for the live
@@ -998,30 +814,6 @@ def daily_stats_query_for_filter(filter_name: str, start: date | None, end: date
     if end is not None:
         query = query.where(DailyStats.trade_date <= end)
     return query.order_by(DailyStats.trade_date.desc())
-
-
-def ai_reviews_query_for_filter(
-    review_date: str = "",
-    strategy: str = "",
-    provider: str = "",
-    decision: str = "",
-    trade_result: str = "",
-) -> Select[tuple[AITradeReview]]:
-    query = select(AITradeReview)
-    if review_date:
-        day = date.fromisoformat(review_date)
-        start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
-        end = datetime.combine(day, time.max, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
-        query = query.where(AITradeReview.created_at.between(start, end))
-    if strategy:
-        query = query.where(AITradeReview.strategy == strategy)
-    if provider:
-        query = query.where(AITradeReview.provider == provider)
-    if decision:
-        query = query.where(AITradeReview.decision == decision)
-    if trade_result:
-        query = query.where(AITradeReview.actual_result == trade_result)
-    return query.order_by(AITradeReview.created_at.desc())
 
 
 def strategy_metrics(db: Session) -> list[dict[str, Any]]:

@@ -295,6 +295,98 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Reviews, AI Alternatives, AI Exit Calls, AI Context Inspector removed; AI Origination summary folded into Reports (15 Aug 2026)
+
+**Requested**: "Remove AI Alternatives, AI Exit calls, AI Reviews and AI Context Inspector as we
+dont need it now. Also include ai origination trade summary in Reports tab, do not make it
+separate." Investigated before building: all four pages are read-only UI layers, but two
+independent backend pipelines feed them and both cost real LLM API money on every run
+regardless of whether the page exists to view the result --
+
+- `app/ai/shadow.py`'s `run_shadow_review()` -- queued as a `BackgroundTasks` job from every
+  accepted BUY webhook (`queue_shadow_review()` in `app/main.py`) -- calls the signal
+  validator/reviewer (feeds **AI Reviews** + **AI Context Inspector**) and, on REJECT, may open
+  a paper `AI_ALT_*` trade via `alternative_trader.py` (feeds **AI Alternatives**).
+- `app/ai/exit_shadow.py`'s `run_exit_shadow_checks()` -- a separate scheduled job, every 3 min,
+  re-reviewing every open `SIGNAL` trade (feeds **AI Exit Calls**). Purely observational -- per
+  its own doc comment it can never close a trade -- but still a real LLM call every 3 minutes
+  regardless of whether anyone is looking at the page.
+
+So removing the pages alone would have deleted the UI while leaving both pipelines running
+silently in the background, still spending money with no visible output anymore -- worse than
+before, not better. Two scope questions went back to the user rather than guessing:
+
+1. **Should removing AI Reviews/AI Alternatives/AI Context Inspector also stop the shared
+   per-signal review call (and the paper `AI_ALT_*` trades it produces)?** → **Stop it entirely
+   (recommended).**
+2. **Should removing AI Exit Calls also stop the 3-minute exit-shadow job?** → **Stop it
+   entirely (recommended).**
+
+**Implementation:**
+
+- `app/main.py`'s `webhook()` no longer calls `queue_shadow_review()` -- removed entirely, along
+  with `_build_shadow_market_data()` (its only caller), the `BackgroundTasks` parameter, and the
+  now-dead `payload_indicators`/`payload_trend`/`payload_strategy_filters`/`payload_trade_state`
+  locals that existed only to feed it. This also removes 1-2 SmartAPI calls per accepted BUY
+  webhook that `_build_shadow_market_data` made purely to enrich the review context.
+- `app/scheduler.py` no longer registers the `ai-exit-shadow-check` job (was every 3 min) --
+  scheduler now runs 8 jobs, not 9.
+- Four routes, their route functions, and their four dedicated `AITradeReview`/`AIExitCall`-
+  reading data functions in `app/platform.py` (`origin_comparison_metrics`,
+  `get_exit_shadow_summary`, `ai_reviews_query_for_filter`) deleted, along with the
+  `/api/ai-reviews/export` CSV route in `app/api_routes.py` and all four templates and their
+  `base.html` nav links.
+- **`app/ai/shadow.py`, `app/ai/exit_shadow.py`, `app/ai/alternative_trader.py`,
+  `app/ai/validator.py`, `app/ai/review_repository.py`, `app/ai/context_repository.py` were
+  deliberately left in the repo, unwired, rather than deleted.** They encode substantial
+  documented history (the three-AI-subsystem design above, the Claude `max_tokens` truncation
+  fix, the JSON-fence parsing gotcha) and the request said "we dont need it **now**", not "this
+  is permanently wrong" -- same reversibility posture already established for
+  `option_chain_collection_enabled` (defaults `False`, module kept intact) rather than deleting
+  `app/option_chain.py`. Confirmed via grep that nothing still imports or calls into any of them
+  after this change -- they are dead code, not orphaned-but-reachable code.
+- Carefully preserved everything adjacent that looked related but wasn't: `_context_json`
+  (shared with `/reports`), `AITradeReview` usage inside `reports.py`'s existing Pattern
+  Discovery report (`_reviews_with_outcome_between`/`_ai_correlation_stats` -- unrelated to the
+  deleted AI Reviews *page*), `strategy_trades_query_for_filter`'s pre-existing `ai_alt` filter
+  value on Trade History (historical `AI_ALT_*` rows already in the DB are still visible there,
+  by design -- only the dedicated comparison page is gone), `get_latest_context_log`/
+  `/ai/latest-context` (a separate, UI-unreferenced API endpoint, out of scope), and
+  `create_reviewer`/`SignalContextBuilder` (AI Settings' unrelated "Test Connection" buttons).
+- **AI Origination trade summary added to `/reports`** as a fifth on-demand report type
+  (`ReportType.ORIGINATION`), not a separate page/tab, matching the existing Daily/Weekly/
+  Monthly/Pattern Discovery "Generate Now" button pattern exactly. `generate_origination_summary()`
+  (`app/reports.py`) queries closed trades with `origin LIKE 'AI_ORIGIN_%'` (explicit `LIKE`, per
+  the standing rule -- never `!= 'SIGNAL'`, which would also sweep in `AI_ALT_*`), over a
+  selectable lookback (30/90/180 days/all-time, default 30 -- shorter than Pattern Discovery's
+  default 90 since AI Origination itself is newer). Stats mirror `_trade_stats()`'s shape but
+  break down `by_provider` (Claude vs OpenAI, parsed off the `origin` suffix) and `by_index`
+  instead of `by_strategy` -- AI Origination trades don't have a `StrategyConfig` row to group
+  by -- and add `by_mode` (paper vs live counts) and `avg_confidence`, both specific to this
+  subsystem. Same `_generate_narrative`/`_save_report` machinery every other report type already
+  uses, including the OpenAI-narrative-with-template-fallback path.
+- **Noticed in passing, not acted on (out of scope for this task)**: AI Settings' "Mode" dropdown
+  (DISABLED/SHADOW/ADVISORY/BLOCKING) never actually gated a real trade -- grep confirmed only
+  the `== "DISABLED"` branch was wired into any code path; `queue_shadow_review()` (now removed
+  entirely) only ever fired *after* `response.accepted` was already `True`, as a decoupled
+  background task, so ADVISORY and BLOCKING behaved identically to SHADOW. Worth knowing if
+  anyone reads that dropdown as a real safety control -- it wasn't one.
+
+8 new tests (`tests/test_origination_report.py`) cover the provider-parsing helper, the
+`origin LIKE`-filter population query (excludes `SIGNAL` and `AI_ALT_*`, excludes open trades),
+the stats bucketing (provider/index/option-type/exit-reason/mode, best/worst provider,
+consecutive-loss streak, empty-population defaults), and `generate_origination_summary()` itself
+(saves an `ORIGINATION`-typed `AIReport`, template-fallback narrative when no AI provider is
+configured, confirms `SIGNAL` trades never leak into the numbers). Full suite: 283 passed (was
+275 before this change).
+
+**Not verified live** -- this sandbox has no deployed server to click through. After deploying,
+confirm on the real dashboard: the four removed nav links are gone and their URLs 404 (or
+redirect to login if unauthenticated), no new `AITradeReview`/`AIExitCall` rows appear after an
+accepted webhook or after 3 minutes elapse with an open `SIGNAL` trade, and the Reports page's
+new "AI Origination Summary" button produces a card with real numbers once there is at least one
+closed `AI_ORIGIN_*` trade in the live DB.
+
 ### AI Origination folded into the main dashboard; its own tab removed (15 Aug 2026)
 
 **Requested**: show AI Origination's live trades on the main dashboard's Active Trades, and
