@@ -18,12 +18,10 @@
       <nav class="sidebar-nav">
       {% set path = request.url.path %}
       <a class="{% if path == '/' %}active{% endif %}" href="/">Dashboard</a>
-      <a class="{% if path == '/performance' %}active{% endif %}" href="/performance">Performance</a>
       <a class="{% if path == '/smartapi-health' %}active{% endif %}" href="/smartapi-health">SmartAPI Health</a>
       <a class="{% if path == '/history' %}active{% endif %}" href="/history">Trade History</a>
       <a class="{% if path == '/control' %}active{% endif %}" href="/control">Bot Control</a>
       <a class="{% if path == '/settings' %}active{% endif %}" href="/settings">Settings</a>
-      <a class="{% if path == '/ai-settings' %}active{% endif %}" href="/ai-settings">AI Settings</a>
       <a class="{% if path == '/reports' %}active{% endif %}" href="/reports">Reports</a>
       <a class="{% if path == '/logs' %}active{% endif %}" href="/logs">Logs</a>
       <a href="/logout" class="mt-3 text-danger">Logout</a>

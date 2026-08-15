@@ -21,6 +21,7 @@ from app.ai.repository import create_settings as create_ai_settings, get_setting
 from app.database import get_db
 from app.db_models import BotStatus, IndexConfig, PlatformSettings, SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeStatus, TradingMode
 from app.platform import (
+    compute_performance_kpis,
     get_dashboard_summary,
     get_index_live_figures,
     get_live_trading_status,
@@ -28,12 +29,12 @@ from app.platform import (
     get_open_trades_with_ticks,
     get_or_create_strategy_stats,
     get_or_create_settings,
-    get_performance_summary,
     get_today_activity,
     latest_logs,
     list_index_configs,
     log_event,
     origin_label,
+    signal_strategy_names,
     strategy_metrics,
     strategy_trades_query_for_filter,
 )
@@ -178,16 +179,29 @@ def history(
     start: str | None = None,
     end: str | None = None,
     origin: str = "all",
+    strategy: str = "",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    origin_filter = origin if origin in ("signal", "ai_alt", "ai_origin") else None
-    trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter)))
+    origin_filter = origin if origin in ("signal", "ai_origin") else None
+    # The strategy sub-filter only makes sense paired with Signal Only --
+    # AI trades don't have a real StrategyConfig-backed strategy name -- so a
+    # stray ?strategy= on another origin is ignored rather than silently
+    # filtering out every row.
+    strategy_filter = strategy if origin == "signal" and strategy else None
+    trades = list(db.scalars(
+        strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter, strategy_filter)
+    ))
     # Net P&L in rupees across whatever filter/date-range/origin is currently
     # applied -- only closed trades have a real profit_loss (open trades default
     # to 0.0, which would understate nothing but also isn't a real realized
     # number yet, so they're excluded from this total on purpose).
     closed_trades = [trade for trade in trades if trade.status == TradeStatus.CLOSED]
-    net_pnl_amount = round(sum(trade.profit_loss for trade in closed_trades), 2)
+    # KPI cards and equity/daily/win-loss charts -- formerly a standalone
+    # /performance page (SIGNAL-only, unconditionally); folded in here and
+    # generalized to reflect whichever origin/strategy filter is currently
+    # selected, so the numbers always describe exactly the trades in the
+    # table below them.
+    performance = compute_performance_kpis(closed_trades)
     return templates.TemplateResponse(
         "history.html",
         {
@@ -197,8 +211,11 @@ def history(
             "start": start or "",
             "end": end or "",
             "origin": origin,
-            "net_pnl_amount": net_pnl_amount,
+            "strategy": strategy,
+            "strategy_names": signal_strategy_names(db),
+            "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
             "closed_count": len(closed_trades),
+            **performance,
         },
     )
 
@@ -210,13 +227,17 @@ def history_export(
     start: str | None = None,
     end: str | None = None,
     origin: str = "all",
+    strategy: str = "",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> StreamingResponse:
     """CSV export of the Trade History table, honoring whatever filter/date-range/
-    origin is currently applied on the page -- same query as the HTML view, just
-    written out as a file instead of rendered."""
-    origin_filter = origin if origin in ("signal", "ai_alt", "ai_origin") else None
-    trades = list(db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter)))
+    origin/strategy is currently applied on the page -- same query as the HTML
+    view, just written out as a file instead of rendered."""
+    origin_filter = origin if origin in ("signal", "ai_origin") else None
+    strategy_filter = strategy if origin == "signal" and strategy else None
+    trades = list(db.scalars(
+        strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), origin_filter, strategy_filter)
+    ))
 
     # MFE/MAE come from the 30-second premium samples in strategy_trade_ticks,
     # NOT from StrategyTrade.highest_price/lowest_price. Those two stored
@@ -393,21 +414,12 @@ def history_export(
     )
 
 
-@router.get("/performance", response_class=HTMLResponse)
-def performance_page(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    filter: str = "30d",
-    start: str | None = None,
-    end: str | None = None,
-    strategy: str = "",
-    _: Annotated[None, Depends(require_admin_page)] = None,
-) -> HTMLResponse:
-    summary = get_performance_summary(db, filter, parse_date(start), parse_date(end), strategy or None)
-    return templates.TemplateResponse(
-        "performance.html",
-        {"request": request, **summary, "filter": filter, "start": start or "", "end": end or ""},
-    )
+@router.get("/performance")
+def performance_page() -> RedirectResponse:
+    # Performance's KPIs/charts were folded into Trade History (15 Aug 2026)
+    # rather than kept as a separate page -- same relocate-not-delete pattern
+    # /strategies already uses for Settings > Strategies.
+    return RedirectResponse("/history", status_code=307)
 
 
 @router.get("/control", response_class=HTMLResponse)
@@ -591,28 +603,37 @@ def delete_strategy(
     return RedirectResponse("/settings?tab=strategies", status_code=303)
 
 
+def _settings_context(db: Session, smartapi: object, tab: str) -> dict[str, object]:
+    """Shared context for every /settings render (the plain GET, and the two
+    AI-connection-test POSTs that re-render the page with a result banner) --
+    factored out so the AI tab's settings/live-trading data doesn't need
+    gathering three separate times now that AI Settings is a Settings tab
+    rather than its own page."""
+    strategies = list(db.scalars(select(StrategyConfig).order_by(StrategyConfig.name)))
+    metrics = strategy_metrics(db)
+    return {
+        "settings": get_or_create_settings(db),
+        "tab": tab,
+        "strategies": strategies,
+        "metrics_by_id": {item["strategy"].id: item for item in metrics},
+        "indexes": list_index_configs(db),
+        "ai_settings": get_ai_settings(db) or create_ai_settings(db, id=1),
+        "live_trading": get_live_trading_status(db, smartapi),
+        "ai_test_result": None,
+    }
+
+
 @router.get("/settings", response_class=HTMLResponse)
 def settings_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
+    smartapi: Annotated[object, Depends(get_smartapi)],
     tab: str = "general",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
-    if tab not in {"general", "notifications", "strategies", "instruments"}:
+    if tab not in {"general", "notifications", "strategies", "instruments", "ai"}:
         tab = "general"
-    strategies = list(db.scalars(select(StrategyConfig).order_by(StrategyConfig.name)))
-    metrics = strategy_metrics(db)
-    return templates.TemplateResponse(
-        "settings.html",
-        {
-            "request": request,
-            "settings": get_or_create_settings(db),
-            "tab": tab,
-            "strategies": strategies,
-            "metrics_by_id": {item["strategy"].id: item for item in metrics},
-            "indexes": list_index_configs(db),
-        },
-    )
+    return templates.TemplateResponse("settings.html", {"request": request, **_settings_context(db, smartapi, tab)})
 
 
 @router.post("/settings")
@@ -638,19 +659,11 @@ def update_settings_page(
     return RedirectResponse(f"/settings?tab={active_tab}", status_code=303)
 
 
-@router.get("/ai-settings", response_class=HTMLResponse)
-def ai_settings_page(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    smartapi: Annotated[object, Depends(get_smartapi)],
-    _: Annotated[None, Depends(require_admin_page)] = None,
-) -> HTMLResponse:
-    settings = get_ai_settings(db) or create_ai_settings(db, id=1)
-    live_trading = get_live_trading_status(db, smartapi)
-    return templates.TemplateResponse(
-        "ai_settings.html",
-        {"request": request, "settings": settings, "test_result": None, "live_trading": live_trading},
-    )
+@router.get("/ai-settings")
+def ai_settings_page() -> RedirectResponse:
+    # AI Settings became a Settings tab (15 Aug 2026) rather than its own
+    # page -- same relocate-not-delete pattern /strategies already uses.
+    return RedirectResponse("/settings?tab=ai", status_code=307)
 
 
 @router.post("/ai-settings")
@@ -704,13 +717,14 @@ def update_ai_settings_page(
     if secondary_api_key:
         values["secondary_api_key"] = secondary_api_key
     update_ai_settings(db, settings, **values)
-    return RedirectResponse("/ai-settings", status_code=303)
+    return RedirectResponse("/settings?tab=ai", status_code=303)
 
 
 @router.post("/ai-settings/test", response_class=HTMLResponse)
 def test_ai_settings(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
+    smartapi: Annotated[object, Depends(get_smartapi)],
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     settings = get_ai_settings(db) or create_ai_settings(db, id=1)
@@ -724,13 +738,16 @@ def test_ai_settings(
         "status": "ERROR" if result.decision == "ERROR" else "OK",
         "error": result.summary if result.decision == "ERROR" else "",
     }
-    return templates.TemplateResponse("ai_settings.html", {"request": request, "settings": settings, "test_result": test_result})
+    context = _settings_context(db, smartapi, "ai")
+    context["ai_test_result"] = test_result
+    return templates.TemplateResponse("settings.html", {"request": request, **context})
 
 
 @router.post("/ai-settings/test-secondary", response_class=HTMLResponse)
 def test_secondary_ai_settings(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
+    smartapi: Annotated[object, Depends(get_smartapi)],
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     from types import SimpleNamespace
@@ -756,7 +773,9 @@ def test_secondary_ai_settings(
         "error": result.summary if result.decision == "ERROR" else "",
         "secondary": True,
     }
-    return templates.TemplateResponse("ai_settings.html", {"request": request, "settings": settings, "test_result": test_result})
+    context = _settings_context(db, smartapi, "ai")
+    context["ai_test_result"] = test_result
+    return templates.TemplateResponse("settings.html", {"request": request, **context})
 
 
 @router.get("/reports", response_class=HTMLResponse)

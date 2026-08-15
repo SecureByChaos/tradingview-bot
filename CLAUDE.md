@@ -295,6 +295,80 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Settings merged into Settings as a tab; Performance merged into Trade History; AI Alternatives filter removed; strategy sub-filter added (15 Aug 2026)
+
+**Requested**: "Merge AI Settings into Setting as a new tab. Also merge performance tab into Trade
+history tab. Remove AI Alternatives from trade history tab. When user select signals a new drop
+down should appear which should have strategies."
+
+**AI Settings → Settings tab**: `/ai-settings` (GET) now 307-redirects to `/settings?tab=ai` --
+the same relocate-not-delete pattern `/strategies` already used for Settings > Strategies. The
+AI form's own POST routes (`/ai-settings`, `/ai-settings/test`, `/ai-settings/test-secondary`)
+keep their URLs (no reason to move them, they're form targets, not pages) but now redirect to /
+render `settings.html` with `tab="ai"` instead of the standalone `ai_settings.html`, which is
+deleted. A new `_settings_context()` helper in `dashboard_routes.py` gathers the full Settings
+page context (general settings, strategies, indexes, AI settings, live-trading status) once,
+shared by the plain GET and both connection-test POSTs -- previously each of the three routes
+that render this page duplicated its own smaller slice of context. The template's AI pane uses
+`ai_settings.*` for the `AISettings` row and `ai_test_result` for the connection-test banner,
+kept distinct from the tab's other panes' `settings.*` (the unrelated `PlatformSettings` row)
+now that both live in one template. Settings > Instruments' existing AI Origination Live blurb,
+which linked to the now-deleted AI Origination page, updated to point at the AI tab instead.
+
+**Performance → Trade History**: `/performance` (GET) now 307-redirects to `/history`. Its
+KPI cards (net return, win rate, max drawdown) and three Chart.js panels (equity curve, daily
+P&L, win/loss donut) are folded into `history.html`, below the existing filter form and above
+the existing trades table -- no second "recent trades" list, since History's own full table
+(richer columns, no 20-row cap) already covers what Performance's own recent-trades section was
+for. `get_performance_summary()` (`app/platform.py`) -- previously hardcoded to `origin ==
+SIGNAL` unconditionally, regardless of what the caller asked for -- is replaced by
+`compute_performance_kpis(closed_trades)`, a pure function over an already-filtered trade list
+rather than a second query: the route fetches trades once for the table, and the same closed
+subset now feeds both the table and the KPI/chart numbers, instead of two separate DB round
+trips computing overlapping populations. This also means the KPI/chart numbers now honor
+whatever origin/strategy filter is currently selected on the page (previously they were silently
+SIGNAL-only even when Performance's own strategy dropdown was left on "All") -- pick "AI
+Origination Only" and the charts describe AI Origination's own equity curve, not signal trades.
+
+**AI Alternatives removed from Trade History**: the `<option value="ai_alt">AI Alternatives
+Only</option>` dropdown entry is gone, and `strategy_trades_query_for_filter()`
+(`app/platform.py`) had its `elif origin == "ai_alt":` branch deleted outright (unreachable dead
+code once the only two callers -- `history()` and `history_export()` -- stopped accepting
+`"ai_alt"` into their allowed-origin set). This reverses the earlier 15 Aug decision ("Trade
+History's pre-existing `ai_alt` filter value... historical `AI_ALT_*` rows already in the DB are
+still visible there, by design") per this task's explicit instruction -- `AI_ALT_*` rows are
+still visible under "All Trades" (no origin filter applied), just no longer separately
+selectable. Historical `AI_ALT_*` data in the DB is untouched either way.
+
+**Strategy sub-filter, shown only for Signal Only**: a new "Strategy" dropdown
+(`signal_strategy_names()` in `app/platform.py`, distinct `StrategyTrade.strategy_name` values
+among `origin == SIGNAL` rows only -- AI trades don't have a real `StrategyConfig`-backed
+strategy name) appears next to the Origin dropdown. It's populated on every page load regardless
+of the current origin selection, but only visually shown when Origin = Signal Only -- a small
+inline `onchange` handler toggles a wrapper div's `display` with no page reload, and the initial
+`display` state is server-rendered from the current `origin` value so a page that already has
+Signal Only selected (e.g. after submitting the form) shows the strategy dropdown immediately,
+not just after a second interaction. Selecting a stray `?strategy=` on a non-signal origin is
+ignored server-side (`strategy_filter = strategy if origin == "signal" and strategy else None`)
+rather than silently filtering the table to nothing. `strategy_trades_query_for_filter()` gained
+a `strategy_name` parameter (applied as a plain `WHERE strategy_name ==` at the query level, not
+a Python-side filter) so both the HTML view and the CSV export honor it identically -- CSV export
+gained the matching `strategy` query param.
+
+Verified live in this sandbox (no browser, but a real running instance): started the app against
+a scratch SQLite DB, logged in, and curled every affected route. Confirmed: `/settings?tab=ai`
+renders the AI pane with no Jinja errors; saving AI settings and hitting both "Test Connection"
+buttons redirect/render correctly with `tab=ai` active; `/performance` and `/ai-settings` both
+307-redirect as expected; `/history` renders the KPI grid and (once real closed trades exist)
+the three charts; a strategy dropdown populated with a real strategy name appears only when
+Origin = Signal Only and correctly excludes an AI Origination trade from both the table and a
+signal+strategy-filtered CSV export; the old `/ops` and `/active-trade-page` (removed in the
+prior task) still correctly 404. Full suite: 286 passed (was 280; 6 new tests in
+`tests/test_history_settings_merge.py` covering the `ai_alt` origin value no longer filtering,
+the strategy filter applying at the query level alone and combined with origin, `signal_
+strategy_names()` excluding AI trades, and `compute_performance_kpis()` on an empty list and a
+real win/loss pair).
+
 ### Active Trade tab removed; Ops Summary renamed to SmartAPI Health and stripped to just health data (15 Aug 2026)
 
 **Requested**: "Remove Active Trade tab completely and rename ops summary to something related to

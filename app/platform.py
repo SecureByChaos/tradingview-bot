@@ -364,7 +364,7 @@ def trades_query_for_filter(filter_name: str, start: date | None, end: date | No
 
 
 def strategy_trades_query_for_filter(
-    filter_name: str, start: date | None, end: date | None, origin: str | None = None
+    filter_name: str, start: date | None, end: date | None, origin: str | None = None, strategy_name: str | None = None
 ) -> Select[tuple[StrategyTrade]]:
     today = today_ist()
     if filter_name == "7d":
@@ -384,20 +384,22 @@ def strategy_trades_query_for_filter(
         query = query.where(func.date(StrategyTrade.entry_time) <= end.isoformat())
     if origin == "signal":
         query = query.where(StrategyTrade.origin == "SIGNAL")
-    elif origin == "ai_alt":
-        # Must match AI_ALT_* specifically, not just "anything but SIGNAL" --
-        # that broader check also pulled in AI_ORIGIN_* trades (fully
-        # independent, self-originated AI trades) onto the AI Alternatives
-        # page, making it look like alternatives were being generated for
-        # AI Origin trades when none actually were.
-        query = query.where(StrategyTrade.origin.like("AI_ALT_%"))
     elif origin == "ai_origin":
         # Fully self-originated AI trades (no TradingView signal involved),
-        # kept distinct from AI_ALT_* above for the same reason: these are
-        # different experiments with different mechanics and mixing them makes
-        # both uninterpretable.
+        # kept distinct from AI_ALT_* (evaluation-only trades, no longer
+        # filterable from Trade History -- see CLAUDE.md, "AI Alternatives
+        # removed from Trade History").
         query = query.where(StrategyTrade.origin.like("AI_ORIGIN_%"))
+    if strategy_name:
+        query = query.where(StrategyTrade.strategy_name == strategy_name)
     return query.order_by(StrategyTrade.entry_time.desc())
+
+
+def signal_strategy_names(db: Session) -> list[str]:
+    """Distinct strategy names among real SIGNAL trades, for Trade History's
+    strategy sub-filter -- shown only when Origin = Signal Only, since AI
+    trades don't carry a meaningful separate strategy name."""
+    return sorted(set(db.scalars(select(StrategyTrade.strategy_name).where(StrategyTrade.origin == "SIGNAL").distinct())))
 
 
 _INDEX_TICK_THROTTLE_SECONDS = 25
@@ -408,25 +410,16 @@ def _index_display_name(symbol: str | None) -> str:
     return _INDEX_DISPLAY_NAMES.get((symbol or "").upper(), (symbol or "").title())
 
 
-def get_performance_summary(
-    db: Session,
-    filter_name: str,
-    start: date | None,
-    end: date | None,
-    strategy_name: str | None = None,
-) -> dict[str, Any]:
-    """Owner-variant of the client reporting portal
-    (docs/client-reporting-portal-design.md): same KPI / equity-curve /
-    daily-P&L / win-loss shape, with strategy attribution added -- a
-    strategy filter and a Strategy column on recent trades, neither of
-    which the eventual client-facing version will have. origin == SIGNAL
-    trades only, same rule as everywhere else."""
-    trades = list(db.scalars(strategy_trades_query_for_filter(filter_name, start, end, "signal")))
-    closed = [
-        trade for trade in trades
-        if trade.status == TradeStatus.CLOSED and (strategy_name is None or trade.strategy_name == strategy_name)
-    ]
-    closed.sort(key=lambda trade: trade.exit_time or trade.entry_time)
+def compute_performance_kpis(closed_trades: list[StrategyTrade]) -> dict[str, Any]:
+    """KPI / equity-curve / daily-P&L / win-loss numbers for an already
+    date/origin/strategy-filtered set of closed trades. Takes the trade list
+    rather than querying itself so the Trade History page (the sole caller,
+    since the standalone Performance page was folded into it) can compute
+    both the trades table and these stats from one query instead of two, and
+    so the numbers always describe exactly the population shown in the table
+    below them -- previously this was hardcoded to origin == SIGNAL only;
+    now it reflects whatever origin/strategy filter is currently selected."""
+    closed = sorted(closed_trades, key=lambda trade: trade.exit_time or trade.entry_time)
 
     daily_totals: dict[str, float] = {}
     daily_amounts: dict[str, float] = {}
@@ -463,21 +456,6 @@ def get_performance_summary(
     total = len(closed)
     net_pnl_amount = round(sum(trade.profit_loss for trade in closed), 2)
 
-    recent_trades = [
-        {
-            "date": to_ist(trade.exit_time).strftime("%d %b") if to_ist(trade.exit_time) else "",
-            "strategy_name": trade.strategy_name,
-            "index_display_name": _index_display_name(trade.index_symbol),
-            "position_label": "Long call" if trade.option_type == "CE" else "Long put",
-            "result": trade.result,
-            "pnl_percent": trade.pnl_percent,
-            "profit_loss": trade.profit_loss,
-        }
-        for trade in reversed(closed[-20:])
-    ]
-
-    strategies = sorted(set(db.scalars(select(StrategyTrade.strategy_name).where(StrategyTrade.origin == "SIGNAL").distinct())))
-
     return {
         "kpis": {
             "net_return_percent": round(running, 2),
@@ -489,9 +467,6 @@ def get_performance_summary(
         "daily_pnl": daily_pnl,
         "equity_curve": equity_curve,
         "win_loss": {"wins": wins, "losses": losses},
-        "recent_trades": recent_trades,
-        "strategies": strategies,
-        "selected_strategy": strategy_name or "",
     }
 
 
