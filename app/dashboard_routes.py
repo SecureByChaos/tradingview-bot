@@ -17,15 +17,12 @@ from sqlalchemy.orm import Session
 from app import reports
 from app.auth import authenticate_admin, require_admin_api, require_admin_page
 from app.ai.context_builder import SignalContextBuilder
-from app.ai.context_repository import get_context_log_for_review
 from app.ai.factory import create_reviewer
 from app.ai.repository import create_settings as create_ai_settings, get_settings as get_ai_settings, update_settings as update_ai_settings
 from app.database import get_db
-from app.db_models import AIContextLog, AITradeReview, BotStatus, IndexConfig, PlatformSettings, SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeStatus, TradingMode
+from app.db_models import BotStatus, IndexConfig, PlatformSettings, SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeStatus, TradingMode
 from app.platform import (
-    ai_reviews_query_for_filter,
     get_dashboard_summary,
-    get_exit_shadow_summary,
     get_index_live_figures,
     get_live_trading_status,
     get_market_conditions,
@@ -37,12 +34,11 @@ from app.platform import (
     latest_logs,
     list_index_configs,
     log_event,
-    origin_comparison_metrics,
     origin_label,
     strategy_metrics,
     strategy_trades_query_for_filter,
 )
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIError
 from app.time_utils import IST, duration_label, format_ist, to_ist, utc_now
@@ -461,42 +457,6 @@ def performance_page(
     )
 
 
-@router.get("/ai-exit-calls", response_class=HTMLResponse)
-def ai_exit_calls_page(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    _: Annotated[None, Depends(require_admin_page)] = None,
-) -> HTMLResponse:
-    summary = get_exit_shadow_summary(db)
-    return templates.TemplateResponse("ai_exit_calls.html", {"request": request, **summary})
-
-
-@router.get("/ai-alternatives", response_class=HTMLResponse)
-def ai_alternatives_page(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    filter: str = "30d",
-    start: str | None = None,
-    end: str | None = None,
-    _: Annotated[None, Depends(require_admin_page)] = None,
-) -> HTMLResponse:
-    comparison = origin_comparison_metrics(db, filter, parse_date(start), parse_date(end))
-    alt_trades = list(
-        db.scalars(strategy_trades_query_for_filter(filter, parse_date(start), parse_date(end), "ai_alt"))
-    )
-    return templates.TemplateResponse(
-        "ai_alternatives.html",
-        {
-            "request": request,
-            "comparison": comparison,
-            "alt_trades": alt_trades,
-            "filter": filter,
-            "start": start or "",
-            "end": end or "",
-        },
-    )
-
-
 @router.get("/control", response_class=HTMLResponse)
 def control_page(
     request: Request,
@@ -906,6 +866,18 @@ def generate_pattern_report_now(
     return RedirectResponse("/reports?report_type=PATTERN", status_code=303)
 
 
+@router.post("/reports/origination/generate")
+def generate_origination_report_now(
+    db: Annotated[Session, Depends(get_db)],
+    lookback_days: Annotated[str, Form()] = "30",
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    normalized = lookback_days.strip().lower()
+    days = None if normalized in {"", "all", "0"} else int(normalized)
+    reports.generate_origination_summary(db, days)
+    return RedirectResponse("/reports?report_type=ORIGINATION", status_code=303)
+
+
 @router.get("/logs", response_class=HTMLResponse)
 def logs_page(
     request: Request,
@@ -915,207 +887,12 @@ def logs_page(
     return templates.TemplateResponse("logs.html", {"request": request, "logs": latest_logs(db, 200)})
 
 
-@router.get("/ai-reviews", response_class=HTMLResponse)
-def ai_reviews_page(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    review_date: str = "",
-    strategy: str = "",
-    provider: str = "",
-    decision: str = "",
-    trade_result: str = "",
-    page: int = 1,
-    _: Annotated[None, Depends(require_admin_page)] = None,
-) -> HTMLResponse:
-    query = ai_reviews_query_for_filter(review_date, strategy, provider, decision, trade_result)
-
-    filtered = query.subquery()
-    summary = db.execute(
-        select(
-            func.count(filtered.c.id),
-            func.sum(case((filtered.c.decision == "APPROVE", 1), else_=0)),
-            func.sum(case((filtered.c.decision == "WATCH", 1), else_=0)),
-            func.sum(case((filtered.c.decision == "REJECT", 1), else_=0)),
-            func.avg(filtered.c.confidence),
-            func.avg(filtered.c.latency_ms),
-        )
-    ).one()
-    page_size = 25
-    total = int(summary[0] or 0)
-    pages = max((total + page_size - 1) // page_size, 1)
-    page = min(max(page, 1), pages)
-    reviews = list(db.scalars(query.order_by(AITradeReview.created_at.desc()).offset((page - 1) * page_size).limit(page_size)))
-    groups: list[dict[str, object]] = []
-    for review in reviews:
-        day_label = to_ist(review.created_at).strftime("%d %b %Y")
-        if not groups or groups[-1]["date"] != day_label:
-            groups.append({"date": day_label, "reviews": []})
-        context_log = get_context_log_for_review(db, review.trade_id, review.signal)
-        groups[-1]["reviews"].append(
-            {
-                "review": review,
-                "reason_to_buy": _review_list(review.reason_to_buy),
-                "reason_not_to_buy": _review_list(review.reason_not_to_buy),
-                "context_log": context_log,
-                "context_json": _context_json(context_log.context_json) if context_log is not None else {},
-                "context_missing_fields": _review_list(context_log.missing_fields) if context_log is not None else [],
-            }
-        )
-    filters = {"review_date": review_date, "strategy": strategy, "provider": provider, "decision": decision, "trade_result": trade_result}
-    export_query = urlencode({key: value for key, value in filters.items() if value})
-    export_url = "/api/ai-reviews/export" + (f"?{export_query}" if export_query else "")
-    return templates.TemplateResponse(
-        "ai_reviews.html",
-        {
-            "request": request,
-            "groups": groups,
-            "summary": {"reviews": total, "approved": summary[1] or 0, "watch": summary[2] or 0, "rejected": summary[3] or 0, "confidence": round(summary[4] or 0, 2), "latency": round(summary[5] or 0, 2)},
-            "strategies": list(db.scalars(select(AITradeReview.strategy).distinct().order_by(AITradeReview.strategy))),
-            "providers": list(db.scalars(select(AITradeReview.provider).distinct().order_by(AITradeReview.provider))),
-            "filters": filters,
-            "export_url": export_url,
-            "page": page,
-            "pages": pages,
-            "previous_url": str(request.url.include_query_params(page=page - 1)),
-            "next_url": str(request.url.include_query_params(page=page + 1)),
-        },
-    )
-
-
-@router.get("/ai-context-inspector", response_class=HTMLResponse)
-@router.get("/ai-context-inspector", response_class=HTMLResponse)
-def ai_context_inspector_page(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    review_date: str = "",
-    context_id: str | None = None,
-    _: Annotated[None, Depends(require_admin_page)] = None,
-) -> HTMLResponse:
-    normalized_review_date = review_date.strip() if review_date else ""
-    if normalized_review_date and "-" in normalized_review_date:
-        parts = normalized_review_date.split("-")
-        if len(parts) == 3 and len(parts[0]) != 4:
-            normalized_review_date = f"{parts[2]}-{parts[1]}-{parts[0]}"
-    try:
-        day = date.fromisoformat(normalized_review_date) if normalized_review_date else datetime.now(IST).date()
-    except ValueError:
-        day = datetime.now(IST).date()
-    review_date = day.isoformat()
-
-    start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
-    end = datetime.combine(day, time.max, tzinfo=IST).astimezone(timezone.utc).replace(tzinfo=None)
-    day_contexts = list(
-        db.scalars(
-            select(AIContextLog)
-            .where(AIContextLog.created_at.between(start, end))
-            .order_by(AIContextLog.created_at.desc())
-        )
-    )
-
-    parsed_context_seq: int | None = None
-    if context_id is not None:
-        candidate = context_id.strip()
-        if candidate:
-            try:
-                parsed_context_seq = int(candidate)
-            except ValueError:
-                parsed_context_seq = None
-
-    day_contexts_by_time = sorted(day_contexts, key=lambda row: row.created_at)
-    context_log = None
-    if day_contexts_by_time:
-        if parsed_context_seq is None:
-            parsed_context_seq = 1
-        if parsed_context_seq > 0:
-            selected_index = parsed_context_seq - 1
-            if selected_index < len(day_contexts_by_time):
-                context_log = day_contexts_by_time[selected_index]
-        if context_log is None:
-            context_log = day_contexts_by_time[0]
-            parsed_context_seq = 1
-    else:
-        parsed_context_seq = 0
-
-    context_json = _context_json(context_log.context_json) if context_log is not None else {}
-    tradingview = context_json.get("tradingview") if isinstance(context_json.get("tradingview"), dict) else {}
-    tradingview_indicators = tradingview.get("indicators") if isinstance(tradingview.get("indicators"), dict) else {}
-    tradingview_trend = tradingview.get("trend") if isinstance(tradingview.get("trend"), dict) else {}
-    tradingview_strategy_filters = tradingview.get("strategy_filters") if isinstance(tradingview.get("strategy_filters"), dict) else {}
-    source_breakdown = context_json.get("source_breakdown") if isinstance(context_json.get("source_breakdown"), dict) else {}
-    return templates.TemplateResponse(
-        "ai_context_inspector.html",
-        {
-            "request": request,
-            "context_log": context_log,
-            "context_json": context_json,
-            "request_json": _context_json(context_log.request_json) if context_log is not None else {},
-            "missing_fields": _review_list(context_log.missing_fields) if context_log is not None else [],
-            "reason_to_buy": _review_list(context_log.reason_to_buy) if context_log is not None else [],
-            "reason_not_to_buy": _review_list(context_log.reason_not_to_buy) if context_log is not None else [],
-            "source_breakdown": source_breakdown,
-            "tradingview_indicators": _section_values(
-                {
-                    **tradingview_indicators,
-                    **{f"trend.{k}": v for k, v in tradingview_trend.items()},
-                    **{f"strategy_filters.{k}": v for k, v in tradingview_strategy_filters.items()},
-                },
-                (
-                    "ema9", "ema20", "ema21", "ema_gap", "vwap", "rsi", "atr", "adx", "di_plus", "di_minus",
-                    "supertrend", "volume_ratio", "orb_high", "orb_low", "filters", "rr_ratio",
-                    "trend.trend_direction", "trend.breakout", "trend.strong_candle", "trend.sideways_filter", "trend.htf_confirmation",
-                    "strategy_filters.ema_filter", "strategy_filters.supertrend_filter", "strategy_filters.adx_filter",
-                    "strategy_filters.session_filter", "strategy_filters.trade_limit_filter",
-                ),
-            ),
-            "tradingview_market_data": _section_values(
-                tradingview.get("market_data") if isinstance(tradingview.get("market_data"), dict) else {},
-                ("banknifty_price", "open", "high", "low", "close", "timeframe", "volume", "timestamp"),
-            ),
-            "trade_data": _section_values(
-                context_json.get("trade_data") if isinstance(context_json.get("trade_data"), dict) else {},
-                (
-                    "entry_price", "current_premium", "stop_loss", "target", "running_pnl", "holding_minutes",
-                    "position", "position_state", "trade_number", "signal", "strategy",
-                ),
-                empty_label="-",
-            ),
-            "broker_data": _section_values(
-                context_json.get("broker_data") if isinstance(context_json.get("broker_data"), dict) else {},
-                ("banknifty_price", "option_price", "strike", "expiry", "option_type"),
-                empty_label="-",
-            ),
-            "review_date": review_date,
-            "context_id": parsed_context_seq,
-            "day_contexts": day_contexts,
-        },
-    )
-def _review_list(value: str | None) -> list[str]:
-    try:
-        parsed = json.loads(value) if value else []
-    except Exception:
-        return []
-    if isinstance(parsed, list):
-        return [str(item) for item in parsed]
-    return [str(parsed)] if parsed else []
-
-
 def _context_json(value: str | None) -> dict[str, object]:
     try:
         parsed = json.loads(value) if value else {}
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
-
-
-def _section_values(values: dict[str, object], fields: tuple[str, ...], empty_label: str = "NOT PROVIDED BY WEBHOOK") -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for field in fields:
-        value = values.get(field)
-        if value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, (dict, list)) and not value):
-            rows.append({"field": field, "value": empty_label})
-        else:
-            rows.append({"field": field, "value": value})
-    return rows
 
 
 def apply_settings(

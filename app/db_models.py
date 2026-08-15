@@ -616,6 +616,7 @@ class ReportType:
     WEEKLY = "WEEKLY"
     MONTHLY = "MONTHLY"
     PATTERN = "PATTERN"
+    ORIGINATION = "ORIGINATION"
 
 
 class AIReport(Base):

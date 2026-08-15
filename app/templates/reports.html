@@ -31,6 +31,17 @@
       <button class="btn btn-outline-info text-nowrap" type="submit">Run Pattern Discovery</button>
     </form>
   </div>
+  <div class="col-md-3">
+    <form method="post" action="/reports/origination/generate" class="d-flex gap-2">
+      <select class="form-select" name="lookback_days">
+        <option value="30" selected>Last 30 days</option>
+        <option value="90">Last 90 days</option>
+        <option value="180">Last 180 days</option>
+        <option value="all">All time</option>
+      </select>
+      <button class="btn btn-outline-info text-nowrap" type="submit">AI Origination Summary</button>
+    </form>
+  </div>
 </div>
 
 <form class="filter-form filter-grid mb-3" method="get" action="/reports">
@@ -41,6 +52,7 @@
       <option value="WEEKLY" {% if report_type == "WEEKLY" %}selected{% endif %}>Weekly Report</option>
       <option value="MONTHLY" {% if report_type == "MONTHLY" %}selected{% endif %}>Monthly Report</option>
       <option value="PATTERN" {% if report_type == "PATTERN" %}selected{% endif %}>Pattern Discovery</option>
+      <option value="ORIGINATION" {% if report_type == "ORIGINATION" %}selected{% endif %}>AI Origination Summary</option>
     </select>
   </div>
   <div><button class="btn btn-primary" type="submit">Filter</button></div>

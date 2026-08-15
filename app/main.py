@@ -6,7 +6,7 @@ from datetime import timedelta
 
 import json
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -19,12 +19,11 @@ from app.database import SessionLocal, engine, get_db, init_db
 from app.logger import TradeCSVLogger, configure_logging
 from app.db_models import IndexConfig, StrategyConfig, StrategyTrade, TradeResult, TradeStatus
 from app.models import WebhookPayload, WebhookResponse
-from app.ai.shadow import run_shadow_review
 from app.multi_strategy import MultiStrategyTradeManager
 from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
-from app.platform import get_index_config, get_or_create_settings, get_or_create_strategy_stats, log_event, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, strategy_trading_allowed, trading_allowed
-from sqlalchemy import func, select
+from app.platform import get_or_create_settings, get_or_create_strategy_stats, log_event, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, strategy_trading_allowed, trading_allowed
+from sqlalchemy import select
 from app.risk import RiskProtectionService
 from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
 from app.ai.originator import run_origination_checks
@@ -192,84 +191,17 @@ _TV_INDICATOR_FIELDS = (
 )
 
 
-def queue_shadow_review(
-    background_tasks: BackgroundTasks,
-    db: Session,
-    strategy_name: str,
-    signal: str,
-    response: WebhookResponse,
-    market_data: dict[str, object] | None = None,
-    indicators: dict[str, object] | None = None,
-    trend: dict[str, object] | None = None,
-    strategy_filters: dict[str, object] | None = None,
-    trade_state: dict[str, object] | None = None,
-) -> WebhookResponse:
-    if not response.accepted:
-        logger.info("[AI] Shadow skipped: webhook response not accepted")
-        return response
-    if not signal.startswith("BUY"):
-        logger.info("[AI] Shadow skipped: webhook signal is not BUY")
-        return response
-    # origin == "SIGNAL" only: the review subject must always be the real
-    # trade, never an AI_ALT_* evaluation side trade that happens to match.
-    query = select(StrategyTrade).where(func.lower(StrategyTrade.strategy_name) == strategy_name.lower())
-    query = query.where(
-        StrategyTrade.signal == signal,
-        StrategyTrade.status == TradeStatus.OPEN,
-        StrategyTrade.origin == "SIGNAL",
-    ).order_by(StrategyTrade.created_at.desc())
-    trade = db.scalar(query.limit(1))
-    if trade is None:
-        logger.info("[AI] Shadow skipped: no matching BUY trade found")
-        return response
-    shadow_market_data = _build_shadow_market_data(db, trade)
-    if market_data:
-        shadow_market_data.update(market_data)
-    logger.info("[AI] Entry review triggered")
-    background_tasks.add_task(
-        run_shadow_review,
-        strategy_name,
-        signal,
-        utc_now(),
-        trade.trade_id if trade else None,
-        shadow_market_data,
-        market_data,
-        indicators,
-        trend,
-        strategy_filters,
-        trade_state,
-        smartapi_client=smartapi,
-        option_finder=option_finder,
-    )
-    return response
-
-
 @app.post("/webhook", response_model=WebhookResponse)
-def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> WebhookResponse:
+def webhook(payload: WebhookPayload, db: Session = Depends(get_db)) -> WebhookResponse:
     try:
         reset_daily_risk_if_needed(db)
         strategy_name = (payload.strategy or settings.default_strategy_name).strip()
         _log_tradingview_indicators(payload.indicators.model_dump(exclude_none=True) if payload.indicators else None)
         log_event(db, "WEBHOOK", f"[{strategy_name}] Webhook received: {payload.signal.value}")
         payload_market_data = payload.market_data.model_dump(exclude_none=True) if payload.market_data else None
-        payload_indicators = payload.indicators.model_dump(exclude_none=True) if payload.indicators else None
-        payload_trend = payload.trend.model_dump(exclude_none=True) if payload.trend else None
-        payload_strategy_filters = payload.strategy_filters.model_dump(exclude_none=True) if payload.strategy_filters else None
-        payload_trade_state = payload.trade_state.model_dump(exclude_none=True) if payload.trade_state else None
         _run_integrity_checks(db, strategy_name, payload.signal.value, payload_market_data)
         if strategy_name.upper() == "V7":
-            return queue_shadow_review(
-                background_tasks,
-                db,
-                strategy_name,
-                payload.signal.value,
-                v7_manager.handle_signal(db, payload.signal, payload_market_data),
-                payload_market_data,
-                payload_indicators,
-                payload_trend,
-                payload_strategy_filters,
-                payload_trade_state,
-            )
+            return v7_manager.handle_signal(db, payload.signal, payload_market_data)
 
         strategy = db.scalar(select(StrategyConfig).where(StrategyConfig.name == strategy_name))
         if strategy is None:
@@ -321,49 +253,12 @@ def webhook(payload: WebhookPayload, background_tasks: BackgroundTasks, db: Sess
                 telegram.send(db, f"Trade Opened\n[{strategy_name}] {payload.signal.value}")
         else:
             log_event(db, "WEBHOOK", f"Signal ignored: {response.message}", "WARNING")
-        return queue_shadow_review(
-            background_tasks,
-            db,
-            strategy_name,
-            payload.signal.value,
-            response,
-            payload_market_data,
-            payload_indicators,
-            payload_trend,
-            payload_strategy_filters,
-            payload_trade_state,
-        )
+        return response
     except Exception as exc:
         logger.exception("Webhook processing failed")
         log_event(db, "ERROR", "Webhook processing failed", "ERROR", {"error": str(exc)})
         telegram.send(db, f"System Error\nWebhook processing failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-def _build_shadow_market_data(db: Session, trade: StrategyTrade) -> dict[str, object]:
-    market_data: dict[str, object] = {
-        "strike": trade.strike,
-        "expiry": trade.expiry,
-        "option_type": trade.option_type,
-        "option_price": trade.current_premium if trade.current_premium is not None else trade.entry_price,
-    }
-    try:
-        index = get_index_config(db, trade.index_symbol)
-        spot = round(smartapi.get_index_spot(index) if index is not None else smartapi.get_banknifty_spot(), 2)
-        market_data["index_price"] = spot
-        market_data["index_symbol"] = trade.index_symbol
-        if trade.index_symbol == "BANKNIFTY":
-            market_data["banknifty_price"] = spot
-    except Exception as exc:
-        logger.info("[AI] Shadow market fetch skipped: %s spot unavailable (%s)", trade.index_symbol, exc)
-    try:
-        market_data["option_price"] = round(
-            smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken),
-            2,
-        )
-    except Exception as exc:
-        logger.info("[AI] Shadow market fetch skipped: option premium unavailable (%s)", exc)
-    return market_data
 
 
 def _run_integrity_checks(

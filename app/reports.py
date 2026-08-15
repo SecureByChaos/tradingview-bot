@@ -73,6 +73,23 @@ def _closed_trades_between(db: Session, start: date, end: date) -> list[Strategy
     )
 
 
+def _origination_trades_between(db: Session, start: date, end: date) -> list[StrategyTrade]:
+    # origin LIKE 'AI_ORIGIN_%' only -- per CLAUDE.md, never `!= 'SIGNAL'`, which would
+    # also sweep in AI_ALT_* evaluation trades.
+    return list(
+        db.scalars(
+            select(StrategyTrade)
+            .where(
+                StrategyTrade.status == TradeStatus.CLOSED,
+                func.date(StrategyTrade.exit_time) >= start.isoformat(),
+                func.date(StrategyTrade.exit_time) <= end.isoformat(),
+                StrategyTrade.origin.like("AI_ORIGIN_%"),
+            )
+            .order_by(StrategyTrade.exit_time)
+        )
+    )
+
+
 def _reviews_with_outcome_between(db: Session, start: date, end: date) -> list[AITradeReview]:
     return list(
         db.scalars(
@@ -177,6 +194,104 @@ def _trade_stats(trades: list[StrategyTrade]) -> dict[str, Any]:
         "by_exit_reason": by_exit_reason,
         "best_strategy": best_strategy,
         "worst_strategy": worst_strategy,
+        "max_consecutive_losses": max_consecutive_losses,
+    }
+
+
+def _provider_from_origin(origin: str) -> str:
+    # "AI_ORIGIN_CLAUDE" -> "CLAUDE", "AI_ORIGIN_OPENAI" -> "OPENAI".
+    return origin.split("AI_ORIGIN_", 1)[-1] if origin.startswith("AI_ORIGIN_") else origin
+
+
+def _origination_trade_stats(trades: list[StrategyTrade]) -> dict[str, Any]:
+    total = len(trades)
+    wins = sum(1 for t in trades if t.result == TradeResult.WIN)
+    losses = sum(1 for t in trades if t.result == TradeResult.LOSS)
+    breakeven = sum(1 for t in trades if t.result == TradeResult.BREAKEVEN)
+    net_pnl = round(sum(t.profit_loss for t in trades), 2)
+    avg_pnl_percent = round(sum(t.pnl_percent for t in trades) / total, 2) if total else 0.0
+    confidences = [t.ai_confidence for t in trades if t.ai_confidence is not None]
+
+    by_provider: dict[str, dict[str, Any]] = {}
+    by_index: dict[str, dict[str, Any]] = {}
+    by_option_type: dict[str, dict[str, Any]] = {}
+    by_exit_reason: dict[str, int] = {}
+    by_mode: dict[str, int] = {}
+    holding_minutes: list[int] = []
+
+    for trade in trades:
+        provider_bucket = by_provider.setdefault(
+            _provider_from_origin(trade.origin), {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+        )
+        provider_bucket["trades"] += 1
+        if trade.result == TradeResult.WIN:
+            provider_bucket["wins"] += 1
+        elif trade.result == TradeResult.LOSS:
+            provider_bucket["losses"] += 1
+        provider_bucket["net_pnl"] = round(provider_bucket["net_pnl"] + trade.profit_loss, 2)
+
+        index_bucket = by_index.setdefault(
+            trade.index_symbol, {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+        )
+        index_bucket["trades"] += 1
+        if trade.result == TradeResult.WIN:
+            index_bucket["wins"] += 1
+        elif trade.result == TradeResult.LOSS:
+            index_bucket["losses"] += 1
+        index_bucket["net_pnl"] = round(index_bucket["net_pnl"] + trade.profit_loss, 2)
+
+        option_bucket = by_option_type.setdefault(
+            trade.option_type or "UNKNOWN", {"trades": 0, "wins": 0, "losses": 0, "net_pnl": 0.0}
+        )
+        option_bucket["trades"] += 1
+        if trade.result == TradeResult.WIN:
+            option_bucket["wins"] += 1
+        elif trade.result == TradeResult.LOSS:
+            option_bucket["losses"] += 1
+        option_bucket["net_pnl"] = round(option_bucket["net_pnl"] + trade.profit_loss, 2)
+
+        reason = trade.exit_reason or "UNKNOWN"
+        by_exit_reason[reason] = by_exit_reason.get(reason, 0) + 1
+        by_mode[trade.mode] = by_mode.get(trade.mode, 0) + 1
+
+        entry_ist = to_ist(trade.entry_time)
+        exit_ist = to_ist(trade.exit_time)
+        if entry_ist is not None and exit_ist is not None:
+            holding_minutes.append(max(int((exit_ist - entry_ist).total_seconds() // 60), 0))
+
+    for bucket_group in (by_provider, by_index, by_option_type):
+        for bucket in bucket_group.values():
+            bucket["win_rate"] = round((bucket["wins"] / bucket["trades"]) * 100, 2) if bucket["trades"] else 0.0
+
+    best_provider = max(by_provider.items(), key=lambda kv: kv[1]["net_pnl"])[0] if by_provider else None
+    worst_provider = min(by_provider.items(), key=lambda kv: kv[1]["net_pnl"])[0] if by_provider else None
+
+    max_consecutive_losses = 0
+    streak = 0
+    for trade in trades:  # trades are ordered chronologically by exit_time
+        if trade.result == TradeResult.LOSS:
+            streak += 1
+            max_consecutive_losses = max(max_consecutive_losses, streak)
+        else:
+            streak = 0
+
+    return {
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+        "net_pnl": net_pnl,
+        "avg_pnl_percent": avg_pnl_percent,
+        "avg_confidence": round(sum(confidences) / len(confidences), 3) if confidences else None,
+        "avg_holding_minutes": round(sum(holding_minutes) / len(holding_minutes), 1) if holding_minutes else 0.0,
+        "by_provider": by_provider,
+        "by_index": by_index,
+        "by_option_type": by_option_type,
+        "by_exit_reason": by_exit_reason,
+        "by_mode": by_mode,
+        "best_provider": best_provider,
+        "worst_provider": worst_provider,
         "max_consecutive_losses": max_consecutive_losses,
     }
 
@@ -321,6 +436,8 @@ def _call_openai_narrative(settings: AISettings, user_prompt: str) -> tuple[Opti
 def _template_narrative(report_label: str, period_label: str, stats: dict[str, Any]) -> str:
     if "trade_stats" in stats:
         return _template_pattern_narrative(period_label, stats)
+    if "by_provider" in stats:
+        return _template_origination_narrative(period_label, stats)
     lines = [f"{report_label.title()} for {period_label}."]
     total = stats.get("total_trades", 0)
     if not total:
@@ -374,6 +491,41 @@ def _template_pattern_narrative(period_label: str, stats: dict[str, Any]) -> str
         lines.append(f"Best-performing weekday: {time_patterns['best_weekday']}.")
     if time_patterns.get("worst_weekday"):
         lines.append(f"Weakest weekday: {time_patterns['worst_weekday']}.")
+    lines.append("(Generated from raw statistics; configure an AI provider in AI Settings for a narrative summary.)")
+    return "\n".join(lines)
+
+
+def _template_origination_narrative(period_label: str, stats: dict[str, Any]) -> str:
+    lines = [f"AI Origination Summary for {period_label}."]
+    total = stats.get("total_trades", 0)
+    if not total:
+        lines.append("No closed AI Origination trades were recorded in this period.")
+        return "\n".join(lines)
+    lines.append(
+        f"Total trades: {total}. Wins: {stats.get('wins', 0)}. Losses: {stats.get('losses', 0)}. "
+        f"Win rate: {stats.get('win_rate', 0)}%. Net P&L: {stats.get('net_pnl', 0)}."
+    )
+    by_provider = stats.get("by_provider", {})
+    if stats.get("best_provider"):
+        best = by_provider.get(stats["best_provider"], {})
+        lines.append(
+            f"Best performing provider: {stats['best_provider']} "
+            f"(net P&L {best.get('net_pnl', 0)}, win rate {best.get('win_rate', 0)}%)."
+        )
+    if stats.get("worst_provider") and stats.get("worst_provider") != stats.get("best_provider"):
+        worst = by_provider.get(stats["worst_provider"], {})
+        lines.append(
+            f"Worst performing provider: {stats['worst_provider']} "
+            f"(net P&L {worst.get('net_pnl', 0)}, win rate {worst.get('win_rate', 0)}%)."
+        )
+    by_mode = stats.get("by_mode", {})
+    if by_mode:
+        mode_summary = ", ".join(f"{mode}: {count}" for mode, count in sorted(by_mode.items()))
+        lines.append(f"Trades by mode: {mode_summary}.")
+    if stats.get("avg_confidence") is not None:
+        lines.append(f"Average model confidence at entry: {stats['avg_confidence']}.")
+    if stats.get("max_consecutive_losses", 0) >= 2:
+        lines.append(f"Longest losing streak in the period: {stats['max_consecutive_losses']} trades.")
     lines.append("(Generated from raw statistics; configure an AI provider in AI Settings for a narrative summary.)")
     return "\n".join(lines)
 
@@ -476,6 +628,23 @@ def generate_pattern_discovery(db: Session, lookback_days: int | None = 90) -> A
     )
     summary_text, provider, model = _generate_narrative(db, "pattern discovery", period_label, stats)
     return _save_report(db, ReportType.PATTERN, start, today, f"Pattern Discovery - {period_label}", summary_text, stats, provider, model)
+
+
+def generate_origination_summary(db: Session, lookback_days: int | None = 30) -> AIReport:
+    today = today_ist()
+    start = today - timedelta(days=lookback_days - 1) if lookback_days else date(2000, 1, 1)
+    trades = _origination_trades_between(db, start, today)
+    stats = _origination_trade_stats(trades)
+    period_label = (
+        f"{start.strftime('%d %b %Y')} - {today.strftime('%d %b %Y')}"
+        if lookback_days
+        else f"All-time through {today.strftime('%d %b %Y')}"
+    )
+    summary_text, provider, model = _generate_narrative(db, "ai origination summary", period_label, stats)
+    return _save_report(
+        db, ReportType.ORIGINATION, start, today, f"AI Origination Summary - {period_label}",
+        summary_text, stats, provider, model,
+    )
 
 
 # ---------------------------------------------------------------------------

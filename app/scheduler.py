@@ -8,7 +8,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo
 
 from app import reports
-from app.ai.exit_shadow import run_exit_shadow_checks
 from app.monitor import TradeMonitor
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -27,14 +26,6 @@ def create_scheduler(
         monitor.tick,
         trigger=IntervalTrigger(seconds=30),
         id="trade-monitor",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        run_exit_shadow_checks,
-        trigger=IntervalTrigger(minutes=3),
-        id="ai-exit-shadow-check",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
