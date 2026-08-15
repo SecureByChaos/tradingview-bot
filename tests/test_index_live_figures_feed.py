@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from sqlalchemy import create_engine
+from datetime import datetime
+
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from app.db_models import Base, IndexConfig
+import app.platform as platform_module
+from app.db_models import Base, IndexConfig, IndexPriceTick
 from app.platform import get_index_live_figures
+from app.time_utils import IST
 
 
 def _make_session() -> Session:
@@ -111,3 +115,51 @@ def test_stale_feed_entry_still_used_with_is_live_false():
     assert smartapi.calls == 0  # never falls back to a fresh call on staleness
     assert figures[0]["price"] == 49000.0
     assert figures[0]["is_live"] is False
+
+
+def _ist(y, m, d, hh=10, mm=0):
+    return datetime(y, m, d, hh, mm, tzinfo=IST)
+
+
+def test_records_a_tick_during_trading_hours_on_a_weekday(monkeypatch):
+    # 14 Aug 2026: this is the path dashboard polling drives, independent of
+    # originator.py's own (already market-hours-gated) tick recording.
+    monkeypatch.setattr(platform_module, "utc_now", lambda: _ist(2026, 8, 13, 11, 0))  # Thursday, trading hours
+    db = _make_session()
+    _seed_index(db)
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 50000.0, "is_live": True, "age_seconds": 0.2}})
+
+    get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    ticks = list(db.scalars(select(IndexPriceTick).where(IndexPriceTick.index_symbol == "BANKNIFTY")))
+    assert len(ticks) == 1
+
+
+def test_does_not_record_a_tick_on_a_weekend(monkeypatch):
+    # The confirmed 14 Aug report: dashboard polling kept writing a new
+    # IndexPriceTick with the same frozen price every ~25s, purely because a
+    # browser tab was open, even on a day the market never opened. The
+    # figure itself must still render (last known price, via the feed) --
+    # only the redundant write should stop.
+    monkeypatch.setattr(platform_module, "utc_now", lambda: _ist(2026, 8, 15, 12, 0))  # Saturday
+    db = _make_session()
+    _seed_index(db)
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 50000.0, "is_live": False, "age_seconds": 999.0}})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    ticks = list(db.scalars(select(IndexPriceTick).where(IndexPriceTick.index_symbol == "BANKNIFTY")))
+    assert len(ticks) == 0
+    assert figures[0]["price"] == 50000.0  # still shown, just not re-recorded
+
+
+def test_does_not_record_a_tick_outside_trading_hours_on_a_weekday(monkeypatch):
+    monkeypatch.setattr(platform_module, "utc_now", lambda: _ist(2026, 8, 13, 20, 0))  # Thursday evening
+    db = _make_session()
+    _seed_index(db)
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 50000.0, "is_live": False, "age_seconds": 999.0}})
+
+    get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    ticks = list(db.scalars(select(IndexPriceTick).where(IndexPriceTick.index_symbol == "BANKNIFTY")))
+    assert len(ticks) == 0

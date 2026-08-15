@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from app.db_models import AIExitCall, AIOriginationLog, AITradeReview, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.market_context import ADX_NO_TREND, ADX_TRENDING
+from app.signal_validation import check_market_hours
 from app.time_utils import duration_label, format_ist, iso_utc, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
@@ -537,10 +538,25 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
     does NOT fall back to smartapi on an ordinary feed disconnect/staleness --
     that would reintroduce the exact per-request SmartAPI cost the feed
     exists to eliminate; a stale feed entry is still used, just flagged via
-    is_live=False."""
+    is_live=False.
+
+    14 Aug 2026: tick recording below is skipped entirely outside market
+    hours. This function is driven by dashboard polling (every 10s per open
+    browser tab, see live_dashboard.html), which has no market-hours
+    awareness of its own -- unlike originator.py's own call to
+    record_index_tick_if_stale, which is now upstream of the market-hours
+    gate added in run_origination_checks (see CLAUDE.md, "SmartAPI calls
+    stopped outside market hours"), this call site had none. A frozen
+    weekend/holiday price was being re-recorded as a new IndexPriceTick
+    roughly every _INDEX_TICK_THROTTLE_SECONDS for as long as anyone had the
+    dashboard open -- real DB writes for a value that never changed, adding
+    nothing today's-first-tick/day-range math below can use. The figures
+    themselves (and the feed's own is_live/stale badge) are unaffected --
+    this only stops the redundant write, not the display."""
     figures: list[dict[str, Any]] = []
     indexes = list(db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)))
     today = today_ist().isoformat()
+    is_trading_now = check_market_hours(utc_now()) is None
     for index in indexes:
         entry: dict[str, Any] = {
             "symbol": index.symbol,
@@ -575,7 +591,8 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
             figures.append(entry)
             continue
 
-        record_index_tick_if_stale(db, index.symbol, price)
+        if is_trading_now:
+            record_index_tick_if_stale(db, index.symbol, price)
 
         todays_ticks = list(
             db.scalars(

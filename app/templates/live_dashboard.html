@@ -30,7 +30,8 @@ const initialData = {
   indices: {{ indices | tojson }},
   trades: {{ trades | tojson }},
   activity: {{ activity | tojson }},
-  conditions: {{ conditions | tojson }}
+  conditions: {{ conditions | tojson }},
+  market_open: {{ market_open | tojson }}
 };
 const tradeCharts = {};
 
@@ -147,12 +148,14 @@ function renderActivity(activity) {
 }
 
 let lastUpdatedAt = Date.now();
+let marketOpen = initialData.market_open;
 
 function renderAll(data) {
   renderIndices(data.indices);
   renderConditions(data.conditions);
   renderTrades(data.trades);
   renderActivity(data.activity);
+  marketOpen = data.market_open;
   lastUpdatedAt = Date.now();
 }
 
@@ -165,9 +168,21 @@ setInterval(function () {
     .catch(function () {});
 }, 10000);
 
+// Market-closed reads as "Market closed" rather than a ticking "Updated Xs
+// ago" -- a fresh fetch every 10s still succeeds outside trading hours (it's
+// just re-serving the same frozen price), and letting the badge keep
+// counting up from each successful poll implied the page was watching
+// something live when it wasn't. Per-index "stale" badges (renderIndices)
+// still cover a genuine feed outage during real trading hours, which this
+// does not touch.
 setInterval(function () {
+  const badge = document.getElementById('last-updated-badge');
+  if (!marketOpen) {
+    badge.textContent = 'Market closed';
+    return;
+  }
   const seconds = Math.round((Date.now() - lastUpdatedAt) / 1000);
-  document.getElementById('last-updated-badge').textContent = seconds < 5 ? 'Updated just now' : 'Updated ' + seconds + 's ago';
+  badge.textContent = seconds < 5 ? 'Updated just now' : 'Updated ' + seconds + 's ago';
 }, 1000);
 </script>
 {% endblock %}

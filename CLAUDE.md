@@ -295,6 +295,52 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Dashboard kept "updating" on closed days -- a real, separate tick-write path the 14 Aug scheduler fix didn't cover (14/15 Aug 2026)
+
+**Trigger**: reported live over a weekend -- the dashboard still looked active on days the
+market never opened, and shouldn't need to.
+
+**Real and separate from the scheduler fix directly above.** That fix gated
+`run_origination_checks`'s and `MultiStrategyMonitor.tick`'s own SmartAPI-driven paths, but
+`get_index_live_figures` (`app/platform.py`) is driven by *dashboard polling* --
+`/api/live-dashboard`, fetched unconditionally every 10s by any open browser tab
+(`live_dashboard.html`), with no market-hours awareness of its own. Confirmed by reading: every
+poll called `record_index_tick_if_stale()`, which wrote a new `IndexPriceTick` row roughly every
+`_INDEX_TICK_THROTTLE_SECONDS` (~25s) regardless of day or hour -- on a weekend/holiday this was
+the *same frozen price*, re-recorded over and over, for as long as anyone had the tab open. Real
+DB writes with zero new information, purely a side effect of viewing the page. Originator.py's
+own call to the same function is unaffected by this entry (already upstream of the scheduler
+gate above); this is `get_index_live_figures`'s independent call site.
+
+**Fixed**: `get_index_live_figures` now checks `check_market_hours(utc_now())` once per call and
+skips `record_index_tick_if_stale` when it's not a trading day/hour -- the figure itself (last
+known price, `is_live` state, the existing per-index "stale" badge) is untouched, only the
+redundant write stops. 3 new tests confirm a tick IS still written on an ordinary trading
+moment, and is NOT written on a weekend, an NSE holiday, or a weekday evening.
+
+**Also fixed the visible symptom this was reported from, not just the backend cause.** The
+dashboard's top "Updated Xs ago" badge resets on every successful 10s fetch regardless of
+whether anything in the payload changed, so it kept implying live activity even with the feed
+frozen and no new ticks being written. `_live_dashboard_data` now returns a `market_open` field
+(same `check_market_hours` check, no new SmartAPI call), and the badge shows "Market closed"
+instead of a ticking counter when it's false -- while the existing per-index "stale" badge
+(`renderIndices`) is untouched, so a genuine feed outage *during* real trading hours still
+reads as "stale," not "market closed," which is a different, more urgent condition. 4 new tests
+cover `market_open` on a trading weekday, a weekend, a holiday, and a weekday evening.
+
+**Not verified live** -- this sandbox has no browser/production access to watch the dashboard
+render. After deploying, the check is straightforward: open the dashboard on a closed day (or
+just watch the top badge outside 09:15-15:30 on an ordinary weekday) and confirm it reads
+"Market closed" rather than counting up, and separately confirm no new `IndexPriceTick` rows
+accumulate for a closed period despite the tab staying open:
+
+```sql
+SELECT index_symbol, COUNT(*) FROM index_price_ticks
+WHERE date(recorded_at) = '<a Saturday or holiday date>' GROUP BY index_symbol;
+```
+
+should come back empty (or with only rows predating this fix's deployment).
+
 ### SmartAPI calls stopped outside market hours -- root cause was scheduling order, not missing logic (14 Aug 2026)
 
 **Confirmed**: 96 `[AI][ORIGIN]`/`SmartAPI` log lines between 16:00-18:00 IST on 13 Aug, hours

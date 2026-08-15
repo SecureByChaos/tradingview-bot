@@ -42,8 +42,9 @@ from app.platform import (
     strategy_trades_query_for_filter,
 )
 from sqlalchemy import case, func, select
+from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIError
-from app.time_utils import IST, duration_label, format_ist, to_ist
+from app.time_utils import IST, duration_label, format_ist, to_ist, utc_now
 from app.trade_manager import TradeManager
 
 
@@ -143,6 +144,13 @@ def _live_dashboard_data(db: Session, smartapi: object, live_feed_store: object)
         # on its own 5-min cycle (app/ai/origination_log.py) -- no new
         # SmartAPI calls, no new computation. See get_market_conditions.
         "conditions": get_market_conditions(db),
+        # 14 Aug 2026: lets the frontend distinguish "market is genuinely
+        # closed" from "the live feed is having a transient outage during
+        # real trading hours" -- both render a per-index "stale" badge today,
+        # but only the former should stop the top "Updated Xs ago" badge from
+        # implying the page is watching something live. Cheap: one weekday/
+        # holiday/hour check, no new SmartAPI call.
+        "market_open": check_market_hours(utc_now()) is None,
     }
 
 
