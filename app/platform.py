@@ -5,7 +5,7 @@ import logging
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
@@ -195,6 +195,32 @@ def get_index_config(db: Session, symbol: str) -> IndexConfig | None:
 
 def list_index_configs(db: Session) -> list[IndexConfig]:
     return list(db.scalars(select(IndexConfig).order_by(IndexConfig.symbol)))
+
+
+def get_live_trading_status(db: Session, smartapi: Any) -> dict[str, Any]:
+    """Read-only summary of AI Origination's two-key live-trading gate
+    (CLAUDE.md, "Live-trading safety"), for the AI Settings page. Deliberately
+    NOT a control -- the per-index ai_origination_live_trade checkbox already
+    lives in Settings > Instruments (app/dashboard_routes.py's
+    update_instrument route) and stays the one place that writes it, so this
+    can't drift into a second, differently-behaving toggle. server_flag_on
+    reads SMARTAPI_LIVE_TRADING (smartapi.settings.live_trading) -- an env
+    var, deliberately not settable from the UI at all, since a UI bug must
+    never be able to flip the half of the gate that's supposed to require a
+    server-side deploy."""
+    indices = [
+        {
+            "symbol": index.symbol,
+            "display_name": index.display_name or index.symbol,
+            "live": bool(index.ai_origination_live_trade),
+        }
+        for index in list_index_configs(db)
+        if index.enabled
+    ]
+    return {
+        "server_flag_on": bool(getattr(getattr(smartapi, "settings", None), "live_trading", False)),
+        "indices": indices,
+    }
 
 
 def sync_trade_row(db: Session, row: dict[str, str], trading_mode: str) -> TradeRecord | None:
@@ -681,14 +707,37 @@ def get_market_conditions(db: Session) -> list[dict[str, Any]]:
     return conditions
 
 
+def origin_label(origin: str | None) -> str:
+    if not origin or origin == "SIGNAL":
+        return "Signal"
+    if origin.startswith("AI_ALT_"):
+        provider = origin[len("AI_ALT_"):].title()
+        return f"AI Alt · {provider}"
+    if origin.startswith("AI_ORIGIN_"):
+        provider = origin[len("AI_ORIGIN_"):].title()
+        return f"AI Origin · {provider}"
+    return origin
+
+
 def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[str, Any]]:
-    """Real (origin == SIGNAL) open trades for the live dashboards, each with
-    its recent premium history for a sparkline and the strategy that took
-    it. Never includes AI_ALT_* evaluation trades."""
+    """Open trades for the live dashboard's Active Trades panel, each with its
+    recent premium history for a sparkline.
+
+    Real (origin == SIGNAL) trades plus AI_ORIGIN_* trades -- both paper and
+    live, distinguished by the mode field below, matching how the AI
+    Origination page itself (now removed, 15 Aug 2026) always showed both.
+    Matched with LIKE 'AI_ORIGIN_%', never != 'SIGNAL' -- see CLAUDE.md,
+    "The origin field is the isolation mechanism": that exact bug once put
+    AI_ALT_* trades where they didn't belong. AI_ALT_* evaluation trades are
+    still deliberately excluded -- they're a shadow/comparison feature, not a
+    position anyone is holding."""
     trades = list(
         db.scalars(
             select(StrategyTrade)
-            .where(StrategyTrade.status == TradeStatus.OPEN, StrategyTrade.origin == "SIGNAL")
+            .where(
+                StrategyTrade.status == TradeStatus.OPEN,
+                or_(StrategyTrade.origin == "SIGNAL", StrategyTrade.origin.like("AI_ORIGIN_%")),
+            )
             .order_by(StrategyTrade.entry_time.desc())
         )
     )
@@ -710,6 +759,9 @@ def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[s
             {
                 "trade_id": trade.trade_id,
                 "strategy_name": trade.strategy_name,
+                "origin": trade.origin,
+                "source_label": origin_label(trade.origin),
+                "mode": trade.mode,
                 "index_symbol": trade.index_symbol,
                 "option_type": trade.option_type,
                 "strike": trade.strike,
@@ -874,66 +926,6 @@ def get_exit_shadow_summary(db: Session) -> dict[str, Any]:
             })
 
     return {"live": live, "comparisons": comparisons, "held_only": held_only}
-
-
-def get_origination_summary(db: Session, limit: int = 30) -> dict[str, Any]:
-    """Data for the AI Origination page -- read-only view over app/ai/originator.py's
-    output. These are trades the AI opened entirely on its own (no TradingView
-    signal involved), tagged origin AI_ORIGIN_*, isolated from real trading logic
-    exactly like AI_ALT_* trades."""
-    open_trades = list(
-        db.scalars(
-            select(StrategyTrade)
-            .where(StrategyTrade.status == TradeStatus.OPEN, StrategyTrade.origin.like("AI_ORIGIN_%"))
-            .order_by(StrategyTrade.entry_time.desc())
-        )
-    )
-    closed_trades = list(
-        db.scalars(
-            select(StrategyTrade)
-            .where(StrategyTrade.status == TradeStatus.CLOSED, StrategyTrade.origin.like("AI_ORIGIN_%"))
-            .order_by(StrategyTrade.exit_time.desc())
-            .limit(limit)
-        )
-    )
-
-    def _row(trade: StrategyTrade, closed: bool) -> dict[str, Any]:
-        return {
-            "trade_id": trade.trade_id,
-            "provider": trade.origin[len("AI_ORIGIN_"):].title() if trade.origin else "",
-            "index_display_name": _index_display_name(trade.index_symbol),
-            "strike": trade.strike,
-            "position_label": "Long call" if trade.option_type == "CE" else "Long put",
-            "mode": trade.mode,
-            "entry_price": trade.entry_price,
-            "investment_amount": trade.investment_amount,
-            "current_premium": trade.current_premium,
-            "exit_price": trade.exit_price if closed else None,
-            "pnl_percent": trade.pnl_percent,
-            "profit_loss": trade.profit_loss if closed else None,
-            "result": trade.result if closed else None,
-            "confidence": trade.ai_confidence,
-            "reasoning": trade.ai_reasoning,
-            "entry_time": format_ist(trade.entry_time),
-            "exit_time": format_ist(trade.exit_time) if closed else None,
-        }
-
-    live = [_row(trade, closed=False) for trade in open_trades]
-    history = [_row(trade, closed=True) for trade in closed_trades]
-
-    wins = sum(1 for trade in closed_trades if trade.result == TradeResult.WIN)
-    losses = sum(1 for trade in closed_trades if trade.result == TradeResult.LOSS)
-    total_closed = len(closed_trades)
-    kpis = {
-        "total_originated": len(open_trades) + len(closed_trades),
-        "open_count": len(open_trades),
-        "closed_count": total_closed,
-        "win_rate": round((wins / total_closed) * 100, 2) if total_closed else 0.0,
-        "net_pnl_percent": round(sum(trade.pnl_percent or 0 for trade in closed_trades), 2),
-        "net_pnl_amount": round(sum(trade.profit_loss or 0 for trade in closed_trades), 2),
-    }
-
-    return {"live": live, "history": history, "kpis": kpis}
 
 
 def get_today_activity(db: Session, limit: int = 20) -> list[dict[str, Any]]:

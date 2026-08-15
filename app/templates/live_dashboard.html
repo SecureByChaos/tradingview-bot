@@ -105,9 +105,19 @@ function renderTrades(trades) {
   grid.innerHTML = trades.map(function (trade) {
     const cls = (trade.pnl_percent || 0) >= 0 ? 'profit' : 'loss';
     const sign = (trade.pnl_percent || 0) >= 0 ? '+' : '';
+    // source badge only for non-signal trades (AI Origin · Claude/Openai) --
+    // a plain signal trade is the common case and needs no extra label.
+    const sourceBadge = trade.origin !== 'SIGNAL'
+      ? ' <span class="badge text-bg-info">' + trade.source_label + '</span>'
+      : '';
+    // LIVE called out prominently (real money) for any trade, signal or AI
+    // Origin alike -- PAPER is the expected default and gets no badge at all.
+    const modeBadge = trade.mode === 'LIVE'
+      ? ' <span class="badge text-bg-danger" title="Real order, not paper">LIVE</span>'
+      : '';
     return '<div class="trade-card">' +
       '<div class="trade-card-header"><strong>' + trade.index_display_name + ' ' + trade.strike + ' · ' + trade.position_label + '</strong>' +
-      '<span class="badge text-bg-success">Open</span></div>' +
+      '<span class="badge text-bg-success">Open</span>' + sourceBadge + modeBadge + '</div>' +
       '<div class="trade-card-strategy">Strategy: ' + trade.strategy_name + '</div>' +
       '<div class="trade-card-figures">' +
       '<div><div class="label">Entry</div><div class="value">' + trade.entry_price + '</div></div>' +

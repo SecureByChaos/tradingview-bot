@@ -295,6 +295,64 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination folded into the main dashboard; its own tab removed (15 Aug 2026)
+
+**Requested**: show AI Origination's live trades on the main dashboard's Active Trades, and
+remove the separate AI Origination tab entirely. Investigated before building (the tab was the
+*only* place `AI_ORIGIN_*` trades were visible at all -- open positions with confidence/
+reasoning, closed history, and KPIs), so three scope questions went back to the user before any
+code changed:
+
+1. **Which AI Origination trades show in Active Trades once the tab is gone?** → **All open
+   AI Origination trades, paper and live alike** (not live-only) -- a mode badge distinguishes
+   them, same as the tab used to.
+2. **What happens to the closed-trade history and KPI strip (win rate, net P&L, total
+   originated) that only the tab showed?** → **Dropped.** The dashboard is live-position-only
+   now; there is no UI view of AI Origination's closed-trade track record anymore. (The data
+   still exists in `strategy_trades` for anyone querying the DB directly --
+   `scripts/confidence_sizing_backtest.py` and friends are unaffected.)
+3. **The live-trading toggle the user also asked for in AI Settings turned out to already
+   exist** -- a per-index "AI Origination Live" checkbox in Settings > Instruments
+   (`IndexConfig.ai_origination_live_trade`), gated together with the server-side
+   `SMARTAPI_LIVE_TRADING` env var exactly per CLAUDE.md's existing two-key pattern. → AI
+   Settings gets a **read-only status panel** (which indices are live-enabled, whether the
+   server flag is on, a link to Instruments), not a second writable control. Two controls
+   writing the same flag was rejected specifically to avoid the two ever silently disagreeing
+   on something that moves real money.
+
+**Implementation:**
+
+- `get_open_trades_with_ticks()` (`app/platform.py`) now matches
+  `origin == 'SIGNAL' OR origin LIKE 'AI_ORIGIN_%'` -- explicit `LIKE`, never `!= 'SIGNAL'`, per
+  the standing rule in "The `origin` field is the isolation mechanism" above. `AI_ALT_*` shadow/
+  comparison trades stay excluded; they're not a position anyone is holding. Each row now also
+  carries `origin`, `source_label` (e.g. "AI Origin · Claude"), and `mode` (PAPER/LIVE).
+- `origin_label()` moved from `app/dashboard_routes.py` to `app/platform.py` (still registered as
+  the same Jinja filter) so the trade-shaping function could use it without a
+  platform→dashboard_routes circular import.
+- `live_dashboard.html`'s trade cards show a source badge for any non-signal trade and a `LIVE`
+  badge (red, real money) for any trade -- signal or AI-originated -- with `mode == LIVE`. `PAPER`
+  gets no badge; it's the expected default.
+- `/ai-origination` route, `get_origination_summary()`, and `ai_origination.html` deleted
+  outright, along with the nav link in `base.html`. Nothing else in the repo referenced them
+  (confirmed by grep) except `docs/ai-origination-roadmap.md` mentions elsewhere, which are about
+  the unrelated background origination *job*, not this page.
+- New `get_live_trading_status()` (`app/platform.py`) reads `IndexConfig.ai_origination_live_trade`
+  per enabled index and `smartapi.settings.live_trading` (the server flag), returned read-only to
+  `ai_settings.html`. Explicitly documented in its own docstring as not-a-control, so a future
+  reader isn't tempted to wire a checkbox to it later without re-reading why that was rejected.
+
+11 new tests across `tests/test_active_trades_ai_origination.py` (mixed SIGNAL/AI_ORIGIN_*
+population, AI_ALT_* still excluded, closed AI Origination trades still excluded, `origin`/
+`source_label`/`mode` fields correct for both trade types) and `tests/test_live_trading_status.py`
+(server flag on/off, per-index status, disabled indices excluded, missing `smartapi.settings`
+defaults safely to off). `tests/test_strike_display.py`'s origination-specific test was repointed
+at `get_open_trades_with_ticks` instead of the deleted function.
+
+**Not verified live** -- no browser access from this sandbox to confirm the dashboard renders
+correctly with a real AI Origination trade open, or that the AI Settings status panel matches
+what Settings > Instruments actually has checked.
+
 ### Dashboard kept "updating" on closed days -- a real, separate tick-write path the 14 Aug scheduler fix didn't cover (14/15 Aug 2026)
 
 **Trigger**: reported live over a weekend -- the dashboard still looked active on days the

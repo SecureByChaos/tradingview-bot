@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db_models import Base, StrategyTrade, TradeStatus
-from app.platform import get_open_trades_with_ticks, get_origination_summary, get_today_activity
+from app.platform import get_open_trades_with_ticks, get_today_activity
 from app.time_utils import utc_now
 
 
@@ -79,7 +79,9 @@ def test_today_activity_exit_message_includes_strike():
     assert "[BNV7] Closed Bank Nifty 57800 long call, -3.2%" in messages
 
 
-def test_origination_summary_rows_include_strike():
+def test_open_trades_with_ticks_includes_ai_origination_strike():
+    # 15 Aug 2026: the AI Origination page is gone -- its open positions now
+    # surface here instead, on the main dashboard's Active Trades.
     db = _make_session()
     db.add(StrategyTrade(**_base_trade(
         trade_id="t-3",
@@ -88,7 +90,7 @@ def test_origination_summary_rows_include_strike():
     )))
     db.commit()
 
-    summary = get_origination_summary(db)
+    trades = get_open_trades_with_ticks(db)
 
-    assert len(summary["live"]) == 1
-    assert summary["live"][0]["strike"] == 57800
+    assert len(trades) == 1
+    assert trades[0]["strike"] == 57800

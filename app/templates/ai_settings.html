@@ -9,6 +9,31 @@
   {% if test_result.error %}<div>{{ test_result.error }}</div>{% endif %}
 </div>
 {% endif %}
+<div class="metric mb-4">
+  <div class="label">Live trading</div>
+  <div style="margin-top:.5rem;">
+    Server flag (<code>SMARTAPI_LIVE_TRADING</code>):
+    {% if live_trading.server_flag_on %}
+    <span class="badge text-bg-danger">ON</span>
+    {% else %}
+    <span class="badge text-bg-secondary">OFF</span>
+    {% endif %}
+    <span class="text-body-secondary" style="font-size:.8rem;">&mdash; set at deploy time, not from this UI</span>
+  </div>
+  <div style="margin-top:.5rem;">
+    {% for index in live_trading.indices %}
+    <span class="badge {% if index.live %}text-bg-danger{% else %}text-bg-secondary{% endif %}" style="margin:.15rem .25rem .15rem 0;" title="{% if index.live %}Places real orders once the server flag is also on{% else %}Paper only{% endif %}">
+      {{ index.display_name }}: {% if index.live %}LIVE{% else %}Paper{% endif %}
+    </span>
+    {% else %}
+    <span class="text-body-secondary" style="font-size:.85rem;">No enabled indices configured.</span>
+    {% endfor %}
+  </div>
+  <div class="text-body-secondary" style="font-size:.8rem; margin-top:.5rem;">
+    A trade only goes live when <strong>both</strong> conditions are true for its index. Toggle the per-index
+    checkbox in <a href="/settings?tab=instruments">Settings &gt; Instruments</a>.
+  </div>
+</div>
 <form class="metric" method="post" action="/ai-settings">
   <div class="form-check mb-3">
     <input class="form-check-input" type="checkbox" name="enabled" id="enabled" {% if settings.enabled %}checked{% endif %}>
