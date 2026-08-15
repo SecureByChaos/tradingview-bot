@@ -295,6 +295,54 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Active Trade tab removed; Ops Summary renamed to SmartAPI Health and stripped to just health data (15 Aug 2026)
+
+**Requested**: "Remove Active Trade tab completely and rename ops summary to something related to
+smartapi health. Remove everything from ops summary except pre market health and broker health."
+
+**Active Trade removal**: `/active-trade-page` (`active_trade_page()` in `app/dashboard_routes.py`)
+and its template `active_trade.html` deleted outright, along with the nav link in `base.html`. Its
+sole supporting mechanism -- `_cached_ltp()`/`_trade_ltp_cache`/`_TRADE_LTP_CACHE_TTL_SECONDS`, a
+5s per-contract SmartAPI LTP cache added 7 Aug specifically for this page's per-open-trade premium
+fetch (see "Dashboard-driven SmartAPI rate exhaustion" below) -- had no other caller, so it was
+deleted with it rather than left unwired: unlike the AI subsystem modules removed in the entry
+below, this was a small helper with no independent documented history, entirely in service of one
+page that no longer exists. Its test file (`tests/test_trade_ltp_cache.py`) removed with it. The
+now-unused `import time as time_module` (only consumer was `_cached_ltp`) was cleaned up too;
+`datetime.time` (imported under the plain `time` name in the same file) is still used elsewhere and
+was left alone.
+
+**Ops Summary → SmartAPI Health**: route moved from `/ops` to `/smartapi-health`
+(`smartapi_health_page()`, replacing the old `dashboard()` function name too, since it no longer
+renders the general-purpose dashboard). Grepped first for anything else depending on the `/ops`
+path -- none found in `app/`, `tests/`, or `docs/` beyond the nav link and the `/health-check`
+POST route's own redirect target, both updated. Template renamed `dashboard.html` →
+`smartapi_health.html`, page title in `page_header()` now shows `health.overall_status` as its
+badge (READY/WARNING/DOWN-colored) instead of the old `summary.bot_status` -- the page is now
+about SmartAPI health specifically, so its own header status is the more relevant one.
+
+**Removed from the page** (per "remove everything except pre market health and broker health"):
+the top bot-status metric grid (Bot Status, Open Trades, today's P&L, consecutive losses, trading
+allowed, risk status, current state) and its risk-lock alert banner, the Recent Logs section, and
+the Strategy Metrics table. `get_dashboard_summary()`, `strategy_metrics()`, and `latest_logs()` are
+all still real functions used elsewhere (`/control`, `/strategies` filters, `/logs`) -- only their
+use from this one route was dropped, nothing in `app/platform.py` was touched.
+
+**Kept, unchanged**: the Pre-Market Health section (overall status/health score/last-checked/
+recovery-count metrics plus the "Run Health Check" button) and the Broker Health section (broker
+metric grid, the broker/authentication/ltp/database/webhook/trading/ai/server components table,
+and Last Error) -- byte-for-byte the same markup as before, just lifted into the new template with
+nothing else around them.
+
+Full suite: 280 passed (was 283; -3 for the deleted LTP-cache test file, no new tests needed --
+this change removes code paths rather than adding conditional logic worth covering).
+
+**Not verified live** -- this sandbox has no deployed server. After deploying: confirm `/ops` and
+`/active-trade-page` both stop routing (404, or a login redirect if the session already expired),
+confirm the nav shows "SmartAPI Health" linking to `/smartapi-health` with no separate "Active
+Trade" entry, and confirm "Run Health Check" on the new page still redirects back to itself
+correctly.
+
 ### AI Reviews, AI Alternatives, AI Exit Calls, AI Context Inspector removed; AI Origination summary folded into Reports (15 Aug 2026)
 
 **Requested**: "Remove AI Alternatives, AI Exit calls, AI Reviews and AI Context Inspector as we

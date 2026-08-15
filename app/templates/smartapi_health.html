@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% from "components.html" import page_header, empty_state %}
+{% block content %}
+{% if health %}
+{{ page_header("SmartAPI Health", health.overall_status, "text-bg-success" if health.overall_status == 'READY' else "text-bg-warning" if health.overall_status == 'WARNING' else "text-bg-danger") }}
+{% else %}
+{{ page_header("SmartAPI Health") }}
+{% endif %}
+<div class="section-header">
+  <h4 class="mb-0">Pre-Market Health</h4>
+  <form method="post" action="/health-check"><button class="btn btn-sm btn-outline-info" type="submit">Run Health Check</button></form>
+</div>
+{% if health %}
+<div class="metric-grid">
+  <div class="metric"><div class="label">Overall Status</div><div class="value {% if health.overall_status == 'READY' %}profit{% elif health.overall_status == 'WARNING' %}warn{% else %}loss{% endif %}">{{ health.overall_status }}</div></div>
+  <div class="metric"><div class="label">Health Score</div><div class="value">{{ health.health_score }}%</div></div>
+  <div class="metric"><div class="label">Last Checked</div><div>{{ health.run_time }}</div></div>
+  <div class="metric"><div class="label">Recovery Count Today</div><div class="value">{{ health.recovery_count }}</div></div>
+</div>
+<div class="section-header"><h5>Broker Health</h5></div>
+<div class="metric-grid">
+  <div class="metric"><div class="label">Broker Status</div><div class="value">{{ health.broker_state.status or '-' }}</div></div>
+  <div class="metric"><div class="label">Authentication Status</div><div class="value">{{ health.broker_state.authentication_status or '-' }}</div></div>
+  <div class="metric"><div class="label">Last Login</div><div>{{ health.broker_state.last_login|ist if health.broker_state.last_login else '-' }}</div></div>
+  <div class="metric"><div class="label">Last Refresh</div><div>{{ health.broker_state.last_refresh|ist if health.broker_state.last_refresh else '-' }}</div></div>
+  <div class="metric"><div class="label">Recovery Count</div><div class="value">{{ health.broker_state.recovery_count if health.broker_state.recovery_count is not none else 0 }}</div></div>
+  <div class="metric"><div class="label">JWT Status</div><div class="value">{{ health.broker_state.jwt_status or '-' }}</div></div>
+  <div class="metric"><div class="label">Feed Token Status</div><div class="value">{{ health.broker_state.feed_token_status or '-' }}</div></div>
+  <div class="metric"><div class="label">LTP Status</div><div class="value">{{ health.broker_state.ltp_status or '-' }}</div></div>
+</div>
+<div class="table-responsive responsive-table mt-3">
+  <table class="table table-dark table-sm align-middle">
+    <thead><tr><th>Broker</th><th>Authentication</th><th>LTP</th><th>Database</th><th>Webhook</th><th>Trading</th><th>AI</th><th>Server</th></tr></thead>
+    <tbody><tr>
+      {% for name in ['broker', 'authentication', 'ltp', 'database', 'webhook', 'trading', 'ai', 'server'] %}
+      {% set item = health.components[name] %}
+      <td data-label="{{ name|title }}" class="{% if item.status == 'Healthy' or item.status == 'Disabled' %}profit{% elif item.status == 'Warning' %}warn{% else %}loss{% endif %}" title="{{ item.message }}">{{ item.status }}</td>
+      {% endfor %}
+    </tr></tbody>
+  </table>
+</div>
+<div class="metric"><div class="label">Last Error</div><div>{{ health.last_error or 'None' }}</div></div>
+{% else %}
+{{ empty_state("No health check has run today.") }}
+{% endif %}
+{% endblock %}
