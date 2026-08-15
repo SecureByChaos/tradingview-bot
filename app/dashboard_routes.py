@@ -27,8 +27,8 @@ from app.platform import (
     get_dashboard_summary,
     get_exit_shadow_summary,
     get_index_live_figures,
+    get_live_trading_status,
     get_market_conditions,
-    get_origination_summary,
     get_open_trades_with_ticks,
     get_or_create_strategy_stats,
     get_or_create_settings,
@@ -38,6 +38,7 @@ from app.platform import (
     list_index_configs,
     log_event,
     origin_comparison_metrics,
+    origin_label,
     strategy_metrics,
     strategy_trades_query_for_filter,
 )
@@ -46,18 +47,6 @@ from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIError
 from app.time_utils import IST, duration_label, format_ist, to_ist, utc_now
 from app.trade_manager import TradeManager
-
-
-def origin_label(origin: str | None) -> str:
-    if not origin or origin == "SIGNAL":
-        return "Signal"
-    if origin.startswith("AI_ALT_"):
-        provider = origin[len("AI_ALT_"):].title()
-        return f"AI Alt · {provider}"
-    if origin.startswith("AI_ORIGIN_"):
-        provider = origin[len("AI_ORIGIN_"):].title()
-        return f"AI Origin · {provider}"
-    return origin
 
 
 templates = Jinja2Templates(directory="app/templates")
@@ -482,16 +471,6 @@ def ai_exit_calls_page(
     return templates.TemplateResponse("ai_exit_calls.html", {"request": request, **summary})
 
 
-@router.get("/ai-origination", response_class=HTMLResponse)
-def ai_origination_page(
-    request: Request,
-    db: Annotated[Session, Depends(get_db)],
-    _: Annotated[None, Depends(require_admin_page)] = None,
-) -> HTMLResponse:
-    summary = get_origination_summary(db)
-    return templates.TemplateResponse("ai_origination.html", {"request": request, **summary})
-
-
 @router.get("/ai-alternatives", response_class=HTMLResponse)
 def ai_alternatives_page(
     request: Request,
@@ -750,10 +729,15 @@ def update_settings_page(
 def ai_settings_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
+    smartapi: Annotated[object, Depends(get_smartapi)],
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     settings = get_ai_settings(db) or create_ai_settings(db, id=1)
-    return templates.TemplateResponse("ai_settings.html", {"request": request, "settings": settings, "test_result": None})
+    live_trading = get_live_trading_status(db, smartapi)
+    return templates.TemplateResponse(
+        "ai_settings.html",
+        {"request": request, "settings": settings, "test_result": None, "live_trading": live_trading},
+    )
 
 
 @router.post("/ai-settings")
