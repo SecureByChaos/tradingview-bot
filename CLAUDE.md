@@ -295,6 +295,58 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Dashboard showed "Unavailable" instead of the last known price -- a direct side effect of the live-feed market-hours gate above (17 Aug 2026)
+
+**Reported**: a mobile screenshot of `/` showing both indices as "Unavailable" under a "Market
+closed" badge, with the request "It should show last value."
+
+**Root cause, confirmed by re-reading the change made earlier this same day**: before the live-
+feed market-hours gate (this file's entry directly above), `IndexFeed._run()` kept retrying every
+10s even outside trading hours, so a freshly-restarted process would often pick up at least one
+tick fairly quickly even off-hours. After that gate shipped, the feed correctly stops attempting
+to connect at all while the market's closed -- which also means `LiveFeedStore` stays completely
+empty for the entire closed period after any restart, since nothing ever populates it. In
+`get_index_live_figures()` (`app/platform.py`), a feed store with no entry for an index fell
+straight to `entry["error"] = "Live feed has not produced a price for this index yet"` with
+`price` left `None` -- rendered client-side as "Unavailable". Fixing the pinging problem correctly
+exposed this pre-existing gap in the fallback logic, rather than causing it outright.
+
+**Fixed**: that branch now queries the most recent `IndexPriceTick` ever recorded for the index
+(no date filter -- whatever the last real value is, regardless of which day) before giving up.
+Zero SmartAPI cost, same fail-closed philosophy `LiveFeedStore.get()` itself already documents.
+`is_live=False` on this path, which the dashboard's *existing* "stale" badge already handles
+correctly (`title="Live feed disconnected -- showing last known price"`) with no template change
+needed for that part. Only truly falls through to "Unavailable" when there is no persisted tick at
+all for that index (e.g. a brand-new index, or a database with zero history) -- there is genuinely
+nothing to show in that case.
+
+**A second bug this exposed, fixed in the same pass**: `live_dashboard.html`'s JS built the
+change-percent line unconditionally, so once the fallback price started rendering with no matching
+`change_abs`/`change_percent` (no tick recorded *today* yet), it would have shown the literal
+string `null (null%)` instead of nothing -- the same "don't render a fabricated/absent value"
+principle this codebase applies everywhere else (see `app/ai/originator.py`'s prompt-building
+docstrings). That line is now omitted entirely when either figure is `null`, not just left to
+concatenate as text.
+
+**Correctness guard, easy to miss**: the fallback price must never be written back as a new
+`IndexPriceTick` via `record_index_tick_if_stale`, even in the rare case this path fires *during*
+trading hours (feed hasn't produced its first tick of the session yet) -- doing so would inject a
+possibly-days-old value into today's tick history and corrupt the change/day-range math computed
+from "today's first tick" for the rest of the session. A `price_is_fresh` flag distinguishes a
+real feed/SmartAPI read from this fallback and gates the tick-write accordingly.
+
+4 new tests in `tests/test_index_live_figures_feed.py`: falls back to the last known tick with no
+SmartAPI call, picks the most recent of several historical ticks (not just any), the fallback
+price is never re-recorded as a fresh tick even during trading hours, and genuinely no history at
+all still correctly shows "Unavailable" rather than fabricating something. Full suite: 321 passed
+(was 317).
+
+**Verified live**: started the app against a scratch SQLite DB after market hours, confirmed the
+live feed log correctly showed `[LIVEFEED] Market closed (...); pausing connection attempts`
+(confirming the prior entry's fix is working), seeded one `IndexPriceTick` directly, and confirmed
+`/api/live-dashboard` returned the real price with `is_live: false` and `change_abs`/
+`change_percent` both `null` (not a fabricated 0) instead of the previous `price: null`.
+
 ### Live index feed now gates on market hours too -- the one SmartAPI-touching path the 14/15 Aug fixes didn't cover (17 Aug 2026)
 
 **Requested**: "Also bot should stop pinging smartapi after market hours." This exact topic already

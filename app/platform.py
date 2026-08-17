@@ -535,6 +535,7 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
             "is_live": None,
         }
         feed_entry = feed_store.get(index.symbol) if feed_store is not None else None
+        price_is_fresh = True
         if feed_entry is not None:
             price = round(feed_entry["price"], 2)
             entry["is_live"] = feed_entry["is_live"]
@@ -553,11 +554,40 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
                 figures.append(entry)
                 continue
         else:
-            entry["error"] = "Live feed has not produced a price for this index yet"
-            figures.append(entry)
-            continue
+            # feed_store is wired but has never produced a tick for this
+            # index THIS PROCESS -- routine right after a restart while the
+            # market's closed, since app/live_feed.py's 17 Aug market-hours
+            # gate means the WS feed no longer even attempts to connect in
+            # that state (previously it kept retrying every 10s and would
+            # often pick up a value quickly). Rather than showing
+            # "Unavailable" for however long the market stays closed, fall
+            # back to the last IndexPriceTick ever recorded for this index --
+            # a plain DB read, zero SmartAPI cost, same fail-closed spirit as
+            # LiveFeedStore.get() itself. is_live=False so the dashboard's
+            # existing "stale" badge (already reads "showing last known
+            # price") renders correctly with no template change needed for
+            # this case specifically.
+            last_tick = db.scalar(
+                select(IndexPriceTick)
+                .where(IndexPriceTick.index_symbol == index.symbol)
+                .order_by(IndexPriceTick.recorded_at.desc())
+                .limit(1)
+            )
+            if last_tick is None:
+                entry["error"] = "Live feed has not produced a price for this index yet"
+                figures.append(entry)
+                continue
+            price = round(last_tick.price, 2)
+            entry["is_live"] = False
+            price_is_fresh = False
 
-        if is_trading_now:
+        # Never record a fallback (not-fresh) price as a new tick -- that
+        # would insert a possibly-days-old value into today's tick history
+        # and corrupt the change/day-range math below for the rest of the
+        # day. Only ever relevant in the rare case this fallback fires while
+        # is_trading_now is still True (feed hasn't produced its first tick
+        # of the session yet).
+        if is_trading_now and price_is_fresh:
             record_index_tick_if_stale(db, index.symbol, price)
 
         todays_ticks = list(

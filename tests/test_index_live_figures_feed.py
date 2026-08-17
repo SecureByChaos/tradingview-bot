@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 import app.platform as platform_module
 from app.db_models import Base, IndexConfig, IndexPriceTick
 from app.platform import get_index_live_figures
-from app.time_utils import IST
+from app.time_utils import IST, utc_now
 
 
 def _make_session() -> Session:
@@ -163,3 +163,75 @@ def test_does_not_record_a_tick_outside_trading_hours_on_a_weekday(monkeypatch):
 
     ticks = list(db.scalars(select(IndexPriceTick).where(IndexPriceTick.index_symbol == "BANKNIFTY")))
     assert len(ticks) == 0
+
+
+# ---------------------------------------------------------------------------
+# 17 Aug 2026: falls back to the last-ever-recorded IndexPriceTick, instead of
+# "Unavailable", when the feed hasn't produced a value for this process yet --
+# routine right after a restart while the market's closed, since the live
+# feed's own market-hours gate (app/live_feed.py, same date) means it no
+# longer even attempts to reconnect in that state.
+# ---------------------------------------------------------------------------
+
+def test_falls_back_to_last_known_tick_when_feed_has_no_entry_yet():
+    db = _make_session()
+    _seed_index(db)
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57250.5, recorded_at=utc_now() - timedelta(days=1)))
+    db.commit()
+    smartapi = FakeSmartAPI()
+    feed_store = FakeFeedStore({})  # feed running, no tick for this index yet
+
+    figures = get_index_live_figures(db, smartapi, feed_store)
+
+    assert smartapi.calls == 0  # still never falls back to a fresh SmartAPI call
+    assert figures[0]["price"] == 57250.5
+    assert figures[0]["is_live"] is False
+    assert "error" not in figures[0]
+
+
+def test_last_known_tick_fallback_picks_the_most_recent_one():
+    db = _make_session()
+    _seed_index(db)
+    now = utc_now()
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57000.0, recorded_at=now - timedelta(days=3)))
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57500.0, recorded_at=now - timedelta(days=1)))
+    db.commit()
+    feed_store = FakeFeedStore({})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    assert figures[0]["price"] == 57500.0
+
+
+def test_last_known_tick_fallback_is_not_re_recorded_as_a_fresh_tick(monkeypatch):
+    # Even in the rare case this fallback fires DURING trading hours (feed
+    # hasn't produced its first tick of the session yet), the fallback price
+    # must not be written as a new tick -- that would inject a possibly-days-
+    # old value into today's tick history and corrupt the change/day-range
+    # math computed from it for the rest of the day.
+    monkeypatch.setattr(platform_module, "utc_now", lambda: _ist(2026, 8, 13, 11, 0))  # Thursday, trading hours
+    db = _make_session()
+    _seed_index(db)
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57250.5, recorded_at=_ist(2026, 8, 11, 10, 0)))
+    db.commit()
+    feed_store = FakeFeedStore({})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    assert figures[0]["price"] == 57250.5
+    ticks = list(db.scalars(select(IndexPriceTick).where(IndexPriceTick.index_symbol == "BANKNIFTY")))
+    assert len(ticks) == 1  # still just the seeded one -- no new row added
+
+
+def test_no_fallback_available_still_shows_unavailable():
+    # Genuinely nothing has ever been recorded for this index -- there is no
+    # "last known price" to fall back to, so this must stay "Unavailable"
+    # rather than fabricating a value.
+    db = _make_session()
+    _seed_index(db)
+    feed_store = FakeFeedStore({})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    assert figures[0]["price"] is None
+    assert "error" in figures[0]
