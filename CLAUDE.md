@@ -295,6 +295,63 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### same_direction_entries_today outcome backtest built, NOT run -- follow-up to the 11 Aug hard gate (17 Aug 2026)
+
+**Trigger**: a proposal to add a live-ADX-based early-exit trigger for running trades
+("if the trend weakens mid-trade, exit regardless of trailing state"). Discussed before
+building anything -- the 6 Aug STALL_EXIT backtest already tested closely-related ground
+from the opposite direction ("skip STALL_EXIT when ADX >= 25", i.e. hold instead of exit)
+and found holding was worse in 8 of 8 applicable trades, the documented conclusion being
+"index continuation is not premium continuation." ADX describes the index, not the
+premium actually held, so a live ADX-weakening trigger risks the same failure mode in
+reverse. ADX is also not actually live at trade-monitor granularity -- it's computed once
+per index per 5-minute AI Origination cycle, not on the 30s monitor tick, so wiring it
+into every open trade's exit check would mean either accepting 5-min-stale reads or
+adding fresh computation to the 30s loop, which risks reopening the SmartAPI rate-limit
+contention this project has fought more than once. No gate was proposed or built from
+that conversation.
+
+Follow-up request, a different and more tractable question: does
+`same_direction_entries_today` (the count already computed at entry time and stored per
+trade in `market_context_json`) predict outcome, bucketed 0/1/2/3+? This revisits the 11
+Aug hard gate (`_MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK = 2` in `app/ai/originator.py`)
+with the thing `trend_age_gate_backtest.py` couldn't use at the time -- real AI
+Origination history. That script validated a *proxy* reconstructed from the 2-year
+index-level candle archive, since no real per-trade history existed yet when the gate
+shipped (shipped from a same-day anecdote -- 7 same-direction entries in one day -- not a
+backtest, per the standing exception CLAUDE.md notes for evidence at that severity).
+
+**Built**: `scripts/same_direction_entries_backtest.py`, same shape as
+`confidence_sizing_backtest.py` (its closest analog -- bucketed outcome backtest over the
+closed-AI-Origination-trades population, MFE/MAE from `strategy_trade_ticks` rather than
+the `highest_price`/`lowest_price` columns per that script's already-documented bug,
+bootstrap 90% CI at `MIN_BUCKET_LIVE=20`). Reads each trade's own
+`same_direction_entries_today[trade.signal]` from its stored `market_context_json` --
+trades predating the field (key absent) are excluded outright rather than defaulted to 0,
+since "unknown" and "zero prior entries today" are different facts. Two comparisons,
+both policy-relevant rather than just descriptive: bucket 0 vs bucket 1 (would tightening
+the gate to >=1 have been justified?), and buckets <2 combined vs >=2 combined (does the
+threshold actually shipped hold up?). Because the gate has blocked any new entry at
+count>=2 since 11 Aug, buckets 2 and 3+ can only ever be populated by pre-gate history --
+the script says this plainly rather than presenting a thin bucket as settled. 12 new tests
+(`tests/test_same_direction_entries_backtest.py`) cover the own-signal-key extraction
+(a BUY_PE trade must read its own count, not BUY_CE's from the same context), the
+field-absent-vs-zero distinction, the tick-based MFE/MAE derivation, the population filter
+(AI Origination only, closed only, context JSON required), and both bootstrap comparisons
+detecting a real synthetic effect.
+
+**Not run** -- same sandbox constraint as every other backtest script in this project:
+`sqlite3.OperationalError: no such table: strategy_trades` against this environment's
+`data/trading.db`. Run on the machine with real history:
+
+```bash
+python -m scripts.same_direction_entries_backtest --db data/trading.db
+```
+
+Read the two bootstrap comparisons before concluding anything; a bucket flagged below the
+20-observation trust minimum is an expected outcome for 2/3+ given the gate's own effect
+on the population, not a reason to force a verdict from it.
+
 ### AI Settings merged into Settings as a tab; Performance merged into Trade History; AI Alternatives filter removed; strategy sub-filter added (15 Aug 2026)
 
 **Requested**: "Merge AI Settings into Setting as a new tab. Also merge performance tab into Trade
