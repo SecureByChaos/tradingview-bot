@@ -295,6 +295,69 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Live index feed now gates on market hours too -- the one SmartAPI-touching path the 14/15 Aug fixes didn't cover (17 Aug 2026)
+
+**Requested**: "Also bot should stop pinging smartapi after market hours." This exact topic already
+has two prior entries in this file (14 Aug's scheduler fix, 15 Aug's dashboard-tick fix), so before
+writing anything a fresh audit (via a research subagent) checked every SmartAPI-touching code path
+in the repo against both fixes rather than assuming either duplicate work or a brand-new problem.
+
+**Confirmed still gated correctly**: `ai-origination-check` (5-min job, `check_market_hours()` at
+the top of `run_origination_checks`), `trade-monitor` (30s job, `trading_day_reason()`, weekday/
+holiday only -- deliberately not hour-gated, per the 14 Aug entry's own reasoning: it must keep
+catching open trades near/after 15:15), `option-chain-collect` (cron window + internal re-check,
+unchanged), `closing-auction-capture` (cron time is the gate), and the dashboard's own
+`get_index_live_figures` (feed reads are pure in-memory; the tick-write path already gated 15 Aug).
+
+**The real, still-live gap**: `app/live_feed.py`'s `IndexFeed._run()` background thread. Neither
+prior fix touched it because both only gated periodic `apscheduler` jobs or dashboard-poll-
+triggered REST calls -- this is a persistent thread started once at app startup
+(`app/main.py`'s lifespan), not a job. Its reconnect loop had no market-hours awareness at all:
+every `_RECONNECT_DELAY_SECONDS` (10s) it read fresh auth tokens and, once available, opened a
+real `SmartWebSocketV2` connection to Angel One and subscribed -- all night, every weekend, every
+NSE holiday, for as long as the process ran. This is almost certainly what prompted the request.
+
+**Fixed**: `_run()`'s loop now checks `check_market_hours(utc_now())` first, before even looking
+at auth tokens. When closed, it skips the connection attempt entirely, marks the feed disconnected
+(so the dashboard's stale-badge logic degrades correctly), and sleeps a much longer
+`_CLOSED_MARKET_POLL_SECONDS` (300s) rather than the open-market `_RECONNECT_DELAY_SECONDS` (10s)
+-- nothing is time-sensitive while the market's shut, and re-deriving "is it open" every 10s all
+night is itself pointless work. Logs once on the open->closed transition and once on closed->open,
+not on every poll iteration, to avoid ~280 identical log lines over a closed weekend.
+
+**Deliberately NOT built**: forcibly disconnecting an already-open connection the instant trading
+hours end. `ws.connect()` blocks for the life of one connection attempt; the gate is only
+re-evaluated after a disconnect happens naturally. Scope here was "stop dialing out repeatedly
+after hours," not "guarantee the socket is closed by 15:30:01" -- the latter would need a second
+thread interrupting a blocking call, real added complexity for a case (an idle overnight WS
+session) that costs nothing further once no new ticks are being requested or produced.
+
+**Also fixed while in this area**: `daily-square-off`'s `CronTrigger` (`app/scheduler.py`) gained
+`day_of_week="mon-fri"`, matching every other cron job in that file. This was flagged-but-not-fixed
+in the 14 Aug entry ("technically fires at 15:15 on Saturday/Sunday too... worth a one-line fix if
+anyone's looking at that file again") -- exactly this situation. Low severity on its own
+(`square_off_all`'s empty-open-trades early return already made a weekend firing a no-op) but a
+real SmartAPI-touching call with no reason to run outside a trading day, same class of gap as the
+live feed fix above.
+
+4 new tests: `tests/test_live_feed.py` gained `test_run_skips_connection_attempt_when_market_closed`
+(asserts `SmartWebSocketV2` is never constructed while closed, and the longer poll interval is
+used) and `test_run_resumes_connecting_once_market_reopens` (closed-then-open transition actually
+reaches `connect()`); the pre-existing `test_run_waits_when_tokens_missing_then_connects_once_available`
+now patches `check_market_hours` to force "open" so it stays deterministic regardless of when the
+suite actually runs, rather than depending on real wall-clock time.
+
+Full suite: 317 passed (was 315). `python -c "import app.main"` imports cleanly -- the two new
+`app.signal_validation`/`app.time_utils` imports in `live_feed.py` don't introduce a circular
+import or grow the live import graph in any way `tests/test_module_imports.py` flags.
+
+**Not verified against the real feed** -- same standing constraint as the rest of this module (see
+its own module docstring): no network path to Angel One from this sandbox. After deploying, the
+check is: confirm no `[LIVEFEED] Connected` log lines appear outside 09:15-15:30 IST on a trading
+day, and confirm exactly one `[LIVEFEED] Market closed (...)` line appears at close (not one every
+10s) followed by silence until the next `[LIVEFEED] Market open again` the following trading
+session.
+
 ### AI Origination gets two manual risk knobs: max stop-loss %, and a same-direction CONSECUTIVE-LOSS gate replacing the old entry-count gate (17 Aug 2026)
 
 **Requested**: "I want set manual max stoploss and threshold value." Discussed before building --

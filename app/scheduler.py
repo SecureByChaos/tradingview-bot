@@ -65,7 +65,16 @@ def create_scheduler(
         )
     scheduler.add_job(
         monitor.square_off,
-        trigger=CronTrigger(hour=15, minute=15, timezone=IST),
+        # day_of_week added 17 Aug 2026 -- every other cron job in this file
+        # already has it; this one didn't, so it technically fired at 15:15 on
+        # Saturday/Sunday too. Harmless in practice (square_off_all's own
+        # empty-open-trades early return makes a weekend firing a no-op), but
+        # a real SmartAPI-touching call with no reason to happen outside a
+        # trading day. Flagged but deliberately not fixed on 14 Aug since that
+        # task was scoped elsewhere; fixed now while touching this file for
+        # the same class of gap (see app/live_feed.py's market-hours gate,
+        # same date).
+        trigger=CronTrigger(day_of_week="mon-fri", hour=15, minute=15, timezone=IST),
         id="daily-square-off",
         replace_existing=True,
         max_instances=1,
