@@ -295,6 +295,93 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination gets two manual risk knobs: max stop-loss %, and a same-direction CONSECUTIVE-LOSS gate replacing the old entry-count gate (17 Aug 2026)
+
+**Requested**: "I want set manual max stoploss and threshold value." Discussed before building --
+scoped to AI Origination only (confirmed via AskUserQuestion), since rule-based strategies
+already have admin-configurable `sl_percent`/`tp_percent` per strategy and are under their own
+change freeze per this file's "shared-FIXED-branch hazard" section. Two follow-up rounds pinned
+down what "max stoploss" and "threshold" actually meant:
+
+- **Max stoploss**: "I can not risk 50% loss." AI Origination's proposed stop/target were only
+  ever accepted if both fell inside a hardcoded 5-50% sanity band
+  (`_MIN_SL_TARGET_PERCENT`/`_MAX_SL_TARGET_PERCENT`); outside it the trade fell back to generic
+  trailing-stop instead of the AI's own numbers. 50% was a code constant, not a setting -- there
+  was no way to tighten it without a deploy.
+- **Threshold**: "if two consecutive same direction trades fails then only threshold should come
+  in picture... 2 trades taken 1 won and second loss then threshold should not apply." This is
+  NOT the same shape as the existing 11 Aug hard gate
+  (`_MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK = 2`), which blocked a 3rd same-direction entry
+  purely on entry COUNT, regardless of whether the first two won or lost -- so it could block a
+  working thesis, not just a failing one. The 17 Aug backtest just above this entry found that
+  count-gate's own threshold inconclusive on real data anyway. Confirmed via AskUserQuestion that
+  this was the specific gate the user meant loosening, and that the intended replacement
+  semantics are a CONSECUTIVE-LOSS streak, not a raw count.
+
+**Implementation:**
+
+- `AISettings` gains two new columns (`app/db_models.py`, additive `_ensure_columns()` migration
+  in `app/database.py`): `ai_origination_max_sl_percent` (float, default 50.0) and
+  `ai_origination_max_same_direction_losses` (int, default 2). Both default to the exact values
+  the code previously hardcoded, so deploying this changes nothing until an admin actually edits
+  Settings > AI's new "AI Origination Risk" section.
+- **Stop/target sanity check split** (`app/ai/originator.py`'s `_open_trade`): `_is_sane` (one
+  shared 5-50% band for both stop and target) is replaced by `_stop_is_sane` (uses the new
+  admin-configurable `max_sl_percent`) and `_target_is_sane` (keeps the original hardcoded 50%
+  ceiling, untouched). Tightening the stop max must not also cap the target -- a trade with a
+  15% stop and a 48% target is still "sane" and uses the AI's own numbers even with the admin
+  max stop set to 20%; only the stop side is now configurable, since that's specifically what
+  was flagged as too permissive.
+- **Same-direction gate replaced, not just re-thresholded.** New
+  `_same_direction_consecutive_losses(db, index_symbol, action)` queries `strategy_trades`
+  directly (CLOSED, `origin LIKE 'AI_ORIGIN_%'`, matching index+signal, across both providers --
+  same cross-provider rationale as the existing `_same_direction_entries_today`) ordered
+  newest-first, and counts a losing streak from the most recent trade backward, stopping at the
+  first non-loss (WIN or BREAKEVEN) or at the start of today's history. A single win anywhere in
+  the window resets it to 0 -- exactly the worked example in the request (1 win + 1 loss today
+  -> streak is 0, not 2, so a 3rd entry is allowed). OPEN trades are excluded entirely from the
+  walk (no resolved outcome yet, so they neither extend nor break the streak), matching how
+  `StrategyStats.consecutive_losses` already treats streaks elsewhere in this app. Gated on
+  `AISettings.ai_origination_max_same_direction_losses` via a new `_max_same_direction_losses()`
+  helper.
+- **The old count-based `_same_direction_entries_today` field is deliberately left completely
+  untouched** -- it still feeds the system prompt's soft trend-age caution text, the CSV export's
+  "Same-Dir Entries Today" column, `market_context_json`, and (importantly) the
+  `same_direction_entries_backtest.py` script built and run for real just above this entry. That
+  script analyzes entry COUNT vs. outcome and remains fully valid and unaffected -- it answers a
+  different, still-useful question ("does the raw count of repeats predict outcome") from the new
+  gate ("did the repeats specifically fail"). Because the new gate no longer reads
+  `market_context.same_direction_entries_today` at all, it also now runs correctly even when
+  `market_context` is `None` -- a behavior improvement over the old gate, which silently skipped
+  entirely in that case.
+- `tests/test_trend_age_gate.py` (tested the old count-gate's exact mechanics via a
+  `market_context` dict) deleted and replaced with `tests/test_same_direction_loss_gate.py` (23
+  tests) covering: the consecutive-loss streak walk (empty day, two losses, a win resetting the
+  streak, win-then-loss only counting the trailing loss, breakeven also resetting, cross-provider
+  counting, per-direction scoping, open trades excluded, previous-day trades excluded, non-AI-
+  Origination origins excluded), the two settings-fallback helpers, and `_open_trade` integration
+  (blocks at 2 consecutive losses, allows the exact 1-win-1-loss worked example, allows the first
+  entry of the day, per-direction, an admin-configured threshold of 1, correct behavior with
+  `market_context=None`, and the stop/target sanity split in both directions).
+- Settings > AI gets a new "AI Origination Risk" section (`settings.html`) with the two fields
+  and explanatory tooltips; `/ai-settings` POST validates `5.0 <
+  ai_origination_max_sl_percent <= 100` (the floor mirrors `_MIN_SL_TARGET_PERCENT`, duplicated
+  rather than imported to avoid a `dashboard_routes` -> `originator` coupling for one constant)
+  and `ai_origination_max_same_direction_losses >= 1`.
+- **Noticed in passing, flagged to the user, not touched**: the "Confidence Threshold" field
+  already on that same Settings > AI page doesn't affect AI Origination at all --
+  `originator.py` uses its own separate hardcoded `_MIN_CONFIDENCE_TO_ACT = 0.60` constant
+  instead of reading `AISettings.confidence_threshold`. Out of scope for this task; worth fixing
+  or removing later so the field isn't misleading.
+
+Full suite: 315 passed (was 298; -6 for the deleted old gate test file, +23 for the new one).
+`python -c "import app.main"` imports cleanly.
+
+**Verified live**: started the app against a scratch SQLite DB, logged in, confirmed
+`/settings?tab=ai` renders the new section with the correct defaults (50.0, 2), saved new values
+(15, 1) and confirmed they persisted and re-rendered correctly, and confirmed both validation
+rejections fire (max stop below the 5% floor, max losses below 1) with a 400.
+
 ### same_direction_entries_today outcome backtest -- run for real, INCONCLUSIVE (17 Aug 2026)
 
 **Trigger**: a proposal to add a live-ADX-based early-exit trigger for running trades

@@ -196,7 +196,23 @@ _MIN_DTE_TO_TRADE = 5
 # repeatedly guarded against elsewhere. See scripts/trend_age_gate_backtest.py
 # and CLAUDE.md's "Move Trend-Age Caution to a Hard Gate" entry -- run that
 # script for real before adding a second threshold here.
-_MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK = 2
+#
+# SUPERSEDED 17 Aug 2026: this pure entry-COUNT gate is no longer what's
+# checked in _open_trade. scripts/same_direction_entries_backtest.py (run for
+# real 17 Aug) found it inconclusive on real AI Origination history -- the
+# point estimates leaned toward the >=2 threshold being right, but n=4 on the
+# blocked side (dominated by a single outlier trade) didn't clear this
+# project's own trust bar either way. Separately, a count gate blocks a 3rd
+# same-direction entry even when the first two both WON, which is blocking a
+# working thesis, not a failing one. Replaced with a CONSECUTIVE-LOSS gate
+# (_same_direction_consecutive_losses) that only blocks once the most recent
+# N same-direction trades lost in a row -- a win anywhere in that window
+# resets it. The trigger count is now AISettings.
+# ai_origination_max_same_direction_losses (Settings > AI), admin-configurable
+# rather than a second hardcoded guess, defaulting to this same value (2) so
+# deploying the column changes nothing until it's actually edited. This
+# constant is kept only as that default.
+_DEFAULT_MAX_SAME_DIRECTION_LOSSES = 2
 # Trailing fallback's own parameters -- these aren't "correcting" the AI's
 # entry/exit judgment, they're the same trailing-engine knobs every other
 # trailing-mode strategy in this app already uses (StrategyConfig.trailing_*),
@@ -730,6 +746,65 @@ def _same_direction_entries_today(db: Session, index_symbol: str) -> dict[str, i
     return counts
 
 
+def _same_direction_consecutive_losses(db: Session, index_symbol: str, action: str) -> int:
+    """How many of TODAY's same-direction (index+action) AI Origination trades
+    lost in a row, most recent first, ACROSS providers -- same cross-provider
+    rationale as _same_direction_entries_today (a thesis Claude lost and
+    OpenAI then also lost is two failures of the same idea, not one).
+
+    Walks CLOSED trades newest-to-oldest and stops at the first non-loss (WIN
+    or BREAKEVEN) or once trades from before today are reached -- so a single
+    win anywhere in the streak resets it to 0, exactly like
+    StrategyStats.consecutive_losses elsewhere in this app. OPEN trades are
+    excluded entirely: they have no resolved outcome yet, so they can neither
+    extend nor break a streak.
+    """
+    today = to_ist(utc_now()).date()
+    rows = db.scalars(
+        select(StrategyTrade)
+        .where(
+            StrategyTrade.origin.like("AI_ORIGIN_%"),
+            StrategyTrade.index_symbol == index_symbol,
+            StrategyTrade.signal == action,
+            StrategyTrade.status == TradeStatus.CLOSED,
+        )
+        .order_by(StrategyTrade.entry_time.desc())
+    )
+    streak = 0
+    for trade in rows:
+        entry_ist = to_ist(trade.entry_time)
+        if entry_ist is None or entry_ist.date() != today:
+            break  # newest-first order -- once we're out of today, nothing older matters
+        if trade.result != TradeResult.LOSS:
+            break
+        streak += 1
+    return streak
+
+
+def _max_same_direction_losses(db: Session) -> int:
+    """Admin-configurable trigger count for _same_direction_consecutive_losses
+    (Settings > AI, AISettings.ai_origination_max_same_direction_losses).
+    Falls back to the pre-17-Aug hardcoded default only if no AISettings row
+    exists at all, which should not happen in practice -- app/database.py
+    seeds one on startup."""
+    settings = get_settings(db)
+    if settings is None:
+        return _DEFAULT_MAX_SAME_DIRECTION_LOSSES
+    return settings.ai_origination_max_same_direction_losses
+
+
+def _max_sl_percent(db: Session) -> float:
+    """Admin-configurable ceiling on the AI's proposed STOP only (Settings >
+    AI, AISettings.ai_origination_max_sl_percent) -- see _open_trade's
+    _stop_is_sane/_target_is_sane split for why the target keeps its own
+    separate, still-hardcoded ceiling. Falls back to the original hardcoded
+    _MAX_SL_TARGET_PERCENT only if no AISettings row exists at all."""
+    settings = get_settings(db)
+    if settings is None:
+        return _MAX_SL_TARGET_PERCENT
+    return settings.ai_origination_max_sl_percent
+
+
 def _find_correlated_entry(
     db: Session, index_symbol: str, signal: str, strike: int, provider: str, window_minutes: int
 ) -> StrategyTrade | None:
@@ -895,38 +970,49 @@ def _open_trade(
     market_context: MarketContext | None = None,
     data_stale: bool = False,
 ) -> Optional[StrategyTrade]:
-    # Trend-age hard gate, checked first and before any quote/contract-resolution
-    # cost is spent: a thesis already traded this many times today for this
-    # index+direction is blocked outright, regardless of confidence or how sane
-    # the AI's own sl/target numbers are. See _MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK's
-    # comment for why this exists and why trend_duration_pct_of_session is not
-    # also gated here yet.
-    if market_context is not None:
-        same_direction_today = market_context.same_direction_entries_today or {}
-        same_direction_count = same_direction_today.get(decision.action, 0)
-        if same_direction_count >= _MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK:
-            logger.info(
-                "[AI][ORIGIN] %s: Skipped: same_direction_entries_today[%s]=%s exceeds threshold %s",
-                index.symbol, decision.action, same_direction_count,
-                _MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK,
-            )
-            return None
+    # Same-direction CONSECUTIVE-LOSS gate, checked first and before any
+    # quote/contract-resolution cost is spent: this index+direction thesis is
+    # blocked outright once its most recent trades today lost N times in a
+    # row, regardless of confidence or how sane the AI's own sl/target numbers
+    # are. Queries strategy_trades directly rather than reading
+    # market_context.same_direction_entries_today (that field is a raw entry
+    # COUNT with no outcome attached, kept only for the prompt/CSV/backtest --
+    # see _same_direction_consecutive_losses's own docstring), so this check
+    # runs even when market_context is None.
+    max_losses = _max_same_direction_losses(db)
+    consecutive_losses = _same_direction_consecutive_losses(db, index.symbol, decision.action)
+    if consecutive_losses >= max_losses:
+        logger.info(
+            "[AI][ORIGIN] %s: Skipped: %s consecutive %s loss(es) today (>= %s)",
+            index.symbol, consecutive_losses, decision.action, max_losses,
+        )
+        return None
 
-    def _is_sane(value: float | None) -> bool:
+    max_sl_percent = _max_sl_percent(db)
+
+    def _stop_is_sane(value: float | None) -> bool:
+        return value is not None and _MIN_SL_TARGET_PERCENT <= value <= max_sl_percent
+
+    def _target_is_sane(value: float | None) -> bool:
         return value is not None and _MIN_SL_TARGET_PERCENT <= value <= _MAX_SL_TARGET_PERCENT
 
     # AI Origin trades run entirely on the AI's own risk judgment where it
     # gives a sane one. When it doesn't -- missing, too tight (closes on pure
-    # noise), or too wide (barely a risk control) -- we don't substitute a
-    # fixed number of our own and pretend it's still the AI's call. Instead
-    # the trade uses trailing-stop methodology, the same mechanism every other
-    # trailing strategy in this app already relies on.
-    use_trailing = not (_is_sane(decision.sl_percent) and _is_sane(decision.target_percent))
+    # noise), or too wide (barely a risk control, or wider than the admin-set
+    # stop ceiling) -- we don't substitute a fixed number of our own and
+    # pretend it's still the AI's call. Instead the trade uses trailing-stop
+    # methodology, the same mechanism every other trailing strategy in this
+    # app already relies on. The stop and target are checked against separate
+    # ceilings (max_sl_percent is admin-configurable; the target's stays at
+    # the original hardcoded _MAX_SL_TARGET_PERCENT) because tightening how
+    # much you're willing to risk should not also cap how much upside a trade
+    # is allowed to target.
+    use_trailing = not (_stop_is_sane(decision.sl_percent) and _target_is_sane(decision.target_percent))
     if use_trailing:
         logger.info(
-            "[AI][ORIGIN] %s sl_percent=%s target_percent=%s outside %.0f-%.0f%% sane range -- "
+            "[AI][ORIGIN] %s sl_percent=%s (max %.0f%%) target_percent=%s (max %.0f%%) outside sane range -- "
             "opening on trailing-stop methodology instead of a fixed AI-proposed band",
-            index.symbol, decision.sl_percent, decision.target_percent, _MIN_SL_TARGET_PERCENT, _MAX_SL_TARGET_PERCENT,
+            index.symbol, decision.sl_percent, max_sl_percent, decision.target_percent, _MAX_SL_TARGET_PERCENT,
         )
 
     option_type = "CE" if decision.action == "BUY_CE" else "PE"

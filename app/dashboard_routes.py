@@ -678,6 +678,8 @@ def update_ai_settings_page(
     timeout_seconds: Annotated[int, Form()],
     confidence_threshold: Annotated[int, Form()],
     system_prompt: Annotated[str, Form()],
+    ai_origination_max_sl_percent: Annotated[float, Form()] = 50.0,
+    ai_origination_max_same_direction_losses: Annotated[int, Form()] = 2,
     enabled: Annotated[str | None, Form()] = None,
     secondary_enabled: Annotated[str | None, Form()] = None,
     secondary_provider: Annotated[str, Form()] = "claude",
@@ -694,6 +696,11 @@ def update_ai_settings_page(
         or not 0 <= temperature <= 2
         or timeout_seconds < 1
         or not 0 <= confidence_threshold <= 100
+        # 5.0 mirrors app/ai/originator.py's _MIN_SL_TARGET_PERCENT floor --
+        # duplicated rather than imported to avoid a dashboard_routes ->
+        # originator import for one constant.
+        or not 5.0 < ai_origination_max_sl_percent <= 100
+        or ai_origination_max_same_direction_losses < 1
     ):
         raise HTTPException(status_code=400, detail="Invalid AI configuration")
     settings = get_ai_settings(db) or create_ai_settings(db, id=1)
@@ -707,6 +714,8 @@ def update_ai_settings_page(
         "timeout_seconds": timeout_seconds,
         "confidence_threshold": confidence_threshold,
         "system_prompt": system_prompt,
+        "ai_origination_max_sl_percent": ai_origination_max_sl_percent,
+        "ai_origination_max_same_direction_losses": ai_origination_max_same_direction_losses,
         "secondary_enabled": secondary_enabled == "on",
         "secondary_provider": secondary_provider,
         "secondary_model": secondary_model.strip(),
