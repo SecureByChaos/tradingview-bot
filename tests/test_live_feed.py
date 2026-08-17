@@ -195,7 +195,8 @@ def test_run_waits_when_tokens_missing_then_connects_once_available():
             feed._stop_requested = True
 
     with patch.dict(sys.modules, {"SmartApi.smartWebSocketV2": fake_module}), \
-         patch("app.live_feed.time.sleep", side_effect=fake_sleep):
+         patch("app.live_feed.time.sleep", side_effect=fake_sleep), \
+         patch("app.live_feed.check_market_hours", return_value=None):  # market open
         feed._run()
 
     assert attempts["n"] == 1
@@ -203,3 +204,67 @@ def test_run_waits_when_tokens_missing_then_connects_once_available():
     entry = store.get("BANKNIFTY")
     assert entry["price"] == 50000.0
     assert entry["is_live"] is False  # on_close fired before connect() returned
+
+
+def test_run_skips_connection_attempt_when_market_closed():
+    # 17 Aug 2026: this thread has its own market-hours gate now (previously
+    # it dialed Angel's WS endpoint every _RECONNECT_DELAY_SECONDS all night
+    # and every weekend). Market closed for the whole loop -- must never
+    # reach SmartWebSocketV2 at all, and must sleep the longer closed-market
+    # interval, not the open-market reconnect delay.
+    store = LiveFeedStore()
+    client = FakeSmartAPIClient()
+    feed = IndexFeed(client, store, [BANKNIFTY])
+
+    fake_module = types.SimpleNamespace(SmartWebSocketV2=lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("must not attempt to connect while market is closed")
+    ))
+    sleep_calls: list[float] = []
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        if len(sleep_calls) >= 2:
+            feed._stop_requested = True
+
+    with patch.dict(sys.modules, {"SmartApi.smartWebSocketV2": fake_module}), \
+         patch("app.live_feed.time.sleep", side_effect=fake_sleep), \
+         patch("app.live_feed.check_market_hours", return_value="a Saturday (market closed)"):
+        feed._run()
+
+    assert sleep_calls == [300.0, 300.0]
+    assert store.get("BANKNIFTY") is None
+
+
+def test_run_resumes_connecting_once_market_reopens():
+    store = LiveFeedStore()
+    client = FakeSmartAPIClient()
+    feed = IndexFeed(client, store, [BANKNIFTY])
+
+    attempts = {"n": 0}
+
+    class FakeWS:
+        def __init__(self, **kwargs):
+            self.on_open = None
+            self.on_data = None
+            self.on_error = None
+            self.on_close = None
+
+        def connect(self):
+            attempts["n"] += 1
+            self.on_close(self)
+            feed._stop_requested = True
+
+        def close_connection(self):
+            pass
+
+    fake_module = types.SimpleNamespace(SmartWebSocketV2=FakeWS)
+    # Closed on the first check, open on the second -- the loop must notice
+    # the transition and proceed to actually connect.
+    market_hours_results = iter(["a Saturday (market closed)", None])
+
+    with patch.dict(sys.modules, {"SmartApi.smartWebSocketV2": fake_module}), \
+         patch("app.live_feed.time.sleep"), \
+         patch("app.live_feed.check_market_hours", side_effect=lambda _now: next(market_hours_results)):
+        feed._run()
+
+    assert attempts["n"] == 1

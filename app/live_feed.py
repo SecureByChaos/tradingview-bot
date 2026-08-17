@@ -50,6 +50,9 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from app.signal_validation import check_market_hours
+from app.time_utils import utc_now
+
 logger = logging.getLogger(__name__)
 
 # Angel's WS binary tick reports last_traded_price in paise; this app's own
@@ -76,6 +79,19 @@ _STALE_AFTER_SECONDS = 30.0
 # to us). This is what keeps the feed alive indefinitely across an outage
 # lasting longer than the SDK's own retry budget.
 _RECONNECT_DELAY_SECONDS = 10.0
+
+# 17 Aug 2026: this thread is not a scheduled job, so it was never covered by
+# the 14 Aug scheduler market-hours gate (that only touched apscheduler jobs)
+# or the 15 Aug dashboard-tick fix (that only touched dashboard-poll-triggered
+# writes) -- see CLAUDE.md's "SmartAPI calls stopped outside market hours" and
+# "Dashboard kept 'updating' on closed days" entries. Without its own gate,
+# _run's reconnect loop dialed Angel's WS endpoint every _RECONNECT_DELAY_
+# SECONDS (10s) all night and every weekend, real connection attempts with
+# zero new information. Checked much less often than the open-market
+# reconnect delay -- nothing here is time-sensitive while the market's shut,
+# and re-deriving "is the market open" every 10s all night is itself pointless
+# work.
+_CLOSED_MARKET_POLL_SECONDS = 300.0
 
 
 @dataclass
@@ -218,7 +234,20 @@ class IndexFeed:
         graph size (see tests/test_module_imports.py)."""
         from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
+        was_closed = False
         while not self._stop_requested:
+            closed_reason = check_market_hours(utc_now())
+            if closed_reason is not None:
+                if not was_closed:
+                    logger.info("[LIVEFEED] Market closed (%s); pausing connection attempts", closed_reason)
+                    was_closed = True
+                self.store.mark_connected(False)
+                time.sleep(_CLOSED_MARKET_POLL_SECONDS)
+                continue
+            if was_closed:
+                logger.info("[LIVEFEED] Market open again; resuming connection attempts")
+                was_closed = False
+
             jwt_token = self._client.jwt_token
             feed_token = self._client.feed_token
             if not jwt_token or not feed_token:
