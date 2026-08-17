@@ -46,10 +46,16 @@ function renderIndices(indices) {
     const staleBadge = idx.is_live === false
       ? ' <span class="badge text-bg-warning" title="Live feed disconnected -- showing last known price">stale</span>'
       : '';
+    // No line at all (not "null (null%)") when there's no today reference
+    // yet to compute change against -- e.g. right after a restart, before
+    // any tick has been recorded today.
+    const changeLine = (idx.change_abs === null || idx.change_percent === null)
+      ? ''
+      : '<div class="' + cls + '" style="font-size:.85rem; margin-top:.2rem;">' + sign + idx.change_abs + ' (' + sign + idx.change_percent + '%)</div>';
     return '<div class="metric">' +
       '<div class="label">' + idx.display_name + staleBadge + '</div>' +
       '<div class="value">' + idx.price.toLocaleString() + '</div>' +
-      '<div class="' + cls + '" style="font-size:.85rem; margin-top:.2rem;">' + sign + idx.change_abs + ' (' + sign + idx.change_percent + '%)</div>' +
+      changeLine +
       '</div>';
   }).join('');
 }
