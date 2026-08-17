@@ -295,7 +295,7 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
-### same_direction_entries_today outcome backtest built, NOT run -- follow-up to the 11 Aug hard gate (17 Aug 2026)
+### same_direction_entries_today outcome backtest -- run for real, INCONCLUSIVE (17 Aug 2026)
 
 **Trigger**: a proposal to add a live-ADX-based early-exit trigger for running trades
 ("if the trend weakens mid-trade, exit regardless of trailing state"). Discussed before
@@ -340,13 +340,40 @@ field-absent-vs-zero distinction, the tick-based MFE/MAE derivation, the populat
 (AI Origination only, closed only, context JSON required), and both bootstrap comparisons
 detecting a real synthetic effect.
 
-**Not run** -- same sandbox constraint as every other backtest script in this project:
-`sqlite3.OperationalError: no such table: strategy_trades` against this environment's
-`data/trading.db`. Run on the machine with real history:
+**Not run in this sandbox** -- same constraint as every other backtest script in this
+project: `sqlite3.OperationalError: no such table: strategy_trades` against this
+environment's `data/trading.db`.
 
 ```bash
 python -m scripts.same_direction_entries_backtest --db data/trading.db
 ```
+
+**Run for real, same day, on production data.** Population was thin from the start: 48
+of the 69 closed AI Origination trades were excluded outright for predating the
+`same_direction_entries_today` field, leaving only 21 usable. Buckets: `0` n=10 (40.0%
+win, +0.56% mean P&L), `1` n=7 (57.1% win, +0.31%), `2` n=3 (33.3% win, -6.00%), `3+` n=1
+(0% win, -12.98%) -- every bucket individually below the trust minimum, exactly as
+expected given the gate's own effect on the population.
+
+- **Bucket 0 vs bucket 1**: bootstrap 90% CI `[-5.68, +7.02]`, crosses zero -- no
+  reliable difference. No case for tightening the gate to `>=1`.
+- **`<2` combined (n=17) vs `>=2` combined (n=4)**: bootstrap 90% CI `[+0.72, +15.54]`,
+  excludes zero -- on its face "reliably better" below the gate. **Not trustworthy as
+  stated**: the `>=2` side is 4 trades, and the entire `3+` bucket is a single `-12.98%`
+  loss doing most of the work in that gap. This is the same single-outlier-as-pattern
+  shape the break-confirmation backtest's n=1 bucket was explicitly not treated as
+  evidence for, and the same standard applies here.
+
+**Verdict: INCONCLUSIVE, not CONFIRMED.** The point estimates lean toward the shipped
+`>=2` threshold being the right call (not toward loosening it), but n=4 -- dominated by
+one trade -- does not clear this project's own bar for calling a threshold validated.
+No code change indicated by this result. Worth noting structurally: because the gate has
+blocked new entries at `>=2` since 11 Aug, this specific comparison's weaker side cannot
+grow beyond pre-gate history -- unlike most "insufficient evidence, keep watching" calls
+elsewhere in this file, more paper trading will not on its own fix this population's
+size. If this needs a real answer, it would have to come from loosening or removing the
+gate temporarily to accumulate fresh `>=2` observations, which is a real risk/reward
+decision this note does not make on its own.
 
 Read the two bootstrap comparisons before concluding anything; a bucket flagged below the
 20-observation trust minimum is an expected outcome for 2/3+ given the gate's own effect
