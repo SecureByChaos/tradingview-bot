@@ -83,6 +83,25 @@ class AISettings(Base):
     secondary_model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     secondary_api_key: Mapped[str] = mapped_column(String(512), default="", nullable=False)
     secondary_base_url: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    # AI Origination-only manual risk knobs (17 Aug 2026) -- both default to the
+    # values the code previously hardcoded (app/ai/originator.py's
+    # _MAX_SL_TARGET_PERCENT / _DEFAULT_MAX_SAME_DIRECTION_LOSSES), so deploying
+    # this column changes nothing until an admin actually edits it.
+    #
+    # ai_origination_max_sl_percent caps only the AI's proposed STOP -- the
+    # target keeps its own separate hardcoded 50% ceiling. A trade whose
+    # sl_percent or target_percent falls outside its respective band is not
+    # substituted with a fixed number; it falls back to trailing-stop
+    # methodology instead (see _open_trade's _stop_is_sane/_target_is_sane).
+    ai_origination_max_sl_percent: Mapped[float] = mapped_column(Float, default=50.0, nullable=False)
+    # Not an entry-count gate -- a CONSECUTIVE-LOSS gate. Blocks a new
+    # same-direction (index+action) AI Origination entry only once the most
+    # recent N same-direction trades today were losses IN A ROW; a single win
+    # anywhere in that window resets the streak to 0. Replaces the original
+    # 11 Aug pure-count gate (_MAX_SAME_DIRECTION_ENTRIES_BEFORE_BLOCK), which
+    # blocked a 3rd same-direction entry regardless of whether the first two
+    # had won -- see app/ai/originator.py's _same_direction_consecutive_losses.
+    ai_origination_max_same_direction_losses: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

@@ -222,6 +222,8 @@ def _ensure_columns() -> None:
             "secondary_model": "ALTER TABLE ai_settings ADD COLUMN secondary_model VARCHAR(128) NOT NULL DEFAULT ''",
             "secondary_api_key": "ALTER TABLE ai_settings ADD COLUMN secondary_api_key VARCHAR(512) NOT NULL DEFAULT ''",
             "secondary_base_url": "ALTER TABLE ai_settings ADD COLUMN secondary_base_url VARCHAR(512) NOT NULL DEFAULT ''",
+            "ai_origination_max_sl_percent": "ALTER TABLE ai_settings ADD COLUMN ai_origination_max_sl_percent FLOAT NOT NULL DEFAULT 50.0",
+            "ai_origination_max_same_direction_losses": "ALTER TABLE ai_settings ADD COLUMN ai_origination_max_same_direction_losses INTEGER NOT NULL DEFAULT 2",
         }
         with engine.begin() as connection:
             for column, statement in ai_statements.items():
