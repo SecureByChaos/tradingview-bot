@@ -295,6 +295,99 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination job moved off a 24/7 IntervalTrigger; three more scheduled jobs gained NSE-holiday awareness (18 Aug 2026)
+
+**Requested**: "I want nothing should run after market hours and holiday. It is wasting resources."
+Follow-up to a question about why `[AI][ORIGIN] Skipped: Signal received outside NSE trading
+hours` kept appearing in the log every 5 minutes overnight -- the answer at the time was "nothing
+real happens, the market-hours gate inside the job fires first and returns before touching
+SmartAPI" (true, and already the state of the world since the 14 Aug fix), but the *scheduler job
+itself* still woke up every 5 minutes around the clock to run that check, which is real scheduler
+overhead and log spam even though the work inside is free. This pass tightens the outer trigger
+itself, not just the inner gate, plus closes two smaller holiday-only gaps found while auditing
+every scheduled job against the request's literal "and holiday."
+
+**`ai-origination-check`**: was `IntervalTrigger(minutes=5)`, unconditional, 288 firings/day
+every day including weekends. `IntervalTrigger` has no day/time-of-day option, which is exactly
+why this was never fixed at the trigger level before -- the 14 Aug fix could only add an in-job
+gate. Replaced with `CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5")`, the same
+pattern `option-chain-collect` already uses one function below it in this same file. The in-job
+`check_market_hours()` call stays exactly as it was -- it's still the real, fine-grained gate
+(covers the 09:00-09:15/15:30-15:55 slop this range leaves on both sides, and NSE holidays, which
+`CronTrigger` has no calendar for at all) -- but the job now only wakes up ~84 times on an
+ordinary trading day and zero times on a weekend, instead of 288 times every single day.
+
+**`pre-market-health`**: fired on every NSE holiday landing on a weekday (`CronTrigger`'s
+`day_of_week="mon-fri"` doesn't know the holiday calendar), making one real broker health-check
+call each time. Wrapped in a new module-level `_run_pre_market_health_if_trading_day()` that
+checks `trading_day_reason()` first -- deliberately NOT added to `HealthManager.run()` itself,
+since the "Run Health Check" button on the SmartAPI Health page also calls `run()` directly, and
+a holiday is exactly a day an admin might legitimately want to run it manually (e.g. checking
+credentials ahead of the next trading day). Kept module-level rather than a closure inside
+`create_scheduler()` specifically so it's directly unit-testable.
+
+**`ai-daily-summary` / `ai-weekly-report` / `ai-monthly-report`**: same gap -- all three
+`CronTrigger`s fire on any weekday including NSE holidays, and if a real narrative provider is
+configured, that means a genuine LLM API call to summarize a day nothing traded. Their
+`run_*_job()` scheduler-only wrappers (in `app/reports.py`, already separate from the
+`generate_*` functions the Reports page's own "Generate Now" buttons call, so this doesn't touch
+the manual path) now check `trading_day_reason()` first. `run_monthly_report_job()`'s existing
+`is_last_trading_day_of_month()` check only ever accounted for weekends by its own docstring --
+if the last weekday of the month happens to also be an NSE holiday, the month now simply goes
+without a report rather than generating one for a day nothing traded.
+
+**Also fixed, prompted by the original "why does it say signal" question**: the log line itself.
+`check_market_hours()`'s return text ("Signal received outside NSE trading hours...") is worded
+for its other caller -- validating an incoming TradingView webhook, a real event -- and
+AI Origination's own periodic self-check reused it verbatim, which read as though a trading
+signal had actually arrived at 11pm. Both call sites (`originator.py`'s `[AI][ORIGIN] Cycle
+skipped -- ...` and `live_feed.py`'s `[LIVEFEED] Market closed (...)`) now strip the leading
+"Signal received " phrase before logging, rather than changing `check_market_hours()`'s actual
+return value (which is still correct for its real webhook-validation caller).
+
+**Deliberately NOT touched: `trade-monitor` (30s, still `IntervalTrigger`, still only
+weekday/holiday-gated, not hour-gated).** This is unchanged from the 14 Aug decision, restated
+here because the current request's blanket "nothing should run after hours" phrasing would
+naturally extend to it too. It stays as-is on purpose: this job must keep running through every
+hour of an actual trading day, including right up to and past 15:15, so it can still catch a
+trade the square-off missed for some reason rather than going silent on it. Its own
+empty-open-trades early return already makes an off-hours firing next to free (one indexed DB
+query, no SmartAPI). Narrowing its firing window would trade away a real safety net for savings
+that are already close to zero. A new test (`test_trade_monitor_stays_a_24_7_interval_trigger`)
+pins this down explicitly so a future pass doesn't "fix" it by accident while sweeping the rest
+of this file.
+
+**Also confirmed unaffected, no change needed**: `daily-square-off` and `closing-auction-capture`
+already fire once/day at a fixed cron time rather than repeatedly, so their residual holiday cost
+is a single already-cheap call (`square_off_all`'s own empty-open-trades early return) rather
+than something worth adding a calendar check for.
+
+12 new tests: `tests/test_scheduler.py` (7 -- `_run_pre_market_health_if_trading_day` skips on a
+weekend/holiday and runs on an ordinary day; `ai-origination-check`'s registered trigger is a
+`CronTrigger` with the right day_of_week/hour/minute fields, not present at all when no job is
+given; `pre-market-health` wires through the scheduler correctly; `trade-monitor` stays an
+`IntervalTrigger`) and `tests/test_report_scheduler_holiday_gate.py` (5 -- each `run_*_job`
+skips on a weekend/holiday without ever opening a DB session, runs normally on an ordinary
+trading day, and the monthly job's NSE-holiday-on-a-last-weekday edge case). 3 existing
+assertions in `tests/test_market_hours_gate.py` updated for the new log wording.
+
+Full suite: 333 passed (was 321). `python -c "import app.main"` imports cleanly -- the new
+`app.signal_validation`/`app.time_utils` imports in `scheduler.py` and `reports.py` don't
+introduce a circular import.
+
+**Verified live**: started the app against a scratch SQLite DB, confirmed the startup log shows
+exactly 8 scheduled jobs registering cleanly with no errors (including the new
+`create_scheduler.<locals>.<lambda>` entry for the pre-market-health wrapper), and confirmed the
+app still serves requests normally afterward.
+
+**Not verified against real overnight/holiday production traffic** -- that needs the actual
+deploy running through a real night and a real NSE holiday to confirm the job-firing-frequency
+drop shows up in practice. After deploying, the check is: `journalctl`'s
+`[AI][ORIGIN] Cycle skipped` lines should stop appearing between roughly 16:00 and 09:00 IST and
+across weekends entirely (a few residual firings in the 09:00-09:15/15:30-15:55 edges are
+expected and fine), and `sudo journalctl -u tradingview-bot | grep "pre-market-health\|ai-daily-summary"`
+around the next NSE holiday should show no broker-health or report-generation activity that day.
+
 ### Dashboard showed "Unavailable" instead of the last known price -- a direct side effect of the live-feed market-hours gate above (17 Aug 2026)
 
 **Reported**: a mobile screenshot of `/` showing both indices as "Unavailable" under a "Market

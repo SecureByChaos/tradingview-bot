@@ -29,7 +29,7 @@ def test_run_origination_checks_skips_entirely_on_a_weekend(monkeypatch, caplog)
     with caplog.at_level("INFO"):
         originator.run_origination_checks(_ExplodingSmartAPI(), _ExplodingOptionFinder())
     messages = [r.message for r in caplog.records]
-    assert any("Skipped: Signal received on a Saturday" in m for m in messages)
+    assert any("Cycle skipped -- on a Saturday" in m for m in messages)
 
 
 def test_run_origination_checks_skips_entirely_on_an_nse_holiday(monkeypatch, caplog):
@@ -37,7 +37,7 @@ def test_run_origination_checks_skips_entirely_on_an_nse_holiday(monkeypatch, ca
     with caplog.at_level("INFO"):
         originator.run_origination_checks(_ExplodingSmartAPI(), _ExplodingOptionFinder())
     messages = [r.message for r in caplog.records]
-    assert any("Skipped: Signal received on an NSE trading holiday" in m for m in messages)
+    assert any("Cycle skipped -- on an NSE trading holiday" in m for m in messages)
 
 
 def test_run_origination_checks_skips_entirely_late_evening_on_a_weekday(monkeypatch, caplog):
@@ -47,7 +47,7 @@ def test_run_origination_checks_skips_entirely_late_evening_on_a_weekday(monkeyp
     with caplog.at_level("INFO"):
         originator.run_origination_checks(_ExplodingSmartAPI(), _ExplodingOptionFinder())
     messages = [r.message for r in caplog.records]
-    assert any("Skipped: Signal received outside NSE trading hours" in m for m in messages)
+    assert any("Cycle skipped -- outside NSE trading hours" in m for m in messages)
 
 
 def test_run_origination_checks_still_requires_smartapi_and_option_finder(monkeypatch, caplog):

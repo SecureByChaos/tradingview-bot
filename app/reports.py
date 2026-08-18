@@ -14,7 +14,8 @@ from app.ai.repository import get_settings as get_ai_settings
 from app.database import SessionLocal
 from app.db_models import AIReport, AISettings, AITradeReview, ReportType, StrategyTrade, TradeResult, TradeStatus
 from app.platform import log_event, today_ist
-from app.time_utils import to_ist
+from app.signal_validation import trading_day_reason
+from app.time_utils import to_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -652,6 +653,15 @@ def generate_origination_summary(db: Session, lookback_days: int | None = 30) ->
 # ---------------------------------------------------------------------------
 
 def run_daily_summary_job() -> None:
+    # 18 Aug 2026: cron's day_of_week="mon-fri" doesn't know about NSE
+    # holidays, so this fired -- and, if a real narrative provider is
+    # configured, made a real LLM call -- for an "empty" report on a weekday
+    # holiday when nothing traded. Skipped here rather than in
+    # generate_daily_summary itself, which the Reports page's own "Generate
+    # Now" button also calls and must keep working any day, holiday
+    # included.
+    if trading_day_reason(to_ist(utc_now())) is not None:
+        return
     with SessionLocal() as db:
         try:
             generate_daily_summary(db)
@@ -660,6 +670,8 @@ def run_daily_summary_job() -> None:
 
 
 def run_weekly_report_job() -> None:
+    if trading_day_reason(to_ist(utc_now())) is not None:
+        return
     with SessionLocal() as db:
         try:
             generate_weekly_report(db)
@@ -670,6 +682,13 @@ def run_weekly_report_job() -> None:
 def run_monthly_report_job() -> None:
     today = today_ist()
     if not is_last_trading_day_of_month(today):
+        return
+    if trading_day_reason(to_ist(utc_now())) is not None:
+        # is_last_trading_day_of_month only accounts for weekends (see its
+        # own docstring) -- if the last weekday of the month happens to also
+        # be an NSE holiday, skip rather than generate on a day nothing
+        # traded. The month simply goes without one in that (rare) case,
+        # same as any other trading-day-only job here.
         return
     with SessionLocal() as db:
         try:

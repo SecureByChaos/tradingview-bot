@@ -239,7 +239,14 @@ class IndexFeed:
             closed_reason = check_market_hours(utc_now())
             if closed_reason is not None:
                 if not was_closed:
-                    logger.info("[LIVEFEED] Market closed (%s); pausing connection attempts", closed_reason)
+                    # closed_reason's own wording ("Signal received...") is
+                    # written for check_market_hours()'s other caller
+                    # (validating an incoming TradingView webhook) -- not
+                    # relevant here, so only the reason itself is logged.
+                    logger.info(
+                        "[LIVEFEED] Market closed (%s); pausing connection attempts",
+                        closed_reason.replace("Signal received ", "", 1),
+                    )
                     was_closed = True
                 self.store.mark_connected(False)
                 time.sleep(_CLOSED_MARKET_POLL_SECONDS)
