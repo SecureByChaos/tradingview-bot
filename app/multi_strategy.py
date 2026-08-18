@@ -54,6 +54,35 @@ _STALL_BAND_PERCENT = 5.0
 _AI_ORIGIN_TRAIL_ACTIVATION_PERCENT = 8.0
 _AI_ORIGIN_TRAIL_OFFSET_PERCENT = 5.0
 
+# NV1 only. 18 Aug 2026: NV1 opened a same-day-expiry (0 DTE) Nifty PE that lost
+# -25.52%, beyond even its own correctly-rescaled 23.9% stop (confirmed via
+# nv1_stop_check.py against the real trade row -- the CE/PE symmetric-premium
+# rescale computed and stored exactly 23.9%; the extra -1.62pp was execution
+# slippage on a fast-moving 0 DTE premium between 30s monitor ticks). 0 DTE is
+# more extreme than the worst bucket stop_survivability.py ever measured
+# (36.5% noise-breach at 2-5 DTE on Bank Nifty calls, rising as DTE shrinks) --
+# AI Origination has carried an equivalent floor (_MIN_DTE_TO_TRADE in
+# app/ai/originator.py) since 3 Aug for the same reason; rule-based strategies
+# never got one because handle_signal never passed min_dte to
+# find_atm_contract at all.
+#
+# Scoped to NV1 alone, not all four rule-based strategies -- BNV5.1/BNV6/BNV7
+# are the currently-profitable strategies under this file's own change-freeze
+# (see CLAUDE.md's "shared-FIXED-branch hazard"), and NV1 is the one that
+# actually hit this, fires under 3x/month, and is already flagged elsewhere as
+# the least statistically tested of the four.
+#
+# Trade-off, deliberately accepted rather than hidden: option_finder.py's
+# expiry_itm_strikes shift (NV1's "Expiry ITM" setting) only ever fires when
+# find_atm_contract's selected expiry IS today (is_expiry_day). Rolling past
+# 0 DTE here means that branch can never trigger for NV1 again -- this floor
+# does not tighten the existing expiry-day mitigation, it removes the
+# scenario it was built for. Accepted because today's real result shows the
+# ITM shift alone did not keep the loss inside the intended stop distance;
+# not trading 0 DTE at all is the more direct fix for what was actually
+# measured.
+_NV1_MIN_DTE = 1
+
 
 class MultiStrategyTradeManager:
     def __init__(
@@ -130,8 +159,11 @@ class MultiStrategyTradeManager:
             message = f"Rejected: index '{strategy.index_symbol}' is not configured/enabled. Configure it in Settings > Instruments."
             log_event(db, "STATE", f"[STATE] FAILED_ENTRY {signal.value}", "WARNING", {"strategy": strategy.name, "reason": message})
             return WebhookResponse(accepted=False, message=message)
+        min_dte = _NV1_MIN_DTE if strategy.name == "NV1" else 0
         try:
-            contract = self.option_finder.find_atm_contract(signal, index, strategy.expiry_itm_strikes)
+            contract = self.option_finder.find_atm_contract(
+                signal, index, strategy.expiry_itm_strikes, min_dte=min_dte
+            )
             entry_price = self.smartapi.get_ltp(contract.exchange, contract.tradingsymbol, contract.symboltoken)
         except Exception as exc:
             log_event(
