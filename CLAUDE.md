@@ -353,9 +353,16 @@ and not a global default change; a similarly-named strategy (`NV1B`) does NOT in
 confirming the match is exact-name, not a prefix. Full suite: 336 passed (was 333).
 `python -c "import app.main"` imports cleanly.
 
-**Not verified live** -- this sandbox has no deployed server or real option-chain data to
-confirm the roll-forward actually engages against a real Nifty expiry calendar. After deploying,
-the check is straightforward: on NV1's next Nifty expiry day, confirm the log line
+**Deployed and verified same day.** PR #39 pulled to production and `tradingview-bot.service`
+restarted cleanly. Before deploying, a second diagnostic script confirmed the trigger trade's
+`expiry_itm_strikes=1` mitigation had fired exactly as designed -- recorded strike 24300 vs.
+computed ATM 24250, a clean +50 (one strike interval) shift ITM for a PE, matching
+`option_finder.py`'s `atm_strike + itm_shift` rule. **The ITM shift was not the gap.** It worked
+correctly and the trade still overshot its correctly-rescaled 23.9% stop by 1.62pp to close at
+-25.52% -- the strongest possible confirmation that the DTE floor, not a broken mitigation, was
+the right fix. Still not verified against a real roll-forward: this confirms the *diagnosis*, not
+that `min_dte=1` actually re-selects a later expiry against a live Nifty expiry calendar. That
+check is still pending NV1's next Nifty expiry day -- confirm the log line
 `"%s: rolled from %s to %s to satisfy the %s-DTE floor"` (from `option_finder.py`) appears for
 NV1 specifically, and that the resulting trade's `expiry` column is not today's date.
 
