@@ -295,6 +295,70 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### NV1 gets a 1-DTE floor -- traded 0 DTE today and lost beyond even its own correctly-rescaled stop (18 Aug 2026)
+
+**Requested**: "We have to minimise losses as they are bugger [bigger] than wins", following a
+review of 18 Aug's 7 real trades. Investigated with the user before building: NV1's `BUY_PE`
+lost -25.52% on a config with `SL % = 15.0`, a 7-minute hold, `exit_reason=STOPLOSS`.
+
+**First confirmed what did NOT go wrong.** A diagnostic script
+(`nv1_stop_check.py`, run against real `data/trading.db`) showed the CE/PE symmetric-premium
+rescale (`app/premium_model.symmetric_premium_percent`, see "Put/call sensitivity asymmetry"
+below) computed and stored exactly what it should: nominal 15% -> rescaled 23.9% for a Nifty PE
+at the traded DTE, `stoploss` column matching to the cent (entry 84.85 -> stoploss 64.57). The
+extra -1.62pp beyond that (actual exit 63.2) is ordinary execution slippage -- the 30s monitor
+tick can't fill exactly at the computed stoploss price if premium gaps past it between checks on
+a fast-moving contract. Neither of those is a bug.
+
+**What actually happened: `dte=0`.** NV1 traded a same-day-expiry contract. `stop_survivability.py`
+already measured that a fixed stop's noise-breach rate rises sharply as DTE shrinks -- 36.5% at
+2-5 DTE versus 23.4% at 6-10 DTE on Bank Nifty calls, the worst bucket that analysis even tested.
+0 DTE is more extreme than either: gamma and theta both spike hardest on expiry day, which is
+exactly the shape of "correctly-computed stop, still overshoots on a fast move" seen here.
+AI Origination has carried an equivalent floor (`_MIN_DTE_TO_TRADE = 5` in `app/ai/originator.py`)
+since 3 Aug for this precise reason. **Rule-based strategies never got one** -- `handle_signal` in
+`app/multi_strategy.py` never passed `min_dte` to `find_atm_contract` at all, so it silently
+defaulted to 0 for BNV5.1/BNV6/BNV7/NV1 alike.
+
+**A real wrinkle surfaced before shipping anything**: NV1's "Expiry ITM" setting
+(`StrategyConfig.expiry_itm_strikes`) turns out to be an expiry-day-specific mitigation, not an
+unrelated field -- `option_finder.py`'s `find_atm_contract` only applies the ITM strike shift
+`if is_expiry_day and expiry_itm_strikes > 0`. That means 0 DTE trading for NV1 looks
+deliberately anticipated, with a partial mitigation already built for it (an ITM strike retains
+more intrinsic value than ATM on the last day, which is less all-or-nothing). Flagged to the user
+before proceeding: a hard `min_dte` floor doesn't tighten that mitigation, it removes the only
+scenario it exists for, since `find_atm_contract` rolling past today's expiry means
+`is_expiry_day` can never be true for NV1 again.
+
+**Shipped anyway, deliberately** -- today's real result is the deciding evidence: even with
+whatever the ITM shift contributed, the loss overshot the correctly-computed 23.9% stop by
+another 1.62pp on a contract that had zero days of time value left to cushion a fast move. Not
+trading 0 DTE at all is the more direct fix for what was actually measured, and the ITM-shift
+mitigation is not proven to be enough on its own. New `_NV1_MIN_DTE = 1` in
+`app/multi_strategy.py`, threaded through as `min_dte=min_dte if strategy.name == "NV1" else 0`
+at the `find_atm_contract` call site -- `find_atm_contract`'s existing `min_dte` behaviour
+(inherited from the AI Origination floor) **rolls forward to the next listed expiry rather than
+declining to trade**, so NV1 keeps firing on an ordinary day, just never against today's expiry.
+
+**Scoped to NV1 alone, not all four rule-based strategies.** BNV5.1/BNV6/BNV7 are the
+currently-profitable strategies under this file's own "shared-FIXED-branch hazard" change-freeze;
+NV1 is the one that actually hit this, fires under 3x/month per the existing backtest note, and
+is already the least statistically tested of the four. Widening this to the other three would be
+a materially bigger, unvalidated change to strategies explicitly flagged elsewhere as
+off-limits -- not done here.
+
+3 new tests (`tests/test_nv1_dte_floor.py`): NV1's entry passes `min_dte=1` to the option finder;
+a different strategy (BNV7) still passes `min_dte=0`, confirming the floor is genuinely scoped
+and not a global default change; a similarly-named strategy (`NV1B`) does NOT inherit the floor,
+confirming the match is exact-name, not a prefix. Full suite: 336 passed (was 333).
+`python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox has no deployed server or real option-chain data to
+confirm the roll-forward actually engages against a real Nifty expiry calendar. After deploying,
+the check is straightforward: on NV1's next Nifty expiry day, confirm the log line
+`"%s: rolled from %s to %s to satisfy the %s-DTE floor"` (from `option_finder.py`) appears for
+NV1 specifically, and that the resulting trade's `expiry` column is not today's date.
+
 ### AI Origination job moved off a 24/7 IntervalTrigger; three more scheduled jobs gained NSE-holiday awareness (18 Aug 2026)
 
 **Requested**: "I want nothing should run after market hours and holiday. It is wasting resources."
