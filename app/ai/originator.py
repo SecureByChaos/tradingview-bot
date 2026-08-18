@@ -1231,7 +1231,13 @@ def run_origination_checks(
     # working exactly as before.
     closed_reason = check_market_hours(utc_now())
     if closed_reason is not None:
-        logger.info("[AI][ORIGIN] Skipped: %s", closed_reason)
+        # check_market_hours()'s own wording ("Signal received outside...")
+        # is written for its other caller -- validating an incoming
+        # TradingView webhook, a real event. Reused verbatim here it read as
+        # though a trading signal had arrived at 11pm, when this is just the
+        # scheduled origination cycle's own periodic check finding the
+        # market shut. Stripped down to the reason only for this log line.
+        logger.info("[AI][ORIGIN] Cycle skipped -- %s", closed_reason.replace("Signal received ", "", 1))
         return
     owns_session = db is None
     session = db or SessionLocal()

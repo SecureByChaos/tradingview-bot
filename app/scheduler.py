@@ -9,8 +9,25 @@ from zoneinfo import ZoneInfo
 
 from app import reports
 from app.monitor import TradeMonitor
+from app.signal_validation import trading_day_reason
+from app.time_utils import to_ist, utc_now
 
 IST = ZoneInfo("Asia/Kolkata")
+
+
+def _run_pre_market_health_if_trading_day(health_manager: object) -> None:
+    """CronTrigger's day_of_week="mon-fri" doesn't know about NSE holidays,
+    so the scheduled job fired (and made a real broker health-check call) on
+    every holiday that lands on a weekday. Wrapped rather than gating
+    HealthManager.run() itself -- the "Run Health Check" button on the
+    SmartAPI Health page also calls run() directly, and a holiday is exactly
+    a day an admin might legitimately want to run it manually (e.g. checking
+    credentials ahead of the next trading day). Module-level (not a closure
+    inside create_scheduler) so it's directly testable without spinning up a
+    real scheduler."""
+    if trading_day_reason(to_ist(utc_now())) is not None:
+        return
+    health_manager.run()
 
 
 def create_scheduler(
@@ -31,9 +48,21 @@ def create_scheduler(
         coalesce=True,
     )
     if originator_job is not None:
+        # 18 Aug 2026: was IntervalTrigger(minutes=5), firing 24/7 by
+        # construction (IntervalTrigger has no day/time-of-day option) --
+        # every firing outside 09:15-15:30 IST was a guaranteed no-op via the
+        # in-job check_market_hours() gate, but still real scheduler overhead
+        # and a log line every 5 minutes all night and every weekend. Narrowed
+        # to weekdays + roughly session hours here, same pattern
+        # option-chain-collect already uses below: the cron is a coarse first
+        # gate, the job's own check_market_hours() call remains the real one
+        # (covers the 09:00-09:15/15:30-15:55 slop this range leaves and NSE
+        # holidays, which CronTrigger has no calendar for) -- a holiday now
+        # costs a handful of cheap no-op firings within this window rather
+        # than 288 of them across a full day.
         scheduler.add_job(
             originator_job,
-            trigger=IntervalTrigger(minutes=5),
+            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
             id="ai-origination-check",
             replace_existing=True,
             max_instances=1,
@@ -96,7 +125,7 @@ def create_scheduler(
         )
     if health_manager is not None:
         scheduler.add_job(
-            health_manager.run,
+            lambda: _run_pre_market_health_if_trading_day(health_manager),
             trigger=CronTrigger(day_of_week="mon-fri", hour=9, minute=0, timezone=IST),
             id="pre-market-health",
             replace_existing=True,
