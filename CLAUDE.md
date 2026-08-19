@@ -295,6 +295,82 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Per-provider confidence backtest tooling built -- Claude/OpenAI confirmed on different scales, floor value NOT yet decided (19 Aug 2026)
+
+**Requested**: root-cause writeup showed the shared 0.60 confidence floor (14 Aug) gates
+Claude out of trading almost entirely -- 393/394 of its post-floor decisions fall below
+0.60 (mean 0.304), versus 2/258 for OpenAI (mean 0.827). Claude's own max observed value
+(0.75) sits barely above OpenAI's *average*. Requested: a per-provider backtest to check
+whether Claude needs its own, lower floor calibrated to its own scale, or whether its
+confidence field isn't informative at all -- plus, if supported, implement a per-provider
+floor; and separately, flag (not fix) why the two providers' scales differ in the first
+place.
+
+**Built, deliverable 1**: `scripts/confidence_by_provider_backtest.py`. Same
+`_load_entries`/bootstrap-CI/`MIN_BUCKET_LIVE=20` machinery as
+`confidence_sizing_backtest.py` (duplicated per this project's established per-script
+convention), split by provider via a new `_provider_from_origin()` parse of the `origin`
+suffix (`AI_ORIGIN_OPENAI`/`AI_ORIGIN_CLAUDE` -> `openai`/`claude`; anything else under
+`AI_ORIGIN_%` is skipped with a loud warning rather than silently mis-bucketed, in case a
+third provider is ever added). Two independent reports:
+
+- **OpenAI reconfirmation**: reruns the *exact* original bucket boundaries (`<0.60,
+  0.60-0.75, 0.75-0.85, >0.85`) and the original 0.60 floor bootstrap check, filtered to
+  `provider='openai'` only -- same bins on purpose, so the result is directly comparable
+  to the already-validated pooled backtest rather than a new measurement.
+- **Claude analysis**: bins sized to Claude's own observed range (`<0.20, 0.20-0.35,
+  0.35-0.50, >=0.50`, per the request's own suggested bins) rather than reusing OpenAI's,
+  which would dump nearly everything Claude produces into one bucket. Sweeps three
+  candidate floor cuts (0.20/0.35/0.50) via the same bootstrap-mean-diff comparison the
+  original 0.60 pick used, reporting the full surface rather than picking a winner. Warns
+  explicitly if Claude's entire population sits below the trust minimum, noting the same
+  structural constraint as the `same_direction_entries_today` backtest: post-floor, Claude
+  opens almost no new trades, so this population will not grow from further paper trading
+  alone -- unlike most "insufficient evidence, keep watching" calls elsewhere in this file.
+
+12 new tests (`tests/test_confidence_by_provider_backtest.py`): provider-suffix parsing
+(including an unrecognised third-provider suffix being skipped and warned, not
+miscounted), MFE/MAE derivation reused from the ticks table, the floor-bootstrap helper
+detecting a real gap / no gap / too-thin-to-compare, and that each report function reads
+only its own provider's entries. Full suite: 369 passed (was 357).
+`python -c "import app.main"` imports cleanly (scripts/ stays outside app.main's import
+graph, per `tests/test_module_imports.py`'s existing isolation check).
+
+**Not run** -- same constraint as every other backtest script in this project: no
+`data/trading.db` with real schema in this sandbox. Run on the machine with real history:
+
+```bash
+python -m scripts.confidence_by_provider_backtest --db data/trading.db
+```
+
+**Deliverables 2 and 3 (a recommended Claude floor, and implementing a per-provider floor
+in `app/ai/originator.py`) are deliberately NOT done in this pass.** The task's own
+instruction is explicit that this is evidence-gated in either direction -- a real gradient
+within Claude's range supports a lower Claude-specific floor, no gradient means confidence
+isn't the right lever for Claude at all, and both are acceptable, reportable outcomes. Only
+the actual backtest output (from the command above, run against real
+`ai_origination_logs`/`strategy_trades` history) can distinguish them; picking a Claude
+floor from this sandbox would be exactly the single-anecdote overfitting error this
+project's own standing discipline guards against elsewhere. `_MIN_CONFIDENCE_TO_ACT`
+remains a single shared `0.60` constant in `app/ai/originator.py`, unchanged, until real
+results come back.
+
+**Deliverable 4 (flag the confidence-scale-mismatch question), answered now -- this part
+doesn't need production data, just reading the prompt.** Confirmed by grep: the *entire*
+confidence-scoring instruction anywhere in `SYSTEM_PROMPT` is the bare JSON-schema clause
+`"confidence": 0-1` -- no numeric anchors, no worked examples, no guidance distinguishing
+what 0.3 vs 0.7 vs 0.9 should mean for this specific task. `_call_openai` and `_call_claude`
+both send the identical `SYSTEM_PROMPT` constant (confirmed by grep -- no per-provider
+prompt variant exists), so the miscalibration is not from different instructions reaching
+each model. With zero anchoring, each model falls back to its own internal, differently-
+calibrated sense of "confidence" for an unfamiliar scoring task, and that is a plausible,
+sufficient explanation for two models landing on structurally different scales from the
+same three-word instruction. **Not fixed here, per the task's own scope** -- worth a future
+pass adding explicit numeric anchors (e.g. "0.5 = a plausible but unremarkable setup, 0.8 =
+a setup with multiple confirming factors and no self-flagged conflict") to `SYSTEM_PROMPT`
+and re-measuring whether that narrows the gap between providers, which would be a more
+durable fix than maintaining two permanently separate floors.
+
 ### Settings > General gets a configurable Trading Start Time; Square Off Time turned out to be a decorative field until now (19 Aug 2026)
 
 **Requested**: "Add trading start timing for strategies and ai origination trades 9:45 am by
