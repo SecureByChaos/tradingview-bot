@@ -295,6 +295,105 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Reasoning-hedge detector rebuilt with a sharper classifier, backtest tooling only -- gate NOT shipped (19 Aug 2026)
+
+**Requested**: five real trades on record where the model's own reasoning states a caution
+or a direct contradiction ("but"/"however") and trades anyway regardless -- e.g. "this is
+not an ideal fresh entry, but the bearish structure still outweighs the exhaustion risk"
+(19 Aug, confidence 0.78). Requested a hedge-language detector on `ai_reasoning`, a
+backtest of hedged-vs-not outcomes (win rate/mean P&L/mean MAE, split by provider), and --
+if validated -- a gate. A fourth, explicitly non-blocking item (make the model resolve its
+own hedge at the prompt level, rather than detect it after the fact) was deferred by the
+request itself to a separate change/testing cycle.
+
+**This revisits already-tested ground -- said plainly rather than presented as new.**
+`confidence_sizing_backtest.py`'s PART 2 (14 Aug) already tested hedge language with a flat
+5-keyword match ("cautious," "moderate," "extended," "already run," "mature") and came back
+NOT reliable: hedged mean P&L -2.08% (n=77) vs not-hedged -0.09% (n=108), bootstrap 90% CI
+`[-4.68, +0.68]`, crosses zero. What's different in this pass is the DETECTOR, not the
+underlying question -- the old flat match is diluted by words like "moderate" appearing in
+unrelated contexts. This pass targets the specific failure shape from the trigger examples
+(a stated risk clause followed by a contrastive conjunction the model then argues past)
+via three categories instead of one flat list. A sharper detector on the same population
+could reveal a real effect the old one diluted, or could reproduce the same "not reliable"
+verdict on a cleaner signal -- which would itself be a stronger negative than the original,
+not a wasted re-test.
+
+**Built, deliverables 1-2**: `scripts/reasoning_hedge_backtest.py`. `classify_hedge()`
+categorizes matched phrases into `direct_hedge` ("not ideal," "not an ideal" -- added
+alongside the request's own "not ideal" since the literal trigger quote uses the "an" form
+and would otherwise have been missed by the request's own phrase list -- "not a strong,"
+"not a high-conviction," "moderate rather than," "cautious rather than,"
+"moderate-confidence"), `contradiction_marker` ("but"/"however"/"although"/"despite"), and
+`risk_acknowledgment` ("the main caution is," "the main risk is," "already extended,"
+"already run," "no fresh breakout"). `contradiction_marker` is a deliberate simplification
+of the request's own "clause before states a risk, clause after states a decision to
+proceed" -- true clause-role parsing needs real NLP, which the request explicitly
+authorizes deferring ("start with a keyword/phrase pass... upgrade if needed"). This v1
+flags the conjunction's mere presence, which will overmatch some reasoning where "but"
+doesn't introduce a real contradiction -- documented in the script rather than quietly
+accepted, and worth tightening if that category's own bucket looks materially different
+from the other two once real data is available.
+
+A trade is `reasoning_hedged=True` if any category matches at least one phrase; matched
+phrases are retained per trade (not just the boolean) for the auditability the request
+asked for. `run_backtest()` reports the same three metrics (win rate, mean P&L, mean MAE)
+overall, per provider (Claude vs OpenAI -- reusing this cycle's `_provider_from_origin`
+pattern, duplicated per this project's established per-script convention), a matched-phrase
+frequency table, and a per-category outcome breakdown so a verdict can be traced to a
+specific category rather than treated as one signal.
+
+17 new tests (`tests/test_reasoning_hedge_backtest.py`): each category's phrase matching
+including case-insensitivity and multi-category matches, the population filter (AI
+Origination only, closed only, non-empty reasoning required), MFE/MAE from ticks (same
+established pattern as every other confidence/outcome script), provider tagging, the
+bootstrap helper detecting a real synthetic gap, and that `run_backtest` reports OpenAI/
+Claude sections independently and surfaces the matched-phrase frequency table. Full suite:
+394 passed (was 377). `python -c "import app.main"` imports cleanly.
+
+**Deliverable 3 (the gate) is deliberately NOT built this pass.** The request's own
+instruction is explicit: "same discipline as every gate this cycle -- validate before
+shipping as a hard block." This sandbox cannot run the backtest (no real `data/trading.db`,
+same standing constraint as every other backtest script here), so there is no result to
+validate against yet. Run on the machine with real history:
+
+```bash
+python -m scripts.reasoning_hedge_backtest --db data/trading.db
+```
+
+Read the per-category breakdown before concluding anything -- if `contradiction_marker`
+alone looks meaningfully worse (or better) than `direct_hedge`/`risk_acknowledgment`, that
+would mean the conjunction-presence simplification is carrying real signal despite its
+coarseness, worth knowing before deciding whether to invest in real clause-role parsing.
+If every category comes back thin or inconclusive the way the 14 Aug flat-keyword pass did,
+report that plainly -- per the request's own framing, that would mean hedge language is
+decorative rather than informative here, which is a real, useful finding, not a failure to
+build the right detector.
+
+**Section 4 (the prompt-level "resolve your own hedge" fix) is out of scope for this pass**,
+per the request's own sequencing note: "ship the detector/gate from sections 1-3 first...
+the prompt-level fix... is worth pursuing but not blocking on." Not started here. If deliverable
+3's gate ships and is later judged insufficient on its own (an after-the-fact block doesn't
+stop the model from generating the hedged reasoning in the first place, only from acting on
+it), this is the natural follow-up -- and per the request, needs the same before/after
+distribution-check discipline as the confidence-scale prompt fix above (hedge-frequency and
+hedge-then-trade-anyway frequency, pre- and post-change).
+
+**Not run** -- same constraint as every backtest script in this project. `app/ai/originator.py`
+is entirely untouched by this pass; the same-direction consecutive-loss gate, the DTE floor,
+and the confidence floor are all unmodified.
+
+**Correction to the request that prompted this**: it referred to "the new trend-extension
+gate shipped today" as an existing, live gate. No such gate exists anywhere in this
+codebase's history. `app/ai/originator.py:207-214` documents the opposite explicitly --
+`trend_duration_pct_of_session` was deliberately kept as a soft prompt caution only, never
+turned into a hard gate, because the 11 Aug incident review gave a sweep range to validate
+(80/90/95%) rather than a committed threshold, and picking one from a single day's anecdote
+was judged exactly the overfitting error this project guards against. The only real hard
+gates in `_open_trade` today are the DTE floor (`_MIN_DTE_TO_TRADE`), the same-direction
+consecutive-loss gate, and the confidence floor (`_MIN_CONFIDENCE_TO_ACT`) -- flagged here
+so this entry doesn't repeat the false premise as if it were established fact.
+
 ### Confidence-scoring instruction rewritten to reduce the Claude/OpenAI scale gap -- prompt-side fix, floor value untouched (19 Aug 2026)
 
 **Requested**: following the per-provider backtest tooling above, fix the likely mechanism
