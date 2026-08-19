@@ -441,6 +441,33 @@ anything either way. `direct_hedge` sits one trade below the trust minimum (19 v
 even a clean bootstrap result there should be read as suggestive, not confirmed, until a
 few more trades land. No gate has been added to `app/ai/originator.py`.
 
+**Per-category bootstrap run for real, same day -- FINAL VERDICT: NOT SUPPORTED, at any
+level of granularity tested.** All three categories, isolated against every trade not in
+them:
+
+- `direct_hedge`: 90% CI `[-7.47, +1.89]` -- crosses zero, and n=19 still one trade short
+  of the trust minimum.
+- `contradiction_marker`: 90% CI `[-0.75, +4.40]` -- crosses zero comfortably, confirming
+  its near-breakeven point estimate (-0.14% mean P&L) is real and not an artefact of
+  dilution.
+- `risk_acknowledgment`: 90% CI `[-6.19, +0.11]` -- the closest miss of the three (upper
+  bound barely above zero), but still crosses zero. By this project's own standard (a
+  reliable effect needs a CI that excludes zero), this does not clear the bar either.
+
+**Conclusion: hedge language in `ai_reasoning`, even with a sharper category-isolated
+detector purpose-built to rescue a signal the 14 Aug flat-keyword pass might have diluted,
+does not predict AI Origination outcomes at the current sample size (n=200).** This is the
+outcome the original request itself flagged as acceptable and important if it happened --
+"if it doesn't [correlate], that's a real and important finding... the hedge language is
+decorative, not informative" -- reported plainly rather than reached past. `risk_
+acknowledgment`'s near-miss is the one thread worth revisiting once more trades accumulate
+past its current n=25, but it is not evidence today. No gate added to `app/ai/originator.py`;
+`same_direction_entries_today`, the DTE floor, and the confidence floor remain the only
+real hard gates in `_open_trade`. Section 4 (the prompt-level "resolve your own hedge" fix)
+stays out of scope per the original request's own sequencing, and is now on weaker footing
+than before this run -- there is no validated hedge-outcome relationship left to build a
+prompt-level resolution mechanism around.
+
 ### Confidence-scoring instruction rewritten to reduce the Claude/OpenAI scale gap -- prompt-side fix, floor value untouched (19 Aug 2026)
 
 **Requested**: following the per-provider backtest tooling above, fix the likely mechanism
