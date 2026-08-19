@@ -295,6 +295,112 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Confidence-scoring instruction rewritten to reduce the Claude/OpenAI scale gap -- prompt-side fix, floor value untouched (19 Aug 2026)
+
+**Requested**: following the per-provider backtest tooling above, fix the likely mechanism
+rather than just work around it with two floors -- since both providers receive the same
+shared system prompt, check whether the scale mismatch is a prompt-interpretation gap
+before accepting it as a fixed model difference. Explicitly scoped to prompt wording only:
+does not touch the floor value, entry/exit logic, stop/target construction, or gate logic.
+Also explicitly noted by the request itself and worth restating: confidence does NOT
+predict outcome for either provider individually (OpenAI Pearson r ~ -0.04 on 170 trades;
+no reliable relationship for Claude either) -- this change is about making the two
+providers' outputs *comparable to each other*, not about making confidence a better
+quality signal. Those are separate questions.
+
+**Deliverable 1 -- exact wording, quoted.** Before this change, the *entire*
+confidence-scoring instruction anywhere in `SYSTEM_PROMPT` (`app/ai/originator.py`) was:
+
+> `{"decision": "BUY_CE"|"BUY_PE"|"NONE", "confidence": 0-1, "sl_percent": number, ...}`
+
+plus one contrastive clause earlier in the prompt ("...unlike confidence, which IS 0-1").
+That's it -- no numeric anchor example, no qualitative description, no worked example of
+what 0.3 vs 0.7 vs 0.9 should mean for this task.
+
+**Deliverable 2 -- diagnosis.** Since there is no numeric anchor anywhere in the prompt
+(no "output 0.3 if uncertain" or similar), hypothesis (a) from the request -- a model
+anchoring on a literal example value present in the prompt text -- cannot be the
+mechanism; there is no anchor value to latch onto. The evidence points to hypothesis (b):
+each model falls back to its own internal, differently-calibrated default mapping of
+certainty to a 0-1 output for an unfamiliar, completely unanchored scoring task. This
+means the fix is not "remove a bad anchor" (there wasn't one) but "add a needed shared
+reference frame where none existed" -- a real fix, but one that may not fully close the
+gap the way removing a genuinely bad literal anchor would have. Framed accordingly in the
+rewrite: relative/behavioural guidance and an explicit instruction to use the tails,
+rather than a claim that a specific wording change will make the scales identical.
+
+**Deliverable 3 -- rewritten instruction, identical for both providers.** New paragraph
+inserted into `SYSTEM_PROMPT`, in the same imperative/technical register as the rest of
+the prompt, between the EMA21-extension guidance and the existing "NONE remains the
+correct answer most of the time" line:
+
+> "Confidence must be genuinely calibrated across the full 0.0-1.0 range, not compressed
+> toward a cautious middle value. Score each setup relative to the full range of setups
+> you could see, not relative to how personally certain you feel in the abstract: reserve
+> values below 0.3 for setups you would call genuinely weak or ambiguous, values above 0.8
+> for setups with multiple confirming factors and no conflict you flag in your own
+> reasoning, and use the full range in between for everything else. A model that never
+> uses the tails of the range is not being cautious, it is compressing information the
+> downstream trading gate needs."
+
+Deliberately range-based (`below 0.3`, `above 0.8`) rather than a single-value-to-adjective
+mapping like the request's own cautioned-against `"0.3 = uncertain"` -- that shape is what
+creates a sticky anchor point in the first place. `_call_openai` and `_call_claude` both
+still reference the single `SYSTEM_PROMPT` constant (confirmed unchanged: exactly one
+`SYSTEM_PROMPT = (` assignment in the module, both call sites read it by name) -- no
+per-provider variant was introduced, which would have reintroduced the exact
+cross-provider comparability problem this exists to fix. The JSON schema clause itself
+(`"confidence": 0-1`) is untouched; the new paragraph is calibration guidance layered
+before it, not a replacement.
+
+**Deliverable 4 -- post-deployment distribution check, tooling built, not yet run.** New
+`scripts/confidence_distribution_check.py`: reads `ai_origination_logs` directly (the
+decision-level table the original 393/394 vs 2/258 counts came from, not just closed
+trades -- Claude's closed-trade sample is far too thin on its own) and reports
+min/max/mean/distinct-value-count per provider, optionally filtered with `--since` to a
+date. Meant to be run twice: once now to log the pre-change baseline (already known from
+the diagnosis: Claude 0.10-0.75, mean 0.304; OpenAI ~0.55-0.97, mean ~0.75-0.83) and again
+after 1-2 weeks of live decisions on the new prompt, per the request's own instruction not
+to judge success from a handful of trades. 4 new tests
+(`tests/test_confidence_distribution_check.py`) cover the min/max/mean/distinct
+computation, the `--since` filter, and null-confidence rows being excluded. 4 more
+(`tests/test_confidence_prompt_calibration.py`) pin the new paragraph's presence, confirm
+no single-value-to-adjective anchor pattern was reintroduced, confirm the JSON schema
+clause survived unchanged, and confirm `SYSTEM_PROMPT` is still the one shared constant
+both providers read. Full suite: 377 passed (was 369).
+
+```bash
+python -m scripts.confidence_distribution_check --db data/trading.db
+# after 1-2 weeks on the new prompt:
+python -m scripts.confidence_distribution_check --db data/trading.db --since <deploy-date>
+```
+
+**Success criterion, restated from the request**: Claude's range widening meaningfully
+toward OpenAI's -- ceiling moving well above the old 0.75, real use of both tails -- not a
+uniform shift and not "looks the same after a few trades." If the range doesn't widen
+after a genuine sample, that would mean hypothesis (b) (general calibration difference)
+dominates strongly enough that prompt wording alone can't close it, which is itself a
+useful, reportable result, not a failure to write the right words.
+
+**Deliverable 5 -- explicit, so this isn't miscast.** This change does NOT address, and
+was never expected to address, Claude's separate lower observed win rate (36% on n=25 vs
+OpenAI's ~50% on n=106 at time of writing). If Claude's win rate stays lower after a wider,
+better-calibrated confidence range accumulates, that is a real, separate finding about
+trade quality -- not evidence the prompt fix failed. The two questions (is the confidence
+*scale* comparable; is Claude's underlying *trade quality* comparable) must be evaluated
+independently. `_MIN_CONFIDENCE_TO_ACT` remains the single shared `0.60` constant,
+untouched -- deciding whether/how to use a per-provider floor is still gated on the
+backtest from the previous entry, now doubly so since the input distribution it would be
+computed against is about to shift.
+
+**Not verified live** -- this sandbox cannot call either provider's real API, so there is
+no way to observe how Claude actually responds to the new wording from here. After
+deploying: watch the next few days of `[AI][ORIGIN]` logs for any `confidence=` values
+that look implausible (e.g. clustering at exactly 0.30 or 0.80, which would suggest the
+new range boundaries became new sticky anchors -- the same failure mode in a different
+shape), then run the distribution-check script for the real before/after comparison once
+1-2 weeks of live decisions have accumulated.
+
 ### Per-provider confidence backtest tooling built -- Claude/OpenAI confirmed on different scales, floor value NOT yet decided (19 Aug 2026)
 
 **Requested**: root-cause writeup showed the shared 0.60 confidence floor (14 Aug) gates
