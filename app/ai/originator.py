@@ -29,10 +29,10 @@ from app.market_data import (
 from app.models import Signal
 from app.option_finder import OptionFinder
 from app.premium_model import days_to_expiry, symmetric_premium_percent, to_risk_units
-from app.platform import list_index_configs, log_event, record_index_tick_if_stale
+from app.platform import get_or_create_settings, list_index_configs, log_event, record_index_tick_if_stale
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
-from app.time_utils import format_ist, to_ist, utc_now
+from app.time_utils import format_ist, parse_hhmm, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -56,28 +56,35 @@ logger = logging.getLogger(__name__)
 # CLAUDE.md's "AI confidence / hedging-language sizing backtest" entry for the
 # full numbers.
 _MIN_CONFIDENCE_TO_ACT = 0.60
-# Applies to every index (Bank Nifty, Nifty, and Sensex whenever it's added) --
-# the first 15 minutes after the 9:15 open are the noisiest, whippiest part of
-# the session. Origination keeps recording price ticks during this window so
-# there's already real momentum history by the time trading is allowed, it
-# just doesn't call the AI or act on anything until the window closes.
-_TRADING_START_HOUR = 9
-# Moved from 09:30 to 09:45 in Phase 1. The opening range is 09:15-09:45, so
+# Fallback only, used when PlatformSettings.trading_start_time/square_off_time
+# (Settings > General) is missing or malformed -- see parse_hhmm. These are
+# what this app hardcoded before 19 Aug 2026, so a missing/bad setting
+# degrades to identical behaviour, never a crash.
+#
+# The first 15 minutes after the 9:15 open are the noisiest, whippiest part of
+# the session. Origination keeps recording price ticks during this window
+# regardless of the configured start time, so there's already real momentum
+# history by the time trading is allowed -- it just doesn't call the AI or
+# act on anything until the window opens.
+#
+# Moved from 09:30 to 09:45 in Phase 1: the opening range is 09:15-09:45, so
 # entries starting at 09:30 left a 15-minute window in which every
 # opening-range-derived setup was undefined -- precisely when breakout logic
 # matters most. Waiting until the range has actually closed means every entry
-# is considered against complete structural context. It also cuts trade count
-# slightly, which is the direction the cost arithmetic wants anyway.
-_TRADING_START_MINUTE = 45
+# is considered against complete structural context. Note this interacts with
+# an admin-configured start time below 09:45: the opening-range window itself
+# (app/market_context.py) is NOT tied to this setting and stays fixed at
+# 09:15-09:45, so a start time earlier than 09:45 means early entries are
+# considered against an opening range that isn't complete yet.
+_DEFAULT_TRADING_START = (9, 45)
 # Mirrors the 15:15 end-of-day square-off every other trade in this app is
 # already subject to (see monitor_open_trades in multi_strategy.py) -- without
 # this, origination had a start gate but no end gate, so it kept opening brand
 # new trades all evening (observed well past 9 PM IST). Each one got caught by
-# that same 15:15 TIME_EXIT check on the very next 30s monitor cycle and
-# closed instantly at breakeven, since that check re-evaluates every open
-# trade's age against wall-clock time on every cycle, not just once at 15:15.
-_TRADING_END_HOUR = 15
-_TRADING_END_MINUTE = 15
+# that same TIME_EXIT check on the very next 30s monitor cycle and closed
+# instantly at breakeven, since that check re-evaluates every open trade's
+# age against wall-clock time on every cycle, not just once at end-of-day.
+_DEFAULT_TRADING_END = (15, 15)
 
 # How recently the other provider must have opened the same strike and side for
 # the two to count as one correlated bet. Both providers are queried inside the
@@ -88,12 +95,12 @@ _TRADING_END_MINUTE = 15
 _CORRELATED_ENTRY_WINDOW_MINUTES = 10
 
 
-def _still_observing(now_ist) -> bool:
-    return (now_ist.hour, now_ist.minute) < (_TRADING_START_HOUR, _TRADING_START_MINUTE)
+def _still_observing(now_ist, start_hm: tuple[int, int]) -> bool:
+    return (now_ist.hour, now_ist.minute) < start_hm
 
 
-def _past_trading_end(now_ist) -> bool:
-    return (now_ist.hour, now_ist.minute) >= (_TRADING_END_HOUR, _TRADING_END_MINUTE)
+def _past_trading_end(now_ist, end_hm: tuple[int, int]) -> bool:
+    return (now_ist.hour, now_ist.minute) >= end_hm
 
 SYSTEM_PROMPT = (
     "You are an options entry-timing assistant running an independent, "
@@ -337,7 +344,13 @@ def _drift_text(value: float | None) -> str:
     return f"{value:+.2f}%" if value is not None else "not available"
 
 
-def _build_user_prompt(index: IndexConfig, current_price: float, ctx: MarketContext, now_ist: datetime) -> str:
+def _build_user_prompt(
+    index: IndexConfig,
+    current_price: float,
+    ctx: MarketContext,
+    now_ist: datetime,
+    end_hm: tuple[int, int] = _DEFAULT_TRADING_END,
+) -> str:
     """Structural market-context prompt (Phase 1b). Replaces the Phase 0/1
     eight-line tick-window prompt, whose "window high/low" and "up/down move
     count" lines were the direct cause of the diagnosed failure mode: over any
@@ -354,7 +367,7 @@ def _build_user_prompt(index: IndexConfig, current_price: float, ctx: MarketCont
     which is the backstop if this ever fails to hold.
     """
     session_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    session_close = now_ist.replace(hour=_TRADING_END_HOUR, minute=_TRADING_END_MINUTE, second=0, microsecond=0)
+    session_close = now_ist.replace(hour=end_hm[0], minute=end_hm[1], second=0, microsecond=0)
     minutes_since_open = max(int((now_ist - session_open).total_seconds() // 60), 0)
     minutes_to_close = max(int((session_close - now_ist).total_seconds() // 60), 0)
 
@@ -1260,6 +1273,13 @@ def run_origination_checks(
         # full day instead of one always winning by default.
         provider_order = _build_provider_order(settings, cycle_toggle=int(utc_now().timestamp() // 300) % 2)
 
+        # Settings > General, 19 Aug 2026 -- replaces the previously-hardcoded
+        # _DEFAULT_TRADING_START/_DEFAULT_TRADING_END module constants (now
+        # fallback-only). Fetched once per cycle, shared by every index below.
+        platform_settings = get_or_create_settings(session)
+        start_hm = parse_hhmm(platform_settings.trading_start_time, _DEFAULT_TRADING_START)
+        end_hm = parse_hhmm(platform_settings.square_off_time, _DEFAULT_TRADING_END)
+
         for index in list_index_configs(session):
             if not index.enabled:
                 continue
@@ -1284,18 +1304,18 @@ def run_origination_checks(
                 price = round(smartapi.get_index_spot(index), 2)
                 record_index_tick_if_stale(session, index.symbol, price)
                 now_ist = to_ist(utc_now())
-                if _still_observing(now_ist):
+                if _still_observing(now_ist, start_hm):
                     logger.info(
-                        "[AI][ORIGIN] %s: still observing (market open until %02d:%02d IST), recording ticks only",
-                        index.symbol, _TRADING_START_HOUR, _TRADING_START_MINUTE,
+                        "[AI][ORIGIN] %s: still observing (trading opens at %02d:%02d IST), recording ticks only",
+                        index.symbol, start_hm[0], start_hm[1],
                     )
                     continue
-                if _past_trading_end(now_ist):
+                if _past_trading_end(now_ist, end_hm):
                     logger.info(
                         "[AI][ORIGIN] %s: past trading end (%02d:%02d IST), no new entries -- "
-                        "a trade opened now would just be caught by the 15:15 square-off "
+                        "a trade opened now would just be caught by the same-time square-off "
                         "check and closed at breakeven a monitor cycle later",
-                        index.symbol, _TRADING_END_HOUR, _TRADING_END_MINUTE,
+                        index.symbol, end_hm[0], end_hm[1],
                     )
                     continue
                 # PHASE 1b: now the sole source of the entry prompt (see
@@ -1369,7 +1389,7 @@ def run_origination_checks(
                     market_context.same_direction_entries_today = _same_direction_entries_today(
                         session, index.symbol
                     )
-                    user_prompt = _build_user_prompt(index, price, market_context, now_ist)
+                    user_prompt = _build_user_prompt(index, price, market_context, now_ist, end_hm)
                     if _prompt_has_defect(user_prompt):
                         logger.error(
                             "[AI][ORIGIN] %s: malformed prompt (contains None/nan/0.00 pts), "

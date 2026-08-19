@@ -59,6 +59,14 @@ class PlatformSettings(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     square_off_time: Mapped[str] = mapped_column(String(8), default="15:15", nullable=False)
+    # 19 Aug 2026: square_off_time was editable here but not actually read by
+    # either the rule-based TIME_EXIT check (app/multi_strategy.py hardcoded
+    # 15:15) or AI Origination's end gate (app/ai/originator.py's own hardcoded
+    # _TRADING_END_HOUR/_MINUTE) -- both now read this column instead. Default
+    # "09:45" matches AI Origination's previous hardcoded _TRADING_START_HOUR/
+    # _MINUTE, so deploying this column changes nothing until an admin edits
+    # it. See handle_signal's and monitor_open_trades' trading-window checks.
+    trading_start_time: Mapped[str] = mapped_column(String(8), default="09:45", nullable=False)
     telegram_bot_token: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     telegram_chat_id: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

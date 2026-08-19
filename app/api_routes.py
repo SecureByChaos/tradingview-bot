@@ -40,6 +40,7 @@ router = APIRouter(prefix="/api")
 
 class SettingsPayload(BaseModel):
     square_off_time: str
+    trading_start_time: str = "09:45"
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
@@ -384,6 +385,7 @@ def get_settings_api(
         column: getattr(settings, column)
         for column in [
             "square_off_time",
+            "trading_start_time",
             "telegram_bot_token",
             "telegram_chat_id",
         ]

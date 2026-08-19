@@ -29,7 +29,8 @@
       <input type="hidden" name="active_tab" value="general">
       <h5>General</h5>
       <div class="form-grid">
-        <div><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"></div>
+        <div><label class="form-label">Trading Start Time</label><input class="form-control" type="time" name="trading_start_time" value="{{ settings.trading_start_time }}"><div class="form-text">No new strategy or AI Origination entries before this time. Default 09:45.</div></div>
+        <div><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"><div class="form-text">Every open strategy and AI Origination trade closes at or after this time. Max 15:15.</div></div>
       </div>
       <button class="btn btn-primary mt-4" type="submit">Save Settings</button>
     </form>
@@ -38,6 +39,7 @@
   <div class="tab-pane fade {% if tab == 'notifications' %}show active{% endif %}" id="notifications-pane" role="tabpanel">
     <form class="metric" method="post" action="/settings">
       <input type="hidden" name="square_off_time" value="{{ settings.square_off_time }}">
+      <input type="hidden" name="trading_start_time" value="{{ settings.trading_start_time }}">
       <input type="hidden" name="active_tab" value="notifications">
       <h5>Telegram Notifications</h5>
       <div class="form-grid">

@@ -229,6 +229,15 @@ def _ensure_columns() -> None:
             for column, statement in ai_statements.items():
                 if column not in existing_ai_columns:
                     connection.execute(text(statement))
+    if "settings" in table_names:
+        existing_settings_columns = {column["name"] for column in inspector.get_columns("settings")}
+        settings_statements = {
+            "trading_start_time": "ALTER TABLE settings ADD COLUMN trading_start_time VARCHAR(8) NOT NULL DEFAULT '09:45'",
+        }
+        with engine.begin() as connection:
+            for column, statement in settings_statements.items():
+                if column not in existing_settings_columns:
+                    connection.execute(text(statement))
 
 
 def _seed_default_strategy() -> None:

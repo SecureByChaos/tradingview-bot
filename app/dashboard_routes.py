@@ -636,19 +636,51 @@ def settings_page(
     return templates.TemplateResponse("settings.html", {"request": request, **_settings_context(db, smartapi, tab)})
 
 
+def _parse_hhmm_strict(value: str) -> tuple[int, int] | None:
+    """Like time_utils.parse_hhmm but returns None on anything malformed
+    instead of silently falling back -- admin form input should be rejected,
+    not quietly coerced."""
+    try:
+        hour_text, minute_text = value.strip().split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+    except (ValueError, AttributeError):
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
 @router.post("/settings")
 def update_settings_page(
     db: Annotated[Session, Depends(get_db)],
     square_off_time: Annotated[str, Form()],
+    trading_start_time: Annotated[str, Form()] = "09:45",
     telegram_bot_token: Annotated[str, Form()] = "",
     telegram_chat_id: Annotated[str, Form()] = "",
     active_tab: Annotated[str, Form()] = "general",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> RedirectResponse:
+    start_hm = _parse_hhmm_strict(trading_start_time)
+    end_hm = _parse_hhmm_strict(square_off_time)
+    # Bounds match this app's own established trading-day facts rather than
+    # arbitrary ones: 09:15 is the NSE open (app/signal_validation.py's
+    # NSE_HOLIDAYS/check_market_hours window), and 15:15 is the ceiling
+    # because app/scheduler.py's daily-square-off safety-net cron is still
+    # fixed at 15:15 -- a configured close later than that would let the cron
+    # force-close trades before the admin's own intended closing time.
+    if (
+        start_hm is None
+        or end_hm is None
+        or start_hm < (9, 15)
+        or end_hm > (15, 15)
+        or start_hm >= end_hm
+    ):
+        raise HTTPException(status_code=400, detail="Invalid trading window: start/close must be HH:MM, 09:15 <= start < close <= 15:15")
     settings = get_or_create_settings(db)
     apply_settings(
         settings,
         square_off_time,
+        trading_start_time,
         telegram_bot_token,
         telegram_chat_id,
     )
@@ -879,10 +911,12 @@ def _context_json(value: str | None) -> dict[str, object]:
 def apply_settings(
     settings: PlatformSettings,
     square_off_time: str,
+    trading_start_time: str,
     telegram_bot_token: str,
     telegram_chat_id: str,
 ) -> None:
     settings.square_off_time = square_off_time
+    settings.trading_start_time = trading_start_time
     settings.telegram_bot_token = telegram_bot_token
     settings.telegram_chat_id = telegram_chat_id
 

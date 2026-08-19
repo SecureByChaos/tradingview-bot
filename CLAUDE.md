@@ -295,6 +295,101 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Settings > General gets a configurable Trading Start Time; Square Off Time turned out to be a decorative field until now (19 Aug 2026)
+
+**Requested**: "Add trading start timing for strategies and ai origination trades 9:45 am by
+default and it should be editable like closing time and it should honour both starting and
+closing time for strategies and ai origination trades."
+
+**Investigated before building, and found the request's own premise ("editable like closing
+time") was only half true.** `PlatformSettings.square_off_time` (default `"15:15"`) has been
+editable in Settings > General since early in this project, but grepping every consumer found
+it was **never actually read anywhere**:
+
+- Rule-based strategies' TIME_EXIT check in `monitor_open_trades` (`app/multi_strategy.py`) had
+  the cutoff hardcoded as a literal `now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute
+  >= 15)`.
+- `app/scheduler.py`'s `daily-square-off` cron trigger is a separately hardcoded
+  `CronTrigger(hour=15, minute=15)`.
+- AI Origination's own entry/exit window (`_TRADING_START_HOUR/_MINUTE`,
+  `_TRADING_END_HOUR/_MINUTE` in `app/ai/originator.py`) was two more hardcoded module
+  constants, entirely independent of the `settings` table.
+- Rule-based strategies also had **no entry-time floor at all** -- `check_market_hours()` at the
+  webhook layer (`app/main.py`) only ever logged a WARNING on an out-of-hours signal, never
+  rejected it, so a `BUY_CE`/`BUY_PE` arriving at any hour the broad market-hours check permitted
+  would open a real trade regardless of an admin's intended window.
+
+So the admin-facing "Square Off Time" field changing something the user could point to and see
+take effect was never actually true; this task fixes that as well as adding the requested new
+start-time field, since both halves needed to be real for either to mean what the request implied.
+
+**Implementation:**
+
+- New `PlatformSettings.trading_start_time` column (default `"09:45"` -- matches AI Origination's
+  previous hardcoded start exactly, so deploying the column changes nothing until an admin edits
+  it), additive migration in `_ensure_columns()`.
+- New `parse_hhmm(value, default) -> (hour, minute)` in `app/time_utils.py` -- shared by both
+  `multi_strategy.py` and `originator.py` rather than duplicating "HH:MM" parsing twice. Falls
+  back to `default` on anything malformed, matching this codebase's fail-safe-not-fail-crash
+  philosophy for a runtime read of an admin setting.
+- **Rule-based strategies** (`app/multi_strategy.py`): `handle_signal` gained a real, rejecting
+  entry-time gate for `BUY_CE`/`BUY_PE` (checked right after the existing enabled/paper/live
+  checks, before any contract resolution) -- this is the first genuine entry-time enforcement
+  rule-based strategies have ever had. `monitor_open_trades`'s hardcoded `15:15` TIME_EXIT literal
+  is replaced with a dynamic comparison against `square_off_time`, fetched once per monitor tick
+  (not per trade in the loop).
+- **AI Origination** (`app/ai/originator.py`): `_still_observing`/`_past_trading_end` changed from
+  reading hardcoded module constants to accepting explicit `(hour, minute)` tuples; `_TRADING_
+  START_HOUR/_MINUTE`/`_TRADING_END_HOUR/_MINUTE` renamed to `_DEFAULT_TRADING_START`/`_DEFAULT_
+  TRADING_END` and kept only as the fallback `parse_hhmm` uses. `run_origination_checks` reads
+  `PlatformSettings` once per 5-min cycle (session already open there) and threads the parsed
+  window through both gates and into `_build_user_prompt` (new `end_hm` parameter, replacing its
+  own hardcoded `_TRADING_END_HOUR/_MINUTE` read for the prompt's "minutes to close" line).
+- **Settings > General** gets the new "Trading Start Time" input next to the existing "Square Off
+  Time" (both `<input type=time>`); the Notifications tab's form (which also POSTs to `/settings`)
+  gained a matching hidden passthrough field so saving from that tab doesn't reset the trading
+  window to blank. `/api/settings` (the separate JSON API surface) gained the same field on both
+  GET and POST for parity.
+- **Validation, new**: `update_settings_page` now rejects malformed times and enforces `09:15 <=
+  start < close <= 15:15`. The `09:15` floor matches NSE open; **the `15:15` ceiling on close is
+  deliberate and load-bearing, not arbitrary** -- `daily-square-off`'s cron trigger is still
+  hardcoded at 15:15 as a safety net (`monitor_open_trades`'s dynamic check is the real,
+  continuous enforcement; the cron catches anything that check somehow missed). Capping the
+  configurable close at 15:15 means that safety net can never fire *before* an admin's configured
+  close time and force-close positions early -- allowing a later value without also making the
+  cron dynamic would have created exactly that conflict. Rescheduling the cron itself from a
+  settings-save call was considered and rejected: the scheduler is constructed at module import
+  time in `app/main.py`, before the DB is guaranteed initialized, so wiring a live
+  `reschedule_job` call into the settings route would have been meaningfully more moving parts for
+  a case (wanting a square-off later than 15:15) this app doesn't otherwise support anywhere.
+- **Noted, not changed**: `app/market_context.py`'s opening-range window (09:15-09:45, used by
+  `ORB_BREAK`/`PDH_PDL_BREAK` setups) is NOT tied to this setting and stays fixed. An admin
+  setting a start time earlier than 09:45 means early entries get considered against an opening
+  range that isn't complete yet -- flagged in a code comment at `_DEFAULT_TRADING_START` rather
+  than hard-blocked, since a start time before 09:45 is a legitimate (if riskier) admin choice,
+  not a malformed one.
+
+21 new tests (`tests/test_trading_window.py`): `parse_hhmm` valid/malformed/out-of-range;
+`update_settings_page`'s four validation branches (start-after-close, close-after-15:15,
+start-before-09:15, valid-and-persists) plus `apply_settings`; `_still_observing`/`_past_trading_
+end` honouring explicit tuples including non-default values; `handle_signal` rejecting entry
+before start and at/after close, allowing entry inside a custom configured window (proving DB
+values are read, not the hardcoded fallback), and falling back correctly when no `PlatformSettings`
+row exists yet; `monitor_open_trades` closing a trade at a configured close time earlier than the
+old hardcoded 15:15, and correctly leaving it open before that configured time. 3 existing tests
+in `tests/test_nv1_dte_floor.py` needed a frozen clock added (`monkeypatch` on `app.multi_strategy.
+datetime`) since they now pass through the new trading-window gate before reaching the option
+finder they were actually testing. Full suite: 357 passed (was 336). `python -c "import
+app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox has no deployed server. After deploying: confirm Settings >
+General renders both fields with the correct defaults (09:45/15:15), confirm saving an invalid
+window (e.g. start after close, or close at 15:30) returns a 400 rather than silently accepting
+it, confirm a real TradingView webhook signal outside the configured window is now actually
+rejected (previously only warned), and confirm an open rule-based trade actually closes at a
+custom configured `square_off_time` earlier than 15:15 rather than waiting for the old hardcoded
+time.
+
 ### NV1 gets a 1-DTE floor -- traded 0 DTE today and lost beyond even its own correctly-rescaled stop (18 Aug 2026)
 
 **Requested**: "We have to minimise losses as they are bugger [bigger] than wins", following a
