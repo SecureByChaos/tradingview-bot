@@ -394,6 +394,53 @@ gates in `_open_trade` today are the DTE floor (`_MIN_DTE_TO_TRADE`), the same-d
 consecutive-loss gate, and the confidence floor (`_MIN_CONFIDENCE_TO_ACT`) -- flagged here
 so this entry doesn't repeat the false premise as if it were established fact.
 
+**Run for real, same day.** 200 closed AI Origination trades with recorded reasoning.
+Headline: the aggregate hedged-vs-not-hedged comparison is still **NOT reliable**
+(bootstrap 90% CI `[-1.17, +4.09]`, crosses zero) -- and the point estimate actually
+**reversed direction** from the 14 Aug flat-keyword pass (that one leaned hedged-worse;
+this one leans hedged-slightly-better). A sharper detector on a bigger sample (200 vs 185)
+still can't confirm the aggregate hypothesis, and the reversal is itself a second,
+independent strike against treating hedge language as a single monolithic signal.
+
+**But the per-category breakdown showed why the aggregate might be hiding something
+rather than just confirming nothing**, so the script gained a second pass the same day:
+a per-category bootstrap (category vs. everything NOT in that category), since the three
+categories perform very differently and pooling them can dilute a real, narrower effect
+into aggregate noise.
+
+| Category | n | win rate | mean P&L |
+|---|---|---|---|
+| `contradiction_marker` (mostly bare "but") | 105 | 38.1% | -0.14% |
+| `direct_hedge` | 19 (below trust min) | 31.6% | -3.60% |
+| `risk_acknowledgment` | 25 | 36.0% | -3.63% |
+
+`contradiction_marker` alone is 105 of the 120 hedged trades (dominated by 73 raw "but"
+matches) and sits close to breakeven -- confirming the docstring's own stated risk that the
+bare-conjunction simplification would overmatch and dilute. `direct_hedge` and
+`risk_acknowledgment` both traded meaningfully worse and land close to each other;
+`risk_acknowledgment` clears the 20-trade trust minimum on its own. Per-provider: OpenAI
+(n=175) shows essentially no hedged/not-hedged gap at all (-0.41% vs -0.65%); Claude (n=25)
+shows an unexpectedly *reversed* lean (hedged n=3, 66.7% win rate, -0.25%; not-hedged n=22,
+27.3% win rate, -5.17%) but the hedged side is pure anecdote at n=3.
+
+**The per-category bootstrap this motivated is built but not yet re-run against this same
+data** -- added to `scripts/reasoning_hedge_backtest.py` after seeing the above, isolating
+each category against every trade not in it rather than only comparing the pooled hedged
+flag. 2 more tests (`tests/test_run_backtest_per_category_bootstrap_*`) confirm it can
+detect an effect a large near-neutral category would otherwise mask, and handles a
+below-trust-minimum category gracefully. Full suite: 396 passed (was 394).
+
+```bash
+python -m scripts.reasoning_hedge_backtest --db data/trading.db
+```
+
+**Verdict so far: the aggregate hedge flag does not clear the bar for a gate.** Whether
+`risk_acknowledgment` specifically does is the open question the per-category bootstrap
+(now built) will answer on the next run -- read that section's output before concluding
+anything either way. `direct_hedge` sits one trade below the trust minimum (19 vs 20), so
+even a clean bootstrap result there should be read as suggestive, not confirmed, until a
+few more trades land. No gate has been added to `app/ai/originator.py`.
+
 ### Confidence-scoring instruction rewritten to reduce the Claude/OpenAI scale gap -- prompt-side fix, floor value untouched (19 Aug 2026)
 
 **Requested**: following the per-provider backtest tooling above, fix the likely mechanism

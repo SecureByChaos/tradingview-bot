@@ -203,3 +203,33 @@ def test_run_backtest_reports_matched_phrase_frequency(caplog):
         run_backtest(entries)
     messages = "\n".join(r.message for r in caplog.records)
     assert "risk_acknowledgment:already extended" in messages
+
+
+def test_run_backtest_per_category_bootstrap_detects_an_isolated_effect(caplog):
+    # 19 Aug 2026 real-data motivation: contradiction_marker (mostly bare "but")
+    # is common and near-breakeven, diluting the aggregate hedged/not-hedged
+    # comparison. direct_hedge and risk_acknowledgment traded much worse on
+    # their own. The per-category bootstrap must be able to surface a
+    # category-specific effect even when it wouldn't survive being pooled
+    # with a large, near-neutral category.
+    risk_ack_bad = [_entry("openai", "the main risk is a lack of confirmation", -6.0) for _ in range(25)]
+    contradiction_neutral = [
+        _entry("openai", "developing trend, but ADX remains marginal", pnl)
+        for pnl in ([1.0, -1.0] * 40)
+    ]
+    with caplog.at_level("INFO"):
+        run_backtest(risk_ack_bad + contradiction_neutral)
+    messages = "\n".join(r.message for r in caplog.records)
+    assert "PER-CATEGORY BOOTSTRAP" in messages
+    assert "risk_acknowledgment" in messages
+    assert "reliably WORSE" in messages
+
+
+def test_run_backtest_per_category_bootstrap_handles_thin_category(caplog):
+    entries = [_entry("openai", "not a strong setup", -1.0)] + [
+        _entry("openai", "clean confirmed setup", 1.0) for _ in range(5)
+    ]
+    with caplog.at_level("INFO"):
+        run_backtest(entries)
+    messages = "\n".join(r.message for r in caplog.records)
+    assert "too few observations for a bootstrap comparison" in messages
