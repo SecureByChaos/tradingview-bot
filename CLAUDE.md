@@ -295,6 +295,101 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Confidence-scoring instruction gets a resolution requirement for self-stated risks -- prompt-only, arrived despite the hedge backtest's null result (19 Aug 2026)
+
+**Requested**: force the model to resolve any risk it names in its own reasoning before
+trading on it, rather than stating the risk and proceeding anyway (the `[risk], but
+[trades anyway]` shape seen across the 12/14/19 Aug trigger trades). Framed explicitly as
+not another gate/detector/threshold -- every other mechanism this cycle (confidence floor,
+same-direction consecutive-loss gate, the just-completed hedge-language backtest) acts on
+the model's output after it's produced; this changes what the model is instructed to do
+*before* producing a decision.
+
+**A second false premise, same as the previous request.** This one repeats "the emergency
+trend-extension gate shipped 19 Aug" -- still does not exist (see the entry above). Worse,
+it explicitly builds on the reasoning-hedge investigation *despite* that investigation's
+same-day conclusion: NOT SUPPORTED at any category, aggregate or isolated. The request's
+own framing tries to route around that null result ("that's a statement about detecting it
+after the fact, not about whether the underlying behavior is a real defect") -- a coherent,
+defensible *qualitative* argument (self-contradictory reasoning is bad practice regardless
+of whether a keyword search can prove it correlates with P&L), but a different kind of
+claim than the empirical one the backtest just tested and found unsupported. Built on that
+basis -- a prompt-only change grounded in the qualitative argument, explicitly not
+represented as backed by the (null) outcome data -- rather than silently accepting the
+"emergency gate" framing.
+
+**Why this doesn't need the same pre-deployment discipline as a gate.** A gate blocks a
+trade outright and carries real risk of blocking a working thesis, which is why every gate
+this cycle (DTE floor, consecutive-loss gate) was backtested before shipping. A prompt
+change doesn't block anything -- it tries to shape what the model produces -- so it follows
+the same precedent as the confidence-scale prompt fix earlier today: ship it, then verify
+with a before/after distribution comparison over real elapsed trading time, not a
+pre-deployment backtest.
+
+**Implementation.** New paragraph in `SYSTEM_PROMPT` (`app/ai/originator.py`), inserted
+after the EMA21-extension caution and before the confidence-calibration paragraph added
+earlier today -- grouping every "treat X as a caution" instruction together with one
+closing rule for how any such caution must be handled:
+
+> "If your reasoning identifies a specific risk to the trade -- extension beyond a normal
+> range, an already-mature trend, absence of a fresh confirming breakout, conflicting
+> signals across timeframes, or any other concrete caution -- resolve that risk explicitly
+> before deciding to trade. A genuine risk you cannot articulate a specific, concrete
+> reason to set aside must result in NONE, not a trade at reduced confidence. A resolution
+> names something additional and specific to this setup -- a fresh volume/momentum signal,
+> a level just broken and held, a specific reason this trend's exhaustion pattern differs
+> from a typical one -- not a restatement of the risk followed by 'but,' and not a general
+> appeal to the structure still favoring continuation. If you notice yourself writing
+> 'but,' 'however,' or 'although' immediately after describing a risk and immediately
+> before a decision to trade, treat that as a signal to stop and re-evaluate: either the
+> risk should change your decision, or you have not yet identified why it doesn't."
+
+Applies identically to both providers (single `SYSTEM_PROMPT` constant, confirmed by the
+same source-inspection pattern the confidence-calibration change already established).
+Does not touch the confidence floor, any gate, entry/exit mechanics, or stop/target
+construction.
+
+**Post-deployment check, tooling built, not yet run.** New `scripts/hedge_resolution_check.py`,
+explicitly reusing `classify_hedge()` from `reasoning_hedge_backtest.py` rather than
+re-implementing the categorization (so "hedged" means the same thing in this check as it
+did in the outcome backtest), reads `ai_origination_logs` (decision-level, including NONE
+-- trade-level data alone can't show a hedge being resolved into a decline) and reports,
+per `--since`-filterable window:
+
+- the **hedge-then-trade rate** -- of decisions containing hedge language, what fraction
+  became a trade rather than NONE. This should fall after the change if the model is
+  actually converting more hedged setups to declines.
+- trade volume in the window -- expected to drop somewhat (that's the mechanism working),
+  flagged if it drops to near-zero (overcorrection).
+- win rate on trades from the window that have since closed -- the actual goal: if the
+  model only trades once it can articulate a real resolution, the trades that remain
+  should be higher quality.
+
+4 new tests (`tests/test_hedge_resolution_prompt.py`) pin the new paragraph's presence, the
+three named contradiction markers, the no-bare-restatement clause, and that the
+confidence-calibration paragraph from earlier today survived intact. 6 more
+(`tests/test_hedge_resolution_check.py`) cover the hedge-then-trade rate computation, the
+n/a case with zero hedged decisions, the `--since` filter, win-rate computed only from
+CLOSED trades, the no-trades-in-window case, and empty reasoning excluded. Full suite: 406
+passed (was 396). `python -c "import app.main"` imports cleanly.
+
+```bash
+python -m scripts.hedge_resolution_check --db data/trading.db
+# after 1-2 weeks on the new prompt:
+python -m scripts.hedge_resolution_check --db data/trading.db --since "<deploy timestamp, UTC>"
+```
+
+**Not verified live** -- this sandbox cannot call either provider's real API. After
+deploying: log the exact deployment timestamp (same requirement as the confidence-scale
+fix), run the check once immediately for the baseline, then again after 1-2 weeks. Per the
+request's own standard, do not judge this from a handful of decisions -- wait for enough
+post-change decisions to compare distributions, not individual outcomes. If the
+hedge-then-trade rate doesn't move, that's a real result too: it would mean the model
+either doesn't reliably follow this more prescriptive instruction either, or genuinely
+can't distinguish a real resolution from a restatement -- worth knowing either way, and
+would leave the reasoning-hedge question closed on the null result already recorded above
+rather than reopened by a prompt change that didn't change behavior.
+
 ### Reasoning-hedge detector rebuilt with a sharper classifier, backtest tooling only -- gate NOT shipped (19 Aug 2026)
 
 **Requested**: five real trades on record where the model's own reasoning states a caution
