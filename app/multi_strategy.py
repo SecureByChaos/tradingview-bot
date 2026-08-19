@@ -11,13 +11,13 @@ from app.config import Settings
 from app.db_models import SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeResult, TradeStatus, TradingMode
 from app.models import ExitReason, Signal, WebhookResponse
 from app.option_finder import OptionFinder
-from app.platform import get_index_config, log_event, update_strategy_stats_after_close
+from app.platform import get_index_config, get_or_create_settings, log_event, update_strategy_stats_after_close
 from app.signal_validation import check_premium_sanity, check_spot_price_deviation
 from app.smartapi_client import SmartAPIClient
 from app.premium_model import days_to_expiry, symmetric_premium_percent
 from app.telegram_service import TelegramService
 from app.trade_costs import estimate_round_trip_cost
-from app.time_utils import IST, format_ist, to_ist, utc_now
+from app.time_utils import IST, format_ist, parse_hhmm, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,14 @@ _STALL_BAND_PERCENT = 5.0
 # at +20%.
 _AI_ORIGIN_TRAIL_ACTIVATION_PERCENT = 8.0
 _AI_ORIGIN_TRAIL_OFFSET_PERCENT = 5.0
+
+# Fallback only -- PlatformSettings.trading_start_time/square_off_time (Settings
+# > General) are the real, admin-editable values. These match what was
+# hardcoded before 19 Aug 2026 (AI Origination's own _TRADING_START_HOUR/
+# _MINUTE default and the TIME_EXIT check's literal 15:15) so a missing/
+# malformed setting degrades to the exact behaviour this app already had.
+_DEFAULT_TRADING_START = (9, 45)
+_DEFAULT_TRADING_END = (15, 15)
 
 # NV1 only. 18 Aug 2026: NV1 opened a same-day-expiry (0 DTE) Nifty PE that lost
 # -25.52%, beyond even its own correctly-rescaled 23.9% stop (confirmed via
@@ -147,6 +155,27 @@ class MultiStrategyTradeManager:
             return WebhookResponse(accepted=False, message=f"Rejected: paper trading is disabled for '{strategy.name}'")
         if strategy.mode == TradingMode.LIVE and not strategy.live_trade:
             return WebhookResponse(accepted=False, message=f"Rejected: live trading is disabled for '{strategy.name}'")
+
+        # Trading-window gate (Settings > General), 19 Aug 2026. Previously
+        # unenforced for every rule-based strategy -- check_market_hours() at
+        # the webhook layer only ever logged a WARNING, never rejected, so a
+        # BUY_CE/BUY_PE arriving at any hour the market technically permits
+        # would open a trade regardless of the admin's intended trading
+        # window. BUY_CE/BUY_PE is the only signal shape that reaches this
+        # point (SELL_* returns above as an observation), so no extra signal
+        # check is needed here.
+        platform_settings = get_or_create_settings(db)
+        start_hm = parse_hhmm(platform_settings.trading_start_time, _DEFAULT_TRADING_START)
+        end_hm = parse_hhmm(platform_settings.square_off_time, _DEFAULT_TRADING_END)
+        now_ist_for_window = datetime.now(IST)
+        now_hm = (now_ist_for_window.hour, now_ist_for_window.minute)
+        if now_hm < start_hm or now_hm >= end_hm:
+            message = (
+                f"Rejected: outside trading window ({start_hm[0]:02d}:{start_hm[1]:02d}-"
+                f"{end_hm[0]:02d}:{end_hm[1]:02d} IST, Settings > General)"
+            )
+            log_event(db, "STATE", f"[STATE] FAILED_ENTRY {signal.value}", "WARNING", {"strategy": strategy.name, "reason": message})
+            return WebhookResponse(accepted=False, message=message)
 
         active_count = self.active_trade_count(db, strategy.name)
         if active_count >= strategy.max_active_trades:
@@ -360,6 +389,10 @@ class MultiStrategyTradeManager:
             for strategy in db.scalars(select(StrategyConfig).where(StrategyConfig.name.in_(strategy_names)))
         }
         now_ist = datetime.now(IST)
+        # Fetched once per tick, not per trade -- Settings > General's
+        # square_off_time (19 Aug 2026) replaces what was a hardcoded 15:15
+        # literal below.
+        square_off_hm = parse_hhmm(get_or_create_settings(db).square_off_time, _DEFAULT_TRADING_END)
         for trade in trades:
             try:
                 strategy = strategies_by_name.get(trade.strategy_name)
@@ -461,7 +494,7 @@ class MultiStrategyTradeManager:
                     if elapsed_minutes >= _STALL_WINDOW_MINUTES and abs(trade.pnl_percent) <= _STALL_BAND_PERCENT:
                         reason = ExitReason.STALL_EXIT
 
-                if reason is None and (now_ist.hour > 15 or (now_ist.hour == 15 and now_ist.minute >= 15)):
+                if reason is None and (now_ist.hour, now_ist.minute) >= square_off_hm:
                     reason = ExitReason.TIME_EXIT
                 if reason is not None:
                     self.close_trade(db, trade, premium, reason)

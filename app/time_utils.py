@@ -33,6 +33,23 @@ def iso_utc(value: datetime | None) -> str | None:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def parse_hhmm(value: str | None, default: tuple[int, int]) -> tuple[int, int]:
+    """Parse a "HH:MM" admin-configured setting into an (hour, minute) tuple,
+    falling back to default on anything malformed -- a bad setting should
+    degrade to known-safe behaviour, never crash the entry/exit gate that
+    reads it."""
+    if not value:
+        return default
+    try:
+        hour_text, minute_text = value.strip().split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+    except (ValueError, AttributeError):
+        return default
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return default
+    return hour, minute
+
+
 def duration_label(start: datetime | None, end: datetime | None = None) -> str:
     if start is None:
         return ""

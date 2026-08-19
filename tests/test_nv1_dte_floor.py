@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.multi_strategy as multi_strategy_module
 from app.config import Settings
 from app.db_models import Base, IndexConfig, IndexSymbol, StrategyConfig
 from app.models import Signal
 from app.multi_strategy import MultiStrategyTradeManager
+from app.time_utils import IST
 
 
 class _StopProbe(Exception):
@@ -62,6 +66,22 @@ def _seed_index(db: Session) -> None:
 def _seed_strategy(db: Session, name: str) -> None:
     db.add(StrategyConfig(name=name, enabled=True, index_symbol=IndexSymbol.NIFTY))
     db.commit()
+
+
+class _FixedDateTime(datetime):
+    """19 Aug 2026: handle_signal gained a trading-window gate (Settings >
+    General) checked before find_atm_contract -- these tests need wall-clock
+    time frozen inside the default 09:45-15:15 IST window so they exercise
+    the DTE floor regardless of when the suite actually runs."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 8, 19, 11, 0, tzinfo=IST)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_inside_trading_window(monkeypatch):
+    monkeypatch.setattr(multi_strategy_module, "datetime", _FixedDateTime)
 
 
 def test_nv1_entry_passes_the_dte_floor(db_session: Session) -> None:
