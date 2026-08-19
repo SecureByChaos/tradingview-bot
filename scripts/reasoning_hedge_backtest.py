@@ -277,6 +277,36 @@ def run_backtest(entries: list[Entry]) -> None:
         in_category = [e for e in entries if any(m.startswith(f"{category}:") for m in e.matched)]
         _report_bucket(category, in_category)
 
+    # 19 Aug 2026, added after the first real run: the aggregate hedged/not-hedged
+    # comparison above pools all three categories, but they can perform very
+    # differently -- a category that's common and near-breakeven (contradiction_marker,
+    # dominated by bare "but") can dilute a real effect in a rarer, worse-performing
+    # category (direct_hedge/risk_acknowledgment) down to statistical noise in the
+    # aggregate. This isolates each category against everything NOT in it, so a
+    # category-specific effect doesn't have to survive being averaged with the other
+    # two to be detected.
+    logger.info("-" * 100)
+    logger.info("PER-CATEGORY BOOTSTRAP (category vs. every trade NOT in that category):")
+    for category in HEDGE_PHRASES:
+        in_category = [e for e in entries if any(m.startswith(f"{category}:") for m in e.matched)]
+        not_in_category = [e for e in entries if not any(m.startswith(f"{category}:") for m in e.matched)]
+        if len(in_category) < 2 or len(not_in_category) < 2:
+            logger.info("  %-22s too few observations for a bootstrap comparison.", category)
+            continue
+        lo, hi = _bootstrap_mean_diff(
+            [e.pnl_percent for e in in_category], [e.pnl_percent for e in not_in_category],
+        )
+        trust = "" if min(len(in_category), len(not_in_category)) >= MIN_BUCKET_LIVE else "  [below trust minimum on the thinner side]"
+        verdict = (
+            "reliably WORSE" if hi < 0
+            else "reliably BETTER" if lo > 0
+            else "no reliable difference at this sample size"
+        )
+        logger.info(
+            "  %-22s 90%% CI [%+.2f, %+.2f] -> %s  (n=%d vs n=%d)%s",
+            category, lo, hi, verdict, len(in_category), len(not_in_category), trust,
+        )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
