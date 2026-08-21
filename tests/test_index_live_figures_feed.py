@@ -235,3 +235,62 @@ def test_no_fallback_available_still_shows_unavailable():
 
     assert figures[0]["price"] is None
     assert "error" in figures[0]
+
+
+# ---------------------------------------------------------------------------
+# 21 Aug 2026: change_abs/change_percent computed against the previous trading
+# day's last recorded tick, not today's first tick -- reported mismatch
+# against TradingView (which shows change vs. previous close) traced to this,
+# since "change since today's open" and "change since previous close" differ
+# by whatever the index gapped overnight.
+# ---------------------------------------------------------------------------
+
+
+def test_change_computed_against_previous_day_last_tick_not_todays_first():
+    db = _make_session()
+    _seed_index(db)
+    now = utc_now()
+    # Previous day: opened 57000, closed 57200 (the LAST tick that day).
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57000.0, recorded_at=now - timedelta(days=1, hours=6)))
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57200.0, recorded_at=now - timedelta(days=1, hours=1)))
+    # Today's first tick (an overnight gap-up from yesterday's close).
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57400.0, recorded_at=now))
+    db.commit()
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 57450.0, "is_live": True, "age_seconds": 0.1}})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    # Against yesterday's LAST tick (57200), not today's first tick (57400).
+    assert figures[0]["change_abs"] == 250.0
+    assert figures[0]["change_percent"] == round(250.0 / 57200.0 * 100, 2)
+
+
+def test_change_falls_back_to_todays_first_tick_when_no_prior_day_tick_exists():
+    db = _make_session()
+    _seed_index(db)
+    now = utc_now()
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57000.0, recorded_at=now))
+    db.commit()
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 57100.0, "is_live": True, "age_seconds": 0.1}})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    assert figures[0]["change_abs"] == 100.0
+
+
+def test_day_low_high_still_computed_from_todays_ticks_only():
+    # Confirms the previous-day reference change didn't accidentally pull
+    # yesterday's prices into today's day-range figures.
+    db = _make_session()
+    _seed_index(db)
+    now = utc_now()
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=50000.0, recorded_at=now - timedelta(days=1)))
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57000.0, recorded_at=now - timedelta(hours=2)))
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57300.0, recorded_at=now - timedelta(hours=1)))
+    db.commit()
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 57100.0, "is_live": True, "age_seconds": 0.1}})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    assert figures[0]["day_low"] == 57000.0
+    assert figures[0]["day_high"] == 57300.0
