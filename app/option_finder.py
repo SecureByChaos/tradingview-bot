@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,18 @@ from app.smartapi_client import SmartAPIClient
 
 logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
+
+# 21 Aug 2026: the instrument master fetch (margincalculator.angelbroking.com,
+# a large shared file, not actually margin-related despite the hostname) timed
+# out 5 times in 7 days -- confirmed via journalctl. Because _cache_is_fresh
+# only refreshes once per IST calendar day, a single slow response on
+# whichever signal happens to be first that day used to fail that one entry
+# outright, with no second chance. One retry plus a fall-back to the existing
+# cached file (even if from a prior day) covers this: contracts rarely change
+# day to day except at expiry rollover, which is a far smaller risk than
+# failing the entry on a transient third-party timeout.
+_INSTRUMENT_FETCH_ATTEMPTS = 2
+_INSTRUMENT_FETCH_BACKOFF_SECONDS = 2.0
 
 
 def get_atm_option_token(spot_price: float, signal_type: str) -> dict:
@@ -166,15 +179,46 @@ class OptionFinder:
     def _load_instruments(self) -> pd.DataFrame:
         cache_path = self.settings.instrument_cache_path
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        payload: list[dict[str, Any]]
         if self._cache_is_fresh(cache_path):
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        else:
-            response = requests.get(self.settings.instrument_master_url, timeout=20)
-            response.raise_for_status()
-            payload = response.json()
-            cache_path.write_text(json.dumps(payload), encoding="utf-8")
-        return pd.DataFrame(payload)
+            return pd.DataFrame(payload)
+        return pd.DataFrame(self._fetch_instruments_with_fallback(cache_path))
+
+    def _fetch_instruments_with_fallback(self, cache_path: Path) -> list[dict[str, Any]]:
+        last_exc: Exception | None = None
+        for attempt in range(1, _INSTRUMENT_FETCH_ATTEMPTS + 1):
+            try:
+                response = requests.get(self.settings.instrument_master_url, timeout=20)
+                response.raise_for_status()
+                payload = response.json()
+                cache_path.write_text(json.dumps(payload), encoding="utf-8")
+                return payload
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(
+                    "Instrument master fetch attempt %d/%d failed: %s",
+                    attempt, _INSTRUMENT_FETCH_ATTEMPTS, exc,
+                )
+                if attempt < _INSTRUMENT_FETCH_ATTEMPTS:
+                    time.sleep(_INSTRUMENT_FETCH_BACKOFF_SECONDS)
+
+        # Every attempt failed -- fall back to whatever is already cached on
+        # disk, even from a prior day, rather than failing the entry outright
+        # on a transient third-party timeout. See the module-level comment.
+        if cache_path.exists() and cache_path.stat().st_size > 0:
+            stale_date = datetime.fromtimestamp(cache_path.stat().st_mtime, tz=IST).date()
+            logger.warning(
+                "Instrument master fetch failed after %d attempt(s) (%s) -- "
+                "falling back to cached file from %s",
+                _INSTRUMENT_FETCH_ATTEMPTS, last_exc, stale_date,
+            )
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+
+        logger.error(
+            "Instrument master fetch failed after %d attempt(s) and no cached file exists",
+            _INSTRUMENT_FETCH_ATTEMPTS,
+        )
+        raise last_exc
 
     def _cache_is_fresh(self, path: Path) -> bool:
         if not path.exists():

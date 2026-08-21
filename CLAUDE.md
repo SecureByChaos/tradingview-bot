@@ -295,6 +295,22 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Instrument-master fetch gets a retry + stale-cache fallback -- 5 real timeouts in 7 days (21 Aug 2026)
+
+**Reported**: NV1 `BUY_CE` failed with `[STATE] FAILED_ENTRY ... "HTTPSConnectionPool(host='margincalculator.angelbroking.com', port=443): Read timed out."`, escalated to a Telegram "System Error" alert and an HTTP 500 back to TradingView. Investigated with the user before building: confirmed via `journalctl` that this exact timeout happened **5 times in the prior 7 days**, not a one-off.
+
+**Root cause**: `OptionFinder._load_instruments()` (`app/option_finder.py`) refreshes the instrument-master file **once per IST calendar day** (`_cache_is_fresh` only checks the cached file's date, not its age) -- so every day's *first* `find_atm_contract` call, whichever signal happens to arrive first, has to do a real network `GET` against Angel One's `OpenAPIScripMaster.json` (a large, shared file) with a 20s timeout, no retry, and no fallback. A single slow response on that one daily fetch failed the entry outright.
+
+**Also traced the full failure chain, not just the network call**: `handle_signal`'s try/except around `find_atm_contract`/`get_ltp` logs `FAILED_ENTRY` then re-raises; the outer `webhook()` handler in `app/main.py` catches *any* exception there, logs `"Webhook processing failed"` as an ERROR, sends a **"System Error"** Telegram alert, and returns a 500 -- treating an ordinary third-party timeout identically to a genuine internal bug.
+
+**Fixed, scoped to the confirmed cause only**: `_load_instruments` now retries the fetch once (`_INSTRUMENT_FETCH_ATTEMPTS = 2`, 2s backoff) and, if every attempt still fails, falls back to whatever instrument file is already cached on disk -- even from a prior day -- rather than failing the entry. A day-stale contract list is virtually always fine (contracts don't change day to day except at expiry rollover); failing the trade outright on a transient timeout is the larger, more certain cost. Only raises (and therefore still reaches the loud System-Error alert path) if every retry fails *and* no cached file exists at all -- a genuinely rare, genuinely alert-worthy case, so that behaviour is deliberately left as-is.
+
+**Deliberately NOT changed: the webhook handler's re-raise-on-any-exception behaviour, more broadly.** Checked `git log` first -- this has been the default since the project's earliest commits, with no documented rationale either way. Since the fallback above means this specific failure mode will now rarely reach that path at all, and there's no evidence the *other* exception types that can occur in the same try block (e.g. `get_ltp` failing for its own broker-side reasons) are causing false alarms, broadening the fix to suppress alerting more generally was scoped out -- that would risk quieting a genuine broker-outage alert with no reported problem to justify it.
+
+5 new tests (`tests/test_option_finder_instrument_fetch.py`): succeeds on first attempt and writes cache, retries once then succeeds, falls back to a stale cached file when every attempt fails, re-raises when every attempt fails and no cache exists at all, and confirms `_load_instruments` never touches the network when the cache is already fresh for today. Full suite: 411 passed (was 406). `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox has no network path to Angel One's real endpoint. After deploying, the check is: `sudo journalctl -u tradingview-bot --since "7 days ago" | grep -c "margincalculator.angelbroking.com.*timed out"` should keep counting raw timeout occurrences (that's Angel's side, unaffected by this fix), but `grep -c "FAILED_ENTRY"` for the same cause should drop to roughly zero, and a `"falling back to cached file from"` WARNING line should appear in its place when a timeout does occur.
+
 ### Confidence-scoring instruction gets a resolution requirement for self-stated risks -- prompt-only, arrived despite the hedge backtest's null result (19 Aug 2026)
 
 **Requested**: force the model to resolve any risk it names in its own reasoning before
