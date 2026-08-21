@@ -295,6 +295,20 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Dashboard "change" now measured against previous close, not today's open -- traced from a real TradingView mismatch (21 Aug 2026)
+
+**Reported**: a screenshot comparison showing StrikeVault's dashboard and TradingView disagreeing on both indices' change figures -- Bank Nifty +64.75 (+0.11%) vs TradingView's +179.50 (+0.31%); Nifty −34.35 (−0.14%) vs TradingView's +1.50 (+0.01%). The live **prices** themselves matched closely (within a couple of points), so this was specifically a "change" calculation mismatch, not a stale/wrong price.
+
+**Root cause**: `get_index_live_figures()` (`app/platform.py`) computed `change_abs`/`change_percent` against **today's first recorded `IndexPriceTick`** -- effectively "change since today's open." TradingView, and every standard market data source, shows change against **the previous trading day's close**. These are two different, both-legitimate numbers that happen to coincide only when an index doesn't gap overnight -- Indian indices routinely do, and the reported mismatch magnitudes (~115 points on Bank Nifty, ~36 on Nifty) are consistent with exactly that kind of overnight gap, not a bug in the live feed or price accuracy.
+
+**Fixed with the previous-day-last-tick approximation, not the fully accurate CAS close.** The truly correct reference is what `capture_closing_auction` (the 15:45 IST job) stores in the candle archive specifically because the naive last-bar-before-close was found to be wrong by hundreds of points on 3 Aug (see "Closing Auction Session" below) -- but that requires a candle fetch, not a cheap `IndexPriceTick` read. Explicitly asked which to build; the previous-day-last-tick approximation was chosen for now. Reference is now the most recent `IndexPriceTick` recorded strictly before today, falling back to today's first tick (the old behaviour) only when no prior-day tick exists at all. `day_low`/`day_high` are untouched -- still computed from today's ticks only, confirmed by a dedicated test that the previous-day reference doesn't leak into the day-range figures.
+
+**Known gap in this approximation, stated rather than hidden**: `IndexPriceTick` recording is gated on `check_market_hours` (09:15-15:30 IST), which ends a few minutes before the CAS settles (~15:35) and the exchange's official close is published (~15:29-15:30 in practice, per the Closing Auction entry). So the "previous day's last tick" this reads is very close to, but not guaranteed identical to, the official closing print -- the same class of small residual gap the CAS job was built to close for AI Origination's own previous-close reads, just smaller in magnitude since tick recording runs later into the session than the old candle-fetch cutoff (15:15) did before that fix.
+
+3 new tests (`tests/test_index_live_figures_feed.py`): change computed against the previous day's last tick rather than today's first, falls back to today's first tick when no prior-day tick exists, and day_low/day_high still computed from today's ticks only. Full suite: 414 passed (was 411). `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox has no real Angel One feed to compare against a live TradingView session. After deploying, the check is: open the dashboard during trading hours and confirm the change figures now track TradingView's within a few points, rather than the previous whole-percent-off mismatch.
+
 ### Instrument-master fetch gets a retry + stale-cache fallback -- 5 real timeouts in 7 days (21 Aug 2026)
 
 **Reported**: NV1 `BUY_CE` failed with `[STATE] FAILED_ENTRY ... "HTTPSConnectionPool(host='margincalculator.angelbroking.com', port=443): Read timed out."`, escalated to a Telegram "System Error" alert and an HTTP 500 back to TradingView. Investigated with the user before building: confirmed via `journalctl` that this exact timeout happened **5 times in the prior 7 days**, not a one-off.

@@ -490,11 +490,26 @@ def record_index_tick_if_stale(db: Session, index_symbol: str, price: float) -> 
 
 def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -> list[dict[str, Any]]:
     """Live index figures (Nifty/Sensex/Bank Nifty) for the live dashboards --
-    figures only, no per-index chart by design. Change and day range are
-    computed from our own recorded ticks, using today's first tick as the
-    reference point, rather than a broker "previous close" field -- the
+    figures only, no per-index chart by design. Day range is computed from
+    today's recorded ticks. Change is computed against the previous trading
+    day's LAST recorded tick, not a broker "previous close" field -- the
     current SmartAPI client wrapper only exposes LTP, not a reliable
     previous-close, so inventing one would be dishonest.
+
+    21 Aug 2026: change used to be computed against TODAY's first tick
+    (effectively today's opening print), which reads as "change since open"
+    while every other source (TradingView included) shows "change since
+    previous close" -- these routinely disagree by however much the index
+    gapped overnight, which is exactly the mismatch reported that day
+    (Bank Nifty off by ~115 points, Nifty by ~36). The previous trading
+    day's last recorded tick is an approximation, not the official CAS
+    closing print capture_closing_auction stores in the candle archive for
+    AI Origination's own previous-close reads (app/market_data.py) -- close
+    enough for a dashboard figure, cheaper (one more IndexPriceTick query,
+    no candle fetch), and explicitly flagged as approximate here rather than
+    presented as authoritative. Falls back to today's first tick (the old
+    behaviour) when no prior-day tick exists at all, e.g. a brand-new index
+    or a database with no history yet.
 
     Price source: prefers feed_store (app/live_feed.py's persistent WebSocket
     feed) when given and it has a value -- zero SmartAPI calls, whether this
@@ -602,7 +617,16 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
         )
         entry["price"] = price
         if todays_ticks:
-            reference = todays_ticks[0].price
+            previous_day_tick = db.scalar(
+                select(IndexPriceTick)
+                .where(
+                    IndexPriceTick.index_symbol == index.symbol,
+                    func.date(IndexPriceTick.recorded_at) < today,
+                )
+                .order_by(IndexPriceTick.recorded_at.desc())
+                .limit(1)
+            )
+            reference = previous_day_tick.price if previous_day_tick is not None else todays_ticks[0].price
             all_prices = [tick.price for tick in todays_ticks] + [price]
             entry["change_abs"] = round(price - reference, 2)
             entry["change_percent"] = round(((price - reference) / reference) * 100, 2) if reference else 0.0
