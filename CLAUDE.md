@@ -295,6 +295,29 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### `lowest_price` never updated on any long trade -- structurally unreachable code, not missing code (24 Aug 2026)
+
+**Reported**: real `strategy_trades` query evidence, both historical (27-28 Jul) and live (24 Aug), showing `lowest_price` pinned at `entry_price` for every AI Origination trade regardless of how far the premium actually fell. Requested: confirm the missing update logic and add it; verify post-deploy that it now moves; re-run the same historical query pattern going forward; and explicitly confirm (not assume) that MAE% in exports was unaffected, tracing its actual source rather than trusting the existing 14 Aug note that flagged this same column as unreliable.
+
+**More precise than "missing logic."** `monitor_open_trades` (`app/multi_strategy.py`) already has a `lowest_price` update -- it lives inside an `if is_short:` branch (line 415) that mirrors the long-side `else:` branch's `highest_price` tracking exactly. The bug is that `is_short = trade.signal.startswith("SELL")` (line 410) is unreachable-true for every trade this function ever processes: `handle_signal` only opens a position on `BUY_CE`/`BUY_PE` for every non-V7 strategy (`SELL_CE`/`SELL_PE` are observation-only, see "Exit paths" and the shared-FIXED-branch section above), and AI Origination only ever issues `BUY_CE`/`BUY_PE` too. A bought put is still long the premium, not short anything -- so `is_short` is `False` for literally every trade in this population, and the branch that updates `lowest_price` has never once executed. This is the same class of finding as the 12 Aug "trailing stop never activates on PE" false alarm below, except this time the code really was dead, not misread. `app/v7_manager.py` was checked separately and has its own independent, already-correct, unconditional `lowest_price` tracking (`if trade.lowest_price is None: ... else: min(...)`, no `is_short` gate at all) -- V7 trades were never affected by this bug, confirming it as a genuinely separate execution path, as documented elsewhere in this file.
+
+**Fixed**: added the same `min()`-tracking line to the long-side (`else:`) branch, directly after the existing `highest_price` line, mirroring its exact shape. Does not touch the `is_short` branch, any exit-decision logic, the trailing-stop mechanism, or stop/target construction -- `highest_price` alone already drives every long-side trailing/exit decision in this function, so this change only restores a real running-low value to a column that was previously cosmetic.
+
+**MAE% in exports traced directly, not assumed unaffected.** `_excursion()` (`app/dashboard_routes.py`) computes MFE/MAE from `StrategyTradeTick` history (`tick_extremes`, built as `best = high if direction==1 else low; worst = low if direction==1 else high` per tick), never from `trade.lowest_price`/`highest_price` -- confirmed by reading the function directly per the request's own instruction not to trust the existing note alone. The raw `trade.lowest_price` column does appear as its own separate, previously-always-`entry_price` cosmetic field in CSV exports (`dashboard_routes.py` line 388) -- that field starts reflecting real data going forward, which is a side benefit, not a change to any already-computed MAE%.
+
+4 new tests (`tests/test_lowest_price_tracking.py`): a real running low is recorded on a single tick, the minimum (not the latest) price is kept across multiple ticks including a bounce back up, `highest_price` tracking is unaffected by the fix running alongside it, and `lowest_price` stays at `entry_price` (not above it) when premium only ever rises. Full suite: 418 passed (was 414). `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox has no real open trades to observe ticking down. After deploying, per the report's own step 2/3: confirm `lowest_price` moves below `entry_price` on a real open trade that draws down at all, then re-run the same historical query pattern used to find this bug against trades opened after deploy:
+
+```sql
+SELECT trade_id, entry_price, lowest_price, highest_price, status
+FROM strategy_trades
+WHERE entry_time > '<deploy timestamp, UTC>' AND status = 'OPEN'
+ORDER BY entry_time DESC;
+```
+
+`lowest_price` should now be strictly less than `entry_price` on any trade that has genuinely traded below entry at any point, not pinned at the seed value the way every pre-fix row in the original report was.
+
 ### Dashboard "change" now measured against previous close, not today's open -- traced from a real TradingView mismatch (21 Aug 2026)
 
 **Reported**: a screenshot comparison showing StrikeVault's dashboard and TradingView disagreeing on both indices' change figures -- Bank Nifty +64.75 (+0.11%) vs TradingView's +179.50 (+0.31%); Nifty −34.35 (−0.14%) vs TradingView's +1.50 (+0.01%). The live **prices** themselves matched closely (within a couple of points), so this was specifically a "change" calculation mismatch, not a stale/wrong price.

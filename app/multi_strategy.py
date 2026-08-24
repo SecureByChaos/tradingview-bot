@@ -430,6 +430,18 @@ class MultiStrategyTradeManager:
                             reason = ExitReason.TARGET
                 else:
                     trade.highest_price = premium if trade.highest_price is None else max(trade.highest_price, premium)
+                    # 24 Aug 2026: long trades (every non-V7 strategy only ever opens
+                    # BUY_CE/BUY_PE -- SELL_* is observation-only) never touched
+                    # lowest_price, since the only place that updated it was the
+                    # is_short branch above, which is structurally unreachable here.
+                    # highest_price alone is sufficient for the long-side trailing
+                    # logic below, so this doesn't change any exit decision -- it's
+                    # purely restoring a real running-low value to a column that was
+                    # otherwise permanently pinned at entry_price. MAE% in exports is
+                    # already computed from strategy_trade_ticks (see dashboard_
+                    # routes.py's _excursion), not this column, so that figure is
+                    # unaffected either way.
+                    trade.lowest_price = premium if trade.lowest_price is None else min(trade.lowest_price, premium)
                     if sl_mode == SLMode.TRAILING:
                         if not trade.trailing_active and premium >= trade.entry_price + activation_threshold:
                             trade.trailing_active = True
