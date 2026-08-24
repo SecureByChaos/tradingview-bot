@@ -1,48 +1,50 @@
 # StrikeVault
 
-Production-ready FastAPI webhook bot for BankNifty option signals from TradingView, with Angel One SmartAPI execution, SQLite-backed multi-strategy trade state, scheduled monitoring, and dashboard controls.
+FastAPI options auto-trading bot for Indian index options (Bank Nifty, Nifty 50; Sensex planned), with two independent entry sources — TradingView webhook strategies and an AI-driven origination engine (Claude / OpenAI) — Angel One SmartAPI execution, SQLite-backed trade state, scheduled monitoring, and an admin dashboard.
+
+**Everything is PAPER trading unless two independent switches are both on** — see [PAPER and LIVE Modes](#paper-and-live-modes). Real money is at stake even in paper mode, since paper results drive live decisions.
 
 ## Architecture
 
 ```text
-TradingView -> Webhook -> FastAPI -> Multi-Strategy Engine -> Angel One SmartAPI
-                                      -> Trade Monitor -> SQLite Trade History
-                         -> Background AI Shadow Review -> SQLite AI Reviews
+TradingView --> POST /webhook --> Multi-Strategy Engine --\
+                                                             >--> Angel One SmartAPI --> SQLite Trade History
+AI Origination (Claude/OpenAI, own 5-min cycle) -----------/          |
+                                                                 Trade Monitor (30s)
 ```
+
+TradingView strategies and AI Origination are independent entry paths that share the same execution, risk, and monitoring layer. `StrategyTrade.origin` (`SIGNAL`, `AI_ORIGIN_OPENAI`, `AI_ORIGIN_CLAUDE`, `AI_ALT_*`) keeps their trade history, stats, and risk locks from mixing.
 
 ## Features
 
-- `POST /webhook` accepts `BUY_CE`, `SELL_CE`, `BUY_PE`, and `SELL_PE`.
-- Dynamic multi-strategy engine driven by database strategy configuration.
-- Supports simultaneous independent trades per strategy without a global active-trade lock.
-- Strategy-specific PAPER/LIVE mode, TP/SL, max active trades, and capital allocation.
+- `POST /webhook` accepts `BUY_CE`, `SELL_CE`, `BUY_PE`, and `SELL_PE`, routed by `strategy` name.
+- Dynamic multi-strategy engine driven by database strategy configuration — no code changes to add a strategy.
+- Multi-index support (Bank Nifty, Nifty 50 today; Sensex planned) configured per-index in Settings > Instruments.
+- **AI Origination**: an independent engine that opens its own trades from price/technical structure alone, with no TradingView signal involved. Runs on its own 5-minute cycle during a configurable trading window, supports Claude and OpenAI as independent providers (each gets its own trade slot per index), and carries its own risk gates (confidence floor, DTE floor, same-direction consecutive-loss gate, admin-configurable max stop-loss).
+- Configurable trading start/close time (Settings > General), enforced for both rule-based strategies and AI Origination — not just displayed.
+- Strategy-specific PAPER/LIVE mode, TP/SL (FIXED or TRAILING), max active trades, max trades/day, consecutive-loss limit, daily loss limit, and lot sizing.
+- Two-key live-trading safety: a per-entity opt-in (strategy or index) **and** a server-side environment variable must both be on before any real order is placed.
 - Single-admin login with signed session cookies.
-- Bootstrap 5 dark dashboard with bot status, active trade, history, controls, settings, and logs.
-- SQLite-backed platform state for bot status, settings, strategy configs, strategy trades, daily stats, and structured logs.
-- REST API under `/api/*` for status, trades, settings, bot controls, kill switch, and daily-lock reset.
-- Telegram notifications for bot events, trade events, exits, risk locks, and system errors.
-- Automatically resolves the nearest weekly ATM BankNifty CE/PE contract from cached Angel One Scrip Master data.
-- Per-strategy active trade limits.
-- 30-minute same-strategy loss cooldown circuit.
+- Bootstrap 5 dark dashboard: live index prices, market-conditions read, trade history, bot control, settings, reports, and structured logs.
+- SQLite-backed platform state for bot status, settings, strategy/index configs, strategy trades, tick history, daily stats, AI decision logs, and structured event logs.
+- REST API under `/api/*` for status, trades, settings, strategy stats, bot controls, kill switch, and daily-lock reset.
+- Telegram notifications for trade events, exits, risk locks, and system errors.
+- Automatically resolves the nearest-expiry ATM option contract per index from a daily-cached Angel One Scrip Master file, with retry and stale-cache fallback on a fetch failure.
 - Daily risk lock and consecutive-loss circuit checks before trade execution.
-- Strategy-level TP/SL plus server-side trailing stop support.
-- Monitors active trades every 30 seconds.
-- Squares off open positions at 15:15 IST.
-- Persists active and completed strategy trades in SQLite.
+- Server-side trailing stop support, per strategy or per trade.
+- Monitors active trades every 30 seconds; squares off open positions at the configured close time (default 15:15 IST).
+- Scheduled jobs for AI Origination, pre-market health checks, option-chain archival (collection only, off by default), closing-auction capture, and daily/weekly/monthly AI-generated reports.
 - Safe-by-default paper mode via `SMARTAPI_LIVE_TRADING=false`.
-- Provider-independent AI review framework with Dummy and OpenAI providers.
-- Optional background Shadow Mode reviews that never block or modify trades.
-- Audited AI requests using request IDs and prompt hashes without logging API keys, full prompts, or raw provider responses.
 
 ## Local Setup
 
-Python 3.11+ is recommended. The Docker image uses Python 3.12.
+Python 3.11+ is recommended.
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
+python -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-copy .env.example .env
+cp .env.example .env
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -63,9 +65,9 @@ curl http://localhost:8000/health
 Send a test signal:
 
 ```bash
-curl -X POST http://localhost:8000/webhook ^
-  -H "Content-Type: application/json" ^
-  -d "{\"strategy\":\"V7\",\"signal\":\"BUY_CE\"}"
+curl -X POST http://localhost:8000/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"strategy":"V7","signal":"BUY_CE"}'
 ```
 
 ## Environment Variables
@@ -76,31 +78,36 @@ curl -X POST http://localhost:8000/webhook ^
 | `SMARTAPI_CLIENT_ID` | Angel One client ID |
 | `SMARTAPI_PIN` | Angel One PIN |
 | `SMARTAPI_TOTP_SECRET` | TOTP secret from SmartAPI setup |
-| `SMARTAPI_LIVE_TRADING` | Set `true` only when ready for real orders |
+| `SMARTAPI_LIVE_TRADING` | Set `true` only when ready for real orders — the server-side half of the two-key live-trading safety pattern |
+| `SMARTAPI_PRODUCT_TYPE` | Order product type, default `INTRADAY` |
+| `SMARTAPI_ORDER_VARIETY` | Order variety, default `NORMAL` |
 | `ADMIN_USERNAME` | Dashboard admin username |
 | `ADMIN_PASSWORD` | Dashboard admin password as a bcrypt hash |
 | `SESSION_SECRET_KEY` | Long random secret for signed session cookies |
 | `SECURE_COOKIES` | Set `true` when serving over HTTPS |
 | `DATABASE_URL` | SQLAlchemy DB URL, defaults to SQLite in `data/` |
-| `QUANTITY_LOTS` | Number of BankNifty lots to trade |
-| `BANKNIFTY_LOT_SIZE` | Current BankNifty lot size from NSE/broker contract specs |
-| `BANKNIFTY_SPOT_TOKEN` | SmartAPI token for BankNifty index |
-| `DEFAULT_STRATEGY_NAME` | Strategy used for legacy webhook payloads without `strategy` |
-| `INSTRUMENT_CACHE_PATH` | Cached Angel One Scrip Master JSON path |
+| `QUANTITY_LOTS` | Default lots to trade (legacy single-index path; per-strategy `lots_per_trade` is the real sizing lever — see Multi-Strategy Operation) |
+| `BANKNIFTY_LOT_SIZE` | Legacy fallback Bank Nifty lot size; per-index lot size is configured in Settings > Instruments |
+| `BANKNIFTY_SPOT_EXCHANGE` / `BANKNIFTY_SPOT_SYMBOL` / `BANKNIFTY_SPOT_TOKEN` | Legacy fallback Bank Nifty spot identifiers; per-index values live in Settings > Instruments |
+| `DEFAULT_STRATEGY_NAME` | Strategy used for webhook payloads without `strategy` |
+| `INSTRUMENT_CACHE_PATH` | Cached Angel One Scrip Master JSON path, refreshed once per IST calendar day |
 | `INSTRUMENT_MASTER_URL` | Angel One Scrip Master source URL |
-| `TRAILING_ACTIVATION_PERCENT` | Trailing stop activation threshold, default `10` |
-| `TRAILING_OFFSET_PERCENT` | Trailing stop offset buffer, default `5` |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
+| `OPTION_CHAIN_COLLECTION_ENABLED` | Archival-only option-chain snapshotting, default `false` — do not enable without `SMARTAPI_ANALYTICS_*` set to a genuinely separate API key; it has caused live rate-limit incidents when sharing the live client's budget |
+| `OPTION_CHAIN_STRIKE_BAND` / `OPTION_CHAIN_EXPIRY_COUNT` / `OPTION_CHAIN_INTERVAL_MINUTES` | Option-chain collector tuning, only relevant if collection is enabled |
+| `SMARTAPI_ANALYTICS_API_KEY` / `_CLIENT_ID` / `_PIN` / `_TOTP_SECRET` | A second, independent SmartAPI credential set for the option-chain collector, so it never competes with live trading for rate-limit budget |
+
+Trading start/close time, per-strategy risk parameters, per-index instrument config, and AI provider settings are **not** environment variables — they live in the database and are edited from the dashboard (Settings tabs), so they can change without a redeploy.
 
 ## SmartAPI Setup
 
 1. Create an Angel One SmartAPI app and collect the API key.
 2. Enable TOTP for the trading account and store the TOTP secret in `.env`.
-3. Confirm `BANKNIFTY_LOT_SIZE` against the current exchange contract specification.
-4. Start with `SMARTAPI_LIVE_TRADING=false`.
-5. After paper testing, set `SMARTAPI_LIVE_TRADING=true` and restart the app.
+3. Confirm each enabled index's lot size and spot token in Settings > Instruments against the current exchange contract specification.
+4. Start with `SMARTAPI_LIVE_TRADING=false` (default).
+5. After paper testing, enable the specific strategy's/index's live-trading opt-in **and** set `SMARTAPI_LIVE_TRADING=true`, then restart the app — both are required.
 
-The code uses Angel One's SmartAPI Python SDK through `app/smartapi_client.py`. It performs TOTP login, stores JWT/refresh/feed tokens, retries API calls after token-expiry responses, refreshes the session when possible, and falls back to full TOTP login if refresh fails.
+The code uses Angel One's SmartAPI Python SDK through `app/smartapi_client.py`. It performs TOTP login, stores JWT/refresh/feed tokens, retries API calls after token-expiry or rate-limit responses, refreshes the session when possible, and falls back to full TOTP login if refresh fails. Every quote-family call (`get_ltp`, `get_index_ohlc`, `get_candles`) shares a single process-wide 1 req/sec throttle.
 
 ## TradingView Webhook Setup
 
@@ -113,16 +120,16 @@ http://YOUR_SERVER_IP:8000/webhook
 Alert message for CE:
 
 ```json
-{"strategy":"V5.1","signal":"BUY_CE"}
+{"strategy":"BNV5.1","signal":"BUY_CE"}
 ```
 
 Alert message for PE:
 
 ```json
-{"strategy":"V6 Momentum","signal":"BUY_PE"}
+{"strategy":"BNV6","signal":"BUY_PE"}
 ```
 
-Short-side examples:
+Short-side examples (observation-only for every strategy except V7 — see below):
 
 ```json
 {"strategy":"V7","signal":"SELL_CE"}
@@ -132,164 +139,149 @@ Short-side examples:
 {"strategy":"V7","signal":"SELL_PE"}
 ```
 
-Signals should already be time-filtered in TradingView. The Python bot enforces platform state, strategy enabled state, per-strategy active trade limits, risk settings, and 15:15 IST square-off.
+The bot enforces platform state, strategy enabled state, per-strategy active trade limits, risk settings, and the configured trading start/close window (Settings > General) — a signal outside that window is rejected, not just logged.
 
-Legacy payloads without `strategy` still route to `DEFAULT_STRATEGY_NAME` from `.env`.
+Legacy payloads without `strategy` route to `DEFAULT_STRATEGY_NAME` from `.env`.
 
 ## Multi-Strategy Operation
 
-Strategies are stored in the `strategy_configs` table and managed from `/strategies`. The backend does not require code changes for new strategy names.
+Strategies are stored in the `strategy_configs` table and managed from Settings > Strategies. The backend does not require code changes for new strategy names.
 
 Each strategy has:
 
-- `name`
-- `enabled`
-- `mode`: `PAPER` or `LIVE`
-- `tp_percent`
-- `sl_percent`
-- `max_active_trades`
-- `capital_per_trade`
-- `paper_trade`
-- `live_trade`
+- `name`, `enabled`, `mode` (`PAPER`/`LIVE`)
+- `index_symbol` — which configured index this strategy trades
+- `expiry_itm_strikes` — shifts the selected strike ITM by N strikes, but only on expiry day itself (0 = always ATM)
+- `tp_percent`, `sl_percent`, `sl_mode` (`FIXED` or `TRAILING`)
+- `trailing_activation_percent`, `trailing_offset_percent`
+- `max_active_trades`, `max_trades_per_day`, `max_consecutive_losses`, `daily_max_loss_percent`
+- `lots_per_trade`, `paper_trade`, `live_trade`
 
-When a webhook arrives, the engine:
+When a `BUY_CE`/`BUY_PE` webhook arrives, the engine:
 
-1. Loads the strategy by name.
-2. Rejects the signal if the strategy does not exist or is disabled.
-3. Checks bot status, daily lock, consecutive-loss limit, daily loss limit, and recent-loss cooldown.
-4. Checks open trades only for that strategy.
-5. Rejects the signal if `max_active_trades` is reached.
-6. Selects the nearest weekly ATM BankNifty option for the signal.
-7. Sizes the position from `capital_per_trade`.
-8. Opens PAPER or LIVE according to strategy config and global `SMARTAPI_LIVE_TRADING`.
-9. Monitors TP, SL, trailing stop, and square-off independently for every open strategy trade.
+1. Loads the strategy by name; rejects if it doesn't exist, is disabled, or the current time is outside the configured trading window.
+2. Checks bot status, daily lock, consecutive-loss limit, and daily loss limit.
+3. Checks open trades only for that strategy; rejects if `max_active_trades` is reached.
+4. Resolves the index's nearest-expiry ATM (or expiry-day ITM-shifted) option contract.
+5. Sizes the position from `lots_per_trade × lot_size`.
+6. Opens PAPER or LIVE according to strategy config and the global `SMARTAPI_LIVE_TRADING` switch.
+7. Monitors TP, SL, trailing stop, and square-off for every open trade every 30 seconds, independently per strategy.
 
-Example simultaneous state:
+`SELL_CE`/`SELL_PE` webhooks are **observation-only** for every strategy except V7 — they never close a position; exits are always decided by the monitor's own SL/target/trailing logic. V7 is the one exception (see below).
 
-```text
-V5.1 -> BUY_CE open
-V6 Momentum -> BUY_PE open
-V7 -> SELL_CE open
-Scalper -> 2 open trades
-```
+Multiple strategies (and AI Origination) can hold independent open positions simultaneously; they are never merged.
 
-These trades are independent and are never merged.
+## AI Origination
+
+An independent entry engine (`app/ai/originator.py`) that opens trades from index price structure and technical indicators alone — no TradingView signal, and each provider (Claude, OpenAI) makes its own independent decision every 5-minute cycle during the configured trading window (default 09:45–15:15 IST). Each provider gets its own trade slot per index, so both can hold concurrent separate positions on the same index.
+
+What it sees, per cycle: regime measures (ADX, ATR, CPR classification), key price levels (opening range, previous session high/low/close, today's range), trend indicators, extension from short-term mean, and price drift. It does **not** see the option chain, OI/IV/PCR, India VIX, news, or its own trade history.
+
+Entry gates, checked before any contract is resolved:
+
+- Confidence floor — the model's own self-reported confidence must clear an admin-configurable threshold.
+- DTE floor — never trades a contract expiring same-day; rolls forward to the next listed expiry instead.
+- Same-direction consecutive-loss gate — blocks a new entry once the most recent same-index-same-direction trades lost N times in a row (a single intervening win resets the streak).
+- Admin-configurable max stop-loss — caps how wide the model's proposed stop can be; an out-of-range stop/target falls back to trailing-stop management instead of being substituted with a fixed number.
+
+Exit reasons: `STOPLOSS`, `TARGET`, `TRAIL_EXIT` (after an activation threshold, a rescued winner giving back a bounded amount), `STALL_EXIT` (flat for too long with the trail never armed), `TIME_EXIT` (square-off at the configured close time).
+
+Configure providers, the confidence threshold, and the risk knobs above from Settings > AI.
 
 ## PAPER and LIVE Modes
 
-`PAPER` records simulated orders while still using live premium data for entry and monitoring.
+`PAPER` records simulated trades using live premium data for entry and monitoring — no broker order is placed.
 
-`LIVE` sends broker orders only when:
+`LIVE` sends a real broker order only when **both** are true:
 
-- Strategy `mode` is `LIVE`
-- Strategy `live_trade` is enabled
-- Global `SMARTAPI_LIVE_TRADING=true`
+- The per-entity opt-in is on (`StrategyConfig.live_trade` for a rule-based strategy, `IndexConfig.ai_origination_live_trade` for AI Origination on that index) **and**
+- The server-side `SMARTAPI_LIVE_TRADING` environment variable is `true`
 
-This keeps a deployment-level safety switch above per-strategy settings.
+`place_market_order` independently no-ops to a `PAPER_ORDER` id if the server-side switch is off, so a dashboard checkbox alone can never move real money.
 
-## TP/SL and Capital
+## Trading Window
 
-TP and SL are loaded from each strategy row. Position size is calculated from:
+Settings > General has two fields, enforced for both rule-based strategies and AI Origination:
 
-```text
-capital_per_trade / (entry_price * option_lot_size)
-```
+- **Trading Start Time** (default `09:45`) — no new entries before this time.
+- **Square Off Time** (default `15:15`, capped at `15:15`) — every open trade closes at or after this time.
 
-The result is rounded down to whole lots.
+The `15:15` ceiling on Square Off Time is deliberate: a daily square-off safety-net job still fires at a fixed 15:15 as a backstop, so a later configured close would let that job force-close positions before the admin's intended time.
 
 ## V7 TradingView-Managed Execution
 
-V7 uses a separate execution path. `BUY_CE` and `BUY_PE` open ATM option trades; `SELL_CE` and `SELL_PE` close the matching open V7 option trade.
+V7 uses a separate execution path. `BUY_CE`/`BUY_PE` open ATM option trades; `SELL_CE`/`SELL_PE` close the matching open V7 option trade (unlike every other strategy, where `SELL_*` is observation-only).
 
-For V7 only, exits are managed by TradingView. The server-side stop-loss, target, trailing-stop, cooldown, strategy-lock, and daily-lock engines do not manage V7 trades. SmartAPI execution, paper trading, trade history, Telegram alerts, and ATM strike resolution remain active.
+For V7 only, exits are managed by TradingView. The server-side stop-loss, target, and trailing-stop engines do not manage V7 trades. SmartAPI execution, paper trading, trade history, Telegram alerts, and ATM strike resolution remain active.
 
-The V7 portal is available at `/v7` and shows status, mode, active trades, and the latest 20 V7 trades.
+## Risk Locks and Trailing Stops
 
-## Risk Locks
+Consecutive-loss counts and locks are stored independently per strategy; a strategy lock does not block other strategies. Global daily account-loss protection is separate from strategy-level locks. At the first webhook of each new `Asia/Kolkata` trading day, strategy consecutive-loss counts, locks, and daily risk status reset automatically.
 
-Consecutive-loss counts and locks are stored independently per strategy. A strategy lock does not block other strategies. Global daily account-loss protection remains separate from strategy locks.
+Open trades track `highest_price`, `lowest_price`, `trailing_active`, and `trailing_stop`. For long entries (`BUY_CE`, `BUY_PE`), trailing activates after price advances past the strategy's activation threshold; the stop trails below `highest_price` by the configured offset. For short entries, the mirror image applies.
 
-At the first webhook of each new `Asia/Kolkata` trading day, strategy consecutive-loss counts, strategy locks, and daily risk status reset automatically. The reset is persisted and logged once per IST day.
+## Database Migrations
 
-Non-V7 open trades track:
+No Alembic, no manual migration step. `init_db()` calls `_ensure_columns()` (`app/database.py`) on every startup, which adds any missing column via a guarded, additive `ALTER TABLE` — safe to run against an existing database with real trade history. New columns default to whatever value reproduces the pre-migration behavior, so deploying a schema change never silently alters existing rows or requires a manual step.
 
-- `highest_price`
-- `lowest_price`
-- `trailing_active`
-- `trailing_stop`
+## Settings (Dashboard)
 
-For long entries (`BUY_CE`, `BUY_PE`), trailing activates after price advances by `TRAILING_ACTIVATION_PERCENT`; the stop trails below `highest_price` by `TRAILING_OFFSET_PERCENT`.
+- **General** — trading start/close time, Telegram bot token and chat ID.
+- **Strategies** — add/edit/enable/disable/delete rule-based strategies (see Multi-Strategy Operation).
+- **Instruments** — per-index config: enabled, exchange segment, spot symbol/token, lot size, strike interval, and the AI Origination live-trading opt-in.
+- **AI** — provider (primary + optional secondary), model, API key, base URL, temperature, timeout, confidence threshold, system prompt, and AI Origination's own risk knobs (max stop-loss %, max consecutive same-direction losses).
 
-For short entries (`SELL_CE`, `SELL_PE`), trailing activates after price falls by `TRAILING_ACTIVATION_PERCENT`; the stop trails above `lowest_price` by `TRAILING_OFFSET_PERCENT`.
+The AI tab's **Test Connection** button runs the configured provider independently of trading and displays only provider, model, latency, status, and a sanitized error — never the raw API key or full prompt/response.
 
-## Database Migration
+## Production Deployment
 
-`init_db()` auto-adds the V7 trailing columns when missing. Manual SQL:
+The live deployment runs directly on a host (currently an Ubuntu EC2 instance) under a Python virtualenv and systemd — no container in production.
 
-```sql
-ALTER TABLE strategy_trades ADD COLUMN highest_price FLOAT;
-ALTER TABLE strategy_trades ADD COLUMN lowest_price FLOAT;
-ALTER TABLE strategy_trades ADD COLUMN trailing_active BOOLEAN NOT NULL DEFAULT 0;
-ALTER TABLE strategy_trades ADD COLUMN trailing_stop FLOAT;
-```
-
-Apply the AI migrations in order for existing databases:
+1. Provision an Ubuntu host, open the port the app listens on (or place it behind Nginx with HTTPS), and clone the repo.
+2. Create the venv and install dependencies:
 
 ```bash
-sqlite3 data/platform.sqlite3 ".read migrations/001_create_ai_settings.sql"
-sqlite3 data/platform.sqlite3 ".read migrations/002_create_ai_trade_reviews.sql"
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # fill in real credentials
 ```
 
-`001_create_ai_settings.sql` creates the provider configuration and default Dummy/Shadow settings. `002_create_ai_trade_reviews.sql` stores AI reviews and later trade outcomes. Historical trade rows are not modified.
+3. Create a systemd unit, e.g. `/etc/systemd/system/tradingview-bot.service`:
 
-## AI Reviews
+```ini
+[Unit]
+Description=TradingView Bot
+After=network.target
 
-AI configuration is available to authenticated admins at `/ai-settings`.
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/tradingview-bot
+ExecStart=/home/ubuntu/tradingview-bot/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
 
-Supported settings include enable/disable, mode, provider, model, API key, base URL, temperature, timeout, confidence threshold, and system prompt. The API key is write-only in the page and is shown only as a masked placeholder after saving.
+[Install]
+WantedBy=multi-user.target
+```
 
-Current providers:
-
-- `dummy`: returns the safe fallback response when AI is not configured.
-- `openai`: uses the shared HTTP client, prompt builder, response validator, and audit logger without an OpenAI SDK.
-
-When AI is enabled with mode `SHADOW`, each successfully processed TradingView signal queues a background review after normal webhook execution. AI cannot accept, reject, execute, resize, or alter a trade. Provider failures are logged and do not interrupt trading. Reviews store provider/model and framework versions, normalized decisions, confidence, reasoning, latency, and the linked trade outcome when available.
-
-The **Test Connection** button runs the configured provider independently of trading and displays only provider, model, latency, status, and a sanitized error.
-
-## AWS Lightsail Deployment
-
-1. Create an Ubuntu Lightsail instance.
-2. Open port `8000` in the Lightsail firewall, or place the app behind Nginx with HTTPS.
-3. Install Docker:
+4. Enable and start it:
 
 ```bash
-sudo apt update
-sudo apt install -y docker.io docker-compose-plugin
-sudo usermod -aG docker ubuntu
+sudo systemctl daemon-reload
+sudo systemctl enable --now tradingview-bot.service
 ```
 
-4. Copy the repository to the server and create `.env`:
+5. Deploying a change:
 
 ```bash
-cp .env.example .env
-nano .env
+cd ~/tradingview-bot
+git pull origin main
+sudo systemctl daemon-reload   # only needed if the unit file itself changed
+sudo systemctl restart tradingview-bot.service
+sudo systemctl status tradingview-bot.service --no-pager
 ```
 
-5. Start the service:
-
-```bash
-docker compose up -d --build
-docker compose logs -f
-```
-
-6. Verify:
-
-```bash
-curl http://YOUR_SERVER_IP:8000/health
-```
-
-For production exposure, terminate TLS with Nginx or a Lightsail load balancer and restrict webhook access where possible.
+Deployment is manual and separate from development — a merged change to `main` is not live until this restart happens.
 
 ## API
 
@@ -299,13 +291,9 @@ Dashboard pages require login at `/login`.
 
 Returns service status and live-trading mode.
 
-### `GET /active-trade`
+### `GET /active-trade`, `GET /trades`
 
-Returns open strategy trades.
-
-### `GET /trades`
-
-Returns recent strategy trades from SQLite.
+Legacy single-index-era read endpoints; the dashboard and `/api/*` routes below are the actively maintained surface.
 
 ### `POST /webhook`
 
@@ -321,51 +309,42 @@ or:
 {"strategy":"V7","signal":"SELL_PE"}
 ```
 
-### Admin REST API
+Optional fields (`market_data`, `indicators`, `trend`, `strategy_filters`, `trade_state`) may be included for logging/validation context; unknown extra fields are accepted, not rejected.
+
+### Admin REST API (`/api/*`)
 
 Authenticated session required:
 
 - `GET /api/status`
-- `GET /api/active-trade`
-- `GET /api/trades`
-- `GET /api/trades/export`
-- `GET /api/strategies`
-- `GET /api/settings`
-- `POST /api/settings`
-- `POST /api/start`
-- `POST /api/stop`
-- `POST /api/restart`
+- `GET /api/trades`, `GET /api/trades/export`
+- `GET /api/strategies`, `GET /api/strategy-stats`
+- `GET /api/instruments`
+- `GET /api/settings`, `POST /api/settings`
+- `GET /api/daily-stats/export`
+- `GET /api/logs/export`
+- `GET /api/reports/export`
+- `GET /api/ai/latest-context`
+- `POST /api/start`, `POST /api/stop`, `POST /api/restart`
 - `POST /api/kill-switch`
 - `POST /api/reset-daily-lock`
 
 ## Dashboard
 
-- `/` shows status, daily stats, active trade, risk status, and recent logs.
-- `/active-trade-page` shows all live active strategy trades.
-- `/history` shows filtered multi-strategy trade history.
-- `/strategies` adds, edits, enables/disables, and deletes strategies.
-- `/control` provides start, stop, restart, kill switch, and daily-lock reset.
-- `/settings` persists trading, risk, square-off, and Telegram settings in SQLite.
-- `/ai-settings` configures and tests the optional AI provider.
-- `/v7` shows the TradingView-managed V7 portal.
-- `/logs` shows structured event logs.
+- `/` — live index prices, day range, market-conditions read (informational, not a second trading gate), and open positions across every strategy and AI Origination.
+- `/history` — filtered trade history plus performance KPIs and charts (equity curve, daily P&L, win/loss).
+- `/smartapi-health` — pre-market health checks and broker connectivity status.
+- `/control` — start, stop, restart, kill switch, and daily-lock reset.
+- `/settings` — General, Strategies, Instruments, and AI tabs (see Settings above).
+- `/reports` — on-demand daily/weekly/monthly/pattern-discovery/AI-origination-summary report generation.
+- `/logs` — structured event logs.
 
 ## Daily Risk Lock
 
-The platform computes cumulative daily P&L from completed trades. If it is less than or equal to `Daily Max Loss %` (default `-20%`), the global risk service disables new non-V7 trades, sends a Telegram alert, and shows a dashboard warning. The lock resets automatically before the first webhook of the next IST trading day; an admin can also reset it from `/control`.
+The platform computes cumulative daily P&L from completed trades. If it is at or below `Daily Max Loss %` (default `-20%`) for a strategy, the risk service disables new trades for that strategy, sends a Telegram alert, and shows a dashboard warning. The lock resets automatically before the first webhook of the next IST trading day; an admin can also reset it from `/control`.
 
 ## Timezone
 
-User-facing timestamps are displayed in IST (`Asia/Kolkata`, UTC+05:30). API trade responses include both UTC and IST timestamp fields, for example:
-
-```json
-{
-  "entry_time_utc": "2026-06-09T06:33:00Z",
-  "entry_time_ist": "09-Jun-2026 12:03 PM IST"
-}
-```
-
-CSV exports from `/api/trades/export` include IST date/time columns.
+User-facing timestamps are displayed in IST (`Asia/Kolkata`, UTC+05:30). SQLite does not reliably round-trip timezone info even on timezone-aware columns, so anything doing datetime arithmetic on a stored timestamp normalizes through `to_ist()` (`app/time_utils.py`) first.
 
 ## Tests
 
@@ -375,4 +354,4 @@ pytest
 
 ## Important Risk Notes
 
-This bot can place live market orders when `SMARTAPI_LIVE_TRADING=true`. Validate credentials, lot size, symbol selection, margin, order product type, and exchange holidays before enabling live mode. Keep the app running during market hours so the monitor can exit positions.
+This bot can place live market orders when both live-trading switches are on (see [PAPER and LIVE Modes](#paper-and-live-modes)). Validate credentials, lot size, symbol selection, margin, order product type, and exchange holidays before enabling live mode on any strategy or index. Keep the app running during market hours so the monitor can exit positions — and remember that AI Origination trades on its own initiative, independent of any TradingView signal, once its own live-trading opt-in is on.
