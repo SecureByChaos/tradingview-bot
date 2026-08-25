@@ -357,6 +357,28 @@ other live-history backtest in this project), that's the correct, reportable ans
 yet" is not a failure to find one, it's what the standing discipline requires until the data says
 otherwise.
 
+**Run for real, same day -- NOT SUPPORTED, on two separate grounds.**
+
+- **The `<20` floor is untestable from closed history: n=0.** Zero closed AI Origination trades have
+  ever had ADX below 20 at decision time. The 25 Aug trigger trade itself (the one that prompted this
+  whole investigation, ADX 19.6) was still `OPEN` when this ran -- it is not yet in this population,
+  and would be the very first observation in this bucket once it closes. This is itself a real,
+  useful fact: entries below ADX 20 are apparently rare enough in practice that a `<20` gate may have
+  had little to act on regardless -- worth re-running once the trigger trade (and any others like it)
+  closes and the bucket actually has data.
+- **The `<25` floor's point estimate runs backwards from the hypothesis.** The would-be-blocked
+  `20-25` band (n=6, below the trust minimum) had mean P&L **+6.05%**, actually *better* than the
+  kept `>=25` band's **-1.59%** (n=38, clears the minimum). Bootstrap 90% CI on the difference is
+  `[-1.67, +17.26]` -- crosses zero, so not reliable either way, but the direction offers no support
+  for blocking the `20-25` band. If anything, on these numbers `>=25` ("Trending" per the dashboard's
+  own label) is the weaker-performing bucket, not the stronger one.
+
+**Verdict: no ADX gate ships.** Neither candidate floor clears this project's own bar (a bootstrap CI
+that excludes zero, both sides at or above the trust minimum). `app/ai/originator.py` remains
+unchanged -- the DTE floor, same-direction consecutive-loss gate, and 0.60 confidence floor stay the
+only three hard gates. Worth revisiting specifically once the `<20` bucket has real closed-trade data
+to look at; until then this is a genuinely unanswered question, not a settled "ADX doesn't matter."
+
 ### Live-market prevClose fixed to use the CAS-corrected candle close -- confirmed with real data, same day (25 Aug 2026)
 
 **Reported**: dashboard change/% mismatch against the broker app on an expiry day -- Nifty off by ~36 points (-0.12% vs broker's -0.27%), Bank Nifty off by ~107 points (-0.02% vs broker's -0.21%). Live LTP itself matched closely; only the change figure was wrong. The request's own framing named a "24 Aug market-hours gate patch" and "Lightsail" as context -- neither is real: `git log` shows no market-hours-gate change landed 24 Aug (that date's only change is the `lowest_price` fix directly above, unrelated), and production is EC2/systemd, not Lightsail. Flagged plainly rather than built around.
