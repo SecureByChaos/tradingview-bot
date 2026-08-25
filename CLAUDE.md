@@ -357,6 +357,73 @@ other live-history backtest in this project), that's the correct, reportable ans
 yet" is not a failure to find one, it's what the standing discipline requires until the data says
 otherwise.
 
+**Run for real, same day -- NOT SUPPORTED, on two separate grounds.**
+
+- **The `<20` floor is untestable from closed history: n=0.** Zero closed AI Origination trades have
+  ever had ADX below 20 at decision time. The 25 Aug trigger trade itself (the one that prompted this
+  whole investigation, ADX 19.6) was still `OPEN` when this ran -- it is not yet in this population,
+  and would be the very first observation in this bucket once it closes. This is itself a real,
+  useful fact: entries below ADX 20 are apparently rare enough in practice that a `<20` gate may have
+  had little to act on regardless -- worth re-running once the trigger trade (and any others like it)
+  closes and the bucket actually has data.
+- **The `<25` floor's point estimate runs backwards from the hypothesis.** The would-be-blocked
+  `20-25` band (n=6, below the trust minimum) had mean P&L **+6.05%**, actually *better* than the
+  kept `>=25` band's **-1.59%** (n=38, clears the minimum). Bootstrap 90% CI on the difference is
+  `[-1.67, +17.26]` -- crosses zero, so not reliable either way, but the direction offers no support
+  for blocking the `20-25` band. If anything, on these numbers `>=25` ("Trending" per the dashboard's
+  own label) is the weaker-performing bucket, not the stronger one.
+
+**Verdict: no ADX gate ships.** Neither candidate floor clears this project's own bar (a bootstrap CI
+that excludes zero, both sides at or above the trust minimum). `app/ai/originator.py` remains
+unchanged -- the DTE floor, same-direction consecutive-loss gate, and 0.60 confidence floor stay the
+only three hard gates. Worth revisiting specifically once the `<20` bucket has real closed-trade data
+to look at; until then this is a genuinely unanswered question, not a settled "ADX doesn't matter."
+
+**PART 3 added same day: DI-direction agreement, prompted by an external ADX-gate design document.**
+The doc proposed a fuller entry gate -- ADX above a floor, `+DI`/`-DI` direction agreeing with the
+trade's own direction, ADX sloping upward, and an EMA/VWAP breakout trigger. Scoped down before
+building anything: confirmed via `AskUserQuestion` this stays a gate layered in front of AI
+Origination's existing LLM decisions (not a new standalone rule-based strategy), and entry-side only
+(no `>40` exhaustion exit, which would touch the shared-FIXED-branch exit logic this file already
+flags as high-risk to change).
+
+Of the doc's four legs, only DI-direction is newly testable from history: `app/indicators.py`'s
+`adx()` already returns `plus_di`/`minus_di` alongside ADX, and `market_context.py` already carries
+both into `MarketContext.as_dict()` -- exactly what `ai_origination_logs.context_json` stores
+verbatim for every past decision, so no new logging was needed to backtest it. **ADX slope is NOT
+testable** -- nothing has ever recorded ADX's trend over time, only a single snapshot per decision;
+it would need a new logged field and a real observation window first, the same path
+`trend_duration_pct_of_session` and `same_direction_entries_today` both took before either was
+gated. The **EMA/VWAP breakout trigger is not re-tested** -- VWAP has no index-instrument data in
+this codebase (index candles report zero volume, the same wall BNV5.1/BNV6 hit), and the
+EMA-alignment alternative is what `break_confirmation_backtest.py` already tested via
+EMA_STACK/ORB/PDH/PDL setups on 12 Aug (verdict NOT SUPPORTED) -- re-testing it here would just
+duplicate that result.
+
+`scripts/adx_gate_backtest.py` extended with `_di_agrees()` (parses `context_json`, `None` when
+either DI value is missing rather than defaulted to a side) and a new PART 3: DI-agrees vs
+DI-disagrees bootstrap, plus a combined-gate check (`ADX >= 20 AND DI agrees`) against everything
+else. 6 new tests (`tests/test_adx_gate_backtest.py`): DI values read correctly from `context_json`,
+missing DI handled without crashing, `_di_agrees`'s BUY_CE/BUY_PE logic and its `None` case, and the
+full report function running clean on a realistic mixed population (some trades with DI, some
+without). Also re-smoke-tested the full CLI against synthetic data including DI values -- ran clean.
+Full suite: 434 passed (was 428). `python -c "import app.main"` and
+`python -c "import scripts.adx_gate_backtest"` both import cleanly.
+
+**Not run against real data yet.** Same standing constraint as every other backtest script here.
+Run on the machine with real history:
+
+```bash
+python -m scripts.adx_gate_backtest --db data/trading.db
+```
+
+Read PART 3 alongside PART 2's already-negative floor result -- if DI-agreement clears the trust
+minimum with a CI excluding zero (in either direction), that's real evidence either for or against
+that specific leg of the doc's proposed gate, independent of the floor question. ADX slope stays
+unbuildable until it's logged going forward; if the doc's design is worth pursuing further, adding
+that field to `AIOriginationLog` (pure instrumentation, no trading-path change, same shape as every
+other field in that table) would be the next concrete step -- not done in this pass.
+
 ### Live-market prevClose fixed to use the CAS-corrected candle close -- confirmed with real data, same day (25 Aug 2026)
 
 **Reported**: dashboard change/% mismatch against the broker app on an expiry day -- Nifty off by ~36 points (-0.12% vs broker's -0.27%), Bank Nifty off by ~107 points (-0.02% vs broker's -0.21%). Live LTP itself matched closely; only the change figure was wrong. The request's own framing named a "24 Aug market-hours gate patch" and "Lightsail" as context -- neither is real: `git log` shows no market-hours-gate change landed 24 Aug (that date's only change is the `lowest_price` fix directly above, unrelated), and production is EC2/systemd, not Lightsail. Flagged plainly rather than built around.
