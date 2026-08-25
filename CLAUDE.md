@@ -424,6 +424,31 @@ unbuildable until it's logged going forward; if the doc's design is worth pursui
 that field to `AIOriginationLog` (pure instrumentation, no trading-path change, same shape as every
 other field in that table) would be the next concrete step -- not done in this pass.
 
+**Re-run for real, same day -- STILL NOT SUPPORTED, all three checks.** The `<20` bucket now has its
+first real observation: the 25 Aug trigger trade itself closed at **-18.81%**, the single worst
+result in the whole dataset. Still `n=1`, still below the trust minimum, still not something a
+bootstrap comparison can run against 44 other trades ("too few observations on one side").
+
+- **`<25` floor**: now `n=7` blocked (the original 6-trade `20-25` band plus the new `<20` loss),
+  mean P&L +2.50%, versus the kept `>=25` band's -1.59% (`n=38`). Bootstrap 90% CI `[-5.59, +14.27]`
+  -- still crosses zero, still no reliable difference, even with the single worst trade in the
+  dataset now inside the blocked bucket.
+- **PART 3, DI-direction**: `agrees` `n=43` (mean -1.47%), `disagrees` `n=2` (mean +9.98%, both
+  trust-minimum-thin). CI `[-2.21, +25.07]` crosses zero. **The real, useful finding here isn't the
+  CI -- it's the population split itself: 43 of 45 trades (95.6%) already had `+DI`/`-DI` agreeing
+  with the model's own chosen direction.** DI almost never disagrees with what AI Origination
+  decides to trade, which means this leg has very little room to discriminate outcomes at all --
+  not "DI doesn't matter," but "the model's direction and DI direction are already almost never in
+  conflict," a different and more specific finding than a null correlation would suggest on its own.
+- **Combined gate** (`ADX >= 20 AND DI agrees`): `passes` `n=42` (-1.05%), `fails` `n=3` (+0.38%).
+  CI `[-13.81, +16.79]` crosses zero, `n=3` on the fail side.
+
+**Verdict unchanged, now on real data for every leg tested: no gate ships.** DTE floor,
+same-direction consecutive-loss gate, and the 0.60 confidence floor remain the only three hard
+gates in `_open_trade`. ADX slope is still the one leg of the original doc with no path to testing
+without new logging -- everything else has now been measured against real history and come back
+without a reliable signal in either direction.
+
 ### Live-market prevClose fixed to use the CAS-corrected candle close -- confirmed with real data, same day (25 Aug 2026)
 
 **Reported**: dashboard change/% mismatch against the broker app on an expiry day -- Nifty off by ~36 points (-0.12% vs broker's -0.27%), Bank Nifty off by ~107 points (-0.02% vs broker's -0.21%). Live LTP itself matched closely; only the change figure was wrong. The request's own framing named a "24 Aug market-hours gate patch" and "Lightsail" as context -- neither is real: `git log` shows no market-hours-gate change landed 24 Aug (that date's only change is the `lowest_price` fix directly above, unrelated), and production is EC2/systemd, not Lightsail. Flagged plainly rather than built around.
