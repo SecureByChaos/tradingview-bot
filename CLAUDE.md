@@ -339,6 +339,37 @@ in this file): a `(setup, floor)` cell is worth trusting only if `below` is reli
 No gate is added to `app/ai/originator.py` by this pass -- reported here per the same discipline as
 every other candidate gate in this project.
 
+**Run for real, same day -- NOT SUPPORTED, the full parameter surface.** Every registered setup, both
+floors, both indices, `HORIZON_BARS=12` (60 min). Scanned every `(setup, floor)` row-pair for the
+project's own bar: `below`'s bootstrap CI fully separated from `at_or_above`'s, in the direction the
+hypothesis predicts. **None exist.** Every row's `below`/`at_or_above` confidence intervals overlap on
+both indices -- not one setup/floor combination clears even a single-index "reliably worse" reading,
+let alone replicates on both.
+
+Two `BACKWARDS` verdicts appear (`EMA_RSI_CROSS[entry_offset=0]` and `EXTENDED_FADE[atr_mult=2.0]`,
+both `<20`, both Bank Nifty only) -- Bank Nifty's `below` bucket edge is reliably negative on their
+own. Checked against Nifty for the same setups: `EMA_RSI_CROSS[entry_offset=0] <20` reverses direction
+entirely (Nifty's `at_or_above` bucket is the worse one, not `below`); `EXTENDED_FADE[atr_mult=2.0]
+<20` is directionally the same sign on Nifty (-3.18pp) but not reliably so (CI `[-8.21, +1.93]`
+crosses zero) and has no reported `at_or_above` bucket to compare against at all (too few signals).
+Neither replicates cleanly enough to count as real, per this project's own standard.
+
+A separate, unrelated observation worth naming: Nifty shows broad positive edge across several
+trend/breakout setups (`ORB_BREAK`, `PDH_PDL_BREAK`, `ST_ALIGNED`, `EMA_STACK`) regardless of which
+ADX bucket a bar falls in -- both `below` and `at_or_above` often read `POSITIVE` on the same setup.
+That is a fact about Nifty's setups carrying edge generally (consistent with this project's own
+earlier walk-forward findings, which already found Nifty setups more consistently positive than Bank
+Nifty's), not evidence that ADX is what discriminates it -- if ADX were the discriminator, `below`
+would read differently from `at_or_above`, and on Nifty it usually doesn't.
+
+**Final verdict: no ADX gate, at any granularity tested this cycle** -- real AI Origination history
+(PARTS 1-3, ~45 trades) and the full 2-year index-level archive (PART 4, every registered setup, both
+floors, both indices) agree. `app/ai/originator.py`'s three hard gates (DTE floor, same-direction
+consecutive-loss gate, 0.60 confidence floor) remain unchanged. This closes out the ADX-gate
+investigation that started with the 25 Aug trigger trade -- worth reopening only if a materially
+different mechanism (the still-unbuildable ADX slope, once logged and observed) or a much larger real
+trade sample changes the picture.
+
 ### ADX hard-gate backtest tooling built -- NOT wired into originator.py yet, pending real data (25 Aug 2026)
 
 **Trigger (25 Aug, one trade, not evidence on its own)**: Nifty 50 `BUY_PE`, AI Origination/OpenAI,
