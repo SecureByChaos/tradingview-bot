@@ -1102,6 +1102,19 @@ def _open_trade(
     target_percent, _ = symmetric_premium_percent(
         target_percent, index.symbol, contract.option_type, dte
     )
+
+    # 25 Aug 2026: max_sl_percent (admin-configured, checked above via
+    # _stop_is_sane) is meant to cap the REALIZED loss on the trade, not just
+    # the AI's nominal input -- but the rescale above can still widen a put's
+    # premium-percent stop past that ceiling even when the nominal number
+    # cleared it (a nominal 12% Nifty put can rescale to ~17-18%; confirmed
+    # on a real trade). This only ever tightens sl_percent, never widens it,
+    # so it cannot turn an already-sane call's stop into something wider, and
+    # it applies identically whether the trade is running on the AI's own
+    # FIXED numbers or the TRAILING fallback's initial stop.
+    if sl_percent is not None and sl_percent > max_sl_percent:
+        sl_percent = max_sl_percent
+
     stoploss = round(entry_price * (1 - sl_percent / 100), 2)
     target = round(entry_price * (1 + target_percent / 100), 2)
 

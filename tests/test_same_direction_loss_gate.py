@@ -372,3 +372,98 @@ def test_open_trade_target_ceiling_stays_fixed_at_fifty_even_with_lower_admin_st
 
     assert trade is not None
     assert trade.sl_mode == "FIXED"
+
+
+# ---------------------------------------------------------------------------
+# 25 Aug 2026: admin max_sl_percent must cap the REALIZED stop, not just the
+# AI's nominal pre-rescale input -- confirmed on a real trade that a nominal
+# stop clearing the sanity check can still rescale wider than the admin's
+# ceiling for a put. See CLAUDE.md.
+# ---------------------------------------------------------------------------
+
+def _widen_by(factor: float):
+    """Fake symmetric_premium_percent -- multiplies every input by a fixed
+    factor, simulating the real PE-widening rescale without needing a real
+    fitted coefficients file (this sandbox has none)."""
+    def _fake(proposed_percent, index_symbol, option_type, dte, moneyness="ATM"):
+        return round(proposed_percent * factor, 2), True
+    return _fake
+
+
+def test_open_trade_clamps_a_rescaled_put_stop_to_the_admin_ceiling(monkeypatch):
+    import app.ai.originator as originator_module
+    monkeypatch.setattr(originator_module, "symmetric_premium_percent", _widen_by(1.45))
+
+    db = _make_session()
+    index = _make_index()
+    create_settings(db, id=1, ai_origination_max_sl_percent=12.0)
+    # Nominal 12.0 clears _stop_is_sane (<= 12.0 ceiling); the fake rescale
+    # then widens it to 17.4, mirroring the real 12% -> 17.39% production case.
+    decision = _Decision(action="BUY_PE", confidence=0.7, sl_percent=12.0, target_percent=20.0, reasoning="test")
+    smartapi = FakeSmartAPI(price=100.0)
+    option_finder = FakeOptionFinder(_make_contract())
+
+    trade = _open_trade(db, index, "claude", decision, smartapi, option_finder)
+
+    assert trade is not None
+    assert trade.sl_mode == "FIXED"
+    # Clamped back to the 12% ceiling, not the rescaled 17.4%.
+    assert trade.stoploss == round(100.0 * (1 - 0.12), 2)
+
+
+def test_open_trade_clamp_does_not_touch_the_target(monkeypatch):
+    import app.ai.originator as originator_module
+    monkeypatch.setattr(originator_module, "symmetric_premium_percent", _widen_by(1.45))
+
+    db = _make_session()
+    index = _make_index()
+    create_settings(db, id=1, ai_origination_max_sl_percent=12.0)
+    decision = _Decision(action="BUY_PE", confidence=0.7, sl_percent=12.0, target_percent=20.0, reasoning="test")
+    smartapi = FakeSmartAPI(price=100.0)
+    option_finder = FakeOptionFinder(_make_contract())
+
+    trade = _open_trade(db, index, "claude", decision, smartapi, option_finder)
+
+    assert trade is not None
+    # Target keeps the full rescaled 29% -- only the stop is capped by
+    # max_sl_percent.
+    assert trade.target == round(100.0 * (1 + 0.29), 2)
+
+
+def test_open_trade_clamp_never_widens_a_stop_already_under_the_ceiling(monkeypatch):
+    import app.ai.originator as originator_module
+    monkeypatch.setattr(originator_module, "symmetric_premium_percent", _widen_by(1.2))
+
+    db = _make_session()
+    index = _make_index()
+    create_settings(db, id=1, ai_origination_max_sl_percent=20.0)
+    decision = _Decision(action="BUY_PE", confidence=0.7, sl_percent=12.0, target_percent=20.0, reasoning="test")
+    smartapi = FakeSmartAPI(price=100.0)
+    option_finder = FakeOptionFinder(_make_contract())
+
+    trade = _open_trade(db, index, "claude", decision, smartapi, option_finder)
+
+    assert trade is not None
+    # 12.0 * 1.2 = 14.4, comfortably under the 20.0 ceiling -- unclamped.
+    assert trade.stoploss == round(100.0 * (1 - 0.144), 2)
+
+
+def test_open_trade_clamp_applies_to_trailing_fallbacks_initial_stop_too(monkeypatch):
+    import app.ai.originator as originator_module
+    monkeypatch.setattr(originator_module, "symmetric_premium_percent", _widen_by(1.45))
+
+    db = _make_session()
+    index = _make_index()
+    create_settings(db, id=1, ai_origination_max_sl_percent=12.0)
+    # sl_percent=45.0 fails _stop_is_sane -> falls back to TRAILING mode's
+    # own _TRAILING_INITIAL_SL_PERCENT (10.0), which the fake rescale then
+    # widens to 14.5 -- still above the 12.0 ceiling and still clamped.
+    decision = _Decision(action="BUY_PE", confidence=0.7, sl_percent=45.0, target_percent=48.0, reasoning="test")
+    smartapi = FakeSmartAPI(price=100.0)
+    option_finder = FakeOptionFinder(_make_contract())
+
+    trade = _open_trade(db, index, "claude", decision, smartapi, option_finder)
+
+    assert trade is not None
+    assert trade.sl_mode == "TRAILING"
+    assert trade.stoploss == round(100.0 * (1 - 0.12), 2)
