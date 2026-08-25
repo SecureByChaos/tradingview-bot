@@ -295,6 +295,68 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### ADX hard-gate backtest tooling built -- NOT wired into originator.py yet, pending real data (25 Aug 2026)
+
+**Trigger (25 Aug, one trade, not evidence on its own)**: Nifty 50 `BUY_PE`, AI Origination/OpenAI,
+confidence 0.66. The dashboard's own tradability read showed ADX 19.6 -- "Not tradable" -- at
+decision time. Asked directly why the trade fired despite that: nothing in `_open_trade`
+(`app/ai/originator.py`) gates on ADX at all. `_classify_tradability`'s TRENDING/MARGINAL/
+NOT_TRADABLE read (`app/platform.py`, added 10 Aug) is explicitly informational-only, shown on the
+dashboard, never consulted by the trading path -- confirmed by the template's own comment: *"Nothing
+in the trading path reads this."* The only three real hard gates today are the DTE floor, the
+same-direction consecutive-loss gate, and the 0.60 confidence floor. This trade cleared all three,
+so it fired despite a caution the model itself named and the dashboard itself flagged.
+
+**Not a new finding -- restates a gap CLAUDE.md's own 11 Aug entry already left open.** "Trend-age
+caution moved to a hard gate" deliberately did NOT hard-gate `trend_duration_pct_of_session` (closely
+related to ADX -- both describe "is there a real trend"), because the incident review that prompted
+it gave a sweep range to validate (80/90/95%) rather than a committed number, and picking one from a
+single day's anecdote was judged exactly the overfitting error this project guards against elsewhere.
+Same standard applies here, so the same discipline: backtest before shipping, per every other gate
+this project has added (DTE floor, same-direction consecutive-loss gate, confidence floor, the
+declined break-confirmation and reasoning-hedge gates).
+
+**Built**: `scripts/adx_gate_backtest.py`, same shape as `break_confirmation_backtest.py`/
+`confidence_sizing_backtest.py` (`ai_origination_logs JOIN strategy_trades`, MFE/MAE from
+`strategy_trade_ticks` -- not `highest_price`/`lowest_price`, since this population spans trades from
+both before and after the 24 Aug `lowest_price` fix, so ticks are the one source correct across the
+whole history). Buckets on `_classify_tradability`'s own bands (`ADX_NO_TREND=20`,
+`ADX_TRENDING=25`, imported as literal values matching `app/market_context.py`, not reinvented):
+`<20`, `20-25`, `>=25`. A trade with no recorded ADX (predates the field) is reported in its own
+bucket, excluded from every comparison rather than defaulted to a side. Sweeps two candidate hard
+floors (block `<20`, block `<25`) via the same floor-bootstrap shape that validated the 0.60
+confidence floor -- 90% CI on `mean_pnl(blocked) - mean_pnl(kept)`, flagged when either side is below
+`MIN_BUCKET_LIVE=20`.
+
+6 new tests (`tests/test_adx_gate_backtest.py`): ADX read correctly off the joined
+`ai_origination_logs` row, a missing ADX doesn't exclude the trade (just excludes it from bucket/floor
+comparisons), MFE/MAE derived from ticks matches the established pattern, the population filter
+excludes `SIGNAL` trades (no joinable log row) and still-`OPEN` trades, and the bootstrap helper
+detects both a real synthetic gap and a null case. Also smoke-tested the full CLI path against 60
+synthetic trades (thin buckets, the no-ADX bucket, per-index breakdown, both floor comparisons) to
+catch formatting bugs the unit tests wouldn't -- ran clean. Full suite: 428 passed (was 422).
+`python -c "import app.main"` and `python -c "import scripts.adx_gate_backtest"` both import cleanly.
+
+**No gate added to `app/ai/originator.py` in this pass -- deliberately.** Per the same standard this
+project has applied to every other candidate gate: a floor ships only if it clears the trust minimum
+with a bootstrap CI that excludes zero. This sandbox has no real `data/trading.db`, so there is no
+result to validate against yet (confirmed again: `sqlite3.OperationalError: no such table:
+strategy_trades`, the same standing constraint every other backtest script in this project hits
+here). Run on the machine with real history:
+
+```bash
+python -m scripts.adx_gate_backtest --db data/trading.db
+```
+
+Read PART 2 (the candidate-floor bootstrap) for the actual go/no-go signal. If either floor (20 or
+25) shows a reliably-worse blocked population with both sides at or above the 20-observation trust
+minimum, that floor is validated and should be wired into `_open_trade` as a real hard gate, the same
+place the DTE/same-direction/confidence gates already live -- report back and I'll build that next.
+If neither clears the bar, or the sample is too thin (likely at the current history size, per every
+other live-history backtest in this project), that's the correct, reportable answer too: "no ADX gate
+yet" is not a failure to find one, it's what the standing discipline requires until the data says
+otherwise.
+
 ### Live-market prevClose fixed to use the CAS-corrected candle close -- confirmed with real data, same day (25 Aug 2026)
 
 **Reported**: dashboard change/% mismatch against the broker app on an expiry day -- Nifty off by ~36 points (-0.12% vs broker's -0.27%), Bank Nifty off by ~107 points (-0.02% vs broker's -0.21%). Live LTP itself matched closely; only the change figure was wrong. The request's own framing named a "24 Aug market-hours gate patch" and "Lightsail" as context -- neither is real: `git log` shows no market-hours-gate change landed 24 Aug (that date's only change is the `lowest_price` fix directly above, unrelated), and production is EC2/systemd, not Lightsail. Flagged plainly rather than built around.
