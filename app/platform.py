@@ -627,6 +627,22 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
                 .limit(1)
             )
             reference = previous_day_tick.price if previous_day_tick is not None else todays_ticks[0].price
+            # 25 Aug 2026: temporary diagnostic for a reported prevClose/change%
+            # mismatch against the broker app on an expiry day (~36-107 point
+            # gap). Confirms exactly which tick this function picked as
+            # "previous close" and when it was recorded, so that can be diffed
+            # directly against SmartAPI's own previous-close field -- this
+            # reference is the known approximate one (see this function's own
+            # docstring), not the corrected candle-based close AI Origination's
+            # market context uses. Remove once the gap is confirmed/resolved.
+            logger.info(
+                "[PREVCLOSE] %s: reference=%.2f (%s, recorded_at=%s) current=%.2f",
+                index.symbol,
+                reference,
+                "previous-day tick" if previous_day_tick is not None else "today's first tick (no prior-day tick found)",
+                previous_day_tick.recorded_at if previous_day_tick is not None else todays_ticks[0].recorded_at,
+                price,
+            )
             all_prices = [tick.price for tick in todays_ticks] + [price]
             entry["change_abs"] = round(price - reference, 2)
             entry["change_percent"] = round(((price - reference) / reference) * 100, 2) if reference else 0.0

@@ -295,6 +295,31 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Live-market prevClose diagnostic logging added -- root cause found, fix NOT yet shipped (25 Aug 2026)
+
+**Reported**: dashboard change/% mismatch against the broker app on an expiry day -- Nifty off by ~36 points (-0.12% vs broker's -0.27%), Bank Nifty off by ~107 points (-0.02% vs broker's -0.21%). Live LTP itself matched closely; only the change figure was wrong. The request's own framing named a "24 Aug market-hours gate patch" and "Lightsail" as context -- neither is real: `git log` shows no market-hours-gate change landed 24 Aug (that date's only change is the `lowest_price` fix directly above, unrelated), and production is EC2/systemd, not Lightsail. Flagged plainly rather than built around.
+
+**Root cause, traced through both real prevClose code paths (they genuinely differ, confirming that part of the request was a fair question):**
+
+- The figure actually showing the mismatch is the **Live market panel** (`get_index_live_figures()`, `app/platform.py`) -- the separate "Market Conditions" panel (`get_market_conditions()`) shows regime/ADX/CPR labels only, no numeric change% at all, so that panel name in the request doesn't point at the right function.
+- `get_index_live_figures()`'s `reference` is the most recent `IndexPriceTick` row from before today -- a deliberate approximation shipped 21 Aug specifically to fix an earlier open-vs-previous-close mismatch, whose own docstring already names this exact residual gap: tick recording is gated to `check_market_hours()`'s 09:15-15:30 IST window (`app/signal_validation.py`), which ends before the Closing Auction Session actually settles (~15:35, see "Closing Auction Session" below). So "previous day's last tick" is whatever price a dashboard poll happened to catch just before 15:30, not guaranteed to be the true settlement print.
+- AI Origination's own previous-close (`compute_levels()` in `app/market_context.py`, feeds CPR/PDH/PDL, not shown as a numeric % anywhere) is a **separate, candle-based** computation, corrected by the `closing-auction-capture` job (15:45 IST, `capture_closing_auction()` in `app/market_data.py`) built for exactly this class of gap on 3 Aug. That path is very likely accurate; it isn't what's showing the mismatch.
+- Today's magnitude (36/107 points) is smaller than 3 Aug's measured CAS gap (200-567 points) but the same mechanism -- consistent with, not necessarily proof of, this being the cause. Expiry-day settlement dynamics plausibly widen the final-auction-window move beyond an ordinary day's.
+
+**Fixed**: nothing computational -- explicitly scoped to diagnosis only, per the request's own "don't ship the fix yet." Added one temporary diagnostic log line in `get_index_live_figures()`, logged on every call: `[PREVCLOSE] {symbol}: reference={value} ({previous-day tick|today's first tick}, recorded_at={ts}) current={value}`. This makes the exact tick this function is choosing, and when it was recorded, directly diffable against the broker's own previous-close on a future trading/expiry day, rather than staying a plausible-but-unconfirmed diagnosis. Remove once the gap is confirmed or the real fix (below) ships.
+
+**Proposed fix, not built**: point the Live market panel's reference at the same corrected candle-based close `compute_levels()`/`capture_closing_auction()` already produce, instead of the `IndexPriceTick` approximation -- reusing a fix this project already built for the AI Origination path rather than inventing a second one for this consumer.
+
+Full suite: 418 passed (unchanged from the `lowest_price` fix -- no new tests, this is a log line only, nothing to assert against without a real dashboard poll). `python -c "import app.main"` imports cleanly.
+
+**Not verified live**. After deploying, watch for `[PREVCLOSE]` log lines on the next trading day and compare `reference`/`recorded_at` against the broker's own displayed previous close directly:
+
+```bash
+sudo journalctl -u tradingview-bot --since today | grep "\[PREVCLOSE\]"
+```
+
+If `recorded_at` consistently lands meaningfully before 15:30 IST on the previous session (rather than right at the CAS settlement print), that confirms this diagnosis with real data and the candle-based fix above should be built next.
+
 ### `lowest_price` never updated on any long trade -- structurally unreachable code, not missing code (24 Aug 2026)
 
 **Reported**: real `strategy_trades` query evidence, both historical (27-28 Jul) and live (24 Aug), showing `lowest_price` pinned at `entry_price` for every AI Origination trade regardless of how far the premium actually fell. Requested: confirm the missing update logic and add it; verify post-deploy that it now moves; re-run the same historical query pattern going forward; and explicitly confirm (not assume) that MAE% in exports was unaffected, tracing its actual source rather than trusting the existing 14 Aug note that flagged this same column as unreliable.
