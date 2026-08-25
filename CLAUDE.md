@@ -295,6 +295,48 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination Max Stop-Loss % now caps the REALIZED loss, not just the AI's nominal input (25 Aug 2026)
+
+**Reported**: a real trade lost -18.81% despite `AISettings.ai_origination_max_sl_percent` set to 12.0.
+Traced with the real CSV export row: stored `SL %` was **17.39**, not 12 -- the admin ceiling is
+checked in `_open_trade`'s `_stop_is_sane()` against `decision.sl_percent`, the AI's *raw, pre-rescale*
+proposed number. `symmetric_premium_percent()` (`app/premium_model.py`) then widens that number for PE
+contracts (puts are more index-sensitive than calls, so an unadjusted percentage would stop a put on a
+smaller move -- the rescale exists specifically to equalize that), and its own docstring gives the
+almost-exact match: *"A 12% call stop becomes an ~18% put stop -- same bet, honestly labelled."* A
+further ~1.4pp came from ordinary 30-second monitor-tick execution slippage on top, the same pattern
+already diagnosed in the NV1 1-DTE-floor entry above. Neither piece was a bug -- both are documented,
+intentional behavior -- but they meant the admin-facing "Max Stop-Loss %" label didn't do what it says
+for puts specifically. Asked directly whether to leave this as-is or make the setting cap the real loss;
+chosen: make it real.
+
+**Fixed**: `_open_trade` now clamps `sl_percent` down to `max_sl_percent` *after* the CE/PE rescale,
+not just checking the pre-rescale nominal value beforehand (the existing `_stop_is_sane` FIXED-vs-
+TRAILING decision is untouched -- that's still evaluating whether the AI's own nominal risk judgment is
+trustworthy, a different question from what ceiling to enforce on the number that actually gets used).
+The clamp only ever tightens `sl_percent`, never widens it, so an already-compliant call's stop cannot
+be affected, and it applies uniformly whether the trade ends up on the AI's own FIXED numbers or the
+TRAILING fallback's initial stop (`_TRAILING_INITIAL_SL_PERCENT`, which gets the same rescale and can
+therefore also need the same clamp). `target_percent` is deliberately untouched -- the admin's stop
+ceiling was never meant to cap upside, and the existing target/stop sanity split (17 Aug) already
+established that principle.
+
+Settings > AI's tooltip for this field updated to say what it now actually does (caps the realized
+loss, enforced after the CE/PE adjustment) rather than the old, technically-narrower "caps the AI's
+proposed stop-loss" wording that read as covering more than it did.
+
+4 new tests (`tests/test_same_direction_loss_gate.py`): a rescaled PE stop is clamped back to the
+admin ceiling (mirrors the real 12%->17.4% production case via a fake rescale, since this sandbox has
+no fitted coefficients file to exercise the real rescale); the target is unaffected by the same clamp;
+a stop that rescales to something still under the ceiling is left alone (the clamp never widens); and
+the TRAILING fallback's own initial stop gets the same clamp. Full suite: 442 passed (was 438).
+`python -c "import app.main"` imports cleanly; `settings.html` verified to still parse.
+
+**Not verified live** -- this sandbox cannot place a real trade to observe the clamp firing end to end.
+After deploying, confirm on the next PE trade that its stored/exported `SL %` never exceeds the
+configured `ai_origination_max_sl_percent`, even when the AI's own reasoning or the CSV export shows a
+wider *nominal* number would otherwise have applied.
+
 ### ADX gate backtest extended with a 2-year index-level fallback -- tooling only, not run (25 Aug 2026)
 
 **Requested**: "I want it to be run on last 2 years data," after the entry directly below settled the
@@ -338,6 +380,37 @@ in this file): a `(setup, floor)` cell is worth trusting only if `below` is reli
 `at_or_above` on **both** indices, not a single-index result with a CI that happens to exclude zero.
 No gate is added to `app/ai/originator.py` by this pass -- reported here per the same discipline as
 every other candidate gate in this project.
+
+**Run for real, same day -- NOT SUPPORTED, the full parameter surface.** Every registered setup, both
+floors, both indices, `HORIZON_BARS=12` (60 min). Scanned every `(setup, floor)` row-pair for the
+project's own bar: `below`'s bootstrap CI fully separated from `at_or_above`'s, in the direction the
+hypothesis predicts. **None exist.** Every row's `below`/`at_or_above` confidence intervals overlap on
+both indices -- not one setup/floor combination clears even a single-index "reliably worse" reading,
+let alone replicates on both.
+
+Two `BACKWARDS` verdicts appear (`EMA_RSI_CROSS[entry_offset=0]` and `EXTENDED_FADE[atr_mult=2.0]`,
+both `<20`, both Bank Nifty only) -- Bank Nifty's `below` bucket edge is reliably negative on their
+own. Checked against Nifty for the same setups: `EMA_RSI_CROSS[entry_offset=0] <20` reverses direction
+entirely (Nifty's `at_or_above` bucket is the worse one, not `below`); `EXTENDED_FADE[atr_mult=2.0]
+<20` is directionally the same sign on Nifty (-3.18pp) but not reliably so (CI `[-8.21, +1.93]`
+crosses zero) and has no reported `at_or_above` bucket to compare against at all (too few signals).
+Neither replicates cleanly enough to count as real, per this project's own standard.
+
+A separate, unrelated observation worth naming: Nifty shows broad positive edge across several
+trend/breakout setups (`ORB_BREAK`, `PDH_PDL_BREAK`, `ST_ALIGNED`, `EMA_STACK`) regardless of which
+ADX bucket a bar falls in -- both `below` and `at_or_above` often read `POSITIVE` on the same setup.
+That is a fact about Nifty's setups carrying edge generally (consistent with this project's own
+earlier walk-forward findings, which already found Nifty setups more consistently positive than Bank
+Nifty's), not evidence that ADX is what discriminates it -- if ADX were the discriminator, `below`
+would read differently from `at_or_above`, and on Nifty it usually doesn't.
+
+**Final verdict: no ADX gate, at any granularity tested this cycle** -- real AI Origination history
+(PARTS 1-3, ~45 trades) and the full 2-year index-level archive (PART 4, every registered setup, both
+floors, both indices) agree. `app/ai/originator.py`'s three hard gates (DTE floor, same-direction
+consecutive-loss gate, 0.60 confidence floor) remain unchanged. This closes out the ADX-gate
+investigation that started with the 25 Aug trigger trade -- worth reopening only if a materially
+different mechanism (the still-unbuildable ADX slope, once logged and observed) or a much larger real
+trade sample changes the picture.
 
 ### ADX hard-gate backtest tooling built -- NOT wired into originator.py yet, pending real data (25 Aug 2026)
 
