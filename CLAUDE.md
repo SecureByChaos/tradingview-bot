@@ -295,6 +295,50 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### ADX gate backtest extended with a 2-year index-level fallback -- tooling only, not run (25 Aug 2026)
+
+**Requested**: "I want it to be run on last 2 years data," after the entry directly below settled the
+ADX gate question against real AI Origination history (NOT SUPPORTED). Real AI Origination history
+cannot itself become 2 years deep -- the feature has existed a couple of months, ~45 closed trades as
+of this run -- so this is a different data source, not a bigger pull of the same one.
+
+**Built**: `scripts/adx_gate_backtest.py`'s new PART 4, following the exact precedent
+`break_confirmation_backtest.py`'s PART 2 and `trend_age_gate_backtest.py` already established for
+this class of question -- the 2-year index-candle archive (`scripts/backtest/`), asking a related but
+not identical question: among bars where an already-registered setup (`default_setups()`) fires, does
+forward index-direction edge differ between `ADX < floor` and `ADX >= floor`, at a 60-minute horizon.
+Index-direction-only, same limitation every `setup_significance`-style script in this project already
+carries -- no real trades, no real premium P&L, no confidence score. `IndexArrays.adx14`
+(`scripts/backtest/data.py`) was already computed for the whole archive; only the threshold sweep is
+new, reusing `_evaluate`'s session-block-bootstrap shape (duplicated per this project's own per-script
+convention, not shared).
+
+`--skip-live-history` added so PART 4 can run alone against a candle-only environment.
+
+4 new tests (`tests/test_adx_gate_backtest.py`): `_eligible_index` correctly excludes bars before
+ATR/EMA/ADX have warmed up and bars outside the 09:45-15:15 window even once warm, `_edge_index`
+matches a hand-computed value and returns 0 for an empty population. Also smoke-tested the full PART 4
+CLI path against ~120 sessions of synthetic candles for both indices (2 years of real data would be
+too large to construct in a sandbox) -- ran clean, correctly reported every setup/floor/bucket
+combination with `-` verdicts (expected: synthetic random-walk price data carries no real embedded
+edge). Full suite: 438 passed (was 434). `python -c "import scripts.adx_gate_backtest"` imports
+cleanly.
+
+**Not run against real 2-year data** -- same standing constraint as `break_confirmation_backtest.py`'s
+own PART 2 and every other `scripts/backtest/`-based script in this project: no real candle archive in
+this sandbox. Run on the machine with the real archive:
+
+```bash
+python -m scripts.adx_gate_backtest --db data/trading.db
+python -m scripts.adx_gate_backtest --db data/trading.db --skip-live-history   # PART 4 alone, faster
+```
+
+Per this project's own stated standard (`setup_significance.py`'s docstring, already quoted elsewhere
+in this file): a `(setup, floor)` cell is worth trusting only if `below` is reliably worse than
+`at_or_above` on **both** indices, not a single-index result with a CI that happens to exclude zero.
+No gate is added to `app/ai/originator.py` by this pass -- reported here per the same discipline as
+every other candidate gate in this project.
+
 ### ADX hard-gate backtest tooling built -- NOT wired into originator.py yet, pending real data (25 Aug 2026)
 
 **Trigger (25 Aug, one trade, not evidence on its own)**: Nifty 50 `BUY_PE`, AI Origination/OpenAI,
@@ -423,6 +467,31 @@ that specific leg of the doc's proposed gate, independent of the floor question.
 unbuildable until it's logged going forward; if the doc's design is worth pursuing further, adding
 that field to `AIOriginationLog` (pure instrumentation, no trading-path change, same shape as every
 other field in that table) would be the next concrete step -- not done in this pass.
+
+**Re-run for real, same day -- STILL NOT SUPPORTED, all three checks.** The `<20` bucket now has its
+first real observation: the 25 Aug trigger trade itself closed at **-18.81%**, the single worst
+result in the whole dataset. Still `n=1`, still below the trust minimum, still not something a
+bootstrap comparison can run against 44 other trades ("too few observations on one side").
+
+- **`<25` floor**: now `n=7` blocked (the original 6-trade `20-25` band plus the new `<20` loss),
+  mean P&L +2.50%, versus the kept `>=25` band's -1.59% (`n=38`). Bootstrap 90% CI `[-5.59, +14.27]`
+  -- still crosses zero, still no reliable difference, even with the single worst trade in the
+  dataset now inside the blocked bucket.
+- **PART 3, DI-direction**: `agrees` `n=43` (mean -1.47%), `disagrees` `n=2` (mean +9.98%, both
+  trust-minimum-thin). CI `[-2.21, +25.07]` crosses zero. **The real, useful finding here isn't the
+  CI -- it's the population split itself: 43 of 45 trades (95.6%) already had `+DI`/`-DI` agreeing
+  with the model's own chosen direction.** DI almost never disagrees with what AI Origination
+  decides to trade, which means this leg has very little room to discriminate outcomes at all --
+  not "DI doesn't matter," but "the model's direction and DI direction are already almost never in
+  conflict," a different and more specific finding than a null correlation would suggest on its own.
+- **Combined gate** (`ADX >= 20 AND DI agrees`): `passes` `n=42` (-1.05%), `fails` `n=3` (+0.38%).
+  CI `[-13.81, +16.79]` crosses zero, `n=3` on the fail side.
+
+**Verdict unchanged, now on real data for every leg tested: no gate ships.** DTE floor,
+same-direction consecutive-loss gate, and the 0.60 confidence floor remain the only three hard
+gates in `_open_trade`. ADX slope is still the one leg of the original doc with no path to testing
+without new logging -- everything else has now been measured against real history and come back
+without a reliable signal in either direction.
 
 ### Live-market prevClose fixed to use the CAS-corrected candle close -- confirmed with real data, same day (25 Aug 2026)
 
