@@ -295,6 +295,51 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination trailing-stop activation percent made admin-configurable (25 Aug 2026)
+
+**Reported**: a real trade (Nifty PE, entry 102.55, high 111.9, MFE 9.12%) never armed its trailing
+stop. Traced with a real DB query against `strategy_trades.trail_activate_percent`: the stored value
+was **11.59%**, not the 8% the hardcoded `_TRAIL_ACTIVATION_NOMINAL` constant in `app/ai/originator.py`
+implies -- the same CE/PE `symmetric_premium_percent()` rescale already covered for stop-loss also
+widens the trailing-activation nominal for puts (8.0 * ~1.449 = 11.59, matching to two decimals and
+independently confirming the rescale factor inferred from the same day's stop-loss investigation
+above). The trade's high of 111.9 was genuinely short of the 114.44 needed to arm -- not a bug, working
+exactly as designed, and confirmed identically on both of that day's Nifty PE trades.
+
+**Asked directly what "fix it" should mean** (AskUserQuestion) since there are several different
+plausible changes with real behavior implications -- remove the CE/PE widening for trail activation
+specifically, lower the nominal in code, or make the nominal admin-configurable while keeping the
+rescale. Chosen: admin-configurable, same pattern as `ai_origination_max_sl_percent`.
+
+**Implementation**: new `AISettings.ai_origination_max_sl_percent`-shaped column,
+`ai_origination_trail_activate_percent` (float, default 8.0 -- matches the value this used to be
+hardcoded to, so deploying changes nothing until an admin edits it), additive `_ensure_columns()`
+migration. New `_trail_activate_nominal(db)` helper mirrors `_max_sl_percent(db)` exactly, falling
+back to the original `_TRAIL_ACTIVATION_NOMINAL` constant only if no `AISettings` row exists.
+`_open_trade`'s `trail_activate, _ = symmetric_premium_percent(...)` call now reads this admin value
+as its input instead of the hardcoded constant -- **the rescale itself is untouched**: a put still
+needs a wider move than a call for the same activation, only the nominal fed into that rescale is now
+tunable from Settings > AI instead of a code constant. `trail_width_percent` (the 5% trail-back
+distance once armed) is deliberately left alone -- the question was specifically about why trailing
+never *activated*, not about the trail's width once it has.
+
+Settings > AI gets a new "Trail Activation % (nominal)" field next to Max Stop-Loss %/Max
+Same-Direction Losses, validated `0.5 <= value <= 50`; `/ai-settings` POST and its values dict updated
+to match.
+
+4 new tests (`tests/test_same_direction_loss_gate.py`): the fallback-without-settings-row case, the
+admin-configured-value read, and two `_open_trade` integration tests (admin value flows through to
+`trade.trail_activate_percent`, and the original hardcoded default is used when no `AISettings` row
+exists) -- both isolate the nominal-selection logic from the rescale math via an identity-rescale
+monkeypatch, the same technique the stop-loss clamp tests already established. Full suite: 458 passed
+(was 454). `python -c "import app.main"` imports cleanly; `settings.html` verified to still parse.
+
+**Not verified live** -- this sandbox cannot place a real trade to observe the new setting take effect
+end to end. After deploying, confirm Settings > AI renders the new field with the correct default
+(8.0), confirm editing it and re-running the same `trail_activate_percent`/`trail_width_percent` SQL
+query from the diagnostic above shows the new nominal (rescaled for puts) on the next AI Origination
+trade opened after the change.
+
 ### AI Origination now included in every periodic report, not just Daily (25 Aug 2026)
 
 **Requested**: "Daily report should include ai origination trades in daily analysis as well." Before

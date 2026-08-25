@@ -110,6 +110,15 @@ class AISettings(Base):
     # blocked a 3rd same-direction entry regardless of whether the first two
     # had won -- see app/ai/originator.py's _same_direction_consecutive_losses.
     ai_origination_max_same_direction_losses: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    # 25 Aug 2026: was a hardcoded nominal (_TRAIL_ACTIVATION_NOMINAL = 8.0) in
+    # app/ai/originator.py -- made admin-configurable after a real trade's
+    # trailing stop never armed (MFE 9.12%, needed 11.59% once the CE/PE
+    # rescale widened this same 8.0 nominal for a put). Default 8.0 matches
+    # the old hardcoded value, so deploying this column changes nothing until
+    # an admin edits it. The CE/PE rescale (symmetric_premium_percent) still
+    # applies on top of whatever nominal is configured here -- this changes
+    # the INPUT to that rescale, not whether the rescale itself happens.
+    ai_origination_trail_activate_percent: Mapped[float] = mapped_column(Float, default=8.0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

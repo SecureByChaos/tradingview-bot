@@ -842,6 +842,19 @@ def _max_sl_percent(db: Session) -> float:
     return settings.ai_origination_max_sl_percent
 
 
+def _trail_activate_nominal(db: Session) -> float:
+    """Admin-configurable nominal trail-activation percent (Settings > AI,
+    AISettings.ai_origination_trail_activate_percent) -- fed into the same
+    symmetric_premium_percent() rescale the stop/target already use, so a put
+    still needs a wider move than a call to arm trailing; this only changes
+    the INPUT to that rescale. Falls back to the original hardcoded
+    _TRAIL_ACTIVATION_NOMINAL only if no AISettings row exists at all."""
+    settings = get_settings(db)
+    if settings is None:
+        return _TRAIL_ACTIVATION_NOMINAL
+    return settings.ai_origination_trail_activate_percent
+
+
 def _find_correlated_entry(
     db: Session, index_symbol: str, signal: str, strike: int, provider: str, window_minutes: int
 ) -> StrategyTrade | None:
@@ -1118,12 +1131,15 @@ def _open_trade(
     stoploss = round(entry_price * (1 - sl_percent / 100), 2)
     target = round(entry_price * (1 + target_percent / 100), 2)
 
-    # The trailing parameters carry the identical asymmetry -- an 8% activation
-    # and 5% trail are also tighter index distances on a put -- so they get the
-    # same rescale and are stored per trade rather than read from the shared
-    # defaults at monitor time.
+    # The trailing parameters carry the identical asymmetry -- the activation
+    # nominal and 5% trail width are also tighter index distances on a put --
+    # so they get the same rescale and are stored per trade rather than read
+    # from the shared defaults at monitor time. The activation nominal itself
+    # is admin-configurable (Settings > AI, default matches the old hardcoded
+    # 8.0) -- see _trail_activate_nominal's own docstring for why 25 Aug added
+    # this rather than leaving it a code constant.
     trail_activate, _ = symmetric_premium_percent(
-        _TRAIL_ACTIVATION_NOMINAL, index.symbol, contract.option_type, dte
+        _trail_activate_nominal(db), index.symbol, contract.option_type, dte
     )
     trail_width, _ = symmetric_premium_percent(
         _TRAIL_WIDTH_NOMINAL, index.symbol, contract.option_type, dte
