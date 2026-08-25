@@ -712,6 +712,7 @@ def update_ai_settings_page(
     system_prompt: Annotated[str, Form()],
     ai_origination_max_sl_percent: Annotated[float, Form()] = 50.0,
     ai_origination_max_same_direction_losses: Annotated[int, Form()] = 2,
+    ai_origination_trail_activate_percent: Annotated[float, Form()] = 8.0,
     enabled: Annotated[str | None, Form()] = None,
     secondary_enabled: Annotated[str | None, Form()] = None,
     secondary_provider: Annotated[str, Form()] = "claude",
@@ -733,6 +734,7 @@ def update_ai_settings_page(
         # originator import for one constant.
         or not 5.0 < ai_origination_max_sl_percent <= 100
         or ai_origination_max_same_direction_losses < 1
+        or not 0.5 <= ai_origination_trail_activate_percent <= 50
     ):
         raise HTTPException(status_code=400, detail="Invalid AI configuration")
     settings = get_ai_settings(db) or create_ai_settings(db, id=1)
@@ -748,6 +750,7 @@ def update_ai_settings_page(
         "system_prompt": system_prompt,
         "ai_origination_max_sl_percent": ai_origination_max_sl_percent,
         "ai_origination_max_same_direction_losses": ai_origination_max_same_direction_losses,
+        "ai_origination_trail_activate_percent": ai_origination_trail_activate_percent,
         "secondary_enabled": secondary_enabled == "on",
         "secondary_provider": secondary_provider,
         "secondary_model": secondary_model.strip(),

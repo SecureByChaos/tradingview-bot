@@ -8,11 +8,13 @@ from sqlalchemy.orm import Session
 from app.ai.originator import (
     _DEFAULT_MAX_SAME_DIRECTION_LOSSES,
     _MAX_SL_TARGET_PERCENT,
+    _TRAIL_ACTIVATION_NOMINAL,
     _Decision,
     _max_same_direction_losses,
     _max_sl_percent,
     _open_trade,
     _same_direction_consecutive_losses,
+    _trail_activate_nominal,
 )
 from app.ai.repository import create_settings
 from app.db_models import Base, IndexConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
@@ -467,3 +469,57 @@ def test_open_trade_clamp_applies_to_trailing_fallbacks_initial_stop_too(monkeyp
     assert trade is not None
     assert trade.sl_mode == "TRAILING"
     assert trade.stoploss == round(100.0 * (1 - 0.12), 2)
+
+
+# ---------------------------------------------------------------------------
+# 25 Aug 2026: trail activation percent made admin-configurable -- a real
+# trade's trailing stop never armed (MFE 9.12%, needed 11.59% once the CE/PE
+# rescale widened the old hardcoded 8.0 nominal for a put).
+# ---------------------------------------------------------------------------
+
+def test_trail_activate_nominal_falls_back_without_settings_row():
+    db = _make_session()
+    assert _trail_activate_nominal(db) == _TRAIL_ACTIVATION_NOMINAL
+
+
+def test_trail_activate_nominal_reads_admin_configured_value():
+    db = _make_session()
+    create_settings(db, id=1, ai_origination_trail_activate_percent=5.0)
+    assert _trail_activate_nominal(db) == 5.0
+
+
+def _identity_rescale(proposed_percent, index_symbol, option_type, dte, moneyness="ATM"):
+    return proposed_percent, True
+
+
+def test_open_trade_uses_admin_configured_trail_activate_nominal(monkeypatch):
+    import app.ai.originator as originator_module
+    monkeypatch.setattr(originator_module, "symmetric_premium_percent", _identity_rescale)
+
+    db = _make_session()
+    index = _make_index()
+    create_settings(db, id=1, ai_origination_trail_activate_percent=5.0)
+    decision = _make_decision("BUY_PE")
+    smartapi = FakeSmartAPI(price=100.0)
+    option_finder = FakeOptionFinder(_make_contract())
+
+    trade = _open_trade(db, index, "claude", decision, smartapi, option_finder)
+
+    assert trade is not None
+    assert trade.trail_activate_percent == 5.0
+
+
+def test_open_trade_falls_back_to_default_trail_activate_without_admin_setting(monkeypatch):
+    import app.ai.originator as originator_module
+    monkeypatch.setattr(originator_module, "symmetric_premium_percent", _identity_rescale)
+
+    db = _make_session()
+    index = _make_index()
+    decision = _make_decision("BUY_PE")
+    smartapi = FakeSmartAPI(price=100.0)
+    option_finder = FakeOptionFinder(_make_contract())
+
+    trade = _open_trade(db, index, "claude", decision, smartapi, option_finder)
+
+    assert trade is not None
+    assert trade.trail_activate_percent == _TRAIL_ACTIVATION_NOMINAL
