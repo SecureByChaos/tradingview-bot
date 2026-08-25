@@ -295,6 +295,51 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Daily report now includes AI Origination trades as a separate section (25 Aug 2026)
+
+**Requested**: "Daily report should include ai origination trades in daily analysis as well." Before
+this, `generate_daily_summary()` (`app/reports.py`) only queried `origin == "SIGNAL"` trades (via
+`_closed_trades_between`) -- AI Origination's own numbers only ever appeared in the separate, on-demand
+"AI Origination Summary" report type (`ReportType.ORIGINATION`, 15 Aug), never inside the daily digest.
+
+**Implementation, scoped to Daily only** (weekly/monthly untouched, per the request's own wording):
+`generate_daily_summary` now also runs `_origination_trades_between()` (already existed, reused rather
+than duplicated) and nests its output under a new `stats["origination_stats"]` key -- **not** merged
+into the same population as the SIGNAL trade stats. Kept structurally separate for the same reason
+CLAUDE.md's "origin field is the isolation mechanism" section has stated repeatedly: AI Origination
+trades have no `StrategyConfig`-backed strategy name, and merging them into `by_strategy` would either
+crash or misrepresent them. Nested under `origination_stats` specifically (not `trade_stats`, which
+`_template_narrative`'s own dispatch already reserves for routing to the Pattern Discovery template) so
+the existing flat daily-report structure -- and every existing reader of `ReportType.DAILY`'s
+`stats_json` -- stays unaffected; this is a pure addition, not a restructuring.
+
+Two consumers updated to actually surface the new data, not just carry it as inert JSON:
+
+- **The OpenAI-narrative prompt** (`_generate_narrative`) gained one added sentence asking the model to
+  summarize `origination_stats` as its own point when present, separate from the strategy numbers --
+  the model already saw the whole `stats` dict as raw JSON before this, but had no instruction to
+  actually mention it.
+- **The template-fallback narrative** (`_template_narrative`, used when no AI provider is configured)
+  gained a new AI Origination paragraph. Required restructuring the existing early-return: the old code
+  returned immediately after "No closed trades were recorded" if the SIGNAL population was empty --
+  which would have silently dropped any AI Origination summary on a day with AI trades but zero SIGNAL
+  trades. Fixed so both sections are always evaluated independently.
+
+7 new tests (`tests/test_daily_report_origination.py`): `origination_stats` populated correctly
+alongside SIGNAL stats, the zero-origination-trades case, the exact zero-SIGNAL-but-real-origination
+regression the early-return fix targets, the template narrative mentioning origination when populated
+and when empty, confirming weekly/monthly-style stats dicts (no `origination_stats` key) are a true
+no-op, and confirming `origination_stats`'s own inner `by_provider` key doesn't leak into the top-level
+dispatch check and misroute the daily narrative into the Origination report's own template (which would
+have printed the wrong report title). Full suite: 449 passed (was 442). `python -c "import app.main"`
+imports cleanly; no template (`reports.html`) changes needed -- it already renders `stats` as a raw
+JSON dump alongside the narrative text, confirmed by reading `app/dashboard_routes.py`'s `reports_page`.
+
+**Not verified live** -- this sandbox cannot generate a report against real trade history end to end
+through the UI. After deploying, generate a Daily Summary (Reports page "Generate Now", or wait for the
+scheduled job) on a day with at least one closed AI Origination trade and confirm the narrative text
+mentions it and the raw stats JSON includes a populated `origination_stats` block.
+
 ### AI Origination Max Stop-Loss % now caps the REALIZED loss, not just the AI's nominal input (25 Aug 2026)
 
 **Reported**: a real trade lost -18.81% despite `AISettings.ai_origination_max_sl_percent` set to 12.0.

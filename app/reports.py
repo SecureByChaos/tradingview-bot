@@ -443,26 +443,55 @@ def _template_narrative(report_label: str, period_label: str, stats: dict[str, A
     total = stats.get("total_trades", 0)
     if not total:
         lines.append("No closed trades were recorded in this period.")
-        return "\n".join(lines)
-    lines.append(
-        f"Total trades: {total}. Wins: {stats.get('wins', 0)}. Losses: {stats.get('losses', 0)}. "
-        f"Win rate: {stats.get('win_rate', 0)}%. Net P&L: {stats.get('net_pnl', 0)}."
-    )
-    by_strategy = stats.get("by_strategy", {})
-    if stats.get("best_strategy"):
-        best = by_strategy.get(stats["best_strategy"], {})
+    else:
         lines.append(
-            f"Best performing strategy: {stats['best_strategy']} "
-            f"(net P&L {best.get('net_pnl', 0)}, win rate {best.get('win_rate', 0)}%)."
+            f"Total trades: {total}. Wins: {stats.get('wins', 0)}. Losses: {stats.get('losses', 0)}. "
+            f"Win rate: {stats.get('win_rate', 0)}%. Net P&L: {stats.get('net_pnl', 0)}."
         )
-    if stats.get("worst_strategy") and stats.get("worst_strategy") != stats.get("best_strategy"):
-        worst = by_strategy.get(stats["worst_strategy"], {})
-        lines.append(
-            f"Worst performing strategy: {stats['worst_strategy']} "
-            f"(net P&L {worst.get('net_pnl', 0)}, win rate {worst.get('win_rate', 0)}%)."
-        )
-    if stats.get("max_consecutive_losses", 0) >= 2:
-        lines.append(f"Longest losing streak in the period: {stats['max_consecutive_losses']} trades.")
+        by_strategy = stats.get("by_strategy", {})
+        if stats.get("best_strategy"):
+            best = by_strategy.get(stats["best_strategy"], {})
+            lines.append(
+                f"Best performing strategy: {stats['best_strategy']} "
+                f"(net P&L {best.get('net_pnl', 0)}, win rate {best.get('win_rate', 0)}%)."
+            )
+        if stats.get("worst_strategy") and stats.get("worst_strategy") != stats.get("best_strategy"):
+            worst = by_strategy.get(stats["worst_strategy"], {})
+            lines.append(
+                f"Worst performing strategy: {stats['worst_strategy']} "
+                f"(net P&L {worst.get('net_pnl', 0)}, win rate {worst.get('win_rate', 0)}%)."
+            )
+        if stats.get("max_consecutive_losses", 0) >= 2:
+            lines.append(f"Longest losing streak in the period: {stats['max_consecutive_losses']} trades.")
+
+    # 25 Aug 2026: daily reports now also carry an origination_stats block
+    # (see generate_daily_summary) -- weekly/monthly reports never populate
+    # this key, so this branch is a no-op for them. Reported as its own
+    # paragraph rather than merged into the strategy numbers above: AI
+    # Origination trades have no StrategyConfig-backed strategy name and are
+    # a structurally separate population (see CLAUDE.md, "The origin field
+    # is the isolation mechanism"). Handled here rather than only relying on
+    # the AI narrative prompt seeing the extra JSON, since this template
+    # path is the one used when no AI provider is configured at all.
+    origination_stats = stats.get("origination_stats")
+    if origination_stats is not None:
+        origination_total = origination_stats.get("total_trades", 0)
+        if not origination_total:
+            lines.append("No closed AI Origination trades were recorded in this period.")
+        else:
+            lines.append(
+                f"AI Origination: {origination_total} trades, {origination_stats.get('wins', 0)} wins, "
+                f"{origination_stats.get('losses', 0)} losses, win rate {origination_stats.get('win_rate', 0)}%, "
+                f"net P&L {origination_stats.get('net_pnl', 0)}."
+            )
+            by_provider = origination_stats.get("by_provider", {})
+            if origination_stats.get("best_provider"):
+                best = by_provider.get(origination_stats["best_provider"], {})
+                lines.append(
+                    f"Best AI Origination provider: {origination_stats['best_provider']} "
+                    f"(net P&L {best.get('net_pnl', 0)}, win rate {best.get('win_rate', 0)}%)."
+                )
+
     lines.append("(Generated from raw statistics; configure an AI provider in AI Settings for a narrative summary.)")
     return "\n".join(lines)
 
@@ -540,8 +569,10 @@ def _generate_narrative(db: Session, report_label: str, period_label: str, stats
             "\n\nWrite a concise plain-text summary (4-8 sentences) of trading performance for this period, "
             "based strictly on the statistics above. Do not invent any numbers not present in the data. "
             "Call out the best and worst performing strategies, notable win-rate patterns, and any risk "
-            "concerns such as loss streaks or a low win rate. If a data point is missing or zero, do not "
-            "speculate about the reason."
+            "concerns such as loss streaks or a low win rate. If an origination_stats block is present, "
+            "summarize AI Origination's performance for the period as its own point -- it is a separate "
+            "population from the strategy trades above, not a strategy itself. If a data point is missing "
+            "or zero, do not speculate about the reason."
         )
         content, error = _call_openai_narrative(settings, user_prompt)
         if content:
@@ -585,7 +616,17 @@ def _save_report(
 def generate_daily_summary(db: Session, report_date: date | None = None) -> AIReport:
     day = report_date or today_ist()
     trades = _closed_trades_between(db, day, day)
+    # origination_stats is nested under its own key rather than merged into
+    # the SIGNAL trade population above -- AI Origination trades have no
+    # StrategyConfig-backed strategy name and are a structurally separate
+    # population (see CLAUDE.md, "The origin field is the isolation
+    # mechanism"). Nesting under a distinct key (not "trade_stats", which
+    # _template_narrative's dispatch already reserves for Pattern Discovery)
+    # keeps the existing flat top-level stats -- and every existing reader of
+    # this report type -- unaffected.
+    origination_trades = _origination_trades_between(db, day, day)
     stats = _trade_stats(trades)
+    stats["origination_stats"] = _origination_trade_stats(origination_trades)
     period_label = day.strftime("%d %b %Y")
     summary_text, provider, model = _generate_narrative(db, "daily summary", period_label, stats)
     return _save_report(db, ReportType.DAILY, day, day, f"Daily Summary - {period_label}", summary_text, stats, provider, model)
