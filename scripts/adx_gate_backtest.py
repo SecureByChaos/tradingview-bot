@@ -76,8 +76,28 @@ EMA-alignment/structural-break alternative is what break_confirmation_
 backtest.py already tested via EMA_STACK/ORB/PDH/PDL setups on 12 Aug --
 verdict NOT SUPPORTED. Re-litigating that here would just duplicate it.
 
+PART 4, ADDED 25 AUG: 2-YEAR INDEX-LEVEL FALLBACK
+----------------------------------------------------
+Real AI Origination history is inherently short (the feature has existed a
+couple of months, ~45 closed trades as of 25 Aug) -- it cannot become "2
+years of data" no matter how long paper trading runs today. What the
+project DOES have at 2-year depth is the index-level candle archive
+scripts/backtest/ already uses for exactly this kind of question (see
+break_confirmation_backtest.py's PART 2, trend_age_gate_backtest.py). This
+asks a related but not identical question from PARTS 1-3: among bars where
+an already-registered setup fires (scripts/backtest/setups.py's
+default_setups()), does forward index-direction edge differ between ADX <
+floor and ADX >= floor, at HORIZON_BARS forward. It is index-direction-only
+-- no real trades, no real premium P&L, no confidence score, the same
+limitation every setup_significance-style script in this project already
+has, stated here rather than glossed over.
+
+IndexArrays.adx14 (scripts/backtest/data.py) is already computed for the
+whole archive -- no new indicator code needed, only the threshold sweep.
+
 Usage:
     python -m scripts.adx_gate_backtest --db data/trading.db
+    python -m scripts.adx_gate_backtest --db data/trading.db --skip-live-history
 """
 
 from __future__ import annotations
@@ -89,12 +109,28 @@ import random
 import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import time
+
+import numpy as np
+
+from scripts.backtest.data import IndexArrays, build_arrays, forward_window_bounds, load_bars_sqlite
+from scripts.backtest.setups import assert_causal, build_signals, default_setups
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("adx_gate_backtest")
 
 BOOTSTRAP_ROUNDS = 10000
 MIN_BUCKET_LIVE = 20  # same trust minimum every other live-history backtest in this project uses
+
+# PART 4 (2-year index-level fallback) constants -- mirrors trend_age_gate_
+# backtest.py / break_confirmation_backtest.py's own conventions.
+FUTURES_SUFFIX = "_FUT"
+VOLUME_DEPENDENT_SETUPS = {"BNV6"}
+INDEX_TRADING_START = time(9, 45)
+INDEX_TRADING_END = time(15, 15)
+HORIZON_BARS = 12  # 60 min at the default FIVE_MINUTE interval
+MIN_SIGNALS_INDEX = 30
+BOOTSTRAP_ITERATIONS_INDEX = 2000
 
 # Matches app/market_context.py's ADX_NO_TREND / ADX_TRENDING exactly --
 # not reinvented here. app/platform.py's _classify_tradability reads these
@@ -396,22 +432,164 @@ def run_di_direction_check(entries: list[Entry]) -> None:
     )
 
 
+# --- PART 4: 2-year index-level fallback -------------------------------------
+
+def _is_futures(symbol: str) -> bool:
+    return symbol.upper().endswith(FUTURES_SUFFIX)
+
+
+def _eligible_index(arrays: IndexArrays) -> np.ndarray:
+    hours = arrays.ts.astype("datetime64[m]").astype(object)
+    in_window = np.array(
+        [INDEX_TRADING_START <= t.time() <= INDEX_TRADING_END for t in hours], dtype=bool,
+    )
+    warm = ~np.isnan(arrays.atr14) & ~np.isnan(arrays.ema21) & ~np.isnan(arrays.adx14)
+    return in_window & warm
+
+
+def _edge_index(wins: float, ups: float, longs: float, n: float) -> float:
+    if n == 0:
+        return 0.0
+    up_rate = ups / n
+    base = (longs * up_rate + (n - longs) * (1.0 - up_rate)) / n
+    return (wins / n - base) * 100.0
+
+
+def _evaluate_index(
+    arrays: IndexArrays, mask: np.ndarray, direction: np.ndarray, forward_bars: int, rng,
+) -> tuple[int, float, float, float]:
+    """(n_signals, edge, ci_low, ci_high) via session-block bootstrap. Same
+    shape as trend_age_gate_backtest.py/break_confirmation_backtest.py's own
+    _evaluate -- duplicated per this project's established per-script
+    convention, not shared."""
+    n_bars = len(arrays)
+    close = arrays.close.astype(np.float64)
+    bounds = forward_window_bounds(arrays, forward_bars)
+    positions = np.arange(n_bars)
+    target = np.minimum(positions + forward_bars, bounds)
+
+    valid = mask & (direction != 0) & (target > positions)
+    idx = np.flatnonzero(valid)
+    if idx.size == 0:
+        return 0, 0.0, 0.0, 0.0
+
+    raw = (close[target[idx]] - close[idx]) / close[idx] * 100.0
+    win = (raw * direction[idx]) > 0
+    up = raw > 0
+    is_long = direction[idx] == 1
+    edge = _edge_index(float(win.sum()), float(up.sum()), float(is_long.sum()), float(idx.size))
+
+    sessions = arrays.session_id[idx]
+    _, session_index = np.unique(sessions, return_inverse=True)
+    size = session_index.max() + 1
+    per_n = np.bincount(session_index, minlength=size).astype(np.float64)
+    per_win = np.bincount(session_index, weights=win.astype(np.float64), minlength=size)
+    per_up = np.bincount(session_index, weights=up.astype(np.float64), minlength=size)
+    per_long = np.bincount(session_index, weights=is_long.astype(np.float64), minlength=size)
+
+    edges = np.empty(BOOTSTRAP_ITERATIONS_INDEX)
+    for b in range(BOOTSTRAP_ITERATIONS_INDEX):
+        pick = rng.integers(0, size, size=size)
+        total = per_n[pick].sum()
+        edges[b] = _edge_index(per_win[pick].sum(), per_up[pick].sum(), per_long[pick].sum(), total) if total else 0.0
+    ci_low, ci_high = np.percentile(edges, [5, 95])
+    return int(idx.size), edge, float(ci_low), float(ci_high)
+
+
+def run_index_fallback(db_path: str, table: str, interval: str) -> None:
+    logger.info("=" * 108)
+    logger.info("PART 4: 2-YEAR INDEX-LEVEL FALLBACK (registered setups, ADX < floor vs ADX >= floor)")
+    logger.info("=" * 108)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        symbols = [
+            row[0] for row in connection.execute(
+                f"SELECT DISTINCT index_symbol FROM {table} WHERE interval = ?", (interval,),
+            )
+        ]
+    finally:
+        connection.close()
+
+    rng = np.random.default_rng(20260825)
+    setups = default_setups()
+    any_result = False
+    logger.info(
+        "  %-10s %-24s %-13s %-13s %6s %9s  %-18s %s",
+        "index", "setup", "adx_floor", "bucket", "n", "edge", "bootstrap 90% CI", "verdict",
+    )
+    for symbol in sorted(symbols):
+        bars = load_bars_sqlite(db_path, table, symbol, interval)
+        if len(bars) < 500:
+            continue
+        arrays = build_arrays(symbol, bars)
+        eligible = _eligible_index(arrays)
+        is_futures = _is_futures(symbol)
+
+        for setup in setups:
+            needs_volume = setup.name.upper() in VOLUME_DEPENDENT_SETUPS
+            if needs_volume != is_futures:
+                continue
+            direction = build_signals(arrays, setup)
+            assert_causal(arrays, setup, direction)
+
+            for floor in CANDIDATE_FLOORS:
+                below = eligible & (arrays.adx14 < floor)
+                at_or_above = eligible & (arrays.adx14 >= floor)
+                for bucket_name, bucket_mask in (("below", below), ("at_or_above", at_or_above)):
+                    n, edge, ci_low, ci_high = _evaluate_index(arrays, bucket_mask, direction, HORIZON_BARS, rng)
+                    if n < MIN_SIGNALS_INDEX:
+                        continue
+                    any_result = True
+                    verdict = "POSITIVE" if ci_low > 0 else ("BACKWARDS" if ci_high < 0 else "-")
+                    logger.info(
+                        "  %-10s %-24s <%-12.0f %-13s %6d %+8.2fpp  [%+6.2f, %+6.2f]  %s",
+                        symbol, setup.label, floor, bucket_name, n, edge, ci_low, ci_high, verdict,
+                    )
+
+    if not any_result:
+        logger.error(
+            "No (index, setup, floor, bucket) cell reached %s signals. Nothing to report -- most "
+            "likely no real candle data in this environment (expected in this sandbox).",
+            MIN_SIGNALS_INDEX,
+        )
+        return
+
+    logger.info("-" * 108)
+    logger.info(
+        "Read this as a related but not identical question from PARTS 1-3: forward index-direction "
+        "edge, not real trades or premium P&L. A (setup, floor) combination where 'below' is "
+        "reliably worse than 'at_or_above' -- on BOTH indices -- is the kind of consistency this "
+        "project's own standard treats as real rather than noise (see setup_significance.py's own "
+        "docstring). A single-index or mixed-direction result is not that, even with a CI excluding "
+        "zero."
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default="data/trading.db")
+    parser.add_argument("--table", default="candles")
+    parser.add_argument("--interval", default="FIVE_MINUTE")
+    parser.add_argument(
+        "--skip-live-history", action="store_true",
+        help="Skip PARTS 1-3 (real AI Origination trades) and only run PART 4 (2-year index archive).",
+    )
     args = parser.parse_args()
 
-    entries = _load_entries(args.db)
-    if not entries:
-        logger.error(
-            "No closed AI Origination entries with a joinable ai_origination_logs row found. "
-            "Either data/trading.db has no history yet, or this sandbox has no real data at "
-            "all (expected here -- see CLAUDE.md). Run this on the machine with real trade history."
-        )
-        return 1
+    if not args.skip_live_history:
+        entries = _load_entries(args.db)
+        if not entries:
+            logger.error(
+                "No closed AI Origination entries with a joinable ai_origination_logs row found. "
+                "Either data/trading.db has no history yet, or this sandbox has no real data at "
+                "all (expected here -- see CLAUDE.md). Run this on the machine with real trade history."
+            )
+        else:
+            run_adx_buckets(entries)
+            run_di_direction_check(entries)
 
-    run_adx_buckets(entries)
-    run_di_direction_check(entries)
+    run_index_fallback(args.db, args.table, args.interval)
     return 0
 
 

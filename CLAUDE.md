@@ -295,6 +295,50 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### ADX gate backtest extended with a 2-year index-level fallback -- tooling only, not run (25 Aug 2026)
+
+**Requested**: "I want it to be run on last 2 years data," after the entry directly below settled the
+ADX gate question against real AI Origination history (NOT SUPPORTED). Real AI Origination history
+cannot itself become 2 years deep -- the feature has existed a couple of months, ~45 closed trades as
+of this run -- so this is a different data source, not a bigger pull of the same one.
+
+**Built**: `scripts/adx_gate_backtest.py`'s new PART 4, following the exact precedent
+`break_confirmation_backtest.py`'s PART 2 and `trend_age_gate_backtest.py` already established for
+this class of question -- the 2-year index-candle archive (`scripts/backtest/`), asking a related but
+not identical question: among bars where an already-registered setup (`default_setups()`) fires, does
+forward index-direction edge differ between `ADX < floor` and `ADX >= floor`, at a 60-minute horizon.
+Index-direction-only, same limitation every `setup_significance`-style script in this project already
+carries -- no real trades, no real premium P&L, no confidence score. `IndexArrays.adx14`
+(`scripts/backtest/data.py`) was already computed for the whole archive; only the threshold sweep is
+new, reusing `_evaluate`'s session-block-bootstrap shape (duplicated per this project's own per-script
+convention, not shared).
+
+`--skip-live-history` added so PART 4 can run alone against a candle-only environment.
+
+4 new tests (`tests/test_adx_gate_backtest.py`): `_eligible_index` correctly excludes bars before
+ATR/EMA/ADX have warmed up and bars outside the 09:45-15:15 window even once warm, `_edge_index`
+matches a hand-computed value and returns 0 for an empty population. Also smoke-tested the full PART 4
+CLI path against ~120 sessions of synthetic candles for both indices (2 years of real data would be
+too large to construct in a sandbox) -- ran clean, correctly reported every setup/floor/bucket
+combination with `-` verdicts (expected: synthetic random-walk price data carries no real embedded
+edge). Full suite: 438 passed (was 434). `python -c "import scripts.adx_gate_backtest"` imports
+cleanly.
+
+**Not run against real 2-year data** -- same standing constraint as `break_confirmation_backtest.py`'s
+own PART 2 and every other `scripts/backtest/`-based script in this project: no real candle archive in
+this sandbox. Run on the machine with the real archive:
+
+```bash
+python -m scripts.adx_gate_backtest --db data/trading.db
+python -m scripts.adx_gate_backtest --db data/trading.db --skip-live-history   # PART 4 alone, faster
+```
+
+Per this project's own stated standard (`setup_significance.py`'s docstring, already quoted elsewhere
+in this file): a `(setup, floor)` cell is worth trusting only if `below` is reliably worse than
+`at_or_above` on **both** indices, not a single-index result with a CI that happens to exclude zero.
+No gate is added to `app/ai/originator.py` by this pass -- reported here per the same discipline as
+every other candidate gate in this project.
+
 ### ADX hard-gate backtest tooling built -- NOT wired into originator.py yet, pending real data (25 Aug 2026)
 
 **Trigger (25 Aug, one trade, not evidence on its own)**: Nifty 50 `BUY_PE`, AI Origination/OpenAI,

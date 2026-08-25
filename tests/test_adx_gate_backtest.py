@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 
+import numpy as np
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db_models import AIOriginationLog, Base, StrategyTrade, StrategyTradeTick, TradeResult, TradeStatus
+from app.market_data import Bar
 from app.time_utils import utc_now
-from scripts.adx_gate_backtest import _bootstrap_mean_diff, _di_agrees, _load_entries, run_di_direction_check
+from scripts.adx_gate_backtest import (
+    _bootstrap_mean_diff,
+    _di_agrees,
+    _edge_index,
+    _eligible_index,
+    _load_entries,
+    run_di_direction_check,
+)
+from scripts.backtest.data import build_arrays
 
 
 def _make_db(tmp_path):
@@ -189,3 +200,65 @@ def test_run_di_direction_check_does_not_crash_on_a_realistic_mixed_population(t
     assert "no DI recorded" in text
     assert "DI agrees with direction" in text
     assert "DI disagrees with direction" in text
+
+
+# ---------------------------------------------------------------------------
+# PART 4 (2-year index-level fallback) helpers
+# ---------------------------------------------------------------------------
+
+def _make_bars(num_sessions: int, bars_per_session: int = 78) -> list[Bar]:
+    """5-min bars from 09:15 IST, one session per day, with a small
+    deterministic oscillation so ATR/ADX/EMA all warm up to real (non-NaN,
+    non-degenerate) values rather than a flat zero-range series."""
+    rng = np.random.default_rng(20260825)
+    bars: list[Bar] = []
+    price = 24000.0
+    start_date = datetime(2026, 1, 5)  # a Monday
+    for session in range(num_sessions):
+        ts = start_date + timedelta(days=session, hours=9, minutes=15)
+        for i in range(bars_per_session):
+            move = rng.normal(0, 8.0)
+            price = max(price + move, 100.0)
+            high = price + abs(rng.normal(0, 3.0))
+            low = price - abs(rng.normal(0, 3.0))
+            bars.append(Bar(ts_ist=ts + timedelta(minutes=5 * i), open=price, high=high, low=low, close=price))
+    return bars
+
+
+def test_eligible_index_excludes_bars_before_indicators_warm_up():
+    bars = _make_bars(num_sessions=3)
+    arrays = build_arrays("NIFTY", bars)
+
+    eligible = _eligible_index(arrays)
+
+    # The first handful of bars of the whole series cannot have a real
+    # ATR14/ADX14 yet, regardless of time-of-day.
+    assert not eligible[0]
+    assert not eligible[5]
+
+
+def test_eligible_index_excludes_bars_outside_the_trading_window():
+    bars = _make_bars(num_sessions=3)
+    arrays = build_arrays("NIFTY", bars)
+
+    eligible = _eligible_index(arrays)
+
+    # Session 3 (index >= 2*78), bar 0 is 09:15 -- before INDEX_TRADING_START
+    # (09:45), even though indicators are long since warm by then.
+    third_session_first_bar = 2 * 78
+    assert not eligible[third_session_first_bar]
+
+    # A bar comfortably inside 09:45-15:15 in a later session should be
+    # eligible (indicators warm, inside the window).
+    mid_session_bar = 2 * 78 + 20  # 09:15 + 100 min = 10:55 IST
+    assert eligible[mid_session_bar]
+
+
+def test_edge_index_matches_hand_computed_value():
+    # 10 wins, 0 losses, all long, base rate 50% (5 up / 10) -> edge = 100% - 50% = +50pp
+    edge = _edge_index(wins=10.0, ups=5.0, longs=10.0, n=10.0)
+    assert edge == 50.0
+
+
+def test_edge_index_returns_zero_for_empty_population():
+    assert _edge_index(wins=0.0, ups=0.0, longs=0.0, n=0.0) == 0.0
