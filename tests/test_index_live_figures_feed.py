@@ -6,7 +6,8 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 import app.platform as platform_module
-from app.db_models import Base, IndexConfig, IndexPriceTick
+from app.db_models import Base, Candle, IndexConfig, IndexPriceTick
+from app.market_data import ONE_MINUTE
 from app.platform import get_index_live_figures
 from app.time_utils import IST, utc_now
 
@@ -294,3 +295,90 @@ def test_day_low_high_still_computed_from_todays_ticks_only():
 
     assert figures[0]["day_low"] == 57000.0
     assert figures[0]["day_high"] == 57300.0
+
+
+# ---------------------------------------------------------------------------
+# 25 Aug 2026: prefer the CAS-corrected candle close over the previous-day-
+# tick approximation. Real production data confirmed the tick-based
+# reference could be recorded at 15:25 IST -- before the auction settles --
+# which is exactly the class of gap capture_closing_auction() was already
+# built to fix for AI Origination's own previous-close reads. This wires the
+# same corrected source into the Live market panel instead of maintaining a
+# second, less accurate mechanism.
+# ---------------------------------------------------------------------------
+
+
+def _candle_ts(days_ago: int = 1, hour: int = 15, minute: int = 29) -> datetime:
+    """A naive IST timestamp, matching Candle.ts_ist's own storage convention
+    (see its docstring: 'IST-naive minute timestamp')."""
+    base = datetime.now(IST) - timedelta(days=days_ago)
+    return base.replace(hour=hour, minute=minute, second=0, microsecond=0, tzinfo=None)
+
+
+def test_prefers_candle_close_over_previous_day_tick_when_both_exist():
+    db = _make_session()
+    _seed_index(db)
+    now = utc_now()
+    # A stale tick recorded well before the real settlement (the confirmed
+    # production shape: 15:25 IST, before the ~15:29-15:35 CAS close).
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57419.45, recorded_at=now - timedelta(days=1, hours=1)))
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57450.0, recorded_at=now))
+    # The corrected CAS close, as capture_closing_auction() would have
+    # written it.
+    db.add(Candle(index_symbol="BANKNIFTY", interval=ONE_MINUTE, ts_ist=_candle_ts(), open=57500.0, high=57550.0, low=57500.0, close=57525.95))
+    db.commit()
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 57450.0, "is_live": True, "age_seconds": 0.1}})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    assert figures[0]["change_abs"] == round(57450.0 - 57525.95, 2)
+
+
+def test_candle_reference_uses_most_recent_previous_day_candle():
+    db = _make_session()
+    _seed_index(db)
+    now = utc_now()
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57450.0, recorded_at=now))
+    db.add(Candle(index_symbol="BANKNIFTY", interval=ONE_MINUTE, ts_ist=_candle_ts(hour=15, minute=13), open=57600.0, high=57600.0, low=57600.0, close=57600.0))
+    db.add(Candle(index_symbol="BANKNIFTY", interval=ONE_MINUTE, ts_ist=_candle_ts(hour=15, minute=29), open=57525.95, high=57525.95, low=57525.95, close=57525.95))
+    db.commit()
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 57450.0, "is_live": True, "age_seconds": 0.1}})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    assert figures[0]["change_abs"] == round(57450.0 - 57525.95, 2)
+
+
+def test_candle_reference_ignores_non_one_minute_interval_rows():
+    db = _make_session()
+    _seed_index(db)
+    now = utc_now()
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57200.0, recorded_at=now - timedelta(days=1)))
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57450.0, recorded_at=now))
+    # A FIVE_MINUTE candle must not be picked up by the ONE_MINUTE-filtered
+    # query -- only the fine-grained series capture_closing_auction() writes.
+    db.add(Candle(index_symbol="BANKNIFTY", interval="FIVE_MINUTE", ts_ist=_candle_ts(), open=57999.0, high=57999.0, low=57999.0, close=57999.0))
+    db.commit()
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 57450.0, "is_live": True, "age_seconds": 0.1}})
+
+    figures = get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    # Falls back to the IndexPriceTick reference, not the FIVE_MINUTE candle.
+    assert figures[0]["change_abs"] == round(57450.0 - 57200.0, 2)
+
+
+def test_prevclose_log_line_reports_which_source_was_used(caplog):
+    db = _make_session()
+    _seed_index(db)
+    now = utc_now()
+    db.add(IndexPriceTick(index_symbol="BANKNIFTY", price=57450.0, recorded_at=now))
+    db.add(Candle(index_symbol="BANKNIFTY", interval=ONE_MINUTE, ts_ist=_candle_ts(), open=57525.95, high=57525.95, low=57525.95, close=57525.95))
+    db.commit()
+    feed_store = FakeFeedStore({"BANKNIFTY": {"price": 57450.0, "is_live": True, "age_seconds": 0.1}})
+
+    with caplog.at_level("INFO"):
+        get_index_live_figures(db, FakeSmartAPI(), feed_store)
+
+    [line] = [r.message for r in caplog.records if "[PREVCLOSE]" in r.message]
+    assert "candle" in line
+    assert "57525.95" in line

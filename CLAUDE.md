@@ -295,7 +295,7 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
-### Live-market prevClose diagnostic logging added -- root cause found, fix NOT yet shipped (25 Aug 2026)
+### Live-market prevClose fixed to use the CAS-corrected candle close -- confirmed with real data, same day (25 Aug 2026)
 
 **Reported**: dashboard change/% mismatch against the broker app on an expiry day -- Nifty off by ~36 points (-0.12% vs broker's -0.27%), Bank Nifty off by ~107 points (-0.02% vs broker's -0.21%). Live LTP itself matched closely; only the change figure was wrong. The request's own framing named a "24 Aug market-hours gate patch" and "Lightsail" as context -- neither is real: `git log` shows no market-hours-gate change landed 24 Aug (that date's only change is the `lowest_price` fix directly above, unrelated), and production is EC2/systemd, not Lightsail. Flagged plainly rather than built around.
 
@@ -319,6 +319,23 @@ sudo journalctl -u tradingview-bot --since today | grep "\[PREVCLOSE\]"
 ```
 
 If `recorded_at` consistently lands meaningfully before 15:30 IST on the previous session (rather than right at the CAS settlement print), that confirms this diagnosis with real data and the candle-based fix above should be built next.
+
+**Confirmed with real production data, same day.** First `[PREVCLOSE]` lines after deploy:
+
+```
+BANKNIFTY: reference=57419.45 (previous-day tick, recorded_at=2026-08-24 09:55:00) current=57350.40
+NIFTY:     reference=24182.80 (previous-day tick, recorded_at=2026-08-24 09:55:01) current=24146.55
+```
+
+`IndexPriceTick.recorded_at` is stored via SQLite's `server_default=func.now()`, which is UTC -- confirmed by `record_index_tick_if_stale()`'s own read-back path, which converts through `to_ist()` before using it. So `09:55:00 UTC = 15:25:00 IST`: the previous day's (itself an expiry day) last recorded tick was captured **4-10 minutes before the CAS settlement actually finalises (~15:29-15:35)**, exactly the gap named above -- not a coincidence of matching magnitude, but the mechanism directly observed. The gap size also matched the original report almost exactly (Bank Nifty ~106.5 points vs. the reported ~107; Nifty ~36.25 vs. ~36), a second independent confirmation on top of the timestamp evidence.
+
+**Fixed for real**: `get_index_live_figures()` now tries the CAS-corrected 1-minute `Candle` close first -- the same table and interval `capture_closing_auction()` writes and `compute_levels()` (AI Origination's own previous-close) already reads -- via `Candle.index_symbol == index.symbol, Candle.interval == ONE_MINUTE, ts_ist < today`, most recent row. Falls back to the previous-day-tick approximation, then today's first tick, only when no candle history exists yet for an index (new index, or candle backfill hasn't run) -- same fail-soft order as before, just with the accurate source tried first. This reuses the fix already built for AI Origination's path rather than maintaining two previous-close mechanisms; `compute_levels()`/`capture_closing_auction()` themselves are untouched.
+
+The `[PREVCLOSE]` log line is kept (not removed) -- now reports which source won (`candle` vs `previous-day tick` vs `today's first tick`) alongside the reference value and timestamp, so a future gap is immediately diagnosable instead of needing this same investigation repeated.
+
+4 new tests (`tests/test_index_live_figures_feed.py`): the candle close is preferred over a simultaneously-present, older/wrong `IndexPriceTick`; the most recent of several previous-day candles is picked, not the earliest; a `FIVE_MINUTE`-interval candle is correctly ignored (only `ONE_MINUTE` rows, matching `capture_closing_auction()`'s own write); and the `[PREVCLOSE]` log line correctly reports `candle` as the source with the right value. All 15 pre-existing tests in this file still pass unmodified -- none of them seed `Candle` rows, so they continue exercising the (unchanged) tick-based fallback path. Full suite: 422 passed (was 418). `python -c "import app.main"` imports cleanly.
+
+**Not yet verified against a second live trading day** -- the fix was deployed and this file's fixed logic is exercised by the new tests, but there's no live re-run of `[PREVCLOSE]` since the fix went in (this same-day round only observed the pre-fix behaviour). After the next deploy cycle, confirm the log line now reports `candle` as the source and that the dashboard's change% matches the broker within a few points on an ordinary day and on the next expiry day specifically, since that's when the old gap was largest.
 
 ### `lowest_price` never updated on any long trade -- structurally unreachable code, not missing code (24 Aug 2026)
 

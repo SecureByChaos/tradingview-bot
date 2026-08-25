@@ -9,8 +9,9 @@ from sqlalchemy import Select, func, or_, select
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
-from app.db_models import AIOriginationLog, BotState, BotStatus, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.db_models import AIOriginationLog, BotState, BotStatus, Candle, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.market_context import ADX_NO_TREND, ADX_TRENDING
+from app.market_data import ONE_MINUTE
 from app.signal_validation import check_market_hours
 from app.time_utils import duration_label, format_ist, iso_utc, to_ist, utc_now
 
@@ -501,15 +502,24 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
     while every other source (TradingView included) shows "change since
     previous close" -- these routinely disagree by however much the index
     gapped overnight, which is exactly the mismatch reported that day
-    (Bank Nifty off by ~115 points, Nifty by ~36). The previous trading
-    day's last recorded tick is an approximation, not the official CAS
-    closing print capture_closing_auction stores in the candle archive for
-    AI Origination's own previous-close reads (app/market_data.py) -- close
-    enough for a dashboard figure, cheaper (one more IndexPriceTick query,
-    no candle fetch), and explicitly flagged as approximate here rather than
-    presented as authoritative. Falls back to today's first tick (the old
-    behaviour) when no prior-day tick exists at all, e.g. a brand-new index
-    or a database with no history yet.
+    (Bank Nifty off by ~115 points, Nifty by ~36). Fixed then with a
+    previous-day-last-IndexPriceTick approximation.
+
+    25 Aug 2026: that approximation itself turned out to still mismatch the
+    broker by ~36-107 points on an expiry day. Confirmed with real data via
+    a temporary [PREVCLOSE] diagnostic log: the reference tick was recorded
+    at 15:25 IST, 4-10 minutes before the Closing Auction Session actually
+    settles (~15:29-15:35, see "Closing Auction Session" in CLAUDE.md) --
+    tick recording is gated to check_market_hours()'s 09:15-15:30 window, so
+    the last tick before that gate closes is not guaranteed to be the real
+    settlement print. Now prefers the same CAS-corrected 1-minute candle
+    close capture_closing_auction() (app/market_data.py) already writes for
+    AI Origination's own previous-close reads -- reusing that fix rather
+    than maintaining two previous-close mechanisms. Falls back to the old
+    previous-day-tick approximation, then today's first tick, only when no
+    candle history exists yet for an index (e.g. brand new, or candle
+    backfill hasn't run) -- same fail-soft order as before, just with the
+    accurate source tried first.
 
     Price source: prefers feed_store (app/live_feed.py's persistent WebSocket
     feed) when given and it has a value -- zero SmartAPI calls, whether this
@@ -617,31 +627,48 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
         )
         entry["price"] = price
         if todays_ticks:
-            previous_day_tick = db.scalar(
-                select(IndexPriceTick)
+            # 25 Aug 2026: the CAS-corrected candle close is tried first --
+            # see the docstring above for why the old tick-based reference
+            # could land a few minutes before the real settlement print.
+            previous_day_candle = db.scalar(
+                select(Candle)
                 .where(
-                    IndexPriceTick.index_symbol == index.symbol,
-                    func.date(IndexPriceTick.recorded_at) < today,
+                    Candle.index_symbol == index.symbol,
+                    Candle.interval == ONE_MINUTE,
+                    func.date(Candle.ts_ist) < today,
                 )
-                .order_by(IndexPriceTick.recorded_at.desc())
+                .order_by(Candle.ts_ist.desc())
                 .limit(1)
             )
-            reference = previous_day_tick.price if previous_day_tick is not None else todays_ticks[0].price
-            # 25 Aug 2026: temporary diagnostic for a reported prevClose/change%
-            # mismatch against the broker app on an expiry day (~36-107 point
-            # gap). Confirms exactly which tick this function picked as
-            # "previous close" and when it was recorded, so that can be diffed
-            # directly against SmartAPI's own previous-close field -- this
-            # reference is the known approximate one (see this function's own
-            # docstring), not the corrected candle-based close AI Origination's
-            # market context uses. Remove once the gap is confirmed/resolved.
+            if previous_day_candle is not None:
+                reference = previous_day_candle.close
+                reference_source = "candle"
+                reference_recorded_at = previous_day_candle.ts_ist
+            else:
+                previous_day_tick = db.scalar(
+                    select(IndexPriceTick)
+                    .where(
+                        IndexPriceTick.index_symbol == index.symbol,
+                        func.date(IndexPriceTick.recorded_at) < today,
+                    )
+                    .order_by(IndexPriceTick.recorded_at.desc())
+                    .limit(1)
+                )
+                reference = previous_day_tick.price if previous_day_tick is not None else todays_ticks[0].price
+                reference_source = (
+                    "previous-day tick" if previous_day_tick is not None
+                    else "today's first tick (no prior-day candle or tick found)"
+                )
+                reference_recorded_at = (
+                    previous_day_tick.recorded_at if previous_day_tick is not None else todays_ticks[0].recorded_at
+                )
+            # Diagnostic log kept from the 25 Aug investigation -- confirms
+            # which source and timestamp this function picked as "previous
+            # close" per index, directly diffable against the broker's own
+            # figure on a live trading day.
             logger.info(
                 "[PREVCLOSE] %s: reference=%.2f (%s, recorded_at=%s) current=%.2f",
-                index.symbol,
-                reference,
-                "previous-day tick" if previous_day_tick is not None else "today's first tick (no prior-day tick found)",
-                previous_day_tick.recorded_at if previous_day_tick is not None else todays_ticks[0].recorded_at,
-                price,
+                index.symbol, reference, reference_source, reference_recorded_at, price,
             )
             all_prices = [tick.price for tick in todays_ticks] + [price]
             entry["change_abs"] = round(price - reference, 2)
