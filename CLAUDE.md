@@ -295,7 +295,7 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
-### Daily report now includes AI Origination trades as a separate section (25 Aug 2026)
+### AI Origination now included in every periodic report, not just Daily (25 Aug 2026)
 
 **Requested**: "Daily report should include ai origination trades in daily analysis as well." Before
 this, `generate_daily_summary()` (`app/reports.py`) only queried `origin == "SIGNAL"` trades (via
@@ -339,6 +339,38 @@ JSON dump alongside the narrative text, confirmed by reading `app/dashboard_rout
 through the UI. After deploying, generate a Daily Summary (Reports page "Generate Now", or wait for the
 scheduled job) on a day with at least one closed AI Origination trade and confirm the narrative text
 mentions it and the raw stats JSON includes a populated `origination_stats` block.
+
+**Extended same day: "Make ai origination as part of every summary."** `generate_weekly_report` and
+`generate_monthly_report` gained the identical `origination_stats` addition (same
+`_origination_trades_between`/`_origination_trade_stats` calls, just over each function's own
+`start, end` window). `generate_pattern_discovery` gained it too, nested alongside its existing
+`trade_stats`/`ai_correlation`/`time_patterns` keys rather than disturbing that structure.
+
+The shared paragraph-building logic was pulled into one new `_origination_narrative_lines()` helper
+so Daily/Weekly/Monthly's default template branch and Pattern Discovery's own `_template_pattern_
+narrative` render the AI Origination section identically rather than maintaining two near-duplicate
+copies. Building this shared helper surfaced the exact same early-return bug in `_template_pattern_
+narrative` that the original Daily fix addressed -- it also returned immediately on zero SIGNAL trades,
+which would have dropped any AI Origination mention from a Pattern Discovery report over a lookback
+window with AI trades but no SIGNAL trades. Fixed the same way, in the same pass.
+
+`ReportType.ORIGINATION` (the dedicated on-demand AI Origination Summary) is unchanged and still
+exists separately -- this addition means AI Origination numbers now also surface inside every other
+report type, not that the dedicated report is redundant; it still has provider-vs-provider detail
+(`by_provider`, `avg_confidence`) the periodic summaries only surface as `best_provider`.
+
+5 new tests (`tests/test_daily_report_origination.py`, same file -- extended in place rather than
+renamed, since the underlying feature and its risks are the same across all four report types):
+Weekly and Monthly both populate `origination_stats` correctly; Pattern Discovery populates it while
+leaving its existing `trade_stats` nested structure intact; the `_template_pattern_narrative`
+early-return fix specifically (zero SIGNAL trades, one AI Origination trade, both must appear); and
+Pattern Discovery's narrative confirmed unaffected when `origination_stats` is absent entirely. Full
+suite: 454 passed (was 449). `python -c "import app.main"` imports cleanly.
+
+**Not verified live**, same constraint as above -- after deploying, generate a Weekly Report, a
+Monthly Report, and a Pattern Discovery report (each with at least one closed AI Origination trade in
+their respective windows) and confirm all three now surface it, the same check already described for
+Daily.
 
 ### AI Origination Max Stop-Loss % now caps the REALIZED loss, not just the AI's nominal input (25 Aug 2026)
 

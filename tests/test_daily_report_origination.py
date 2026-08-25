@@ -7,7 +7,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db_models import Base, StrategyTrade, TradeResult, TradeStatus, TradingMode
-from app.reports import _template_narrative, generate_daily_summary
+from app.reports import (
+    _template_narrative,
+    _template_pattern_narrative,
+    generate_daily_summary,
+    generate_monthly_report,
+    generate_pattern_discovery,
+    generate_weekly_report,
+)
 from app.time_utils import utc_now
 
 
@@ -145,3 +152,91 @@ def test_template_narrative_dispatch_is_not_confused_by_origination_stats_key():
     text = _template_narrative("daily summary", "25 Aug 2026", stats)
 
     assert text.startswith("Daily Summary for 25 Aug 2026.")
+
+
+# ---------------------------------------------------------------------------
+# 25 Aug 2026: "make ai origination part of every summary" -- extended from
+# Daily-only to Weekly, Monthly and Pattern Discovery too.
+# ---------------------------------------------------------------------------
+
+def test_generate_weekly_report_includes_origination_stats():
+    db = _make_session()
+    today = date.today()
+    db.add(_trade(trade_id="s-1", origin="SIGNAL", entry_time=utc_now(), exit_time=utc_now()))
+    db.add(_trade(
+        trade_id="o-1", origin="AI_ORIGIN_OPENAI", strategy_name="AI Origination - Bank Nifty",
+        profit_loss=25.0, pnl_percent=2.5, result=TradeResult.WIN,
+        entry_time=utc_now(), exit_time=utc_now(),
+    ))
+    db.commit()
+
+    report = generate_weekly_report(db, reference=today)
+
+    stats = json.loads(report.stats_json)
+    assert stats["origination_stats"]["total_trades"] == 1
+
+
+def test_generate_monthly_report_includes_origination_stats():
+    db = _make_session()
+    today = date.today()
+    db.add(_trade(
+        trade_id="o-1", origin="AI_ORIGIN_CLAUDE", strategy_name="AI Origination - Nifty 50",
+        profit_loss=-15.0, pnl_percent=-1.5, result=TradeResult.LOSS,
+        entry_time=utc_now(), exit_time=utc_now(),
+    ))
+    db.commit()
+
+    report = generate_monthly_report(db, reference=today)
+
+    stats = json.loads(report.stats_json)
+    assert stats["origination_stats"]["total_trades"] == 1
+    assert stats["origination_stats"]["losses"] == 1
+
+
+def test_generate_pattern_discovery_includes_origination_stats():
+    db = _make_session()
+    db.add(_trade(trade_id="s-1", origin="SIGNAL", entry_time=utc_now(), exit_time=utc_now()))
+    db.add(_trade(
+        trade_id="o-1", origin="AI_ORIGIN_OPENAI", strategy_name="AI Origination - Nifty 50",
+        profit_loss=40.0, pnl_percent=4.0, result=TradeResult.WIN,
+        entry_time=utc_now(), exit_time=utc_now(),
+    ))
+    db.commit()
+
+    report = generate_pattern_discovery(db, lookback_days=90)
+
+    stats = json.loads(report.stats_json)
+    assert "origination_stats" in stats
+    assert stats["origination_stats"]["total_trades"] == 1
+    assert "trade_stats" in stats  # confirms the existing nested shape is unchanged
+
+
+def test_pattern_narrative_includes_origination_even_with_zero_signal_trades():
+    # Same early-return bug class fixed in _template_narrative's default
+    # branch also existed in _template_pattern_narrative -- confirm it's
+    # fixed here too.
+    stats = {
+        "trade_stats": {"total_trades": 0},
+        "ai_correlation": {},
+        "time_patterns": {},
+        "origination_stats": {
+            "total_trades": 1, "wins": 1, "losses": 0, "win_rate": 100.0, "net_pnl": 40.0,
+        },
+    }
+
+    text = _template_pattern_narrative("25 Aug 2026", stats)
+
+    assert "No closed trades were recorded in this period." in text
+    assert "AI Origination: 1 trades" in text
+
+
+def test_pattern_narrative_unaffected_when_origination_stats_absent():
+    stats = {
+        "trade_stats": {"total_trades": 1, "win_rate": 100.0, "net_pnl": 40.0},
+        "ai_correlation": {},
+        "time_patterns": {},
+    }
+
+    text = _template_pattern_narrative("25 Aug 2026", stats)
+
+    assert "AI Origination" not in text

@@ -464,36 +464,43 @@ def _template_narrative(report_label: str, period_label: str, stats: dict[str, A
         if stats.get("max_consecutive_losses", 0) >= 2:
             lines.append(f"Longest losing streak in the period: {stats['max_consecutive_losses']} trades.")
 
-    # 25 Aug 2026: daily reports now also carry an origination_stats block
-    # (see generate_daily_summary) -- weekly/monthly reports never populate
-    # this key, so this branch is a no-op for them. Reported as its own
-    # paragraph rather than merged into the strategy numbers above: AI
-    # Origination trades have no StrategyConfig-backed strategy name and are
-    # a structurally separate population (see CLAUDE.md, "The origin field
-    # is the isolation mechanism"). Handled here rather than only relying on
-    # the AI narrative prompt seeing the extra JSON, since this template
-    # path is the one used when no AI provider is configured at all.
-    origination_stats = stats.get("origination_stats")
-    if origination_stats is not None:
-        origination_total = origination_stats.get("total_trades", 0)
-        if not origination_total:
-            lines.append("No closed AI Origination trades were recorded in this period.")
-        else:
-            lines.append(
-                f"AI Origination: {origination_total} trades, {origination_stats.get('wins', 0)} wins, "
-                f"{origination_stats.get('losses', 0)} losses, win rate {origination_stats.get('win_rate', 0)}%, "
-                f"net P&L {origination_stats.get('net_pnl', 0)}."
-            )
-            by_provider = origination_stats.get("by_provider", {})
-            if origination_stats.get("best_provider"):
-                best = by_provider.get(origination_stats["best_provider"], {})
-                lines.append(
-                    f"Best AI Origination provider: {origination_stats['best_provider']} "
-                    f"(net P&L {best.get('net_pnl', 0)}, win rate {best.get('win_rate', 0)}%)."
-                )
-
+    lines.extend(_origination_narrative_lines(stats.get("origination_stats")))
     lines.append("(Generated from raw statistics; configure an AI provider in AI Settings for a narrative summary.)")
     return "\n".join(lines)
+
+
+def _origination_narrative_lines(origination_stats: dict[str, Any] | None) -> list[str]:
+    """Shared AI Origination paragraph for the template-fallback narratives
+    that also cover a SIGNAL (or SIGNAL + review) population -- Daily,
+    Weekly, Monthly and Pattern Discovery as of 25 Aug 2026, all requested
+    to include AI Origination in every periodic summary. Returns [] when the
+    caller's stats dict never set origination_stats at all (report kinds
+    that don't track it), which keeps this a true no-op there rather than an
+    empty section. Reported as its own paragraph rather than merged into the
+    strategy numbers above it: AI Origination trades have no StrategyConfig-
+    backed strategy name and are a structurally separate population (see
+    CLAUDE.md, "The origin field is the isolation mechanism"). Handled here
+    rather than only relying on the AI narrative prompt seeing the extra
+    JSON, since these template paths are what render when no AI provider is
+    configured at all."""
+    if origination_stats is None:
+        return []
+    total = origination_stats.get("total_trades", 0)
+    if not total:
+        return ["No closed AI Origination trades were recorded in this period."]
+    lines = [
+        f"AI Origination: {total} trades, {origination_stats.get('wins', 0)} wins, "
+        f"{origination_stats.get('losses', 0)} losses, win rate {origination_stats.get('win_rate', 0)}%, "
+        f"net P&L {origination_stats.get('net_pnl', 0)}."
+    ]
+    by_provider = origination_stats.get("by_provider", {})
+    if origination_stats.get("best_provider"):
+        best = by_provider.get(origination_stats["best_provider"], {})
+        lines.append(
+            f"Best AI Origination provider: {origination_stats['best_provider']} "
+            f"(net P&L {best.get('net_pnl', 0)}, win rate {best.get('win_rate', 0)}%)."
+        )
+    return lines
 
 
 def _template_pattern_narrative(period_label: str, stats: dict[str, Any]) -> str:
@@ -503,24 +510,26 @@ def _template_pattern_narrative(period_label: str, stats: dict[str, Any]) -> str
     lines = [f"Pattern Discovery for {period_label}."]
     if not trade_stats.get("total_trades"):
         lines.append("No closed trades were recorded in this period.")
-        return "\n".join(lines)
-    lines.append(
-        f"Analyzed {trade_stats.get('total_trades', 0)} closed trades "
-        f"(win rate {trade_stats.get('win_rate', 0)}%, net P&L {trade_stats.get('net_pnl', 0)})."
-    )
-    if correlation.get("ai_agreement_rate") is not None:
+    else:
         lines.append(
-            f"AI review agreement with actual outcomes: {correlation['ai_agreement_rate']}% "
-            f"across {correlation.get('total_reviews_with_outcome', 0)} graded reviews."
+            f"Analyzed {trade_stats.get('total_trades', 0)} closed trades "
+            f"(win rate {trade_stats.get('win_rate', 0)}%, net P&L {trade_stats.get('net_pnl', 0)})."
         )
-    if time_patterns.get("best_hour"):
-        lines.append(f"Best-performing entry hour: {time_patterns['best_hour']} IST.")
-    if time_patterns.get("worst_hour"):
-        lines.append(f"Weakest entry hour: {time_patterns['worst_hour']} IST.")
-    if time_patterns.get("best_weekday"):
-        lines.append(f"Best-performing weekday: {time_patterns['best_weekday']}.")
-    if time_patterns.get("worst_weekday"):
-        lines.append(f"Weakest weekday: {time_patterns['worst_weekday']}.")
+        if correlation.get("ai_agreement_rate") is not None:
+            lines.append(
+                f"AI review agreement with actual outcomes: {correlation['ai_agreement_rate']}% "
+                f"across {correlation.get('total_reviews_with_outcome', 0)} graded reviews."
+            )
+        if time_patterns.get("best_hour"):
+            lines.append(f"Best-performing entry hour: {time_patterns['best_hour']} IST.")
+        if time_patterns.get("worst_hour"):
+            lines.append(f"Weakest entry hour: {time_patterns['worst_hour']} IST.")
+        if time_patterns.get("best_weekday"):
+            lines.append(f"Best-performing weekday: {time_patterns['best_weekday']}.")
+        if time_patterns.get("worst_weekday"):
+            lines.append(f"Weakest weekday: {time_patterns['worst_weekday']}.")
+
+    lines.extend(_origination_narrative_lines(stats.get("origination_stats")))
     lines.append("(Generated from raw statistics; configure an AI provider in AI Settings for a narrative summary.)")
     return "\n".join(lines)
 
@@ -636,7 +645,9 @@ def generate_weekly_report(db: Session, reference: date | None = None) -> AIRepo
     ref = reference or today_ist()
     start, end = _week_bounds(ref)
     trades = _closed_trades_between(db, start, end)
+    origination_trades = _origination_trades_between(db, start, end)
     stats = _trade_stats(trades)
+    stats["origination_stats"] = _origination_trade_stats(origination_trades)
     period_label = f"{start.strftime('%d %b %Y')} - {end.strftime('%d %b %Y')}"
     summary_text, provider, model = _generate_narrative(db, "weekly report", period_label, stats)
     return _save_report(db, ReportType.WEEKLY, start, end, f"Weekly Report - {period_label}", summary_text, stats, provider, model)
@@ -646,7 +657,9 @@ def generate_monthly_report(db: Session, reference: date | None = None) -> AIRep
     ref = reference or today_ist()
     start, end = _month_bounds(ref)
     trades = _closed_trades_between(db, start, end)
+    origination_trades = _origination_trades_between(db, start, end)
     stats = _trade_stats(trades)
+    stats["origination_stats"] = _origination_trade_stats(origination_trades)
     period_label = ref.strftime("%B %Y")
     summary_text, provider, model = _generate_narrative(db, "monthly report", period_label, stats)
     return _save_report(db, ReportType.MONTHLY, start, end, f"Monthly Report - {period_label}", summary_text, stats, provider, model)
@@ -657,11 +670,13 @@ def generate_pattern_discovery(db: Session, lookback_days: int | None = 90) -> A
     start = today - timedelta(days=lookback_days - 1) if lookback_days else date(2000, 1, 1)
     trades = _closed_trades_between(db, start, today)
     reviews = _reviews_with_outcome_between(db, start, today)
+    origination_trades = _origination_trades_between(db, start, today)
     stats = {
         "lookback_days": lookback_days,
         "trade_stats": _trade_stats(trades),
         "ai_correlation": _ai_correlation_stats(reviews),
         "time_patterns": _time_pattern_stats(trades),
+        "origination_stats": _origination_trade_stats(origination_trades),
     }
     period_label = (
         f"{start.strftime('%d %b %Y')} - {today.strftime('%d %b %Y')}"
