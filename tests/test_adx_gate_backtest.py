@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.db_models import AIOriginationLog, Base, StrategyTrade, StrategyTradeTick, TradeResult, TradeStatus
 from app.time_utils import utc_now
-from scripts.adx_gate_backtest import _bootstrap_mean_diff, _load_entries
+from scripts.adx_gate_backtest import _bootstrap_mean_diff, _di_agrees, _load_entries, run_di_direction_check
 
 
 def _make_db(tmp_path):
@@ -17,11 +17,17 @@ def _make_db(tmp_path):
     return path, Session(engine)
 
 
-def _add_trade(db, *, trade_id, decision, adx, entry_price, pnl_percent, result, index_name="NIFTY"):
+def _add_trade(db, *, trade_id, decision, adx, entry_price, pnl_percent, result, index_name="NIFTY",
+               plus_di=None, minus_di=None):
+    context = {}
+    if plus_di is not None:
+        context["plus_di"] = plus_di
+    if minus_di is not None:
+        context["minus_di"] = minus_di
     db.add(AIOriginationLog(
         timestamp=utc_now(), index_name=index_name, provider="openai", provider_role="primary",
         decision=decision, trade_id=trade_id, regime="MIXED", adx=adx, setups=json.dumps([]),
-        context_json="{}", data_stale=False,
+        context_json=json.dumps(context), data_stale=False,
     ))
     db.add(StrategyTrade(
         trade_id=trade_id, strategy_name=f"AI Origination - {index_name}", signal=decision,
@@ -121,3 +127,65 @@ def test_bootstrap_mean_diff_no_effect_when_populations_are_identical():
     lo, hi = _bootstrap_mean_diff(a, b)
 
     assert lo <= 0 <= hi
+
+
+def test_load_entries_reads_plus_minus_di_from_context_json(tmp_path):
+    path, db = _make_db(tmp_path)
+    _add_trade(db, trade_id="t1", decision="BUY_CE", adx=28.0, entry_price=100.0,
+               pnl_percent=3.0, result=TradeResult.WIN, plus_di=32.0, minus_di=14.0)
+    db.commit()
+    db.close()
+
+    entries = _load_entries(str(path))
+
+    assert entries[0].plus_di == 32.0
+    assert entries[0].minus_di == 14.0
+
+
+def test_load_entries_handles_missing_di_in_context_json(tmp_path):
+    path, db = _make_db(tmp_path)
+    _add_trade(db, trade_id="t1", decision="BUY_CE", adx=28.0, entry_price=100.0,
+               pnl_percent=3.0, result=TradeResult.WIN)
+    db.commit()
+    db.close()
+
+    entries = _load_entries(str(path))
+
+    assert entries[0].plus_di is None
+    assert entries[0].minus_di is None
+
+
+def test_di_agrees_buy_ce_wants_plus_di_greater():
+    assert _di_agrees("BUY_CE", 30.0, 15.0) is True
+    assert _di_agrees("BUY_CE", 15.0, 30.0) is False
+
+
+def test_di_agrees_buy_pe_wants_minus_di_greater():
+    assert _di_agrees("BUY_PE", 15.0, 30.0) is True
+    assert _di_agrees("BUY_PE", 30.0, 15.0) is False
+
+
+def test_di_agrees_returns_none_when_either_value_missing():
+    assert _di_agrees("BUY_CE", None, 15.0) is None
+    assert _di_agrees("BUY_CE", 30.0, None) is None
+
+
+def test_run_di_direction_check_does_not_crash_on_a_realistic_mixed_population(tmp_path, caplog):
+    path, db = _make_db(tmp_path)
+    _add_trade(db, trade_id="t1", decision="BUY_CE", adx=28.0, entry_price=100.0,
+               pnl_percent=5.0, result=TradeResult.WIN, plus_di=32.0, minus_di=14.0)
+    _add_trade(db, trade_id="t2", decision="BUY_PE", adx=22.0, entry_price=100.0,
+               pnl_percent=-6.0, result=TradeResult.LOSS, plus_di=25.0, minus_di=18.0)
+    _add_trade(db, trade_id="t3", decision="BUY_CE", adx=19.0, entry_price=100.0,
+               pnl_percent=1.0, result=TradeResult.WIN)  # no DI recorded
+    db.commit()
+    db.close()
+
+    entries = _load_entries(str(path))
+    with caplog.at_level("INFO"):
+        run_di_direction_check(entries)
+
+    text = "\n".join(r.message for r in caplog.records)
+    assert "no DI recorded" in text
+    assert "DI agrees with direction" in text
+    assert "DI disagrees with direction" in text

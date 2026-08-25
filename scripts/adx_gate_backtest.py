@@ -51,6 +51,31 @@ outcome. No gate is added to app/ai/originator.py by this script -- that is
 a deliberate follow-up decision, made only if a floor clears the trust
 minimum with a bootstrap CI that excludes zero.
 
+PART 3, ADDED 25 AUG: DI-DIRECTION AGREEMENT
+----------------------------------------------
+Prompted by a proposed ADX-gate design (external doc) with three legs: ADX
+above a floor, +DI/-DI direction agreeing with the trade's own direction,
+and ADX sloping upward. Only the DI leg is retroactively testable --
+app/indicators.py's adx() already computes plus_di/minus_di alongside ADX,
+and market_context.py already carries both into MarketContext.as_dict(),
+which is exactly what ai_origination_logs.context_json stores verbatim.
+So DI agreement at decision time can be reconstructed for every past trade
+with no new logging.
+
+ADX SLOPE IS DELIBERATELY NOT TESTED HERE. Nothing has ever recorded ADX's
+trend over time -- only a single snapshot value per decision -- so there is
+no historical series to compute a slope from. Same shape as
+trend_duration_pct_of_session and same_direction_entries_today before
+either was gated: log it going forward first, then backtest once real
+history accumulates. Not built in this pass.
+
+The doc's EMA/VWAP breakout trigger is not separately re-tested here either
+-- VWAP has no index-instrument data in this codebase (see CLAUDE.md: index
+candles report zero volume, the same wall BNV5.1/BNV6 hit), and the
+EMA-alignment/structural-break alternative is what break_confirmation_
+backtest.py already tested via EMA_STACK/ORB/PDH/PDL setups on 12 Aug --
+verdict NOT SUPPORTED. Re-litigating that here would just duplicate it.
+
 Usage:
     python -m scripts.adx_gate_backtest --db data/trading.db
 """
@@ -58,6 +83,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import random
 import sqlite3
@@ -91,6 +117,8 @@ class Entry:
     index_symbol: str
     decision: str
     adx: float | None
+    plus_di: float | None
+    minus_di: float | None
     pnl_percent: float
     mfe_percent: float | None
     mae_percent: float | None
@@ -113,6 +141,7 @@ def _load_entries(db_path: str) -> list[Entry]:
                 l.trade_id    AS trade_id,
                 l.decision    AS decision,
                 l.adx         AS adx,
+                l.context_json AS context_json,
                 t.index_symbol AS index_symbol,
                 t.entry_price AS entry_price,
                 t.pnl_percent AS pnl_percent,
@@ -150,17 +179,39 @@ def _load_entries(db_path: str) -> list[Entry]:
                 # Every AI Origination trade is long (BUY_CE/BUY_PE).
                 mfe = (high - entry_price) / entry_price * 100.0
                 mae = (low - entry_price) / entry_price * 100.0
+        plus_di = minus_di = None
+        try:
+            context = json.loads(row["context_json"] or "{}")
+            plus_di = context.get("plus_di")
+            minus_di = context.get("minus_di")
+        except (TypeError, ValueError):
+            pass
         entries.append(Entry(
             trade_id=trade_id,
             index_symbol=str(row["index_symbol"]),
             decision=str(row["decision"]),
             adx=row["adx"],
+            plus_di=plus_di,
+            minus_di=minus_di,
             pnl_percent=float(row["pnl_percent"]),
             mfe_percent=mfe,
             mae_percent=mae,
             is_win=(row["result"] == "WIN"),
         ))
     return entries
+
+
+def _di_agrees(decision: str, plus_di: float | None, minus_di: float | None) -> bool | None:
+    """True if +DI/-DI direction agrees with the trade's own direction (the
+    doc's rule: BUY_CE wants +DI > -DI, BUY_PE wants -DI > +DI). None when
+    either DI value is missing -- not defaulted to a side."""
+    if plus_di is None or minus_di is None:
+        return None
+    if decision == "BUY_CE":
+        return plus_di > minus_di
+    if decision == "BUY_PE":
+        return minus_di > plus_di
+    return None
 
 
 def _bootstrap_mean_diff(a: list[float], b: list[float], rounds: int = BOOTSTRAP_ROUNDS) -> tuple[float, float]:
@@ -266,6 +317,85 @@ def run_adx_buckets(entries: list[Entry]) -> None:
         )
 
 
+def run_di_direction_check(entries: list[Entry]) -> None:
+    logger.info("=" * 100)
+    logger.info("PART 3: DI-DIRECTION AGREEMENT (does +DI/-DI matching the trade's own direction predict outcome?)")
+    logger.info("=" * 100)
+
+    with_di = [e for e in entries if _di_agrees(e.decision, e.plus_di, e.minus_di) is not None]
+    with_di_ids = {e.trade_id for e in with_di}
+    no_di = [e for e in entries if e.trade_id not in with_di_ids]
+    if no_di:
+        logger.info(
+            "%d of %d entries have no plus_di/minus_di in their stored context_json -- "
+            "reported separately, excluded from the comparison below.",
+            len(no_di), len(entries),
+        )
+        _report_bucket("no DI recorded", no_di)
+        logger.info("-" * 100)
+
+    agrees = [e for e in with_di if _di_agrees(e.decision, e.plus_di, e.minus_di)]
+    disagrees = [e for e in with_di if not _di_agrees(e.decision, e.plus_di, e.minus_di)]
+    _report_bucket("DI agrees with direction", agrees)
+    _report_bucket("DI disagrees with direction", disagrees)
+    if len(agrees) >= 2 and len(disagrees) >= 2:
+        lo, hi = _bootstrap_mean_diff(
+            [e.pnl_percent for e in disagrees], [e.pnl_percent for e in agrees],
+        )
+        verdict = (
+            "disagreeing trades reliably WORSE -- DI-agreement rule is supported" if hi < 0
+            else "disagreeing trades reliably BETTER -- DI-agreement rule would hurt" if lo > 0
+            else "no reliable difference at this sample size"
+        )
+        trust = (
+            "" if min(len(agrees), len(disagrees)) >= MIN_BUCKET_LIVE
+            else "  [smaller bucket below the trust minimum -- read as suggestive, not confirmed]"
+        )
+        logger.info(
+            "bootstrap 90%% CI on mean_pnl(disagrees) - mean_pnl(agrees): [%+.2f, %+.2f] -> %s%s",
+            lo, hi, verdict, trust,
+        )
+    else:
+        logger.info("Too few observations on one side for a bootstrap comparison.")
+
+    # The doc's full entry condition is ADX >= floor AND DI agrees -- check
+    # the combined gate too, not just each leg in isolation.
+    logger.info("-" * 100)
+    logger.info("Combined check: ADX >= 20 AND DI agrees, vs. everything else")
+    combined_pass = [e for e in with_di if e.adx is not None and e.adx >= ADX_NO_TREND and _di_agrees(e.decision, e.plus_di, e.minus_di)]
+    combined_pass_ids = {e.trade_id for e in combined_pass}
+    combined_fail = [e for e in with_di if e.trade_id not in combined_pass_ids]
+    _report_bucket("combined gate PASSES", combined_pass)
+    _report_bucket("combined gate FAILS", combined_fail)
+    if len(combined_pass) >= 2 and len(combined_fail) >= 2:
+        lo, hi = _bootstrap_mean_diff(
+            [e.pnl_percent for e in combined_fail], [e.pnl_percent for e in combined_pass],
+        )
+        verdict = (
+            "failing trades reliably WORSE -- combined gate is supported" if hi < 0
+            else "failing trades reliably BETTER -- combined gate would hurt" if lo > 0
+            else "no reliable difference at this sample size"
+        )
+        trust = (
+            "" if min(len(combined_pass), len(combined_fail)) >= MIN_BUCKET_LIVE
+            else "  [smaller bucket below the trust minimum -- read as suggestive, not confirmed]"
+        )
+        logger.info(
+            "bootstrap 90%% CI on mean_pnl(fails) - mean_pnl(passes): [%+.2f, %+.2f] -> %s%s",
+            lo, hi, verdict, trust,
+        )
+    else:
+        logger.info("Too few observations on one side for a bootstrap comparison.")
+
+    logger.info("-" * 100)
+    logger.info(
+        "ADX SLOPE (rising/falling) is not tested above -- no historical series exists to compute "
+        "it from. It would need to be logged going forward (a new AIOriginationLog field) before "
+        "it can ever be backtested, the same path trend_duration_pct_of_session and "
+        "same_direction_entries_today both took before either was gated."
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default="data/trading.db")
@@ -281,6 +411,7 @@ def main() -> int:
         return 1
 
     run_adx_buckets(entries)
+    run_di_direction_check(entries)
     return 0
 
 
