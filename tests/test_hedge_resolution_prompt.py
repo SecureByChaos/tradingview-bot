@@ -32,3 +32,27 @@ def test_confidence_calibration_paragraph_still_intact():
     # the other.
     assert "full 0.0-1.0 range" in SYSTEM_PROMPT
     assert '"confidence": 0-1' in SYSTEM_PROMPT
+
+
+def test_system_prompt_requires_checking_resolutions_against_own_context():
+    # 26 Aug 2026: a real trade's resolution called a move "fresh" while the
+    # same context showed trend_duration_pct_of_session=100.0 -- the
+    # resolution-shaped language requirement above doesn't catch a resolution
+    # that is specific-sounding but factually inconsistent with data already
+    # in the prompt. This is a distinct, additional check.
+    assert "checked against the numeric context you were" in SYSTEM_PROMPT
+    assert "fresh" in SYSTEM_PROMPT
+    assert "70-80%" in SYSTEM_PROMPT
+
+
+def test_system_prompt_names_move_extent_as_a_second_freshness_check():
+    assert "cumulative move since trend start is" in SYSTEM_PROMPT
+    assert "several ATR" in SYSTEM_PROMPT
+
+
+def test_system_prompt_self_consistency_check_also_forces_none():
+    # Same escape hatch as the original hedge-resolution requirement --
+    # a resolution that fails this check must not be downgraded to a
+    # lower-confidence trade, it must become NONE.
+    assert "that resolution does not hold" in SYSTEM_PROMPT
+    assert SYSTEM_PROMPT.count("not a trade at reduced confidence") == 2
