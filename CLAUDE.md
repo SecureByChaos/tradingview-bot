@@ -295,6 +295,67 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Market Conditions panel froze per-index whenever every configured provider held an open trade there (26 Aug 2026)
+
+**Reported**: a screenshot showing Bank Nifty's Market Conditions snapshot "4m ago" (fresh) next to
+Nifty 50's "59m ago" (stale), with exactly one open Nifty 50 AI Origination trade visible (OpenAI,
+long put). No fix requested yet, just "Nifty50 is not updated for more than hour."
+
+**Root cause, confirmed by reading, not guessed**: `run_origination_checks` (`app/ai/originator.py`)
+had an index-level early exit --
+
+```python
+if all(_has_open_origination(session, index.symbol, provider_name) for _, provider_name, _ in provider_order):
+    continue
+```
+
+-- added purely to save the spot-price fetch when no configured provider had a free slot. `_has_
+open_origination` is checked per-provider (`app/ai/originator.py`'s own comment: "each provider gets
+its own independent trade per index"), but with `secondary_enabled=False` (a single-provider config,
+matching the screenshot's one OpenAI trade), `provider_order` has exactly one entry -- so `all(...)`
+over a one-element list is trivially true the moment that one provider has an open trade. The `continue`
+fires before `_load_market_context`, before the `[AI][ORIGIN][CTX]` log line, and critically before
+`record_decision()` -- which only runs inside the per-provider loop further down, never reached. `get_
+market_conditions()` (`app/platform.py`) reads the *latest* `AIOriginationLog` row per index, written
+exclusively by `record_decision()` -- so once a provider's only slot filled, that index's dashboard
+snapshot stopped getting new rows entirely and froze at whatever it last wrote, for as long as the
+trade stayed open. Bank Nifty had no open trade blocking any slot, so it kept cycling and logging
+normally -- exactly the fresh-vs-stale contrast reported.
+
+**Fixed**, per the chosen option (asked via AskUserQuestion: keep building context every cycle,
+skip only the trade decision): the index-level early exit is removed -- price/`_load_market_context`/
+the CTX log line now run every cycle regardless of slot occupancy, same cost as before this
+optimization existed. The per-provider loop still skips a provider whose slot is occupied (unchanged,
+`_has_open_origination` check per provider, zero LLM calls saved before were still saved). New: if
+every provider in `provider_order` was skipped this way (`provider_evaluated` stays `False`), a single
+context-only marker row is now written via `record_decision()` with a synthetic `_Decision(action=
+"SLOT_OCCUPIED", confidence=None, reasoning="")` -- this is what keeps the dashboard panel updating.
+`confidence=None` and `reasoning=""` are deliberate: every existing backtest/check script in `scripts/`
+filters on one or the other (`confidence IS NOT NULL`, or `reasoning IS NOT NULL AND reasoning != ''`),
+so this marker is automatically excluded from every population those scripts analyze -- it was never a
+real model decision and must never be counted as one. `AIOriginationLog.decision` is a plain
+`String(16)` with no enum constraint; nothing else in `app/` reads that column outside `originator.py`
+itself and `get_market_conditions()` (which never inspects the `decision` value, only regime/adx/cpr/
+setups), confirmed by grep before shipping this.
+
+2 new tests (`tests/test_stale_market_conditions_gate.py`): a full `run_origination_checks` cycle with
+a single-provider config and an open trade on the only slot confirms a `SLOT_OCCUPIED` marker row is
+written with real regime/adx data and the LLM is never called (an exploding stand-in for `_call_
+provider` would fail the test if it were); a control case with no open trade confirms the provider is
+still called normally and a real decision is recorded, unaffected by this change. Full suite: 471
+passed (was 469). `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox cannot run a real origination cycle end-to-end. After deploying,
+confirm the Market Conditions panel keeps updating (a fresh `last_updated` on every ~5-min cycle) for
+an index with an open AI Origination trade on its only configured provider slot, and spot-check
+`ai_origination_logs` for `decision='SLOT_OCCUPIED', confidence IS NULL, reasoning=''` rows appearing
+during that window:
+
+```sql
+SELECT timestamp, index_name, decision, confidence, regime, adx
+FROM ai_origination_logs WHERE decision = 'SLOT_OCCUPIED' ORDER BY timestamp DESC LIMIT 10;
+```
+
 ### Confidence-scoring instruction gets a resolution requirement for self-consistency (26 Aug 2026)
 
 **Trigger**: a real trade (Nifty PE, confidence 0.89) resolved a self-stated exhaustion risk with
