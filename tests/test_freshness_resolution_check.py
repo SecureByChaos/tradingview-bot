@@ -158,6 +158,52 @@ def test_run_check_does_not_flag_high_trend_pct_without_freshness_language(caplo
     assert "No candidate violations found" in messages
 
 
+def test_run_check_does_not_flag_a_none_decision_that_negates_freshness(caplog):
+    # 26 Aug 2026, first real production run: 38/46 "flagged" decisions were
+    # every one a NONE decline whose reasoning used freshness language
+    # NEGATED ("there is no fresh breakout") to correctly justify NOT
+    # trading -- exactly the prompt working as intended, not a violation of
+    # it. A bare "fresh" substring match can't distinguish "a fresh confirmed
+    # break" (the real violation shape) from "no fresh breakout" (a correct
+    # decline); requiring decision to be BUY_CE/BUY_PE is the fix, since a
+    # NONE decision can never violate "don't trade on a contradicted fresh
+    # framing" -- nothing was traded.
+    connection = _make_db()
+    _insert_log(
+        connection, "NONE",
+        "ADX and Supertrend are supportive, but there is no fresh breakout: price "
+        "is still inside the opening range and the move has already run the "
+        "whole session and 9.94 ATR, which makes continuation risky.",
+        {"trend_duration_pct_of_session": 100.0, "move_extent_atr": 9.94},
+    )
+    connection.commit()
+
+    with caplog.at_level("INFO"):
+        run_check(connection, since=None)
+
+    messages = "\n".join(r.message for r in caplog.records)
+    assert "No candidate violations found" in messages
+
+
+def test_run_check_excludes_none_and_error_decisions_from_the_trade_count(caplog):
+    connection = _make_db()
+    _insert_log(connection, "NONE", "a fresh confirmed break", {"trend_duration_pct_of_session": 100.0})
+    _insert_log(connection, "ERROR", "a fresh confirmed break", {"trend_duration_pct_of_session": 100.0})
+    _insert_log(
+        connection, "BUY_CE", "a fresh confirmed break",
+        {"trend_duration_pct_of_session": 100.0}, trade_id="t1",
+    )
+    connection.commit()
+
+    with caplog.at_level("INFO"):
+        run_check(connection, since=None)
+
+    messages = "\n".join(r.message for r in caplog.records)
+    assert "Total decisions with reasoning: 3" in messages
+    assert "decisions that opened a trade (BUY_CE/BUY_PE): 1" in messages
+    assert "FLAGGED" in messages and ": 1" in messages
+
+
 def test_since_filter_excludes_earlier_rows(caplog):
     connection = _make_db()
     _insert_log(

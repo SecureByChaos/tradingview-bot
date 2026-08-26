@@ -19,11 +19,14 @@ with --since set to the deployment timestamp.
 
 WHAT IT FLAGS
 --------------
-A decision is a candidate violation of the new instruction if BOTH:
-  1. Its reasoning text contains freshness/newness language ("fresh", "newly
+A decision is a candidate violation of the new instruction if ALL THREE:
+  1. It actually opened a trade (decision IN ('BUY_CE', 'BUY_PE')). A NONE
+     decision can never violate "don't call a stale move fresh and trade on
+     it" -- nothing was traded. See the real-data bug this fixed, below.
+  2. Its reasoning text contains freshness/newness language ("fresh", "newly
      confirm", "just confirm", "new breakout", "newly break") -- matching the
      exact phrasing the new prompt paragraph names.
-  2. Its own logged context shows trend_duration_pct_of_session >= FRESHNESS_
+  3. Its own logged context shows trend_duration_pct_of_session >= FRESHNESS_
      TREND_PCT_FLOOR (70, matching the prompt's own "roughly 70-80% or higher")
      OR move_extent_atr >= FRESHNESS_ATR_FLOOR (5.0, chosen from the 26 Aug
      trigger trade's own 5.99 ATR reading as a starting point, not a validated
@@ -31,9 +34,31 @@ A decision is a candidate violation of the new instruction if BOTH:
      gate, so a conservative floor that over-flags slightly is preferable to
      one that under-flags).
 
-A decision missing either field in its context_json is not flagged either way --
-"unknown" and "condition not met" are different facts, same convention as every
-other context-dependent check in this project.
+A decision missing either context field is not flagged either way -- "unknown"
+and "condition not met" are different facts, same convention as every other
+context-dependent check in this project.
+
+REAL-DATA BUG FOUND AND FIXED THE SAME DAY (26 Aug 2026, first live run)
+--------------------------------------------------------------------------
+The first real run against production found 38/46 "flagged" decisions --
+every single one was decision=NONE, and every single one's reasoning used
+freshness language NEGATED ("there is no fresh breakout", "no fresh
+momentum"), citing the absence of a fresh confirmation as the reason to
+correctly decline. _mentions_freshness is a bare substring match with no
+negation awareness, so "no fresh breakout" and "a fresh confirmed break"
+both matched identically -- the check was flagging the prompt working
+exactly as intended (the model citing high trend_duration_pct_of_session /
+move_extent_atr to justify NOT trading) as if it were 38 violations of it.
+Condition 1 above (decision must be BUY_CE/BUY_PE) is the fix: a self-
+consistency violation requires a trade to have actually been taken on the
+contradicted "fresh" framing, which a NONE decision definitionally cannot
+be. This does not fully solve keyword negation in general (a BUY decision
+could theoretically still use "no fresh X" language about something other
+than its own entry thesis) but real data gives zero evidence that pattern
+occurs, so it is not built against speculatively -- restricting to trade
+decisions removes 100% of the real false positives observed. run_outcome_
+backtest() below was never affected: it already only ever reads rows from
+strategy_trades, which only contains trades that opened.
 
 OUTCOME BACKTEST (26 Aug 2026, added after a second request to evaluate this
 with the same statistical discipline as every other backtest in this project)
@@ -99,6 +124,9 @@ def _context_contradicts_freshness(context_json: str) -> bool:
     return False
 
 
+TRADE_DECISIONS = ("BUY_CE", "BUY_PE")
+
+
 def run_check(connection: sqlite3.Connection, since: str | None) -> None:
     query = (
         "SELECT timestamp, index_name, decision, trade_id, reasoning, context_json "
@@ -115,17 +143,28 @@ def run_check(connection: sqlite3.Connection, since: str | None) -> None:
         return
 
     total = len(rows)
-    freshness_rows = [r for r in rows if _mentions_freshness(r[4])]
+    # NONE/ERROR decisions are excluded up front -- only a decision that
+    # actually opened a trade (BUY_CE/BUY_PE) can violate "don't call a stale
+    # move fresh and trade on it". See the module docstring's "REAL-DATA BUG"
+    # section: without this, "there is no fresh breakout" (a correct NONE
+    # decline) and "a fresh confirmed break" (the real violation shape) match
+    # the same bare keyword search.
+    trade_rows = [r for r in rows if r[2] in TRADE_DECISIONS]
+    freshness_rows = [r for r in trade_rows if _mentions_freshness(r[4])]
     flagged = [r for r in freshness_rows if _context_contradicts_freshness(r[5])]
 
     logger.info("Total decisions with reasoning: %d%s", total, f" (since {since})" if since else "")
     logger.info(
-        "Decisions using freshness/newness language: %d (%.1f%% of all decisions)",
-        len(freshness_rows), len(freshness_rows) / total * 100.0,
+        "Of those, decisions that opened a trade (BUY_CE/BUY_PE): %d", len(trade_rows),
     )
     logger.info(
-        "FLAGGED (freshness language + trend_duration_pct_of_session >= %.0f or move_extent_atr >= %.1f "
-        "in the same context): %d",
+        "Trade decisions using freshness/newness language: %d%s",
+        len(freshness_rows),
+        f" ({len(freshness_rows) / len(trade_rows) * 100.0:.1f}%% of trade decisions)" if trade_rows else "",
+    )
+    logger.info(
+        "FLAGGED (opened a trade + freshness language + trend_duration_pct_of_session >= %.0f or "
+        "move_extent_atr >= %.1f in the same context): %d",
         FRESHNESS_TREND_PCT_FLOOR, FRESHNESS_ATR_FLOOR, len(flagged),
     )
     if flagged:
