@@ -295,6 +295,58 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### freshness_resolution_check.py's first real run found a detector bug, not 38 violations -- fixed, real result is clean so far (26 Aug 2026)
+
+**Run for real, same day, hours after the tooling above shipped:**
+
+```
+Total decisions with reasoning: 47 (since 2026-08-26 06:02:42)
+Decisions using freshness/newness language: 46 (97.9% of all decisions)
+FLAGGED (freshness language + trend_duration_pct_of_session >= 70 or move_extent_atr >= 5.0): 38
+```
+
+Alarming at first read -- until the 38 printed rows were actually read, not just counted. **Every single
+one was `decision=NONE`**, and every single one's reasoning used the flagged language NEGATED: *"there
+is no fresh breakout: price is still inside the opening range and the move has already run the whole
+session and 9.94 ATR, which makes continuation risky."* `_mentions_freshness` is a bare substring match
+on `"fresh"` with no negation awareness, so `"no fresh breakout"` (correctly declining) and `"a fresh
+confirmed break"` (the actual 26 Aug trigger-trade shape, wrongly trading) matched identically. The
+check was flagging the self-consistency prompt working exactly as intended -- BankNifty repeatedly and
+correctly declining because trend_duration_pct_of_session sat near 100% all session, in the model's own
+words -- as if it were 38 violations of the instruction it was following correctly.
+
+**Fixed**: a decision can only be a genuine violation if it actually opened a trade -- a NONE decision
+definitionally cannot "trade on a contradicted fresh framing" if nothing was traded. `run_check` now
+filters to `decision IN ('BUY_CE', 'BUY_PE')` before the freshness/context checks, added as an explicit
+first condition rather than a smarter negation parser: real data gives zero evidence a BUY decision ever
+uses negated freshness language about its own thesis, so building negation-detection NLP against a
+pattern that hasn't been observed would be exactly the speculative-build this project avoids elsewhere.
+`run_outcome_backtest()` was never affected -- it already only reads `strategy_trades` rows, which by
+construction only ever contains trades that opened.
+
+2 new tests (`tests/test_freshness_resolution_check.py`, extended in place): the exact real NONE-decline
+shape (negated "no fresh breakout" + `trend_duration_pct_of_session=100.0`) is no longer flagged; NONE
+and ERROR decisions are excluded from the trade count while a genuine BUY_CE violation in the same batch
+is still caught. Full suite: 482 passed (was 480).
+
+**Re-run against the same real data, same fix, same day:**
+
+```
+Total decisions with reasoning: 47 (since 2026-08-26 06:02:42)
+Of those, decisions that opened a trade (BUY_CE/BUY_PE): 3
+Trade decisions using freshness/newness language: 0
+FLAGGED (opened a trade + freshness language + ... in the same context): 0
+```
+
+**Zero flagged violations, on the corrected detector, in the only window that has existed since PR #59
+deployed.** All 3 real trades opened since deploy are clean by this check. This is a genuinely good
+early signal, not a confirmed result -- n=3 is far below any trust minimum this project uses anywhere,
+and the 44 correctly-declined BankNifty NONE cycles printed above (same trend stuck near 100% all
+session, same correct decline every 5 minutes for hours) says more about one persistent BankNifty regime
+than about general model behavior. Re-run `python -m scripts.freshness_resolution_check --db
+data/trading.db --since "2026-08-26 06:02:42"` after real trade volume accumulates before treating this
+as anything more than "no violations found yet."
+
 ### freshness_resolution_check.py extended with a real outcome backtest -- tooling only, not run (26 Aug 2026)
 
 **Trigger**: a task document claimed "the gate confirmed deployed, still not firing" against two real
