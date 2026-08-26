@@ -295,6 +295,71 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### freshness_resolution_check.py extended with a real outcome backtest -- tooling only, not run (26 Aug 2026)
+
+**Trigger**: a task document claimed "the gate confirmed deployed, still not firing" against two real
+26 Aug trades (100.0% trend duration / 5.99 and 7.37 ATR, both "fresh"-framed, one loss one win) --
+investigated and corrected (see this file's own repeated notes on this exact false premise): no hard
+`trend_duration_pct_of_session`/`move_extent_atr` gate has ever existed in this codebase, in any commit,
+ever (`git log -S`, repo-wide grep, both empty). Only PR #59's advisory `SYSTEM_PROMPT` paragraph and the
+`freshness_resolution_check.py` diagnostic script are real. The follow-up request, correctly reframed:
+stop asking whether a gate is "firing" and instead run the diagnostic tooling that already exists,
+with the same bootstrap-CI discipline as every other backtest in this project, and report a real go/no-go
+on whether a hard gate is now supported by evidence -- not build one from three anecdotes.
+
+**A concrete, verifiable correction surfaced while checking this**: PR #59 merged to `main` at
+`2026-08-26 11:32:42 +0530` (`2026-08-26 06:02:42` UTC), confirmed from the merge commit itself
+(`git show --no-patch --format="%H %ai %s" 6d48e16`). Both of the request's own trigger trades (10:30 AM
+and 11:25 AM IST) predate that merge -- the second by only 7 minutes. Deployment here is manual and
+separate from a merge (this file's own ground rules), so the real production deploy can only be at or
+after this timestamp, never before. **Neither trigger trade could have run against the new prompt
+paragraph at all** -- they aren't evidence the advisory language failed, they're evidence of nothing
+about it either way, since the code they'd need to have been influenced by did not exist yet when they
+opened. Any `--since` filter evaluating this prompt's real effect must use `2026-08-26 06:02:42` (UTC)
+as a hard floor, and later once the actual manual production-deploy timestamp is confirmed.
+
+**Built**: `freshness_resolution_check.py`'s existing decision-level audit (`run_check` -- flags a
+candidate violation from `ai_origination_logs`, unchanged) is now paired with a new
+`run_outcome_backtest()`, reading CLOSED `AI_ORIGIN_%` trades directly from `strategy_trades`
+(`ai_reasoning`/`market_context_json` -- the same `MarketContext.as_dict()` shape
+`ai_origination_logs.context_json` already uses, since both are written from the same `market_context`
+object at entry time) rather than the decision-level table, since only opened trades have a real
+`pnl_percent` to compare. Same two-part flag test as the existing audit (freshness language present AND
+`trend_duration_pct_of_session >= 70` or `move_extent_atr >= 5.0` in the same context), bucketed
+flagged vs not-flagged: win rate, mean P&L, mean MAE (from `strategy_trade_ticks`, not the stored
+`lowest_price` column -- same documented reason `reasoning_hedge_backtest.py`'s `_load_entries` already
+gives: `lowest_price` is pinned at entry price for this always-long population), and a bootstrap 90% CI
+on the mean P&L difference. Same `MIN_BUCKET_LIVE=20` trust minimum and the same bootstrap-resampling
+shape as `reasoning_hedge_backtest.py`'s `_bootstrap_mean_diff`, duplicated rather than imported per
+this project's established per-script convention. `main()` now runs both sections back to back.
+
+9 new tests (`tests/test_freshness_resolution_check.py`, extended in place): the flag applied correctly
+to the trigger-trade shape, MAE derived from ticks matching the real trigger trade's own -13.09% MAE,
+the population filter excluding non-`AI_ORIGIN_%` origins and still-`OPEN` trades, the `--since` filter,
+the bootstrap helper on a fully-separated synthetic gap (deterministic: constant-valued groups collapse
+to an exact CI with zero variance) and an overlapping-groups null case, and three `run_outcome_backtest`
+integration cases (a reliable-but-thin synthetic difference correctly flagged both "reliably WORSE" and
+"below trust minimum" in the same line, the no-closed-trades case, and the one-empty-bucket case). Full
+suite: 480 passed (was 471). `python -c "import scripts.freshness_resolution_check"` imports cleanly;
+`--help` renders without error.
+
+**Not run** -- same standing constraint as every backtest script in this project: this sandbox has no
+real `data/trading.db` (`data/` here holds only an unrelated `trades.csv`). Run on the machine with real
+history, using the confirmed deploy floor above:
+
+```bash
+python -m scripts.freshness_resolution_check --db data/trading.db --since "2026-08-26 06:02:42"
+```
+
+Read `FRESHNESS-FLAGGED OUTCOME BACKTEST`'s reported bucket sizes first -- given PR #59 merged only
+today, the post-floor population is very likely thin (`[BELOW MIN SAMPLE]`/`[below trust minimum]`) at
+first read; per this project's own standard, that is the expected, reportable "not yet enough evidence"
+outcome, not a failure of the check. **No gate has been proposed or built from this pass.** If the CI
+ever excludes zero on a sample that clears the trust minimum, that is the trigger to bring a *specific*
+numeric gate proposal back for review as its own follow-up -- not to build one from this backtest run
+directly, per the discipline every other gate in this project (DTE floor, same-direction-loss,
+confidence floor) was held to before shipping.
+
 ### Market Conditions panel froze per-index whenever every configured provider held an open trade there (26 Aug 2026)
 
 **Reported**: a screenshot showing Bank Nifty's Market Conditions snapshot "4m ago" (fresh) next to

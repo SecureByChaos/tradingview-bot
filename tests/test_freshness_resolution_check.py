@@ -3,10 +3,15 @@ from __future__ import annotations
 import json
 import sqlite3
 
+import pytest
+
 from scripts.freshness_resolution_check import (
+    _bootstrap_mean_diff,
     _context_contradicts_freshness,
+    _load_trade_entries,
     _mentions_freshness,
     run_check,
+    run_outcome_backtest,
 )
 
 
@@ -25,8 +30,48 @@ def _make_db():
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE strategy_trades (
+            trade_id TEXT PRIMARY KEY,
+            entry_time TEXT NOT NULL,
+            entry_price REAL,
+            origin TEXT NOT NULL,
+            status TEXT NOT NULL,
+            ai_reasoning TEXT,
+            market_context_json TEXT,
+            pnl_percent REAL,
+            result TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE strategy_trade_ticks (
+            trade_id TEXT NOT NULL,
+            premium REAL NOT NULL
+        )
+        """
+    )
     connection.commit()
     return connection
+
+
+def _insert_trade(
+    connection, trade_id, reasoning, context, pnl_percent, result,
+    entry_price=100.0, entry_time="2026-08-26T10:00:00", origin="AI_ORIGIN_OPENAI",
+    ticks=None,
+):
+    connection.execute(
+        "INSERT INTO strategy_trades "
+        "(trade_id, entry_time, entry_price, origin, status, ai_reasoning, market_context_json, pnl_percent, result) "
+        "VALUES (?, ?, ?, ?, 'CLOSED', ?, ?, ?, ?)",
+        (trade_id, entry_time, entry_price, origin, reasoning, json.dumps(context), pnl_percent, result),
+    )
+    for premium in (ticks or [entry_price]):
+        connection.execute(
+            "INSERT INTO strategy_trade_ticks (trade_id, premium) VALUES (?, ?)", (trade_id, premium)
+        )
 
 
 def _insert_log(connection, decision, reasoning, context, trade_id=None,
@@ -130,3 +175,135 @@ def test_since_filter_excludes_earlier_rows(caplog):
 
     messages = "\n".join(r.message for r in caplog.records)
     assert "Total decisions with reasoning: 1" in messages
+
+
+# ---------------------------------------------------------------------------
+# Outcome backtest (26 Aug 2026 -- evaluate the flag against real P&L, not
+# just count occurrences)
+# ---------------------------------------------------------------------------
+
+def test_load_trade_entries_flags_the_trigger_trade_shape():
+    connection = _make_db()
+    _insert_trade(
+        connection, "t1",
+        "the fresh confirmed break and continued negative drift make the bearish "
+        "continuation case the clearest setup right now.",
+        {"trend_duration_pct_of_session": 100.0, "move_extent_atr": 5.99},
+        pnl_percent=-13.09, result="LOSS",
+    )
+    _insert_trade(
+        connection, "t2", "a routine setup, no conflicting signals",
+        {"trend_duration_pct_of_session": 20.0}, pnl_percent=4.2, result="WIN",
+    )
+    connection.commit()
+
+    entries = {e.trade_id: e for e in _load_trade_entries(connection, since=None)}
+    assert entries["t1"].flagged is True
+    assert entries["t2"].flagged is False
+
+
+def test_load_trade_entries_derives_mae_from_ticks():
+    connection = _make_db()
+    _insert_trade(
+        connection, "t1", "a fresh confirmed break",
+        {"trend_duration_pct_of_session": 100.0}, pnl_percent=-13.09, result="LOSS",
+        entry_price=100.0, ticks=[100.0, 90.0, 105.0, 86.91],
+    )
+    connection.commit()
+
+    entries = _load_trade_entries(connection, since=None)
+    assert len(entries) == 1
+    # low tick 86.91 vs entry 100.0 -> -13.09% MAE, matching the real trigger trade
+    assert entries[0].mae_percent == pytest.approx(-13.09)
+
+
+def test_load_trade_entries_excludes_non_ai_origination_and_open_trades():
+    connection = _make_db()
+    _insert_trade(
+        connection, "signal-trade", "a fresh confirmed break",
+        {"trend_duration_pct_of_session": 100.0}, pnl_percent=-5.0, result="LOSS",
+        origin="SIGNAL",
+    )
+    connection.execute(
+        "INSERT INTO strategy_trades (trade_id, entry_time, entry_price, origin, status, ai_reasoning, "
+        "market_context_json, pnl_percent, result) VALUES "
+        "('open-trade', '2026-08-26T10:00:00', 100.0, 'AI_ORIGIN_OPENAI', 'OPEN', 'a fresh confirmed break', "
+        "'{}', NULL, NULL)"
+    )
+    connection.commit()
+
+    assert _load_trade_entries(connection, since=None) == []
+
+
+def test_load_trade_entries_since_filter():
+    connection = _make_db()
+    _insert_trade(
+        connection, "old", "a fresh confirmed break", {"trend_duration_pct_of_session": 100.0},
+        pnl_percent=-5.0, result="LOSS", entry_time="2026-08-10T10:00:00",
+    )
+    _insert_trade(
+        connection, "new", "a fresh confirmed break", {"trend_duration_pct_of_session": 100.0},
+        pnl_percent=-5.0, result="LOSS", entry_time="2026-08-27T10:00:00",
+    )
+    connection.commit()
+
+    entries = _load_trade_entries(connection, since="2026-08-26")
+    assert [e.trade_id for e in entries] == ["new"]
+
+
+def test_bootstrap_mean_diff_detects_a_real_separated_gap():
+    lo, hi = _bootstrap_mean_diff([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0])
+    assert lo == hi == -20.0
+
+
+def test_bootstrap_mean_diff_no_gap_when_groups_overlap_identically():
+    lo, hi = _bootstrap_mean_diff([5.0, -5.0, 5.0, -5.0], [5.0, -5.0, 5.0, -5.0])
+    assert lo <= 0.0 <= hi
+
+
+def test_run_outcome_backtest_reports_a_reliable_difference_but_flags_thin_sample(caplog):
+    connection = _make_db()
+    for i in range(3):
+        _insert_trade(
+            connection, f"flagged-{i}", "a fresh confirmed break",
+            {"trend_duration_pct_of_session": 100.0}, pnl_percent=-10.0, result="LOSS",
+        )
+    for i in range(3):
+        _insert_trade(
+            connection, f"clean-{i}", "a routine setup, no conflicts",
+            {"trend_duration_pct_of_session": 20.0}, pnl_percent=10.0, result="WIN",
+        )
+    connection.commit()
+
+    with caplog.at_level("INFO"):
+        run_outcome_backtest(connection, since=None)
+
+    messages = "\n".join(r.message for r in caplog.records)
+    assert "flagged reliably WORSE" in messages
+    assert "below trust minimum" in messages  # n=3 per bucket, well under MIN_BUCKET_LIVE=20
+
+
+def test_run_outcome_backtest_reports_no_closed_trades_gracefully(caplog):
+    connection = _make_db()
+    connection.commit()
+
+    with caplog.at_level("INFO"):
+        run_outcome_backtest(connection, since=None)
+
+    messages = "\n".join(r.message for r in caplog.records)
+    assert "No closed AI Origination trades with reasoning + market context in this window." in messages
+
+
+def test_run_outcome_backtest_reports_too_few_for_bootstrap_when_one_bucket_is_empty(caplog):
+    connection = _make_db()
+    _insert_trade(
+        connection, "t1", "a fresh confirmed break",
+        {"trend_duration_pct_of_session": 100.0}, pnl_percent=-10.0, result="LOSS",
+    )
+    connection.commit()
+
+    with caplog.at_level("INFO"):
+        run_outcome_backtest(connection, since=None)
+
+    messages = "\n".join(r.message for r in caplog.records)
+    assert "Too few observations in one bucket for a bootstrap comparison." in messages

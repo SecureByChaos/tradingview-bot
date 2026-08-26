@@ -35,6 +35,26 @@ A decision missing either field in its context_json is not flagged either way --
 "unknown" and "condition not met" are different facts, same convention as every
 other context-dependent check in this project.
 
+OUTCOME BACKTEST (26 Aug 2026, added after a second request to evaluate this
+with the same statistical discipline as every other backtest in this project)
+------------------------------------------------------------------------------
+The section above is a decision-level AUDIT -- it flags candidates for manual
+review, nothing more. It does not say whether flagged trades actually perform
+worse. run_outcome_backtest() answers that, restricted to CLOSED AI Origination
+trades (StrategyTrade.ai_reasoning/market_context_json, not the decision-level
+ai_origination_logs table, since only opened trades have a real pnl_percent):
+flagged (freshness language + context contradicts, same two-part test as
+above) vs not-flagged, win rate / mean P&L / mean MAE per bucket, and a
+bootstrap 90% CI on the mean P&L difference -- same MIN_BUCKET_LIVE=20 trust
+minimum and the same bootstrap-resampling shape as every other live-history
+backtest in this project (e.g. reasoning_hedge_backtest.py's _bootstrap_mean_
+diff; duplicated here rather than imported, per this project's established
+per-script convention). A CI that excludes zero is the one bar this project
+has required before treating any prior finding (confidence floor, hedge
+categories, stop-distance sweep) as real; a CI that crosses zero is reported
+exactly as plainly as a real effect would be -- "not yet enough evidence" is
+an intended, useful outcome of this check, not a failure of it.
+
 Usage:
     python -m scripts.freshness_resolution_check --db data/trading.db
     python -m scripts.freshness_resolution_check --db data/trading.db --since "2026-08-26 12:00:00"
@@ -45,8 +65,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import sqlite3
 import sys
+from dataclasses import dataclass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("freshness_resolution_check")
@@ -54,6 +76,8 @@ logger = logging.getLogger("freshness_resolution_check")
 FRESHNESS_KEYWORDS = ("fresh", "newly confirm", "just confirm", "new breakout", "newly break")
 FRESHNESS_TREND_PCT_FLOOR = 70.0
 FRESHNESS_ATR_FLOOR = 5.0
+BOOTSTRAP_ROUNDS = 10000
+MIN_BUCKET_LIVE = 20  # same trust minimum every other live-history backtest in this project uses
 
 
 def _mentions_freshness(reasoning: str) -> bool:
@@ -117,10 +141,130 @@ def run_check(connection: sqlite3.Connection, since: str | None) -> None:
         logger.info("No candidate violations found in this window.")
 
 
+@dataclass
+class TradeEntry:
+    trade_id: str
+    pnl_percent: float
+    is_win: bool
+    mae_percent: float | None
+    flagged: bool
+
+
+def _load_trade_entries(connection: sqlite3.Connection, since: str | None) -> list[TradeEntry]:
+    """CLOSED AI Origination trades with a recorded reasoning + market context.
+    market_context_json (StrategyTrade) is the same MarketContext.as_dict() shape
+    as ai_origination_logs.context_json -- both are written from the same
+    market_context object at entry time -- so _context_contradicts_freshness
+    applies unchanged. MAE from strategy_trade_ticks, not the stored lowest_price
+    column, per the same reasoning reasoning_hedge_backtest.py's _load_entries
+    documents: lowest_price is pinned at entry_price for this always-long
+    population and is not a real adverse-excursion figure."""
+    query = (
+        "SELECT trade_id, entry_price, ai_reasoning, market_context_json, pnl_percent, result "
+        "FROM strategy_trades "
+        "WHERE origin LIKE 'AI_ORIGIN_%' AND status = 'CLOSED' "
+        "AND ai_reasoning IS NOT NULL AND ai_reasoning != '' "
+        "AND market_context_json IS NOT NULL AND pnl_percent IS NOT NULL"
+    )
+    params: list[object] = []
+    if since:
+        query += " AND entry_time >= ?"
+        params.append(since)
+    rows = connection.execute(query, params).fetchall()
+
+    tick_extremes = {
+        row[0]: (row[1], row[2])
+        for row in connection.execute(
+            "SELECT trade_id, MIN(premium) AS low, MAX(premium) AS high FROM strategy_trade_ticks GROUP BY trade_id"
+        ).fetchall()
+    }
+
+    entries: list[TradeEntry] = []
+    for trade_id, entry_price, reasoning, context_json, pnl_percent, result in rows:
+        flagged = _mentions_freshness(reasoning or "") and _context_contradicts_freshness(context_json)
+        mae = None
+        extremes = tick_extremes.get(trade_id)
+        if extremes and entry_price:
+            low, _high = extremes
+            if low is not None:
+                mae = (low - entry_price) / entry_price * 100.0
+        entries.append(TradeEntry(
+            trade_id=str(trade_id), pnl_percent=float(pnl_percent),
+            is_win=(result == "WIN"), mae_percent=mae, flagged=flagged,
+        ))
+    return entries
+
+
+def _bootstrap_mean_diff(a: list[float], b: list[float], rounds: int = BOOTSTRAP_ROUNDS) -> tuple[float, float]:
+    """90% CI on mean(a) - mean(b) via independent resampling of each group."""
+    rng = random.Random(20260826)
+    diffs = []
+    for _ in range(rounds):
+        sample_a = [rng.choice(a) for _ in a]
+        sample_b = [rng.choice(b) for _ in b]
+        diffs.append(sum(sample_a) / len(sample_a) - sum(sample_b) / len(sample_b))
+    diffs.sort()
+    lo = diffs[int(0.05 * rounds)]
+    hi = diffs[int(0.95 * rounds) - 1]
+    return lo, hi
+
+
+def _report_bucket(label: str, entries: list[TradeEntry]) -> None:
+    if not entries:
+        logger.info("  %-14s n=0", label)
+        return
+    n = len(entries)
+    wins = sum(1 for e in entries if e.is_win)
+    mean_pnl = sum(e.pnl_percent for e in entries) / n
+    maes = [e.mae_percent for e in entries if e.mae_percent is not None]
+    mae_txt = f"{sum(maes) / len(maes):+.2f}%" if maes else "n/a"
+    flag = "" if n >= MIN_BUCKET_LIVE else "  [BELOW MIN SAMPLE -- treat as anecdote, not evidence]"
+    logger.info(
+        "  %-14s n=%-4d win_rate=%5.1f%%  mean_pnl=%+6.2f%%  mean_mae=%-8s%s",
+        label, n, wins / n * 100.0, mean_pnl, mae_txt, flag,
+    )
+
+
+def run_outcome_backtest(connection: sqlite3.Connection, since: str | None) -> None:
+    entries = _load_trade_entries(connection, since)
+    logger.info("=" * 100)
+    logger.info(
+        "FRESHNESS-FLAGGED OUTCOME BACKTEST (%d closed AI Origination trades with reasoning + context)%s",
+        len(entries), f" since {since}" if since else "",
+    )
+    logger.info("=" * 100)
+    if not entries:
+        logger.info("No closed AI Origination trades with reasoning + market context in this window.")
+        return
+
+    flagged = [e for e in entries if e.flagged]
+    not_flagged = [e for e in entries if not e.flagged]
+    _report_bucket("flagged", flagged)
+    _report_bucket("not flagged", not_flagged)
+
+    if len(flagged) >= 2 and len(not_flagged) >= 2:
+        lo, hi = _bootstrap_mean_diff([e.pnl_percent for e in flagged], [e.pnl_percent for e in not_flagged])
+        trust = (
+            "" if min(len(flagged), len(not_flagged)) >= MIN_BUCKET_LIVE
+            else "  [below trust minimum on the thinner side -- treat as suggestive, not confirmed]"
+        )
+        verdict = (
+            "flagged reliably WORSE" if hi < 0
+            else "flagged reliably BETTER" if lo > 0
+            else "no reliable difference at this sample size (CI crosses zero)"
+        )
+        logger.info(
+            "bootstrap 90%% CI on mean_pnl(flagged) - mean_pnl(not flagged): [%+.2f, %+.2f] -> %s%s",
+            lo, hi, verdict, trust,
+        )
+    else:
+        logger.info("Too few observations in one bucket for a bootstrap comparison.")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", default="data/trading.db")
-    parser.add_argument("--since", default=None, help="ISO date/datetime (UTC) -- only decisions at/after this timestamp")
+    parser.add_argument("--since", default=None, help="ISO date/datetime (UTC) -- only decisions/trades at/after this timestamp")
     args = parser.parse_args()
 
     connection = sqlite3.connect(args.db)
@@ -134,6 +278,7 @@ def main() -> int:
             )
             return 0
         run_check(connection, args.since)
+        run_outcome_backtest(connection, args.since)
     finally:
         connection.close()
     return 0
