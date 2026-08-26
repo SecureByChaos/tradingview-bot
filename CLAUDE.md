@@ -295,6 +295,82 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Confidence-scoring instruction gets a resolution requirement for self-consistency (26 Aug 2026)
+
+**Trigger**: a real trade (Nifty PE, confidence 0.89) resolved a self-stated exhaustion risk with
+*"the fresh confirmed break and continued negative drift make the bearish continuation case the
+clearest setup"* -- but the same logged context showed `trend_duration_pct_of_session = 100.0`. The
+trend had already consumed the entire session; "fresh" was directly contradicted by data already in
+the same prompt the model reasoned from. MFE -1.20% -- straight to stop, never moved favorably. This
+is a sharper version of the 12/14/19 Aug pattern (state a risk, dismiss it with a bare "but") the 19-20
+Aug hedge-resolution fix already targets: the model now produces resolution-*shaped* language, but
+nothing checks whether the resolution is actually *true* against fields already in its own context.
+
+**A third instance of the same false premise, checked and rejected before anything else.** The
+request's Section 4 claimed "the emergency trend-extension gate shipped after 19 Aug" blocks entries at
+`trend_duration_pct_of_session >= 95 OR move_extent_atr >= 10`, and asked to verify it's deployed. It
+still isn't real. `git log -S"trend_duration_pct_of_session >="` across the **entire history** of
+`app/ai/originator.py` returns nothing -- not "not deployed," never written, in any commit, ever. The
+code comment at that exact spot (line ~222) states the real, deliberate decision: this was investigated
+11 Aug, `trend_age_gate_backtest.py` was built for it, the result was inconclusive (not "not supported,"
+genuinely insufficient data), and it was deliberately not shipped rather than gated on a single day's
+anecdote -- this project's own repeatedly-stated standard. Flagged plainly rather than built around,
+same as the two earlier instances of this exact claim (documented in the "Reasoning-hedge detector"
+entry below).
+
+**Did not ship the hard gate anyway, despite a second real anecdote now existing.** This trade is a
+second data point consistent with the same 11 Aug pattern, which is worth knowing -- but shipping a
+hard `trend_duration_pct_of_session`/`move_extent_atr` gate from two anecdotes is exactly the
+overfitting error this project has repeatedly guarded against, and the existing backtest for this
+specific question came back inconclusive rather than supportive. Re-running
+`scripts/trend_age_gate_backtest.py` against current (larger) history is the right next step if this
+gate is worth revisiting -- not done here, since that's a distinct decision from the prompt fix below
+and wasn't asked for as clearly.
+
+**What was actually built: the self-consistency prompt paragraph (the request's Section 1), which
+needs no backtest** -- same discipline as every other prompt-only change this cycle (confidence scale,
+hedge resolution): ship, then verify with a before/after distribution check over real elapsed time, not
+a pre-deployment gate. New `SYSTEM_PROMPT` paragraph in `app/ai/originator.py`, inserted directly after
+the existing hedge-resolution paragraph and before the confidence-calibration one (same grouping the 19
+Aug entry established): tells the model not to call a move "fresh" or "newly confirmed" when trend
+duration is roughly 70-80%+ of the session, and not to call a breakout "new" when the cumulative move is
+already several ATR -- phrased against the exact human-readable labels the model actually sees in its
+own prompt ("~X% of session elapsed", "Cumulative move since trend start: Y ATR"), not the internal
+snake_case field names, since the model never sees those literally. Same NONE-not-downgraded escape
+hatch as the original resolution requirement.
+
+7 new tests (`tests/test_hedge_resolution_prompt.py`, extended in place): the new paragraph's presence,
+the 70-80% and "several ATR" language, and that it forces NONE the same way the original resolution
+requirement does. New `scripts/freshness_resolution_check.py` (the request's Section 3/deliverable 4):
+flags any `ai_origination_logs` decision whose reasoning uses freshness language ("fresh", "newly
+confirm", "just confirm", "new breakout") while its own logged `context_json` shows
+`trend_duration_pct_of_session >= 70` or `move_extent_atr >= 5.99` (`FRESHNESS_ATR_FLOOR`, taken from
+this trigger trade's own reading as a starting point, explicitly not a validated threshold -- this is a
+diagnostic flag for manual review, not a gate). 8 new tests
+(`tests/test_freshness_resolution_check.py`) including the exact trigger-trade shape reproduced from
+its real reasoning text and context values. Full suite: 469 passed (was 461).
+`python -c "import app.main"` and `python -c "import scripts.freshness_resolution_check"` both import
+cleanly.
+
+**Sandbox note**: mid-session, this sandbox's installed packages were reset (pytest, SQLAlchemy,
+FastAPI etc. all gone, confirmed via `pip list`) while the filesystem and git state were unaffected --
+reinstalled from `requirements.txt` before continuing. Not a code or data issue, just an environment
+hiccup worth naming in case it recurs.
+
+**Not verified live** -- this sandbox cannot call either provider's real API. After deploying, log the
+exact deployment timestamp, then run the check script now for the baseline and again after 1-2 weeks:
+
+```bash
+python -m scripts.freshness_resolution_check --db data/trading.db
+python -m scripts.freshness_resolution_check --db data/trading.db --since "<deploy timestamp, UTC>"
+```
+
+If flagged decisions drop to near zero after the change, the prompt fix is working. If they don't,
+that's a real result too -- per the same standard the hedge-resolution fix itself established, it
+would mean the model can't reliably self-check a resolution against its own numeric context even when
+explicitly told to, which is worth knowing regardless of whether the underlying hard-gate question
+(re-running `trend_age_gate_backtest.py`) is ever revisited.
+
 ### AI Origination trailing-stop activation percent made admin-configurable (25 Aug 2026)
 
 **Reported**: a real trade (Nifty PE, entry 102.55, high 111.9, MFE 9.12%) never armed its trailing
