@@ -1349,12 +1349,19 @@ def run_origination_checks(
             if not index.enabled:
                 continue
             try:
-                # Skip the whole index this cycle only if every configured
-                # provider already has its own open trade here -- if even one
-                # provider has room, it's still worth fetching price/ticks so
-                # that provider gets its turn below.
-                if all(_has_open_origination(session, index.symbol, provider_name) for _, provider_name, _ in provider_order):
-                    continue
+                # 26 Aug 2026: this used to skip the whole index here when
+                # every configured provider already had an open trade, to
+                # save the price fetch below. That also skipped
+                # _load_market_context and record_decision() for the entire
+                # cycle, which silently froze the dashboard's Market
+                # Conditions panel (get_market_conditions() reads the latest
+                # AIOriginationLog row) for as long as the occupying trade
+                # stayed open -- reported live as Nifty 50 stuck ~59 minutes
+                # stale while Bank Nifty (no open trade) kept updating every
+                # cycle. Context is now built every cycle regardless of slot
+                # occupancy; only the per-provider decision loop below still
+                # skips a provider whose slot is already occupied, via
+                # _has_open_origination -- no extra LLM calls result from this.
                 # Cooldown disabled for now, on purpose -- observing raw
                 # AI Origination trade volume with no throttle to see where the
                 # daily count actually lands before deciding whether the
@@ -1428,6 +1435,7 @@ def run_origination_checks(
                     sorted(k for k, v in market_context.setups.items() if v),
                 )
 
+                provider_evaluated = False
                 for turn, provider_name, view in provider_order:
                     # Each provider gets its own independent trade slot per
                     # index -- Claude and OpenAI can each hold their own open
@@ -1436,6 +1444,7 @@ def run_origination_checks(
                     # other out entirely.
                     if _has_open_origination(session, index.symbol, provider_name):
                         continue
+                    provider_evaluated = True
 
                     # Refreshed PER PROVIDER, not once per cycle. Both providers
                     # are evaluated inside the same cycle seconds apart, so a
@@ -1550,6 +1559,38 @@ def run_origination_checks(
                         market_context=market_context,
                         data_stale=data_stale,
                         trade=opened,
+                    )
+
+                if not provider_evaluated:
+                    # Every configured provider already has an open trade on
+                    # this index, so the loop above never called a provider or
+                    # record_decision(). Market context was still computed
+                    # above and must still reach the dashboard's Market
+                    # Conditions panel (get_market_conditions() only ever
+                    # reads the latest AIOriginationLog row) -- write a
+                    # context-only marker row so the panel keeps updating for
+                    # the duration of the open trade(s) instead of freezing.
+                    # confidence=None and reasoning="" so this row is
+                    # automatically excluded from every existing backtest/
+                    # check script, which all filter on one or the other
+                    # (confidence IS NOT NULL, or reasoning != '') -- it was
+                    # never a real model decision and must not be counted as
+                    # one.
+                    record_decision(
+                        session,
+                        index_symbol=index.symbol,
+                        provider=provider_order[0][1] if provider_order else "",
+                        provider_role="context_only",
+                        decision=_Decision(
+                            action="SLOT_OCCUPIED",
+                            confidence=None,
+                            sl_percent=None,
+                            target_percent=None,
+                            reasoning="",
+                        ),
+                        market_context=market_context,
+                        data_stale=data_stale,
+                        trade=None,
                     )
             except Exception as exc:
                 logger.exception("[AI][ORIGIN] Check failed for index %s", index.symbol)
