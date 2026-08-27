@@ -920,6 +920,29 @@ def _max_sl_percent(db: Session) -> float:
     return settings.ai_origination_max_sl_percent
 
 
+def _chop_gate_enabled(db: Session) -> bool:
+    """Admin opt-in for the chop-efficiency-ratio gate (Settings > AI,
+    AISettings.ai_origination_chop_gate_enabled). OFF by default -- see
+    the column's own comment in app/db_models.py for why this is a manual
+    risk control, not a backtested finding. Falls back to disabled only if
+    no AISettings row exists at all."""
+    settings = get_settings(db)
+    if settings is None:
+        return False
+    return settings.ai_origination_chop_gate_enabled
+
+
+def _chop_gate_min_efficiency_ratio(db: Session) -> float:
+    """Admin-configurable floor for the chop gate (Settings > AI,
+    AISettings.ai_origination_chop_gate_min_efficiency_ratio). Falls back
+    to the same 0.3 CHOPPY threshold used elsewhere (_efficiency_ratio_text,
+    app/platform.py's _classify_chop) only if no AISettings row exists."""
+    settings = get_settings(db)
+    if settings is None:
+        return 0.3
+    return settings.ai_origination_chop_gate_min_efficiency_ratio
+
+
 def _trail_activate_nominal(db: Session) -> float:
     """Admin-configurable nominal trail-activation percent (Settings > AI,
     AISettings.ai_origination_trail_activate_percent) -- fed into the same
@@ -1115,6 +1138,24 @@ def _open_trade(
             index.symbol, consecutive_losses, decision.action, max_losses,
         )
         return None
+
+    # Chop gate, admin opt-in and OFF by default (Settings > AI) -- see
+    # AISettings.ai_origination_chop_gate_enabled's own comment in
+    # app/db_models.py for why this ships without a backtest behind it.
+    # Checked here (same early position as the loss gate above, before any
+    # contract-resolution cost) since it only needs market_context, already
+    # in hand. A missing market_context or a missing chop_efficiency_ratio
+    # reading (e.g. before an index has a full hour of 5-min bars) fails
+    # OPEN, not closed -- "no reading yet" is not "choppy", same convention
+    # every other missing-value case in this project follows.
+    if _chop_gate_enabled(db) and market_context is not None and market_context.chop_efficiency_ratio is not None:
+        chop_floor = _chop_gate_min_efficiency_ratio(db)
+        if market_context.chop_efficiency_ratio < chop_floor:
+            logger.info(
+                "[AI][ORIGIN] %s: Skipped: chop_efficiency_ratio=%.2f below configured floor %.2f",
+                index.symbol, market_context.chop_efficiency_ratio, chop_floor,
+            )
+            return None
 
     max_sl_percent = _max_sl_percent(db)
 

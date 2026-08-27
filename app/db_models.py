@@ -119,6 +119,18 @@ class AISettings(Base):
     # applies on top of whatever nominal is configured here -- this changes
     # the INPUT to that rescale, not whether the rescale itself happens.
     ai_origination_trail_activate_percent: Mapped[float] = mapped_column(Float, default=8.0, nullable=False)
+    # 27 Aug 2026: an admin-opt-in risk control, NOT a validated finding --
+    # scripts/chop_gate_backtest.py was built the same day chop_efficiency_
+    # ratio started being logged, so there is no real closed-trade history
+    # yet to backtest a floor against. Defaults to disabled so deploying
+    # this column changes no live behavior; an admin who wants it enforced
+    # before that backtest returns a result is opting into that risk
+    # knowingly, not something this project is asserting is correct.
+    # min_efficiency_ratio's default (0.3) matches the existing CHOPPY
+    # threshold already shown on the dashboard and in the model's own
+    # prompt (_efficiency_ratio_text), not a separately-chosen number.
+    ai_origination_chop_gate_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    ai_origination_chop_gate_min_efficiency_ratio: Mapped[float] = mapped_column(Float, default=0.3, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

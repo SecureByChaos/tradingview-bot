@@ -713,7 +713,9 @@ def update_ai_settings_page(
     ai_origination_max_sl_percent: Annotated[float, Form()] = 50.0,
     ai_origination_max_same_direction_losses: Annotated[int, Form()] = 2,
     ai_origination_trail_activate_percent: Annotated[float, Form()] = 8.0,
+    ai_origination_chop_gate_min_efficiency_ratio: Annotated[float, Form()] = 0.3,
     enabled: Annotated[str | None, Form()] = None,
+    ai_origination_chop_gate_enabled: Annotated[str | None, Form()] = None,
     secondary_enabled: Annotated[str | None, Form()] = None,
     secondary_provider: Annotated[str, Form()] = "claude",
     secondary_model: Annotated[str, Form()] = "",
@@ -735,6 +737,7 @@ def update_ai_settings_page(
         or not 5.0 < ai_origination_max_sl_percent <= 100
         or ai_origination_max_same_direction_losses < 1
         or not 0.5 <= ai_origination_trail_activate_percent <= 50
+        or not 0.0 <= ai_origination_chop_gate_min_efficiency_ratio <= 1.0
     ):
         raise HTTPException(status_code=400, detail="Invalid AI configuration")
     settings = get_ai_settings(db) or create_ai_settings(db, id=1)
@@ -751,6 +754,8 @@ def update_ai_settings_page(
         "ai_origination_max_sl_percent": ai_origination_max_sl_percent,
         "ai_origination_max_same_direction_losses": ai_origination_max_same_direction_losses,
         "ai_origination_trail_activate_percent": ai_origination_trail_activate_percent,
+        "ai_origination_chop_gate_enabled": ai_origination_chop_gate_enabled == "on",
+        "ai_origination_chop_gate_min_efficiency_ratio": ai_origination_chop_gate_min_efficiency_ratio,
         "secondary_enabled": secondary_enabled == "on",
         "secondary_provider": secondary_provider,
         "secondary_model": secondary_model.strip(),

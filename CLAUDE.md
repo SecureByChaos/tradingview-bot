@@ -295,6 +295,168 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination gets a chop gate -- admin opt-in, OFF by default, shipped without a backtest behind it (27 Aug 2026)
+
+**Requested**: after walking through the dashboard's Market Conditions panel live (a Bank Nifty card
+reading TRENDING on ADX 26.5 while its own efficiency ratio read CHOPPY 0.20 at the same moment --
+explained as two different signals over two different windows, not a contradiction), asked what a
+hard chop gate would do to a decision like that one. Answered: nothing changes about what the AI
+decides -- a gate only vetoes whether a decision becomes a real trade, the same mechanism the
+same-direction-loss gate already uses. Flagged that no chop gate exists yet and that
+`scripts/chop_gate_backtest.py` (27 Aug) was deliberately not run, since `chop_efficiency_ratio` had
+zero days of real closed-trade history at that point. User: "Lets build the gate." Flagged plainly,
+before building anything, that this would be the first gate in this project ever shipped without a
+backtest behind it -- every other real gate (DTE floor, same-direction-loss, confidence floor) was
+validated first, and every rejected candidate (ADX, reasoning-hedge, break-confirmation) was rejected
+specifically because its backtest didn't support it. Asked via `AskUserQuestion` how to proceed; user
+chose: **ship it now, admin-configurable, OFF by default** -- exists in code, doesn't change any live
+behavior until an admin explicitly opts in via Settings > AI.
+
+**Implementation**: two new `AISettings` columns (`app/db_models.py`, additive `_ensure_columns()`
+migration), both defaulting to today's actual behavior so deploying this changes nothing on its own --
+`ai_origination_chop_gate_enabled` (bool, default `False`) and
+`ai_origination_chop_gate_min_efficiency_ratio` (float, default `0.3`, matching the existing CHOPPY
+threshold already shown on the dashboard and in the model's own prompt via `_efficiency_ratio_text`,
+not a separately-chosen number). Two new helper functions in `app/ai/originator.py`
+(`_chop_gate_enabled`/`_chop_gate_min_efficiency_ratio`) mirror `_max_same_direction_losses`/
+`_max_sl_percent`'s exact shape. The gate itself sits in `_open_trade`, checked immediately after the
+same-direction-loss gate -- same early position (before any contract-resolution cost), since it only
+needs `market_context`, already in hand. Blocks when `chop_efficiency_ratio < configured floor`
+**strictly** (a reading exactly at the floor is not blocked).
+
+**Fails open on missing data, deliberately**: a `None` `market_context` or a `None`
+`chop_efficiency_ratio` (an index with under an hour of 5-min bar history, or the field simply not yet
+populated) never blocks -- "no reading yet" is not "choppy," the same missing-value convention this
+project applies everywhere else (see CLAUDE.md's own "new nullable columns mean not recorded" rule).
+This mirrors the same-direction-loss gate's own `market_context=None` handling exactly.
+
+Settings > AI gets a new "Chop Gate" section: a checkbox (default unchecked) and a "Min Efficiency
+Ratio" number input (default 0.3, validated `0.0 <= value <= 1.0` in `/ai-settings` POST), with an
+explicit tooltip/description stating this ships without backtest validation and pointing at
+`scripts/chop_gate_backtest.py` for when enough history exists to check. `/ai-settings`'s form and
+values dict both extended to match the same pattern every other AI Origination risk knob already
+uses.
+
+18 new tests (`tests/test_chop_gate.py`): the two settings-fallback helpers (defaults without a
+settings row, reads an admin-configured value), and `_open_trade` integration -- disabled-by-default
+ignores a choppy reading, enabled blocks below the floor (and short-circuits before contract
+resolution, matching the loss gate's own test pattern), enabled allows at-or-above the floor, the
+exact boundary (reading == floor is not blocked), enabled-but-no-`market_context` fails open,
+enabled-but-missing-`chop_efficiency_ratio` fails open, and an admin-configured custom floor (0.5)
+blocking a reading (0.40) that would clear the default. Full suite: 549 passed (was 538).
+`python -c "import app.main"` imports cleanly. Migration verified against a simulated pre-migration
+DB (built the full current schema, dropped both new columns via `ALTER TABLE ... DROP COLUMN`, ran
+`_ensure_columns()` for real, confirmed both columns reappear, confirmed a second run is a clean
+no-op).
+
+**Verified live**: started the app against a scratch SQLite DB, logged in, confirmed `/settings?tab=ai`
+renders the new section with the correct default (unchecked, 0.3), saved with the gate enabled and a
+custom floor (0.45) and confirmed both values round-trip correctly on re-render, and confirmed the
+`0.0-1.0` validation rejects an out-of-range floor (1.5) with a 400.
+
+**Not backtest-validated -- stated explicitly in the Settings UI itself, not just here.** This is a
+manual risk decision the user made knowingly, not a finding this project has confirmed. Per this
+project's own standing discipline (unbroken until now), a floor only ships as *validated* once
+`scripts/chop_gate_backtest.py` clears the same bootstrap-CI bar every other gate has been held to --
+that has not happened, and won't be possible until real closed-trade history with a
+`chop_efficiency_ratio` reading accumulates (the field is one day old as of this entry). If enabled in
+production, re-run the backtest once enough history exists and revisit whether the 0.3 default (or
+whatever an admin has set it to) is actually the right floor:
+
+```bash
+python -m scripts.chop_gate_backtest --db data/trading.db
+```
+
+### Loss-gate override backtest -- tooling built, not run; index-direction-only proxy by design (27 Aug 2026)
+
+**Trigger**: same-day follow-up to the chop-signal dashboard work. 27 Aug: the same-direction
+consecutive-loss gate (17 Aug, `_same_direction_consecutive_losses` in `app/ai/originator.py`)
+correctly blocked `BUY_PE` on both indices after 2 consecutive losses. Walked through real data with
+the user showing that hours later, both indices' `chop_efficiency_ratio` had climbed from CHOPPY
+(`<0.3`) into CLEAN (`>=0.5`) and confidence/sub-scores were reading high 70s%, genuinely different
+conditions from the losing entries -- yet the gate kept blocking every `BUY_PE` decision regardless,
+since it only counts a loss streak, blind to whether the setup that produced it still resembles the
+current one. User pushed back with "If i traded now i would have got profits" (hindsight, not
+evidence) -- explained the gate's real tradeoff and offered a backtest instead of a unilateral
+judgment call either way. User: "Yes, build that backtest."
+
+**Question asked**: does the gate ever block a decision where conditions have genuinely diverged
+from the triggering losses, and if so, does that divergence predict a better outcome than the
+similar-conditions case -- i.e. is a conditions-aware override worth building, or does relaxing the
+gate just let the same failure back in wearing a better-looking prompt.
+
+**Real, load-bearing limitation, stated up front rather than glossed over**: a gate-blocked decision
+never opens a trade, so there is no real premium P&L to read -- unlike every other gate backtest in
+this project (ADX, freshness, hedge), which analyze real closed trades. `_open_trade`'s gates
+(including this one) are checked *before* contract/strike resolution, so a blocked decision has no
+resolved contract to look up archived option premium for without independently re-deriving strike
+selection -- meaningfully more machinery than this pass. Built as an index-direction-only proxy
+instead, from the live 1-minute `Candle` archive (populated continuously by AI Origination's own
+candle refresh) as a stand-in for "would the thesis have been directionally right" over a 60-minute
+horizon. This project has repeatedly found index continuation is not premium continuation (see the
+STALL_EXIT entry below, 6 Aug) -- every number this backtest produces is evidence about the
+directional thesis only, never a confirmed trading outcome. A real premium-reconstruction version is
+a larger follow-up, not built here.
+
+**Built**: `scripts/loss_gate_override_backtest.py`. Identifies "blocked by this gate" decisions
+precisely: `ai_origination_logs` rows with `decision IN ('BUY_CE','BUY_PE')`, `trade_id IS NULL`
+(never opened), confidence already clearing the 0.60 floor (checked in `run_origination_checks`
+*before* `_open_trade` is ever called -- a floor-fail is a different, unrelated block and must not be
+folded in here), AND reconstructing `_same_direction_consecutive_losses`'s own logic as of that exact
+historical decision's timestamp (not "now") shows the streak was already at or above the configured
+threshold (`AISettings.ai_origination_max_same_direction_losses`, default 2). A `BUY_CE`/`BUY_PE`
+non-opener that doesn't reconstruct this way (a DTE floor with no future expiry, a live order
+failure) is reported separately as "unexplained," never silently folded in as gate-caused. Reuses
+`db_timestamp_to_ist()`'s exact shift logic from `stall_exit_backtest.py` (plain `sqlite3` reads a
+`DateTime(timezone=True)` column back with no offset marker at all -- the wall-clock numbers are
+always the UTC value regardless of what `fromisoformat` parses out), duplicated per this project's
+per-script convention. The reconstruction adds one explicit guard the live function doesn't need: an
+`entry_time < decision_raw_timestamp` filter, since replaying the past (unlike the live function,
+which only ever runs in real time) needs an explicit look-ahead barrier against trades that hadn't
+happened yet at the moment being reconstructed.
+
+For each gate-blocked decision, compares its own `chop_efficiency_ratio`/`confidence` against the
+mean of the *same losing trades* that produced the streak blocking it (read from their own
+`ai_origination_logs` row via `trade_id`) -- what the gate is protecting against, in the model's own
+terms, at the time it failed. "Diverged" if chop reads at least 0.15 higher or confidence at least
+0.10 higher than that mean -- explicit starting points, not validated, same status every new
+threshold in this project carries before a backtest looks at it. Losses that predate
+`chop_efficiency_ratio`'s own existence (27 Aug) have no chop reading to compare against by
+construction, not a gap in this script. Reports two buckets (diverged vs. similar) with win-direction
+rate and mean forward return, plus a bootstrap 90% CI on the difference, same `MIN_BUCKET_LIVE=20`
+trust minimum and bootstrap-resampling shape as every other gate backtest in this project.
+
+20 new tests (`tests/test_loss_gate_override_backtest.py`): the timestamp shift, loss-streak
+reconstruction (stops at first win, ignores trades that hadn't happened yet via the explicit
+look-ahead guard, excludes yesterday's trades), the admin-setting fallback, the mean-readings helper
+ignoring missing values, forward-return computation from real candle rows (None when a candle is
+missing, never fabricated), the `diverged` classification's four cases (chop alone, confidence alone,
+neither, missing readings), the end-to-end decision loader (confidence-floor decisions excluded,
+"unexplained" reported separately, a real reconstructed streak+forward-return+diverged flag), the
+bootstrap helper, and `run_backtest`'s empty-population/unexplained-count/mixed-population paths.
+Full suite: 538 passed (was 518). `python -c "import app.main"` and
+`python -c "import scripts.loss_gate_override_backtest"` both import cleanly;
+`python -m scripts.loss_gate_override_backtest --help` renders without error.
+
+**Not run** -- same standing constraint as every backtest script in this project: this sandbox's
+`data/trading.db` is a 0-byte file with no schema, confirmed again this session
+(`sqlite3.OperationalError`-equivalent: the script's own startup check reports "No
+ai_origination_logs table found" and exits cleanly rather than crashing). Run on the machine with
+real history:
+
+```bash
+python -m scripts.loss_gate_override_backtest --db data/trading.db
+```
+
+Read the bootstrap CI before concluding anything. Per this project's own standard: a reliably-better
+diverged bucket (CI excludes zero on the positive side, both buckets at or above the trust minimum)
+is real support for building a conditions-aware override; a reliably-worse or inconclusive result
+means the gate's current blind streak-count is not costing anything worth trading away it own
+simplicity for. Given the gate only started producing chop-comparable blocked decisions from 27 Aug
+onward (`chop_efficiency_ratio` didn't exist before that), expect a thin sample on the first run --
+"not yet enough evidence" is the expected, correct outcome here, not a failure of the tooling.
+**No change to `app/ai/originator.py`'s gate has been made or proposed from this pass.**
+
 ### Market Conditions panel extended with chop + confidence sub-scores (27 Aug 2026)
 
 **Requested**: a single place to watch the two things just built (the efficiency-ratio chop signal

@@ -216,6 +216,17 @@
       </div>
 
       <hr class="mt-4 mb-3">
+      <h5>Chop Gate</h5>
+      <div class="text-body-secondary mb-3" style="font-size:.85rem;">Blocks a new AI Origination entry when the last hour's efficiency ratio reads below this floor. <strong>OFF by default and not backtest-validated</strong> -- the underlying signal was only added 27 Aug, so there isn't yet enough real closed-trade history to confirm this floor helps. Enabling this is a manual risk decision, not a finding this project has confirmed. See scripts/chop_gate_backtest.py once more history accumulates.</div>
+      <div class="form-check mb-3">
+        <input class="form-check-input" type="checkbox" name="ai_origination_chop_gate_enabled" id="ai_origination_chop_gate_enabled" {% if ai_settings.ai_origination_chop_gate_enabled %}checked{% endif %}>
+        <label class="form-check-label" for="ai_origination_chop_gate_enabled">Enable chop gate (block entries below the floor)</label>
+      </div>
+      <div class="form-grid">
+        <div><label class="form-label" title="AI Origination entries are blocked while chop_efficiency_ratio (last hour, Kaufman's Efficiency Ratio) reads below this value. 0.3 matches the existing CHOPPY threshold shown on the Market Conditions panel and in the model's own prompt. A missing reading (e.g. an index with under an hour of history) never blocks -- unknown is not choppy.">Min Efficiency Ratio</label><input class="form-control" type="number" step="0.01" min="0" max="1" name="ai_origination_chop_gate_min_efficiency_ratio" value="{{ ai_settings.ai_origination_chop_gate_min_efficiency_ratio }}"></div>
+      </div>
+
+      <hr class="mt-4 mb-3">
       <div class="form-check mb-3">
         <input class="form-check-input" type="checkbox" name="secondary_enabled" id="secondary_enabled" {% if ai_settings.secondary_enabled %}checked{% endif %}>
         <label class="form-check-label" for="secondary_enabled">Also review every signal with a second provider (comparison only &mdash; does not affect trading)</label>
