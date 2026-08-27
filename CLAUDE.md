@@ -295,6 +295,73 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Four confidence sub-scores added to the AI Origination schema -- instrumentation only, no gating change (26 Aug 2026)
+
+**Discussion, not an incident.** A design proposal argued against trusting the LLM's own `confidence`
+number as a calibrated probability, and recommended decomposing it into independent sub-scores
+(setup/entry/risk/market-alignment) plus a future calibration curve mapping raw scores to observed
+outcome rates. Checked against what this project has already found rather than accepted at face value:
+confidence is *already* not treated as a probability here -- its only consumer is
+`_clears_confidence_floor()`, a single backtested pass/fail gate (0.60, from `confidence_sizing_
+backtest.py`'s 185-trade run: `<0.60` reliably worse, `0.60+` flat with no further gradient -- `0.60-
+0.75` is in fact the best-performing bucket, not `0.85+`). Position size is fixed at 1 lot regardless of
+confidence; nothing else reads it. So the proposal's core warning was already the operating assumption,
+just arrived at empirically. Its calibration-curve architecture is sound long-term direction but needs
+real trade volume this project doesn't have yet (~200 trades total historically, `MIN_BUCKET_LIVE=20`
+already strains for a single confidence-bucket split) -- building the calibration model now would fit a
+curve to noise, the same trap `freshness_resolution_check.py`'s first real run just found (see the entry
+below). Agreed scope: add the four sub-scores to the schema and persist them now, so a real calibration
+attempt has raw material once enough history exists; leave `confidence`'s own gating untouched.
+
+**Implementation**: `SYSTEM_PROMPT` (`app/ai/originator.py`) now asks for `setup_quality`,
+`entry_quality`, `risk_quality`, `market_alignment` (each 0-100, independent of each other and of
+confidence -- the prompt explicitly warns against restating confidence four times under different
+names) alongside the existing fields, with one sentence per field describing what it means against
+data the model actually sees (REGIME/STRUCTURE/TREND/EXTENSION sections from `_build_user_prompt`) and
+an explicit statement that these do not currently gate or size anything. `_Decision` gained the four
+fields as trailing optional attributes (after `latency_ms`, matching that field's own reason for being
+last: several call sites still construct `_Decision` positionally on `ERROR`, e.g.
+`_Decision("ERROR", None, None, None, response.error, response.latency_ms)`, and must stay valid without
+knowing these fields exist). `_parse_response` parses and clamps each to `[0, 100]` the same permissive,
+fail-to-`None` way `sl_percent`/`target_percent` already are -- a missing or malformed sub-score is "not
+provided," never a synthetic 0, and never fails the whole parse.
+
+Persisted on both existing decision-record paths: `StrategyTrade` gained `ai_setup_quality`/
+`ai_entry_quality`/`ai_risk_quality`/`ai_market_alignment` (populated in `_open_trade`, mirroring
+`ai_confidence`/`ai_reasoning` exactly), and `AIOriginationLog` gained `setup_quality`/`entry_quality`/
+`risk_quality`/`market_alignment` (populated in `record_decision()` via `getattr(decision, ..., None)` --
+defensive on purpose, so a caller still constructing an older decision-shaped object doesn't raise).
+Both additive `_ensure_columns()` migrations (`app/database.py`) -- `ai_origination_logs` gets its own
+new migration block; it never had one before despite several fields being added to the class over
+multiple dated commits (`trend_duration_pct_of_session`, `concurrent_correlated_entry`, etc.), which
+this pass does not retroactively fix (out of scope, and the real production table already has those
+columns by some other path, confirmed by every real query run against it this session -- worth noting,
+not investigating further here).
+
+11 new tests: `tests/test_confidence_sub_scores.py` (new -- parsing including clamping/missing/invalid
+sub-scores, the prompt schema and calibration-paragraph survival, `_open_trade` persisting all four
+scores and a regression case confirming a decision with none of them still opens a trade normally with
+the columns left `NULL`) and `tests/test_origination_log.py` (extended -- `record_decision` persists the
+four scores when present, and defaults them to `None` without raising when handed an older decision
+object that predates the fields). Full suite: 493 passed (was 482).
+
+**Migration verified against a simulated pre-migration DB** (not just a fresh schema, since this table
+class has a history of fields added without a corresponding `_ensure_columns()` entry, per the note
+above): built the full current schema, dropped the 8 new columns via `ALTER TABLE ... DROP COLUMN` to
+reproduce an already-deployed old-shape DB, ran `_ensure_columns()` for real, confirmed all 8 columns
+appear, and confirmed a second run is a clean no-op. `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox cannot call either provider's real API, so there's no way to
+observe whether OpenAI/Claude actually populate these four fields usefully (versus, say, just echoing
+confidence four times despite being told not to) from here. After deploying: spot-check a few real
+`ai_origination_logs` rows for non-null `setup_quality`/`entry_quality`/`risk_quality`/`market_alignment`
+values that visibly differ from each other and from `confidence`, and watch Claude's `stop_reason`
+specifically -- its cap was raised 256 -> 2048 on 5 Aug for exactly this class of risk (a longer expected
+response outrunning the token budget), but four new numeric fields is still more output than before, so
+worth confirming `stop_reason == "max_tokens"` hasn't reappeared rather than assuming the old fix still
+has headroom. No calibration analysis is possible yet and none is planned until real history
+accumulates -- this is instrumentation only, same standing status as `option_chain.py`'s archive.
+
 ### freshness_resolution_check.py's first real run found a detector bug, not 38 violations -- fixed, real result is clean so far (26 Aug 2026)
 
 **Run for real, same day, hours after the tooling above shipped:**

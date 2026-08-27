@@ -449,6 +449,14 @@ class StrategyTrade(Base):
     ai_action: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     ai_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     ai_reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # 26 Aug 2026: four 0-100 sub-scores recorded alongside ai_confidence for
+    # future calibration research (see CLAUDE.md). Pure instrumentation --
+    # nothing reads these to gate, size, or shape a trade; null on any trade
+    # opened before this column existed or whose provider omitted them.
+    ai_setup_quality: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ai_entry_quality: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ai_risk_quality: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ai_market_alignment: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -555,6 +563,13 @@ class AIOriginationLog(Base):
     provider_role: Mapped[str] = mapped_column(String(16), nullable=False)
     decision: Mapped[str] = mapped_column(String(16), nullable=False)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 26 Aug 2026: four 0-100 sub-scores, same instrumentation-only status and
+    # null-on-omission convention as confidence itself -- see StrategyTrade's
+    # matching ai_setup_quality/etc. columns and CLAUDE.md.
+    setup_quality: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_quality: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_quality: Mapped[float | None] = mapped_column(Float, nullable=True)
+    market_alignment: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Null unless the decision actually opened a trade -- which is correct, not
     # a gap: NONE and ERROR have no trade to point at.
     trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
