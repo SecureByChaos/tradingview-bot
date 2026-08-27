@@ -295,6 +295,86 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Live chop signal added (efficiency ratio) -- prompt + logging + backtest tooling, no gate (27 Aug 2026)
+
+**Trigger**: a user watching a live index chart reported the market as "clearly choppy and not
+tradable" while AI Origination kept taking same-direction BUY_PE entries anyway, each one citing
+ADX above 25 / Supertrend / EMA-stack alignment as support. Traced to a real gap rather than a
+bug: `app/indicators.py`'s `adx()` docstring says outright that ADX is deliberately lagging --
+*"ADX typically crosses 20 well after a move is underway... a filter against trading in chop, not
+an entry trigger."* Supertrend and the EMA stack are the same shape -- direction-only, no notion
+of how noisy the path was. CPR is the only existing chop-adjacent signal in this codebase, and
+it's a static, once-per-session prior computed from **yesterday's** range, not a live read of
+today's actual path. None of the four signals the model has (ADX/Supertrend/EMA/CPR) can tell a
+clean move from one that has gone choppy in just the last hour -- they all answer "which direction
+and has that held," never "how cleanly is price actually getting there right now."
+
+**Built**: `compute_efficiency_ratio()` (`app/market_context.py`) -- Kaufman's Efficiency Ratio
+over the most recent ~1 hour (12 bars) of 5-min closes: net displacement divided by total
+bar-to-bar path length. 1.0 = a dead-straight move, near 0 = as much back-and-forth as net
+progress. Pure arithmetic on `bars_5m`, already fetched every cycle -- zero new SmartAPI cost,
+same justification CPR's own docstring already gives for itself. Deliberately a SHORT window,
+distinct from `trend_duration_pct_of_session` (which can span the whole session) -- this answers
+a different question: is the *last hour* clean, not how long has the overall bias held.
+
+New `MarketContext.chop_efficiency_ratio` field, threaded through `build_market_context()`,
+`as_dict()`, the TREND AGE prompt section (`_build_user_prompt`, new `_efficiency_ratio_text()`
+helper: `<0.3` choppy, `0.3-0.5` mixed, `>=0.5` clean -- a reasonable starting point, not
+validated, same status `CPR_NARROW_MAX_PERCENT`/`CPR_WIDE_MIN_PERCENT` had before any backtest
+looked at them), and a new `SYSTEM_PROMPT` paragraph telling the model to weigh it alongside ADX
+specifically because ADX/Supertrend/EMA are lagging and can still read "trending" after the last
+hour has gone choppy. Persisted on `AIOriginationLog.chop_efficiency_ratio` (own additive
+`_ensure_columns()` entry, verified against a simulated pre-migration DB the same way the
+confidence sub-scores' migration was) -- **descriptive only, does not gate or size anything**,
+same status as `trend_duration_pct_of_session`/`move_extent_atr` when those were first added.
+
+**Backtest tooling built, matching `adx_gate_backtest.py`'s exact PART 1/2 shape**: new
+`scripts/chop_gate_backtest.py` buckets real closed AI Origination trades by
+`chop_efficiency_ratio` (choppy/mixed/clean, the same bands the prompt itself shows the model),
+reports win rate/mean P&L/mean MFE/mean MAE per bucket plus a bootstrap 90% CI on two candidate
+hard floors (block `<0.3`, block `<0.5`) -- same `MIN_BUCKET_LIVE=20` trust minimum and
+bootstrap-resampling shape as every other gate backtest in this project, duplicated rather than
+imported per the established per-script convention. **No gate is shipped or proposed from this
+pass** -- the field was only added today, so real history to backtest against does not exist yet
+by construction; this is the tooling that will answer the question once it does, not a preview of
+the answer. A 2-year index-level fallback (mirroring `adx_gate_backtest.py`'s PART 4) was
+explicitly not built this pass -- it would need `compute_efficiency_ratio` threaded into
+`scripts/backtest/data.py`'s shared `IndexArrays`, a larger change than this pass's scope; worth
+a follow-up if the real-trade sample turns out too thin once there's history to look at.
+
+21 new tests across `tests/test_efficiency_ratio.py` (formula correctness: straight move = 1.0,
+pure back-and-forth with zero net progress = 0.0 exactly -- distinct from all-flat-bars which
+correctly returns `None`, "no data" rather than a fabricated zero -- insufficient bars, a
+hand-computed mixed case, and confirmation that only the recent window is considered, not the
+whole bar history), `tests/test_market_context_efficiency_wiring.py` (the live `build_market_
+context()` path reaches the same value the isolated formula does), `tests/test_chop_efficiency_
+prompt.py` (bucket-label boundaries, the prompt line's omit-when-`None` convention, the new
+`SYSTEM_PROMPT` paragraph, confirmation neighboring paragraphs survived), and `tests/test_chop_
+gate_backtest.py` (population filter, MFE/MAE from ticks matching a real 27 Aug trade's own
+figures, the bootstrap helper, and a full `run_chop_buckets()` smoke run). Plus one assertion
+added to `tests/test_origination_log.py`'s existing trend-age persistence test. Full suite: 514
+passed (was 493). Migration verified against a simulated pre-migration DB (built the full current
+schema, dropped the new column via `ALTER TABLE ... DROP COLUMN`, ran `_ensure_columns()` for
+real, confirmed the column reappears, confirmed a second run is a clean no-op).
+`python -c "import app.main"` imports cleanly; `python -m scripts.chop_gate_backtest --help`
+renders without error.
+
+**Not verified live** -- this sandbox cannot call either provider's real API, so there's no way to
+observe whether the model actually uses the new prompt paragraph the way the resolution-requirement
+paragraphs do (weighing it, not just echoing the number). After deploying: spot-check a few real
+`ai_origination_logs` rows for a populated `chop_efficiency_ratio` that varies independently of
+`adx`/`trend_duration_pct_of_session` (a value that's always near-identical to what ADX would imply
+would mean the model isn't getting new information out of it), and once enough real history exists
+under trades opened after this deploy, run:
+
+```bash
+python -m scripts.chop_gate_backtest --db data/trading.db
+```
+
+Per the same standard as every other candidate gate in this project: a floor only ships if PART 2's
+bootstrap CI excludes zero on both sides at or above the trust minimum -- "not yet enough evidence"
+is the expected, correct outcome for a field with less than a day of history behind it.
+
 ### Four confidence sub-scores added to the AI Origination schema -- instrumentation only, no gating change (26 Aug 2026)
 
 **Discussion, not an incident.** A design proposal argued against trusting the LLM's own `confidence`

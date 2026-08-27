@@ -250,6 +250,7 @@ def _ensure_columns() -> None:
             "entry_quality": "ALTER TABLE ai_origination_logs ADD COLUMN entry_quality FLOAT",
             "risk_quality": "ALTER TABLE ai_origination_logs ADD COLUMN risk_quality FLOAT",
             "market_alignment": "ALTER TABLE ai_origination_logs ADD COLUMN market_alignment FLOAT",
+            "chop_efficiency_ratio": "ALTER TABLE ai_origination_logs ADD COLUMN chop_efficiency_ratio FLOAT",
         }
         with engine.begin() as connection:
             for column, statement in log_statements.items():
