@@ -295,6 +295,50 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Market Conditions panel extended with chop + confidence sub-scores (27 Aug 2026)
+
+**Requested**: a single place to watch the two things just built (the efficiency-ratio chop signal
+and the four confidence sub-scores) live, without grepping logs or writing SQL. Asked first whether
+this should be a new standalone page or an extension of the existing Market Conditions panel on `/`
+-- chosen: extend the panel, consistent with this project's repeated pattern of consolidating
+AI-related views into the main dashboard rather than adding separate pages (AI Origination page
+removed 15 Aug, AI Settings merged into Settings, Performance merged into Trade History, Active
+Trade tab removed -- all folded in for the same "one place to look" reason).
+
+**Implementation**: `get_market_conditions()` (`app/platform.py`) already reads the latest
+`AIOriginationLog` row per index for regime/ADX/CPR/setups -- extended to read the same row's
+`chop_efficiency_ratio`, `confidence`, `setup_quality`, `entry_quality`, `risk_quality`,
+`market_alignment` too. Zero new computation, zero new SmartAPI calls, same as the function's own
+existing docstring already promises -- this is strictly more columns off a row already being read.
+New `_classify_chop()` mirrors `_classify_tradability()`'s exact shape (same three-band pattern,
+same duplicated-not-imported reasoning: `app/ai/originator.py` already imports FROM
+`app/platform.py`, so the reverse import for `_efficiency_ratio_text` would be circular).
+
+All five new fields are `None` on a `SLOT_OCCUPIED` marker row (the "Market Conditions panel
+froze" fix's own synthetic decision) -- correct, not a gap: that marker carries real context/chop
+data (built every cycle regardless of slot occupancy) but no real model decision, so confidence and
+the sub-scores genuinely don't exist for it. The template (`live_dashboard.html`) omits both new
+lines entirely when null, same omit-don't-fabricate convention as everywhere else in this project,
+rather than showing a `--` that could be mistaken for a real reading.
+
+`get_market_conditions()`/`_live_dashboard_data()` already power both the initial page render and
+the existing 10s `/api/live-dashboard` poll, so this needed no new route, no new poll cycle, and no
+frontend wiring beyond the two new lines in `renderConditions()`.
+
+7 new tests (`tests/test_market_conditions.py`, extended in place): `_classify_chop`'s band
+boundaries, the five new fields read correctly from a real-shaped row, all five correctly `None`
+on a `SLOT_OCCUPIED` row while `chop_efficiency_ratio` itself still reads through, and the
+no-log-yet placeholder case. Full suite: 518 passed (was 514).
+
+**Verified live**, not just unit-tested: started the app against a scratch SQLite DB, seeded a real
+`AIOriginationLog` row with the full new-field shape (`chop_efficiency_ratio=0.22, confidence=0.78,
+setup_quality=82.0`, etc.), logged in, and confirmed `/api/live-dashboard` returns exactly those
+values with `chop_label` correctly classified as `"CHOPPY"` (0.22 < 0.3), and that `/` itself
+renders with a 200 (no Jinja error) rather than just trusting the unit tests. No browser available
+in this sandbox, so the JS `renderConditions()` client-side rendering itself is not directly
+screenshotted -- the JSON payload it consumes is confirmed correct, which is what would need to be
+wrong for the rendered cards to be wrong.
+
 ### Live chop signal added (efficiency ratio) -- prompt + logging + backtest tooling, no gate (27 Aug 2026)
 
 **Trigger**: a user watching a live index chart reported the market as "clearly choppy and not
