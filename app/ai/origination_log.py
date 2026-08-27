@@ -78,6 +78,7 @@ def record_decision(
             trend_duration_bars=getattr(market_context, "trend_duration_bars", None),
             trend_duration_pct_of_session=getattr(market_context, "trend_duration_pct_of_session", None),
             move_extent_atr=getattr(market_context, "move_extent_atr", None),
+            chop_efficiency_ratio=getattr(market_context, "chop_efficiency_ratio", None),
             same_direction_entries_ce=counts.get("BUY_CE"),
             same_direction_entries_pe=counts.get("BUY_PE"),
             concurrent_correlated_entry=trade.concurrent_correlated_entry if trade else None,

@@ -46,6 +46,41 @@ CPR_WIDE_MIN_PERCENT = 0.50
 ADX_NO_TREND = 20.0
 ADX_TRENDING = 25.0
 
+# 27 Aug 2026: nothing in this module (or the prompt) previously measured
+# whether price is moving CLEANLY right now, as distinct from whether a
+# directional bias has held for a while. ADX/Supertrend/EMA stack are all
+# lagging by design (see app/indicators.py's adx() docstring: "ADX typically
+# crosses 20 well after a move is underway... a filter against trading in
+# chop, not an entry trigger") -- they can keep reading "trending" well after
+# the last few bars have gone choppy. CPR is the only existing chop-adjacent
+# signal, and it is a static, once-per-session prior computed from
+# YESTERDAY's range, not a live read of today's actual path.
+#
+# Kaufman's Efficiency Ratio: net displacement over the lookback window
+# divided by the total bar-to-bar path length covering that same window.
+# 1.0 = every bar moved the same direction (a dead-straight trend); values
+# near 0 = as much back-and-forth as net progress (chop). A SHORT window
+# (~1 hour) is deliberate -- this is meant to catch a trend that has gone
+# choppy recently, which is a different question from trend_duration_pct_
+# of_session's "how long has the overall bias held" (that can span the
+# whole day). Not backtested yet -- see scripts/chop_gate_backtest.py.
+CHOP_EFFICIENCY_LOOKBACK_BARS = 12  # ~60 minutes of 5-min bars
+
+
+def compute_efficiency_ratio(bars_5m: list[Bar], lookback: int = CHOP_EFFICIENCY_LOOKBACK_BARS) -> float | None:
+    """Kaufman's Efficiency Ratio over the most recent `lookback` 5-min bars.
+    None when there isn't a full window yet, or when every close in the
+    window is identical (zero path length -- "no data" is a more honest
+    reading than a fabricated 0.0 or 1.0)."""
+    closes = [b.close for b in bars_5m[-(lookback + 1):]]
+    if len(closes) < lookback + 1:
+        return None
+    net_change = abs(closes[-1] - closes[0])
+    path_length = sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
+    if path_length == 0:
+        return None
+    return round(net_change / path_length, 3)
+
 # A breakout requires a completed bar to CLOSE beyond the level. A wick
 # touching it does not qualify -- that distinction is most of the difference
 # between a breakout and a failed breakout.
@@ -136,6 +171,13 @@ class MarketContext:
     trend_duration_bars: int | None = None
     trend_duration_pct_of_session: float | None = None
     move_extent_atr: float | None = None
+    # 27 Aug 2026: see compute_efficiency_ratio's own docstring -- a SHORT
+    # (~1 hour) recency-weighted read of whether price is moving cleanly
+    # right now, distinct from trend_duration_pct_of_session's "how long has
+    # the overall bias held" (which can span the whole session). DESCRIPTIVE
+    # ONLY, same as the trend-age fields above -- not backtested, does not
+    # gate anything.
+    chop_efficiency_ratio: float | None = None
     # Filled by the caller, not by build_market_context -- it needs the trade
     # table, and this module is deliberately pure over bars.
     same_direction_entries_today: dict[str, int] = field(default_factory=dict)
@@ -188,6 +230,7 @@ class MarketContext:
             "trend_duration_bars": self.trend_duration_bars,
             "trend_duration_pct_of_session": self.trend_duration_pct_of_session,
             "move_extent_atr": self.move_extent_atr,
+            "chop_efficiency_ratio": self.chop_efficiency_ratio,
             "same_direction_entries_today": self.same_direction_entries_today,
             "setups": {k: v for k, v in self.setups.items() if v},
             "setup_strength": self.setup_strength,
@@ -545,6 +588,7 @@ def build_market_context(
     # Computed off the SAME st_5m series the supertrend_5m field reports, so
     # "trend duration" always describes the trend the model is being shown.
     trend_bars, trend_pct, move_atr = compute_trend_age(bars_5m, st_5m, atr_value, as_of)
+    efficiency_ratio = compute_efficiency_ratio(bars_5m)
 
     return MarketContext(
         index_symbol=index_symbol,
@@ -579,4 +623,5 @@ def build_market_context(
         trend_duration_bars=trend_bars,
         trend_duration_pct_of_session=trend_pct,
         move_extent_atr=move_atr,
+        chop_efficiency_ratio=efficiency_ratio,
     )

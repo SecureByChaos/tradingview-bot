@@ -137,6 +137,14 @@ SYSTEM_PROMPT = (
     "whether a trend exists, not how much of it is left. Treat trend age and "
     "repeat count as a caution against the current reading, not as separate "
     "facts to note alongside it.\n\n"
+    "Weigh the efficiency ratio for the last hour alongside ADX and trend age, "
+    "not instead of them. ADX and Supertrend are both lagging -- they can still "
+    "read as an established trend well after the last several bars have turned "
+    "choppy. A low efficiency ratio (price moving back and forth with little "
+    "net progress) is a caution independent of how strong ADX looks, because it "
+    "describes what the last hour actually did rather than what the broader "
+    "move has done since it started; a high ratio is mild supporting evidence, "
+    "not confirmation on its own.\n\n"
     "On a wide-CPR day, expect range-bound conditions and treat breakout "
     "signals with particular scepticism. On a narrow-CPR day, trending "
     "conditions are more likely.\n\n"
@@ -358,6 +366,19 @@ def _ema_stack_text(ema9: float | None, ema21: float | None, ema50: float | None
     return "mixed"
 
 
+def _efficiency_ratio_text(ratio: float) -> str:
+    """Qualitative label for compute_efficiency_ratio's 0-1 value. Bucket
+    boundaries are a reasonable starting point, not validated -- same status
+    as CPR_NARROW_MAX_PERCENT/CPR_WIDE_MIN_PERCENT when they were introduced.
+    See scripts/chop_gate_backtest.py before treating these as anything more
+    than a descriptive label."""
+    if ratio < 0.3:
+        return "choppy, little net progress despite the back-and-forth"
+    if ratio < 0.5:
+        return "mixed, some chop within the move"
+    return "clean, moving directly with little backtracking"
+
+
 def _adx_regime_text(adx_value: float | None) -> str | None:
     if adx_value is None:
         return None
@@ -457,6 +478,9 @@ def _build_user_prompt(
         age_lines.append(f"  Same-direction entries already taken today: CE {ce}, PE {pe}")
     if ctx.move_extent_atr is not None:
         age_lines.append(f"  Cumulative move since trend start: {ctx.move_extent_atr:.2f} ATR")
+    if ctx.chop_efficiency_ratio is not None:
+        er_text = _efficiency_ratio_text(ctx.chop_efficiency_ratio)
+        age_lines.append(f"  Efficiency ratio (last hour): {ctx.chop_efficiency_ratio:.2f} -> {er_text}")
     if age_lines:
         lines.append("")
         lines.append("TREND AGE")

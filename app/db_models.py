@@ -582,6 +582,10 @@ class AIOriginationLog(Base):
     trend_duration_bars: Mapped[int | None] = mapped_column(Integer, nullable=True)
     trend_duration_pct_of_session: Mapped[float | None] = mapped_column(Float, nullable=True)
     move_extent_atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 27 Aug 2026: Kaufman's Efficiency Ratio over the last ~hour of 5-min
+    # bars -- see app/market_context.py's compute_efficiency_ratio. Same
+    # descriptive-only, not-backtested status as the trend-age fields above.
+    chop_efficiency_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
     # SPLIT BY SIDE rather than the single integer the spec asked for. At
     # decision time the direction is not yet known -- the decision is what
     # determines it -- so a single "same direction" count is undefined for

@@ -47,6 +47,7 @@ class FakeContext:
     trend_duration_bars: int | None = 18
     trend_duration_pct_of_session: float | None = 41.5
     move_extent_atr: float | None = 3.2
+    chop_efficiency_ratio: float | None = 0.62
     same_direction_entries_today: dict | None = None
 
     def as_dict(self):
@@ -108,6 +109,7 @@ def test_trend_age_fields_are_persisted(session):
     assert row.trend_duration_bars == 18
     assert row.trend_duration_pct_of_session == 41.5
     assert row.move_extent_atr == 3.2
+    assert row.chop_efficiency_ratio == 0.62
 
 
 def test_entry_counts_are_stored_per_side(session):
