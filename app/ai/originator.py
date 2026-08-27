@@ -1144,16 +1144,39 @@ def _open_trade(
     # app/db_models.py for why this ships without a backtest behind it.
     # Checked here (same early position as the loss gate above, before any
     # contract-resolution cost) since it only needs market_context, already
-    # in hand. A missing market_context or a missing chop_efficiency_ratio
-    # reading (e.g. before an index has a full hour of 5-min bars) fails
-    # OPEN, not closed -- "no reading yet" is not "choppy", same convention
-    # every other missing-value case in this project follows.
-    if _chop_gate_enabled(db) and market_context is not None and market_context.chop_efficiency_ratio is not None:
+    # in hand.
+    #
+    # 27 Aug 2026: requires chop AND ADX to BOTH read bad before blocking,
+    # not chop alone. Chop (last ~1 hour, Kaufman's Efficiency Ratio) and ADX
+    # (a longer, lagging trend-strength read) answer different questions and
+    # can legitimately disagree -- a real dashboard case showed ADX 26.5
+    # (established trend, >= ADX_TRENDING) alongside chop 0.20 (choppy) at
+    # the same moment. Gating on chop alone would have blocked that entry
+    # even though the broader trend was still intact by ADX; requiring ADX
+    # to ALSO be below ADX_TRENDING means this only fires when the market is
+    # genuinely neither trending nor moving cleanly, not when one signal is
+    # just naturally noisier than the other. Reuses ADX_TRENDING (25) rather
+    # than inventing a new threshold -- the same boundary already shown on
+    # the dashboard's own tradability read (_classify_tradability).
+    #
+    # A missing market_context, a missing chop_efficiency_ratio reading (an
+    # index with under an hour of 5-min bar history), or a missing adx
+    # reading (not yet warmed up) fails OPEN, not closed -- "no reading yet"
+    # is not "bad", same convention every other missing-value case in this
+    # project follows.
+    if (
+        _chop_gate_enabled(db)
+        and market_context is not None
+        and market_context.chop_efficiency_ratio is not None
+        and market_context.adx is not None
+    ):
         chop_floor = _chop_gate_min_efficiency_ratio(db)
-        if market_context.chop_efficiency_ratio < chop_floor:
+        if market_context.chop_efficiency_ratio < chop_floor and market_context.adx < ADX_TRENDING:
             logger.info(
-                "[AI][ORIGIN] %s: Skipped: chop_efficiency_ratio=%.2f below configured floor %.2f",
+                "[AI][ORIGIN] %s: Skipped: chop_efficiency_ratio=%.2f below configured floor %.2f "
+                "AND adx=%.1f below trending threshold %.0f",
                 index.symbol, market_context.chop_efficiency_ratio, chop_floor,
+                market_context.adx, ADX_TRENDING,
             )
             return None
 
