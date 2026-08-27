@@ -66,6 +66,10 @@ def record_decision(
             provider_role=provider_role,
             decision=decision.action,
             confidence=decision.confidence,
+            setup_quality=getattr(decision, "setup_quality", None),
+            entry_quality=getattr(decision, "entry_quality", None),
+            risk_quality=getattr(decision, "risk_quality", None),
+            market_alignment=getattr(decision, "market_alignment", None),
             trade_id=trade.trade_id if trade else None,
             regime=getattr(market_context, "regime", None) or "UNKNOWN",
             adx=getattr(market_context, "adx", None),
@@ -83,6 +87,10 @@ def record_decision(
                 {
                     "action": decision.action,
                     "confidence": decision.confidence,
+                    "setup_quality": getattr(decision, "setup_quality", None),
+                    "entry_quality": getattr(decision, "entry_quality", None),
+                    "risk_quality": getattr(decision, "risk_quality", None),
+                    "market_alignment": getattr(decision, "market_alignment", None),
                     "sl_percent": decision.sl_percent,
                     "target_percent": decision.target_percent,
                 }

@@ -27,6 +27,10 @@ class FakeDecision:
     target_percent: float | None
     reasoning: str
     latency_ms: float | None = None
+    setup_quality: float | None = None
+    entry_quality: float | None = None
+    risk_quality: float | None = None
+    market_alignment: float | None = None
 
 
 @dataclass
@@ -118,6 +122,48 @@ def test_entry_counts_are_stored_per_side(session):
     row = _only_row(session)
     assert row.same_direction_entries_ce == 3
     assert row.same_direction_entries_pe == 0
+
+
+def test_sub_scores_are_persisted_when_present(session):
+    """26 Aug 2026: four 0-100 sub-scores recorded alongside confidence for
+    future calibration research (see CLAUDE.md) -- pure instrumentation, but
+    still needs to actually reach the row."""
+    record_decision(
+        session, index_symbol="BANKNIFTY", provider="openai", provider_role="primary",
+        decision=FakeDecision(
+            "BUY_CE", 0.78, 10.0, 20.0, "clean setup",
+            setup_quality=82.0, entry_quality=79.0, risk_quality=76.0, market_alignment=74.0,
+        ),
+        market_context=_context(), data_stale=False, trade=None,
+    )
+    row = _only_row(session)
+    assert row.setup_quality == 82.0
+    assert row.entry_quality == 79.0
+    assert row.risk_quality == 76.0
+    assert row.market_alignment == 74.0
+
+
+def test_sub_scores_default_to_none_when_the_decision_object_lacks_them(session):
+    """record_decision must not raise if handed a decision-like object that
+    predates these fields -- getattr(..., None), not decision.setup_quality
+    directly, is what makes that safe."""
+
+    @dataclass(frozen=True)
+    class OldShapeDecision:
+        action: str
+        confidence: float | None
+        sl_percent: float | None
+        target_percent: float | None
+        reasoning: str
+
+    record_decision(
+        session, index_symbol="BANKNIFTY", provider="claude", provider_role="primary",
+        decision=OldShapeDecision("NONE", 0.4, None, None, "declining"),
+        market_context=_context(), data_stale=False, trade=None,
+    )
+    row = _only_row(session)
+    assert row.setup_quality is None
+    assert row.market_alignment is None
 
 
 def test_error_populates_error_detail_with_the_real_cause(session):

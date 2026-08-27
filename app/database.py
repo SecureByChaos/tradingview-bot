@@ -179,6 +179,10 @@ def _ensure_columns() -> None:
             # observed fact.
             "concurrent_correlated_entry": "ALTER TABLE strategy_trades ADD COLUMN concurrent_correlated_entry BOOLEAN",
             "correlated_with_trade_id": "ALTER TABLE strategy_trades ADD COLUMN correlated_with_trade_id VARCHAR(64)",
+            "ai_setup_quality": "ALTER TABLE strategy_trades ADD COLUMN ai_setup_quality FLOAT",
+            "ai_entry_quality": "ALTER TABLE strategy_trades ADD COLUMN ai_entry_quality FLOAT",
+            "ai_risk_quality": "ALTER TABLE strategy_trades ADD COLUMN ai_risk_quality FLOAT",
+            "ai_market_alignment": "ALTER TABLE strategy_trades ADD COLUMN ai_market_alignment FLOAT",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():
@@ -238,6 +242,18 @@ def _ensure_columns() -> None:
         with engine.begin() as connection:
             for column, statement in settings_statements.items():
                 if column not in existing_settings_columns:
+                    connection.execute(text(statement))
+    if "ai_origination_logs" in table_names:
+        existing_log_columns = {column["name"] for column in inspector.get_columns("ai_origination_logs")}
+        log_statements = {
+            "setup_quality": "ALTER TABLE ai_origination_logs ADD COLUMN setup_quality FLOAT",
+            "entry_quality": "ALTER TABLE ai_origination_logs ADD COLUMN entry_quality FLOAT",
+            "risk_quality": "ALTER TABLE ai_origination_logs ADD COLUMN risk_quality FLOAT",
+            "market_alignment": "ALTER TABLE ai_origination_logs ADD COLUMN market_alignment FLOAT",
+        }
+        with engine.begin() as connection:
+            for column, statement in log_statements.items():
+                if column not in existing_log_columns:
                     connection.execute(text(statement))
 
 

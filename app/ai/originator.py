@@ -188,9 +188,25 @@ SYSTEM_PROMPT = (
     "and anything above 50 is barely a risk control at all. If you can't "
     "propose a sane value in that range, this trade will automatically fall "
     "back to trailing-stop management instead of your fixed band. "
+    "Alongside confidence, also score four components of the setup on a "
+    "0-100 scale, each independent of the others and of confidence itself -- "
+    "do not just restate confidence four times under different names: "
+    "setup_quality (how clean the technical setup is on its own terms -- "
+    "trend/breakout/momentum structure -- independent of timing); "
+    "entry_quality (how good this specific moment is to enter: proximity to "
+    "a real trigger level, whether the move is already extended, freshness "
+    "per the rules above); risk_quality (how favorable the risk/reward shape "
+    "is -- a stop placed near a real invalidation level against a realistic "
+    "target, not the position size); market_alignment (how well the broader "
+    "trend/regime picture -- ADX, Supertrend, EMA stack, CPR -- supports this "
+    "specific direction). These four scores are recorded for calibration "
+    "research and do not currently gate or size any trade -- score them "
+    "honestly, not defensively. "
     "Respond with a single valid JSON object only, no markdown, code fences, or "
     "extra text: {\"decision\": \"BUY_CE\"|\"BUY_PE\"|\"NONE\", \"confidence\": 0-1, "
-    "\"sl_percent\": number, \"target_percent\": number, \"reasoning\": \"one or two sentences\"}."
+    "\"setup_quality\": 0-100, \"entry_quality\": 0-100, \"risk_quality\": 0-100, "
+    "\"market_alignment\": 0-100, \"sl_percent\": number, \"target_percent\": number, "
+    "\"reasoning\": \"one or two sentences\"}."
 )
 
 # Defensive bounds independent of the prompt wording above -- LLMs aren't 100%
@@ -547,6 +563,16 @@ class _Decision:
     # record it -- nothing reads it to decide anything. Defaults to None so the
     # many _Decision(...) constructions that predate it are unaffected.
     latency_ms: float | None = None
+    # 26 Aug 2026: four sub-scores (0-100), recorded alongside confidence for
+    # future calibration research -- see CLAUDE.md's "confidence calibration"
+    # entry. Pure instrumentation: nothing reads these to gate, size, or shape
+    # a trade. Defaulted to None for the same reason latency_ms is, and for
+    # the same reason: several call sites below still construct _Decision
+    # positionally and must stay valid without knowing these fields exist.
+    setup_quality: float | None = None
+    entry_quality: float | None = None
+    risk_quality: float | None = None
+    market_alignment: float | None = None
 
 
 def _clears_confidence_floor(decision: _Decision) -> bool:
@@ -602,12 +628,28 @@ def _parse_response(text: str) -> _Decision:
             except (TypeError, ValueError):
                 return None
 
+        def _score(value: object) -> float | None:
+            # Same permissive-parse, fail-to-None shape as confidence/percent
+            # above -- an unparseable or missing sub-score is "not provided",
+            # not a synthetic 0, since this is instrumentation, not a gate.
+            if value is None or value == "":
+                return None
+            try:
+                score = float(value)
+            except (TypeError, ValueError):
+                return None
+            return min(100.0, max(0.0, score))
+
         return _Decision(
-            decision,
-            confidence,
-            _percent(data.get("sl_percent")),
-            _percent(data.get("target_percent")),
-            str(data.get("reasoning") or ""),
+            action=decision,
+            confidence=confidence,
+            sl_percent=_percent(data.get("sl_percent")),
+            target_percent=_percent(data.get("target_percent")),
+            reasoning=str(data.get("reasoning") or ""),
+            setup_quality=_score(data.get("setup_quality")),
+            entry_quality=_score(data.get("entry_quality")),
+            risk_quality=_score(data.get("risk_quality")),
+            market_alignment=_score(data.get("market_alignment")),
         )
     except Exception as exc:
         # The exception type and the text that caused it are the whole
@@ -1249,6 +1291,10 @@ def _open_trade(
         ai_action=decision.action,
         ai_confidence=decision.confidence,
         ai_reasoning=decision.reasoning,
+        ai_setup_quality=decision.setup_quality,
+        ai_entry_quality=decision.entry_quality,
+        ai_risk_quality=decision.risk_quality,
+        ai_market_alignment=decision.market_alignment,
     )
     db.add(trade)
     db.commit()
