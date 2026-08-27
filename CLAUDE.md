@@ -295,6 +295,68 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Chop gate now requires ADX to ALSO read below trending before blocking, not chop alone (27 Aug 2026)
+
+**Requested**: after the user enabled the chop gate (previous entry) and asked whether it could block
+an entry during a market the dashboard reads as TRENDING -- answered yes, since the gate only checked
+`chop_efficiency_ratio` and never looked at ADX/regime at all. User: "Lets make choppy signal enabled
+with adx and trending market. Make a system which has precise market condition so it can take better
+trading decisions." Asked via `AskUserQuestion` how ADX/chop should combine (block on both bad vs.
+either bad vs. a new weighted composite) and whether this should also reach the model's own prompt.
+User answered the first with a question back -- "What needed exactly to define the market except adx
+and chop filters?" -- and the second with "Do what is best."
+
+**Answered the question directly before building anything**: this project has already backtested most
+of the plausible additional signals as standalone gates, and nearly all of them came back unsupported --
+DI-direction agreement (25 Aug: 95.6% of trades already agree with their own direction, almost no room
+to discriminate), trend duration / move extent (11/19/25 Aug: investigated three times, backtest came
+back inconclusive, never shipped as a hard gate), break confirmation (12 Aug: not supported, both
+indices), reasoning-hedge language (19 Aug: not supported at any category). CPR is a static once-a-day
+number, not a live read. The pattern across this project: only three gates have ever cleared a real
+backtest (DTE floor, same-direction-loss, confidence floor), and none of them are technical indicators
+-- stacking more untested technical signals into one composite score would mean inventing a new
+unvalidated number out of ingredients that mostly failed validation individually. Recommended against a
+bigger composite and against touching the model's prompt (it already receives ADX and chop as separate
+lines and is already told to weigh them together, per the chop-signal `SYSTEM_PROMPT` paragraph, 27
+Aug) -- the model-facing side needed no change, only the block itself was ADX-blind.
+
+**Implementation**: the gate in `_open_trade` (`app/ai/originator.py`) now requires **both**
+`chop_efficiency_ratio < configured floor` **and** `market_context.adx < ADX_TRENDING` before blocking
+-- chop alone no longer blocks, and a weak ADX alone no longer blocks. Reuses `ADX_TRENDING` (25),
+already imported into this module and already the exact threshold shown on the dashboard's own
+tradability read (`_classify_tradability`) -- no new threshold invented. This directly fixes the case
+the user asked about: the real Bank Nifty card (ADX 26.5, chop 0.20) would NOT be blocked under the new
+logic, since ADX alone still clears 25. Fails open the same way as before on any missing reading -- a
+`None` `market_context`, `None` `chop_efficiency_ratio`, or now also `None` `adx` never blocks.
+
+Settings > AI's Chop Gate tooltip/description rewritten to state the AND condition plainly, including
+in the checkbox label itself, rather than leaving the UI describing the old chop-only behavior.
+
+4 new tests (`tests/test_chop_gate.py`, 11 -> 15): the exact real Bank Nifty case (chop bad, ADX still
+trending) is not blocked; a weak-ADX-but-clean-chop market is not blocked; ADX exactly at the trending
+threshold does not count as below it (strict `<`, same convention as the chop floor); a missing ADX
+reading fails open even when chop is bad. The existing 11 tests were updated in place -- the test
+helper's `_make_context` previously hardcoded `adx=26.5` for every case (always >= `ADX_TRENDING`),
+which would have silently broken every existing "blocks" assertion under the new AND logic; `adx` is
+now a required, explicit parameter at every call site so each test states its intent for both signals
+rather than inheriting a hidden default. Full suite: 553 passed (was 549). `python -c "import
+app.main"` imports cleanly; `settings.html` verified to still parse and render the new AND wording live.
+
+**Not backtest-validated, same standing status as the chop-only gate it replaces.** This is still a
+manual risk decision, still off by default in the code but the user has since enabled it in production
+-- the AND combination is a more conservative rule than chop alone (strictly fewer entries get blocked,
+since both conditions must now hold rather than one), but it is still not something
+`scripts/chop_gate_backtest.py` has validated; that script tests the chop signal alone (PART 1/2), not
+this specific AND-with-ADX combination, and was not extended to do so in this pass. If this needs a
+real validation pass once enough post-27-Aug history exists, the backtest would need its own new
+candidate-floor check reconstructing this exact AND rule rather than reusing the existing chop-only
+sweep as a proxy for it.
+
+**Not verified live** -- this sandbox cannot run a real origination cycle. After deploying, confirm a
+choppy-but-still-ADX-trending market (the exact scenario that prompted this) no longer produces a
+`chop_efficiency_ratio=... AND adx=...` skip line in the logs, and that a genuinely neither-trending-
+nor-clean market still does.
+
 ### AI Origination gets a chop gate -- admin opt-in, OFF by default, shipped without a backtest behind it (27 Aug 2026)
 
 **Requested**: after walking through the dashboard's Market Conditions panel live (a Bank Nifty card
