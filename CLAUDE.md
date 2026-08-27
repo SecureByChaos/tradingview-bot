@@ -295,6 +295,78 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination gets a chop gate -- admin opt-in, OFF by default, shipped without a backtest behind it (27 Aug 2026)
+
+**Requested**: after walking through the dashboard's Market Conditions panel live (a Bank Nifty card
+reading TRENDING on ADX 26.5 while its own efficiency ratio read CHOPPY 0.20 at the same moment --
+explained as two different signals over two different windows, not a contradiction), asked what a
+hard chop gate would do to a decision like that one. Answered: nothing changes about what the AI
+decides -- a gate only vetoes whether a decision becomes a real trade, the same mechanism the
+same-direction-loss gate already uses. Flagged that no chop gate exists yet and that
+`scripts/chop_gate_backtest.py` (27 Aug) was deliberately not run, since `chop_efficiency_ratio` had
+zero days of real closed-trade history at that point. User: "Lets build the gate." Flagged plainly,
+before building anything, that this would be the first gate in this project ever shipped without a
+backtest behind it -- every other real gate (DTE floor, same-direction-loss, confidence floor) was
+validated first, and every rejected candidate (ADX, reasoning-hedge, break-confirmation) was rejected
+specifically because its backtest didn't support it. Asked via `AskUserQuestion` how to proceed; user
+chose: **ship it now, admin-configurable, OFF by default** -- exists in code, doesn't change any live
+behavior until an admin explicitly opts in via Settings > AI.
+
+**Implementation**: two new `AISettings` columns (`app/db_models.py`, additive `_ensure_columns()`
+migration), both defaulting to today's actual behavior so deploying this changes nothing on its own --
+`ai_origination_chop_gate_enabled` (bool, default `False`) and
+`ai_origination_chop_gate_min_efficiency_ratio` (float, default `0.3`, matching the existing CHOPPY
+threshold already shown on the dashboard and in the model's own prompt via `_efficiency_ratio_text`,
+not a separately-chosen number). Two new helper functions in `app/ai/originator.py`
+(`_chop_gate_enabled`/`_chop_gate_min_efficiency_ratio`) mirror `_max_same_direction_losses`/
+`_max_sl_percent`'s exact shape. The gate itself sits in `_open_trade`, checked immediately after the
+same-direction-loss gate -- same early position (before any contract-resolution cost), since it only
+needs `market_context`, already in hand. Blocks when `chop_efficiency_ratio < configured floor`
+**strictly** (a reading exactly at the floor is not blocked).
+
+**Fails open on missing data, deliberately**: a `None` `market_context` or a `None`
+`chop_efficiency_ratio` (an index with under an hour of 5-min bar history, or the field simply not yet
+populated) never blocks -- "no reading yet" is not "choppy," the same missing-value convention this
+project applies everywhere else (see CLAUDE.md's own "new nullable columns mean not recorded" rule).
+This mirrors the same-direction-loss gate's own `market_context=None` handling exactly.
+
+Settings > AI gets a new "Chop Gate" section: a checkbox (default unchecked) and a "Min Efficiency
+Ratio" number input (default 0.3, validated `0.0 <= value <= 1.0` in `/ai-settings` POST), with an
+explicit tooltip/description stating this ships without backtest validation and pointing at
+`scripts/chop_gate_backtest.py` for when enough history exists to check. `/ai-settings`'s form and
+values dict both extended to match the same pattern every other AI Origination risk knob already
+uses.
+
+18 new tests (`tests/test_chop_gate.py`): the two settings-fallback helpers (defaults without a
+settings row, reads an admin-configured value), and `_open_trade` integration -- disabled-by-default
+ignores a choppy reading, enabled blocks below the floor (and short-circuits before contract
+resolution, matching the loss gate's own test pattern), enabled allows at-or-above the floor, the
+exact boundary (reading == floor is not blocked), enabled-but-no-`market_context` fails open,
+enabled-but-missing-`chop_efficiency_ratio` fails open, and an admin-configured custom floor (0.5)
+blocking a reading (0.40) that would clear the default. Full suite: 549 passed (was 538).
+`python -c "import app.main"` imports cleanly. Migration verified against a simulated pre-migration
+DB (built the full current schema, dropped both new columns via `ALTER TABLE ... DROP COLUMN`, ran
+`_ensure_columns()` for real, confirmed both columns reappear, confirmed a second run is a clean
+no-op).
+
+**Verified live**: started the app against a scratch SQLite DB, logged in, confirmed `/settings?tab=ai`
+renders the new section with the correct default (unchecked, 0.3), saved with the gate enabled and a
+custom floor (0.45) and confirmed both values round-trip correctly on re-render, and confirmed the
+`0.0-1.0` validation rejects an out-of-range floor (1.5) with a 400.
+
+**Not backtest-validated -- stated explicitly in the Settings UI itself, not just here.** This is a
+manual risk decision the user made knowingly, not a finding this project has confirmed. Per this
+project's own standing discipline (unbroken until now), a floor only ships as *validated* once
+`scripts/chop_gate_backtest.py` clears the same bootstrap-CI bar every other gate has been held to --
+that has not happened, and won't be possible until real closed-trade history with a
+`chop_efficiency_ratio` reading accumulates (the field is one day old as of this entry). If enabled in
+production, re-run the backtest once enough history exists and revisit whether the 0.3 default (or
+whatever an admin has set it to) is actually the right floor:
+
+```bash
+python -m scripts.chop_gate_backtest --db data/trading.db
+```
+
 ### Loss-gate override backtest -- tooling built, not run; index-direction-only proxy by design (27 Aug 2026)
 
 **Trigger**: same-day follow-up to the chop-signal dashboard work. 27 Aug: the same-direction

@@ -229,6 +229,8 @@ def _ensure_columns() -> None:
             "ai_origination_max_sl_percent": "ALTER TABLE ai_settings ADD COLUMN ai_origination_max_sl_percent FLOAT NOT NULL DEFAULT 50.0",
             "ai_origination_max_same_direction_losses": "ALTER TABLE ai_settings ADD COLUMN ai_origination_max_same_direction_losses INTEGER NOT NULL DEFAULT 2",
             "ai_origination_trail_activate_percent": "ALTER TABLE ai_settings ADD COLUMN ai_origination_trail_activate_percent FLOAT NOT NULL DEFAULT 8.0",
+            "ai_origination_chop_gate_enabled": "ALTER TABLE ai_settings ADD COLUMN ai_origination_chop_gate_enabled BOOLEAN NOT NULL DEFAULT 0",
+            "ai_origination_chop_gate_min_efficiency_ratio": "ALTER TABLE ai_settings ADD COLUMN ai_origination_chop_gate_min_efficiency_ratio FLOAT NOT NULL DEFAULT 0.3",
         }
         with engine.begin() as connection:
             for column, statement in ai_statements.items():
