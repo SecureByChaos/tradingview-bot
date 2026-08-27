@@ -679,6 +679,22 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
     return figures
 
 
+def _classify_chop(ratio: float | None) -> str:
+    """Same three-band read as app/ai/originator.py's _efficiency_ratio_text
+    (<0.3 choppy, 0.3-0.5 mixed, >=0.5 clean) -- duplicated rather than
+    imported: app/ai/originator.py already imports FROM this module
+    (get_or_create_settings/list_index_configs/log_event/etc.), so importing
+    back from it here would be circular. Same duplication _classify_
+    tradability already established for the ADX bands, same reason."""
+    if ratio is None:
+        return "UNKNOWN"
+    if ratio < 0.3:
+        return "CHOPPY"
+    if ratio < 0.5:
+        return "MIXED"
+    return "CLEAN"
+
+
 def _classify_tradability(adx: float | None) -> str:
     """Three-band read of the same ADX thresholds app/market_context.py's
     regime classification and the AI Origination system prompt already use
@@ -709,7 +725,17 @@ def get_market_conditions(db: Session) -> list[dict[str, Any]]:
 
     `tradability` is informational only -- see _classify_tradability. Nothing
     in the trading path reads this; it exists so "is this index trending
-    right now" is answerable from the dashboard instead of grepping logs."""
+    right now" is answerable from the dashboard instead of grepping logs.
+
+    27 Aug 2026: also surfaces chop_efficiency_ratio (see app/market_context.
+    py's compute_efficiency_ratio) and the model's own confidence/setup_
+    quality/entry_quality/risk_quality/market_alignment for the same latest
+    row -- same zero-new-computation read, just more of the columns that
+    row already has. All five are null on a SLOT_OCCUPIED marker row (see
+    the "Market Conditions panel froze" fix -- that marker carries real
+    context/chop data but no real decision, so confidence/sub-scores
+    genuinely don't exist for it, and null says so honestly rather than
+    inventing a number)."""
     conditions: list[dict[str, Any]] = []
     for index in db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)):
         entry: dict[str, Any] = {
@@ -722,6 +748,13 @@ def get_market_conditions(db: Session) -> list[dict[str, Any]]:
             "data_stale": None,
             "last_updated": None,
             "tradability": "UNKNOWN",
+            "chop_efficiency_ratio": None,
+            "chop_label": "UNKNOWN",
+            "confidence": None,
+            "setup_quality": None,
+            "entry_quality": None,
+            "risk_quality": None,
+            "market_alignment": None,
         }
         latest = db.scalar(
             select(AIOriginationLog)
@@ -740,6 +773,13 @@ def get_market_conditions(db: Session) -> list[dict[str, Any]]:
             entry["data_stale"] = latest.data_stale
             entry["last_updated"] = iso_utc(latest.timestamp)
             entry["tradability"] = _classify_tradability(latest.adx)
+            entry["chop_efficiency_ratio"] = latest.chop_efficiency_ratio
+            entry["chop_label"] = _classify_chop(latest.chop_efficiency_ratio)
+            entry["confidence"] = latest.confidence
+            entry["setup_quality"] = latest.setup_quality
+            entry["entry_quality"] = latest.entry_quality
+            entry["risk_quality"] = latest.risk_quality
+            entry["market_alignment"] = latest.market_alignment
         conditions.append(entry)
     return conditions
 

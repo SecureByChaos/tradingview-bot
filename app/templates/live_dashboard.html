@@ -67,6 +67,13 @@ const TRADABILITY_LABEL = {
   UNKNOWN: { emoji: '⚪', text: 'No data yet' }
 };
 
+const CHOP_LABEL = {
+  CLEAN: { emoji: '\u{1F7E2}', text: 'Clean' },
+  MIXED: { emoji: '\u{1F7E1}', text: 'Mixed' },
+  CHOPPY: { emoji: '\u{1F534}', text: 'Choppy' },
+  UNKNOWN: { emoji: '⚪', text: 'No data yet' }
+};
+
 function timeAgoLabel(isoTimestamp) {
   if (!isoTimestamp) { return 'never'; }
   const seconds = Math.max(0, Math.round((Date.now() - new Date(isoTimestamp).getTime()) / 1000));
@@ -86,11 +93,32 @@ function renderConditions(conditions) {
     const staleBadge = c.data_stale
       ? ' <span class="badge text-bg-warning" title="Built from stale stored history -- the last candle refresh failed">stale data</span>'
       : '';
+    // Chop and confidence/sub-scores line -- both null on a SLOT_OCCUPIED
+    // marker row (context was built, but no real decision was made that
+    // cycle), so both lines are omitted entirely rather than showing a
+    // fabricated "--" that could be mistaken for a real reading.
+    const chop = CHOP_LABEL[c.chop_label] || CHOP_LABEL.UNKNOWN;
+    const chopLine = c.chop_efficiency_ratio === null || c.chop_efficiency_ratio === undefined
+      ? ''
+      : '<div style="font-size:.85rem; margin-top:.2rem;">Efficiency ratio (last hour): ' +
+        c.chop_efficiency_ratio.toFixed(2) + ' &middot; ' + chop.emoji + ' ' + chop.text + '</div>';
+    const scorePart = function (label, value) {
+      return value === null || value === undefined ? '' : label + ' ' + Math.round(value);
+    };
+    const scoreParts = [
+      scorePart('Setup', c.setup_quality), scorePart('Entry', c.entry_quality),
+      scorePart('Risk', c.risk_quality), scorePart('Alignment', c.market_alignment),
+    ].filter(Boolean);
+    const confidenceLine = c.confidence === null || c.confidence === undefined
+      ? ''
+      : '<div style="font-size:.85rem; margin-top:.2rem;">Confidence: ' + Math.round(c.confidence * 100) + '%' +
+        (scoreParts.length ? ' &middot; ' + scoreParts.join(' &middot; ') : '') + '</div>';
     return '<div class="metric">' +
       '<div class="label">' + c.display_name + staleBadge + '</div>' +
       '<div class="value">' + status.emoji + ' ' + status.text + '</div>' +
       '<div style="font-size:.85rem; margin-top:.2rem;">Regime: ' + (c.regime || '--') +
       ' &middot; ADX: ' + adxText + ' &middot; CPR: ' + (c.cpr || '--') + '</div>' +
+      chopLine + confidenceLine +
       '<div style="margin-top:.4rem;">' + (setups || '<span class="text-body-secondary" style="font-size:.8rem;">No active setups</span>') + '</div>' +
       '<div class="text-body-secondary" style="font-size:.75rem; margin-top:.4rem;">Last snapshot: ' + timeAgoLabel(c.last_updated) + '</div>' +
       '</div>';
