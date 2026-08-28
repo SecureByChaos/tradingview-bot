@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db_models import Base, StrategyTrade, TradeStatus
-from app.platform import get_open_trades_with_ticks, get_today_activity
+from app.platform import get_open_trades_with_ticks
 from app.time_utils import utc_now
 
 
@@ -47,36 +47,6 @@ def test_open_trades_with_ticks_includes_strike():
 
     assert len(trades) == 1
     assert trades[0]["strike"] == 57800
-
-
-def test_today_activity_entry_message_includes_strike():
-    db = _make_session()
-    db.add(StrategyTrade(**_base_trade()))
-    db.commit()
-
-    activity = get_today_activity(db)
-
-    assert len(activity) == 1
-    assert "57800" in activity[0]["message"]
-    assert activity[0]["message"] == "[BNV7] Entered Bank Nifty 57800 long call"
-
-
-def test_today_activity_exit_message_includes_strike():
-    db = _make_session()
-    db.add(StrategyTrade(**_base_trade(
-        trade_id="t-2",
-        status=TradeStatus.CLOSED,
-        exit_time=utc_now(),
-        pnl_percent=-3.2,
-    )))
-    db.commit()
-
-    activity = get_today_activity(db)
-
-    # This trade entered AND closed today, so both events are reported --
-    # only the "Closed" one is under test here.
-    messages = [event["message"] for event in activity]
-    assert "[BNV7] Closed Bank Nifty 57800 long call, -3.2%" in messages
 
 
 def test_open_trades_with_ticks_includes_ai_origination_strike():

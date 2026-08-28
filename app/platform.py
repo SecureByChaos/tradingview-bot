@@ -875,56 +875,122 @@ def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[s
 
 
 
-def get_today_activity(db: Session, limit: int = 20) -> list[dict[str, Any]]:
-    """Plain-language, strategy-attributed activity feed for the live
-    dashboards, derived directly from real (origin == SIGNAL) trade
-    entry/exit times rather than parsing internal log-event strings."""
-    today = today_ist().isoformat()
-    trades = list(
-        db.scalars(
+def get_ai_origination_today_highlights(db: Session) -> dict[str, Any]:
+    """Replaces the old SIGNAL-strategy activity feed (get_today_activity,
+    removed 28 Aug 2026) now that AI Origination is the only thing actually
+    running -- that feed only ever showed rule-based-strategy entry/exit
+    lines ("[BNV7] Entered...") and had nothing to say once strategies
+    stopped being used. Everything here is scoped to origin LIKE
+    'AI_ORIGIN_%' and today (IST), and reads data already written on every
+    origination cycle -- zero new computation, zero new SmartAPI calls.
+
+    Four pieces:
+    - index_comparison: today's closed-trade record per enabled index
+      (trades/wins/losses/net P&L), so Bank Nifty and Nifty can be read
+      head-to-head. Uses net_pnl (net of cost), not gross profit_loss --
+      see compute_performance_kpis's own 28 Aug fix for why that matters.
+    - funnel: how many decision cycles ran today, how many declined (NONE),
+      how many wanted to trade but never got a trade_id (blocked by the
+      confidence floor or a gate), how many actually opened. SLOT_OCCUPIED
+      marker rows are excluded -- they're not real decisions, see the
+      "Market Conditions panel froze" fix.
+    - sharpest_call: today's best closed trade and its own ai_reasoning, or
+      -- if nothing has closed yet today -- the single highest-confidence
+      NONE decline, so there's always something to show once cycles have
+      run.
+    - near_misses: up to 5 most recent BUY_CE/BUY_PE decisions today that
+      never opened a trade, newest first, with confidence and reasoning.
+    """
+    today = today_ist()
+
+    logs_today = [
+        row
+        for row in db.scalars(
+            select(AIOriginationLog).where(AIOriginationLog.timestamp >= utc_now() - timedelta(hours=30))
+        )
+        if to_ist(row.timestamp) is not None and to_ist(row.timestamp).date() == today
+    ]
+    real_decisions = [row for row in logs_today if row.decision != "SLOT_OCCUPIED"]
+    wanted_to_trade = [row for row in real_decisions if row.decision in ("BUY_CE", "BUY_PE")]
+    blocked_decisions = [row for row in wanted_to_trade if not row.trade_id]
+
+    funnel = {
+        "total_cycles": len(real_decisions),
+        "declined": sum(1 for row in real_decisions if row.decision == "NONE"),
+        "opened": sum(1 for row in wanted_to_trade if row.trade_id),
+        "blocked": len(blocked_decisions),
+        "errors": sum(1 for row in real_decisions if row.decision == "ERROR"),
+    }
+
+    closed_ai_today = [
+        trade
+        for trade in db.scalars(
             select(StrategyTrade).where(
-                StrategyTrade.origin == "SIGNAL",
-                func.date(StrategyTrade.entry_time) == today,
+                StrategyTrade.origin.like("AI_ORIGIN_%"),
+                StrategyTrade.status == TradeStatus.CLOSED,
             )
         )
-    )
-    closed_today = list(
-        db.scalars(
-            select(StrategyTrade).where(
-                StrategyTrade.origin == "SIGNAL",
-                StrategyTrade.exit_time.is_not(None),
-                func.date(StrategyTrade.exit_time) == today,
-            )
-        )
-    )
-    events: list[dict[str, Any]] = []
-    for trade in trades:
-        position = "long call" if trade.option_type == "CE" else "long put"
-        events.append(
+        if to_ist(trade.exit_time) is not None and to_ist(trade.exit_time).date() == today
+    ]
+
+    index_comparison: list[dict[str, Any]] = []
+    for index in db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)):
+        trades = [trade for trade in closed_ai_today if trade.index_symbol == index.symbol]
+        wins = sum(1 for trade in trades if trade.result == TradeResult.WIN)
+        losses = sum(1 for trade in trades if trade.result == TradeResult.LOSS)
+        total = len(trades)
+        index_comparison.append(
             {
-                "timestamp": trade.entry_time,
-                "time_label": to_ist(trade.entry_time).strftime("%I:%M %p") if to_ist(trade.entry_time) else "",
-                "message": f"[{trade.strategy_name}] Entered {_index_display_name(trade.index_symbol)} {trade.strike} {position}",
+                "symbol": index.symbol,
+                "display_name": index.display_name or index.symbol,
+                "trades": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+                "net_pnl": round(sum(trade.net_pnl for trade in trades), 2),
             }
         )
-    for trade in closed_today:
-        position = "long call" if trade.option_type == "CE" else "long put"
-        sign = "+" if (trade.pnl_percent or 0) >= 0 else ""
-        events.append(
-            {
-                "timestamp": trade.exit_time,
-                "time_label": to_ist(trade.exit_time).strftime("%I:%M %p") if to_ist(trade.exit_time) else "",
-                "message": f"[{trade.strategy_name}] Closed {_index_display_name(trade.index_symbol)} {trade.strike} {position}, {sign}{trade.pnl_percent:.1f}%",
+
+    sharpest_call: dict[str, Any] | None = None
+    if closed_ai_today:
+        best = max(closed_ai_today, key=lambda trade: trade.pnl_percent)
+        sharpest_call = {
+            "kind": "trade",
+            "index_display_name": _index_display_name(best.index_symbol),
+            "strike": best.strike,
+            "position_label": "Long Call" if best.option_type == "CE" else "Long Put",
+            "pnl_percent": best.pnl_percent,
+            "reasoning": best.ai_reasoning or "",
+        }
+    else:
+        none_decisions = [row for row in real_decisions if row.decision == "NONE" and row.confidence is not None]
+        if none_decisions:
+            best_none = max(none_decisions, key=lambda row: row.confidence)
+            sharpest_call = {
+                "kind": "decline",
+                "index_display_name": _index_display_name(best_none.index_name),
+                "confidence": best_none.confidence,
+                "reasoning": best_none.reasoning or "",
             }
-        )
-    events.sort(key=lambda event: event["timestamp"], reverse=True)
-    # Drop the raw datetime before returning -- only used for sorting above.
-    # Jinja's `tojson` filter (used to seed the initial page render) can't
-    # serialize a datetime object, and only time_label/message are ever
-    # displayed.
-    for event in events:
-        del event["timestamp"]
-    return events[:limit]
+
+    near_misses = sorted(blocked_decisions, key=lambda row: row.timestamp, reverse=True)[:5]
+    near_miss_entries = [
+        {
+            "index_display_name": _index_display_name(row.index_name),
+            "action": row.decision,
+            "confidence": row.confidence,
+            "reasoning": row.reasoning or "",
+            "time_label": to_ist(row.timestamp).strftime("%I:%M %p") if to_ist(row.timestamp) else "",
+        }
+        for row in near_misses
+    ]
+
+    return {
+        "funnel": funnel,
+        "index_comparison": index_comparison,
+        "sharpest_call": sharpest_call,
+        "near_misses": near_miss_entries,
+    }
 
 
 def daily_stats_query_for_filter(filter_name: str, start: date | None, end: date | None) -> Select[tuple[DailyStats]]:

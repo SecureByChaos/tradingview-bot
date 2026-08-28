@@ -18,10 +18,21 @@
 <div class="trade-card-grid mb-4" id="trade-cards"></div>
 <div id="trade-empty-state" style="display:none;">{{ empty_state("Monitoring markets, no active trade.") }}</div>
 
-<div class="section-header"><h4 class="mb-0">Today's activity</h4></div>
-<div class="panel">
-  <div class="activity-feed" id="activity-feed"></div>
-  <div id="activity-empty-state" style="display:none;">{{ empty_state("No activity yet today.") }}</div>
+<div class="section-header"><h4 class="mb-0">Today's highlights</h4></div>
+
+<div class="highlights-grid mb-4" id="vs-cards"></div>
+
+<div class="panel mb-4">
+  <div class="field-label mb-2">Decision funnel</div>
+  <div class="funnel-row" id="funnel-row"></div>
+</div>
+
+<div id="sharpest-call-wrap" class="mb-4"></div>
+
+<div class="panel mb-4">
+  <div class="field-label mb-2">Near misses &mdash; wanted to trade, didn't</div>
+  <div class="near-miss-row" id="near-miss-row"></div>
+  <div id="near-miss-empty-state" style="display:none;">{{ empty_state("No blocked decisions today.") }}</div>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
@@ -29,7 +40,7 @@
 const initialData = {
   indices: {{ indices | tojson }},
   trades: {{ trades | tojson }},
-  activity: {{ activity | tojson }},
+  today_highlights: {{ today_highlights | tojson }},
   conditions: {{ conditions | tojson }},
   market_open: {{ market_open | tojson }}
 };
@@ -177,18 +188,95 @@ function renderTrades(trades) {
   });
 }
 
-function renderActivity(activity) {
-  const container = document.getElementById('activity-feed');
-  const empty = document.getElementById('activity-empty-state');
-  if (!activity.length) {
+// Today's Highlights (AI Origination only, 28 Aug 2026) -- replaces the old
+// SIGNAL-strategy activity feed, which had nothing to say once rule-based
+// strategies stopped being used. Four pieces: an index head-to-head, a
+// decision funnel (cycles -> declined -> opened/blocked), the day's single
+// most notable decision with its own reasoning, and a row of "wanted to
+// trade but didn't" near-misses.
+
+function renderIndexComparison(indexComparison) {
+  const container = document.getElementById('vs-cards');
+  const items = indexComparison || [];
+  if (!items.length) { container.innerHTML = ''; return; }
+  const maxAbs = Math.max(1, ...items.map(function (i) { return Math.abs(i.net_pnl); }));
+  container.innerHTML = items.map(function (i) {
+    const cls = i.net_pnl >= 0 ? 'profit' : 'loss';
+    const barPct = Math.min(100, Math.round(Math.abs(i.net_pnl) / maxAbs * 100));
+    const record = i.trades
+      ? (i.wins + 'W - ' + i.losses + 'L &middot; ' + i.win_rate + '% win rate')
+      : 'No closed trades yet today';
+    return '<div class="vs-card">' +
+      '<div class="vs-card-header"><span class="vs-card-index">' + i.display_name + '</span>' +
+      '<span class="' + cls + '" style="font-weight:700;">' + (i.net_pnl >= 0 ? '+' : '') + '₹' + i.net_pnl.toFixed(2) + '</span></div>' +
+      '<div class="vs-card-record">' + record + '</div>' +
+      '<div class="vs-bar-track"><div class="vs-bar-fill ' + cls + '" style="width:' + barPct + '%;"></div></div>' +
+      '</div>';
+  }).join('');
+}
+
+function renderFunnel(funnel) {
+  const container = document.getElementById('funnel-row');
+  if (!funnel) { container.innerHTML = ''; return; }
+  const chip = function (value, label, cls) {
+    return '<div class="funnel-chip"><div class="funnel-value' + (cls ? ' ' + cls : '') + '">' + value + '</div>' +
+      '<div class="funnel-label">' + label + '</div></div>';
+  };
+  const arrow = '<div class="funnel-arrow">→</div>';
+  let html = chip(funnel.total_cycles, 'Cycles today', '') + arrow +
+    chip(funnel.declined, 'Declined', '') + arrow +
+    chip(funnel.opened, 'Opened', 'profit');
+  if (funnel.blocked) { html += arrow + chip(funnel.blocked, 'Blocked', 'loss'); }
+  if (funnel.errors) { html += arrow + chip(funnel.errors, 'Errors', 'loss'); }
+  container.innerHTML = html;
+}
+
+function renderSharpestCall(call) {
+  const container = document.getElementById('sharpest-call-wrap');
+  if (!call) { container.innerHTML = ''; return; }
+  const quote = call.reasoning ? '<blockquote>&ldquo;' + call.reasoning + '&rdquo;</blockquote>' : '';
+  if (call.kind === 'trade') {
+    const cls = call.pnl_percent >= 0 ? 'profit' : 'loss';
+    const accent = call.pnl_percent >= 0 ? 'accent-profit' : 'accent-loss';
+    const sign = call.pnl_percent >= 0 ? '+' : '';
+    container.innerHTML = '<div class="highlight-card ' + accent + '">' +
+      '<div class="field-label">Today&rsquo;s sharpest call</div>' +
+      '<div style="margin-top:.3rem;"><strong>' + call.index_display_name + ' ' + call.strike + ' &middot; ' + call.position_label + '</strong>' +
+      ' <span class="' + cls + '" style="font-weight:700;">' + sign + call.pnl_percent + '%</span></div>' +
+      quote + '</div>';
+  } else {
+    container.innerHTML = '<div class="highlight-card accent-neutral">' +
+      '<div class="field-label">Today&rsquo;s sharpest read</div>' +
+      '<div style="margin-top:.3rem;"><strong>' + call.index_display_name + '</strong> &middot; declined at ' +
+      Math.round(call.confidence * 100) + '% confidence</div>' + quote + '</div>';
+  }
+}
+
+function renderNearMisses(nearMisses) {
+  const container = document.getElementById('near-miss-row');
+  const empty = document.getElementById('near-miss-empty-state');
+  const items = nearMisses || [];
+  if (!items.length) {
     container.innerHTML = '';
     empty.style.display = 'block';
     return;
   }
   empty.style.display = 'none';
-  container.innerHTML = activity.map(function (event) {
-    return '<div><span class="time">' + event.time_label + '</span>' + event.message + '</div>';
+  container.innerHTML = items.map(function (m) {
+    const dir = m.action === 'BUY_CE' ? 'Call' : 'Put';
+    const confText = m.confidence === null || m.confidence === undefined ? '' : ' &middot; ' + Math.round(m.confidence * 100) + '%';
+    const title = (m.reasoning || '').replace(/"/g, '&quot;');
+    return '<span class="near-miss-chip" title="' + title + '">' + m.time_label + ' &middot; ' +
+      m.index_display_name + ' ' + dir + confText + '</span>';
   }).join('');
+}
+
+function renderTodayHighlights(highlights) {
+  highlights = highlights || {};
+  renderIndexComparison(highlights.index_comparison);
+  renderFunnel(highlights.funnel);
+  renderSharpestCall(highlights.sharpest_call);
+  renderNearMisses(highlights.near_misses);
 }
 
 let lastUpdatedAt = Date.now();
@@ -198,7 +286,7 @@ function renderAll(data) {
   renderIndices(data.indices);
   renderConditions(data.conditions);
   renderTrades(data.trades);
-  renderActivity(data.activity);
+  renderTodayHighlights(data.today_highlights);
   marketOpen = data.market_open;
   lastUpdatedAt = Date.now();
 }
