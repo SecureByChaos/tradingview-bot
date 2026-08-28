@@ -79,9 +79,37 @@ h1, h2, h3, h4, h5 { letter-spacing: 0; }
 .trade-card-figures .label { color: var(--muted); font-size: .72rem; }
 .trade-card-figures .value { font-size: .95rem; font-weight: 600; }
 .trade-chart-wrap { position: relative; width: 100%; height: 100px; }
-.activity-feed { display: flex; flex-direction: column; gap: .6rem; font-size: .88rem; }
-.activity-feed .time { color: var(--muted); min-width: 66px; display: inline-block; }
-.activity-strategy { color: #7fb7ff; }
+/* Today's Highlights (live dashboard, AI Origination) */
+.highlights-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+.vs-card { padding: 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.vs-card-header { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+.vs-card-index { font-weight: 600; }
+.vs-card-record { color: var(--muted); font-size: .8rem; margin-top: .2rem; }
+.vs-bar-track { height: 8px; border-radius: 4px; background: var(--surface-2); overflow: hidden; margin-top: .6rem; }
+.vs-bar-fill { height: 100%; border-radius: 4px; transition: width .3s ease; }
+.vs-bar-fill.profit { background: var(--success); }
+.vs-bar-fill.loss { background: var(--danger); }
+
+.funnel-row { display: flex; align-items: stretch; flex-wrap: wrap; gap: .5rem; }
+.funnel-chip { flex: 1; min-width: 100px; padding: .7rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; text-align: center; }
+.funnel-value { font-size: 1.4rem; font-weight: 700; }
+.funnel-label { color: var(--muted); font-size: .72rem; margin-top: .15rem; }
+.funnel-arrow { display: flex; align-items: center; color: var(--muted); font-size: 1.2rem; padding: 0 .1rem; }
+
+.highlight-card {
+  padding: 1rem 1rem 1rem 1.25rem; background: var(--surface); border: 1px solid var(--border);
+  border-left-width: 4px; border-radius: 8px;
+}
+.highlight-card.accent-profit { border-left-color: var(--success); }
+.highlight-card.accent-loss { border-left-color: var(--danger); }
+.highlight-card.accent-neutral { border-left-color: var(--muted); }
+.highlight-card blockquote { margin: .6rem 0 0; padding: 0; font-style: italic; color: var(--text); font-size: .92rem; line-height: 1.5; }
+
+.near-miss-row { display: flex; flex-wrap: wrap; gap: .5rem; }
+.near-miss-chip {
+  padding: .4rem .75rem; background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 999px; font-size: .8rem; cursor: help;
+}
 
 @media (max-width: 1399.98px) {
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }

@@ -295,6 +295,78 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### "Today's activity" replaced with "Today's Highlights" -- AI Origination only, since strategies are no longer used (28 Aug 2026)
+
+**Requested**: "Today's activity just shows bnv7 started and bnv closed like messages. Dont show that
+instead show some interesting stats about today's trades for both strategies and ai generation trades."
+Investigated before building: `get_today_activity()` was hardcoded to `origin == "SIGNAL"` -- it could
+never have shown AI Origination activity even if asked to, which is exactly why it read as dead noise:
+the user confirmed in the same conversation they've dropped Claude (`AI_ORIGIN_CLAUDE`) and stopped
+using rule-based strategies entirely, running AI Origination/OpenAI only. Talked through several ideas
+before building (exploratory, per this project's convention of not jumping straight to code): a
+Claude-vs-OpenAI head-to-head (dropped once single-provider was confirmed), an AI-vs-strategies
+comparison (dropped once strategies were confirmed unused), then converged on: a Bank Nifty vs Nifty
+head-to-head, a decision funnel, the day's most notable decision with its own reasoning, and a
+near-miss tracker -- all AI-Origination-scoped, all real comparisons already latent in the data rather
+than invented metrics. User: "Ok lets build it but display it in interesting way not just boring text."
+
+**Implementation**: `get_today_activity()` deleted outright (`app/platform.py`) -- confirmed via grep it
+had exactly one caller (`_live_dashboard_data`) and its own dedicated tests, both updated/removed with
+it, per this project's established clean-removal pattern. Replaced with
+`get_ai_origination_today_highlights()`, scoped throughout to `origin LIKE 'AI_ORIGIN_%'` and today
+(IST calendar day, filtered in Python via `to_ist()` after a 30-hour-lookback query -- same pattern as
+every other "today" filter in this codebase, since SQLite's `date()` on a UTC column doesn't line up
+with the IST calendar day). Four pieces, all zero-new-computation reads of data already written on
+every origination cycle:
+
+- **index_comparison**: today's closed AI Origination trades per enabled index -- trades/wins/losses/
+  win rate/net P&L. Uses `net_pnl` (net of cost), not gross `profit_loss` -- same fix as the Trade
+  History KPI entry directly below this one, applied here too rather than reintroducing the same
+  gross-wearing-a-net-label mistake in a brand new function.
+- **funnel**: how many real decision cycles ran today, how many declined (`NONE`), how many opened
+  (`trade_id` set), how many wanted to trade but got blocked (`BUY_CE`/`BUY_PE` with `trade_id` still
+  null -- confidence floor or a gate). `SLOT_OCCUPIED` marker rows are excluded from every count, same
+  as every other analysis in this project treats them -- they're not real decisions.
+- **sharpest_call**: today's best closed trade (highest `pnl_percent`) and its own `ai_reasoning`; if
+  nothing has closed yet today, falls back to the single highest-confidence `NONE` decline instead, so
+  there's always something to show once cycles have run rather than an empty card all morning.
+- **near_misses**: up to 5 most recent `BUY_CE`/`BUY_PE` decisions today that never got a `trade_id`,
+  newest first, with confidence and reasoning -- the "wanted to trade, didn't" population this session
+  spent a lot of time reading directly from `ai_origination_logs` by hand.
+
+**Display, per the explicit "not just boring text" ask**: new CSS (`app/static/dashboard.css`) rather
+than reusing plain metric tiles -- two side-by-side index cards each with a horizontal bar sized
+relative to the larger index's net P&L magnitude (an actual visual comparison, not just two numbers
+next to each other); a connected funnel of chips with arrows between them (Cycles → Declined → Opened
+→ Blocked), colored green/red on the outcome chips; a left-accent-bordered "highlight card" for the
+sharpest call, colored by win/loss/neutral, with the reasoning rendered as an italicized blockquote
+rather than a plain paragraph; and a row of near-miss pills (time · index · direction · confidence)
+carrying the full reasoning in a hover tooltip rather than spelling it out inline. The old
+`.activity-feed`/`.activity-strategy` CSS rules were dead once the markup using them was removed, so
+they were deleted too rather than left orphaned.
+
+8 new tests (`tests/test_today_highlights.py`): empty-day defaults, funnel counting with `SLOT_OCCUPIED`
+correctly excluded, index comparison using `net_pnl` not `profit_loss` and correctly excluding
+yesterday's trades/`SIGNAL`-origin trades/still-open trades, the sharpest-call trade-vs-decline-fallback
+branches, near-miss ordering and the 5-item cap, and a dedicated same-day-filter test. `tests/test_
+strike_display.py`'s two `get_today_activity`-specific tests removed with the function they tested (its
+other two tests, unrelated to activity, are untouched). Full suite: 560 passed (was 555).
+`python -c "import app.main"` imports cleanly.
+
+**Verified live with a real browser**, not just the JSON payload -- seeded a full realistic scenario
+into a scratch SQLite DB (a Bank Nifty win, a Nifty loss, a mix of NONE/opened/blocked decisions, one
+`SLOT_OCCUPIED` row) and screenshotted the actual rendered `/` page via Playwright/Chromium (pre-installed
+in this sandbox). Confirmed: the index comparison bars render proportionally correct (Bank Nifty's
+green bar visibly wider than Nifty's red one, matching ₹820 vs ₹225), the funnel shows 5 → 2 → 2 → 1
+with the right colors, the sharpest-call card shows the winning trade's real reasoning in a styled
+quote block, and the near-miss row shows the one blocked decision as a pill. No JS console errors, no
+layout breakage.
+
+**Not verified against real live traffic** -- this sandbox has no real trading day to observe. After
+deploying, confirm the dashboard's "Today's Highlights" section updates correctly on the existing 10s
+poll as real decisions accumulate through a real session, and that the sharpest-call card correctly
+flips from a "decline" card to a "trade" card the first time a real AI Origination trade closes that day.
+
 ### Trade History KPIs: "Net return" could read the opposite sign of "Net P&L" -- fixed to be capital-weighted, not a naive percent sum (28 Aug 2026)
 
 **Reported**: a real Trade History screenshot showing "Net return" +2.93% (green) sitting directly next
