@@ -295,6 +295,48 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Trade History KPIs: "Net return" could read the opposite sign of "Net P&L" -- fixed to be capital-weighted, not a naive percent sum (28 Aug 2026)
+
+**Reported**: a real Trade History screenshot showing "Net return" +2.93% (green) sitting directly next
+to "Net P&L (₹), this selection" -829.75 (red) for the same 3-trade selection -- asked to find the
+mistake. Traced to `compute_performance_kpis()` (`app/platform.py`, added 15 Aug when the standalone
+Performance page was folded into Trade History): `net_return_percent` was a naive SUM of each trade's
+own `pnl_percent`, not a capital-weighted aggregate return. Since trades can have very different
+investment sizes, summing raw percentages has no reliable relationship to the summed rupee total -- a
+small trade with a big % gain and a large trade with a modest % loss can sum to a POSITIVE percent
+while the actual money lost. Reproduced exactly: a 500-rupee trade at +10% next to a 20,000-rupee trade
+at -4% summed to +6.00% naively while the real rupee outcome was -750.00 -- the identical shape of bug
+the screenshot showed.
+
+**A second, related mislabeling found while reading the same function**: `net_pnl_amount` (and every
+other rupee figure in this function -- the daily P&L chart, the equity curve) summed `trade.profit_loss`,
+which per this file's own "Costs" convention is explicitly **gross**, not net. A KPI card literally
+labelled "Net P&L" was showing gross P&L wearing that label.
+
+**Fixed**: `net_return_percent`, the per-day `pnl_percent` in the daily-P&L chart, and `cumulative_percent`
+in the equity curve are now all computed as `net_pnl / investment_amount * 100` (capital-weighted),
+guaranteed to share the same sign as the corresponding rupee figure since `investment_amount` is always
+non-negative. Every rupee figure in the function (`net_pnl_amount`, daily `pnl_amount`, equity curve's
+`cumulative_amount`) switched from `trade.profit_loss` (gross) to `trade.net_pnl` (net of
+`estimated_cost`), so a KPI labelled "Net" is now actually net throughout, not gross in some places and
+net in others. Guards against zero invested capital (a day or a trade set with no capital deployed reads
+0.0%, not a `ZeroDivisionError`). Route (`app/dashboard_routes.py`) and template (`history.html`) needed
+no changes -- same key names (`net_return_percent`, `net_pnl_amount`, `cumulative_percent`,
+`cumulative_amount`, `pnl_amount`), only their computation changed.
+
+3 tests updated/added in `tests/test_history_settings_merge.py` (5 -> 8): the existing win/loss test now
+asserts the capital-weighted return and that `net_pnl_amount` reads from `net_pnl` not `profit_loss`; a
+new test reproduces the exact real bug shape (small high-% winner + large modest-% loser) and asserts
+the fixed return percent shares the sign of the rupee total (previously would have read positive); a new
+test confirms zero invested capital doesn't crash and reads 0.0% rather than raising. Full suite: 555
+passed (was 553). `python -c "import app.main"` imports cleanly.
+
+**Verified live**: started the app against a scratch SQLite DB, seeded the exact reproduction shape (a
+500-rupee trade at net +50 and a 20,000-rupee trade at net -800), logged in, and confirmed `/history`
+now renders "Net return" as -3.66% (red) directly alongside "Net P&L" as -₹750.00 (red) -- both correctly
+negative and sign-consistent, where the pre-fix formula would have shown +6.00% (green) next to the same
+-₹750.00 (red), reproducing the exact contradiction from the reported screenshot.
+
 ### Chop gate now requires ADX to ALSO read below trending before blocking, not chop alone (27 Aug 2026)
 
 **Requested**: after the user enabled the chop gate (previous entry) and asked whether it could block
