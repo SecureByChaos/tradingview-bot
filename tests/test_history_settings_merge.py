@@ -103,11 +103,13 @@ def test_compute_performance_kpis_computes_win_rate_and_drawdown():
     closed = [
         _trade(
             trade_id="t-win", status=TradeStatus.CLOSED, result=TradeResult.WIN,
-            profit_loss=500.0, pnl_percent=10.0, entry_time=now - timedelta(days=1), exit_time=now - timedelta(days=1),
+            profit_loss=520.0, net_pnl=500.0, pnl_percent=10.0, investment_amount=5000.0,
+            entry_time=now - timedelta(days=1), exit_time=now - timedelta(days=1),
         ),
         _trade(
             trade_id="t-loss", status=TradeStatus.CLOSED, result=TradeResult.LOSS,
-            profit_loss=-200.0, pnl_percent=-4.0, entry_time=now, exit_time=now,
+            profit_loss=-195.0, net_pnl=-200.0, pnl_percent=-4.0, investment_amount=5000.0,
+            entry_time=now, exit_time=now,
         ),
     ]
 
@@ -115,6 +117,52 @@ def test_compute_performance_kpis_computes_win_rate_and_drawdown():
 
     assert result["kpis"]["total_trades"] == 2
     assert result["kpis"]["win_rate"] == 50.0
+    # Uses net_pnl (net of costs), not the gross profit_loss column.
     assert result["kpis"]["net_pnl_amount"] == 300.0
+    # Capital-weighted: 300 / (5000 + 5000) * 100, not a naive sum of pnl_percent.
+    assert result["kpis"]["net_return_percent"] == 3.0
     assert result["win_loss"] == {"wins": 1, "losses": 1}
     assert len(result["equity_curve"]) == 2
+
+
+def test_compute_performance_kpis_return_percent_matches_the_sign_of_net_pnl():
+    # The exact real bug this fixes: a small, high-percentage winner and a
+    # large, modest-percentage loser used to sum to a POSITIVE percent
+    # (10 + -4 = +6, naive sum) while the actual rupee total was negative.
+    # The capital-weighted figure must agree in sign with net_pnl_amount.
+    now = utc_now()
+    closed = [
+        _trade(
+            trade_id="t-small-win", status=TradeStatus.CLOSED, result=TradeResult.WIN,
+            net_pnl=50.0, pnl_percent=10.0, investment_amount=500.0,
+            entry_time=now, exit_time=now,
+        ),
+        _trade(
+            trade_id="t-big-loss", status=TradeStatus.CLOSED, result=TradeResult.LOSS,
+            net_pnl=-800.0, pnl_percent=-4.0, investment_amount=20000.0,
+            entry_time=now, exit_time=now,
+        ),
+    ]
+
+    result = compute_performance_kpis(closed)
+
+    assert result["kpis"]["net_pnl_amount"] == -750.0
+    assert result["kpis"]["net_return_percent"] < 0  # must NOT read positive here
+    assert result["kpis"]["net_return_percent"] == round(-750.0 / 20500.0 * 100, 2)
+
+
+def test_compute_performance_kpis_handles_zero_investment_without_crashing():
+    now = utc_now()
+    closed = [
+        _trade(
+            trade_id="t-zero-capital", status=TradeStatus.CLOSED, result=TradeResult.WIN,
+            net_pnl=50.0, pnl_percent=10.0, investment_amount=0.0,
+            entry_time=now, exit_time=now,
+        ),
+    ]
+
+    result = compute_performance_kpis(closed)
+
+    assert result["kpis"]["net_pnl_amount"] == 50.0
+    assert result["kpis"]["net_return_percent"] == 0.0  # no capital deployed -- no meaningful percent
+    assert result["equity_curve"][0]["cumulative_percent"] == 0.0

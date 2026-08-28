@@ -419,47 +419,66 @@ def compute_performance_kpis(closed_trades: list[StrategyTrade]) -> dict[str, An
     both the trades table and these stats from one query instead of two, and
     so the numbers always describe exactly the population shown in the table
     below them -- previously this was hardcoded to origin == SIGNAL only;
-    now it reflects whatever origin/strategy filter is currently selected."""
+    now it reflects whatever origin/strategy filter is currently selected.
+
+    28 Aug 2026: every percent figure here is capital-weighted (net P&L
+    divided by capital invested), not a naive sum of each trade's own
+    pnl_percent. Summing raw per-trade percentages is not a valid aggregate
+    return -- a small trade with a big % gain and a large trade with a
+    modest % loss can sum to a POSITIVE percent while the actual rupee
+    total is NEGATIVE, which is exactly what a real selection showed: a
+    +2.93% "Net return" next to a -829.75 "Net P&L" on the same 3 trades.
+    Every rupee figure also switched from trade.profit_loss (gross -- see
+    this file's own "Costs" convention) to trade.net_pnl (net of
+    estimated_cost), so a KPI literally labelled "Net P&L" is actually net,
+    not gross wearing that label."""
     closed = sorted(closed_trades, key=lambda trade: trade.exit_time or trade.entry_time)
 
-    daily_totals: dict[str, float] = {}
     daily_amounts: dict[str, float] = {}
+    daily_invested: dict[str, float] = {}
     for trade in closed:
         exit_ist = to_ist(trade.exit_time)
         if exit_ist is None:
             continue
         day = exit_ist.date().isoformat()
-        daily_totals[day] = daily_totals.get(day, 0.0) + trade.pnl_percent
-        daily_amounts[day] = daily_amounts.get(day, 0.0) + trade.profit_loss
+        daily_amounts[day] = daily_amounts.get(day, 0.0) + trade.net_pnl
+        daily_invested[day] = daily_invested.get(day, 0.0) + trade.investment_amount
     daily_pnl = [
-        {"date": day, "pnl_percent": round(daily_totals[day], 2), "pnl_amount": round(daily_amounts[day], 2)}
-        for day in sorted(daily_totals)
+        {
+            "date": day,
+            "pnl_percent": round(daily_amounts[day] / daily_invested[day] * 100, 2) if daily_invested[day] else 0.0,
+            "pnl_amount": round(daily_amounts[day], 2),
+        }
+        for day in sorted(daily_amounts)
     ]
 
     equity_curve: list[dict[str, Any]] = []
-    running = 0.0
     running_amount = 0.0
+    running_invested = 0.0
     peak = 0.0
     max_drawdown = 0.0
-    for point in daily_pnl:
-        running += point["pnl_percent"]
-        running_amount += point["pnl_amount"]
-        peak = max(peak, running)
-        max_drawdown = max(max_drawdown, peak - running)
+    for day in sorted(daily_amounts):
+        running_amount += daily_amounts[day]
+        running_invested += daily_invested[day]
+        cumulative_percent = round(running_amount / running_invested * 100, 2) if running_invested else 0.0
+        peak = max(peak, cumulative_percent)
+        max_drawdown = max(max_drawdown, peak - cumulative_percent)
         equity_curve.append({
-            "date": point["date"],
-            "cumulative_percent": round(running, 2),
+            "date": day,
+            "cumulative_percent": cumulative_percent,
             "cumulative_amount": round(running_amount, 2),
         })
 
     wins = sum(1 for trade in closed if trade.result == TradeResult.WIN)
     losses = sum(1 for trade in closed if trade.result == TradeResult.LOSS)
     total = len(closed)
-    net_pnl_amount = round(sum(trade.profit_loss for trade in closed), 2)
+    net_pnl_amount = round(sum(trade.net_pnl for trade in closed), 2)
+    total_invested = sum(trade.investment_amount for trade in closed)
+    net_return_percent = round(net_pnl_amount / total_invested * 100, 2) if total_invested else 0.0
 
     return {
         "kpis": {
-            "net_return_percent": round(running, 2),
+            "net_return_percent": net_return_percent,
             "net_pnl_amount": net_pnl_amount,
             "win_rate": round((wins / total) * 100, 2) if total else 0.0,
             "total_trades": total,
