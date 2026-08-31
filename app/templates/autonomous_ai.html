@@ -16,8 +16,10 @@
   isn't the same as a mechanical rule, so that finding doesn't automatically apply here -- but it means
   this page's own real results are a fair, still-open test, not a foregone conclusion either way. Every
   open position also carries a wide backstop stop/target (a safety net, not the intended exit -- the
-  model's own per-cycle decision is meant to act first) and the same end-of-day square-off every trade
-  in this app gets. Paper trading only -- no live-order code path exists for this strategy.</p>
+  model's own per-cycle decision is meant to act first). No new entries after 3:00 PM IST, and every
+  open position is squared off unconditionally at 3:00 PM regardless of what the model says -- an
+  earlier, dedicated cutoff for this strategy specifically, not the later time every other strategy in
+  this app uses. Paper trading only -- no live-order code path exists for this strategy.</p>
   <p class="mb-0"><strong>Cost note:</strong> re-asking the model every cycle for every open position is
   real, ongoing API spend beyond a normal one-shot entry decision -- accepted deliberately for this
   strategy, not something every strategy in this app does.</p>

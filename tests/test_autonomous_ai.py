@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.db_models import Base, IndexConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.models import OptionContract, Signal
 from app.multi_strategy import MultiStrategyTradeManager
-from app.time_utils import to_ist, utc_now
+from app.time_utils import IST, to_ist, utc_now
 from app.ai.autonomous import (
     ORIGIN,
     _build_entry_prompt,
@@ -369,8 +369,13 @@ def test_check_entry_provider_error_opens_nothing(monkeypatch):
 # check_autonomous_exits
 # ---------------------------------------------------------------------------
 
+def _before_cutoff(monkeypatch, module) -> None:
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 12, 0, tzinfo=IST))
+
+
 def test_check_exits_closes_trade_on_exit_decision(monkeypatch):
     import app.ai.autonomous as module
+    _before_cutoff(monkeypatch, module)
     db = _make_session()
     _add_trade(db, trade_id="t1", current_premium=140.0)
     trade_manager = _make_trade_manager()
@@ -378,7 +383,7 @@ def test_check_exits_closes_trade_on_exit_decision(monkeypatch):
     monkeypatch.setattr(module, "_call_provider",
                          lambda *a, **k: module._RawCall('{"decision": "EXIT", "confidence": 0.8, "reasoning": "good gain, taking it"}', None, 5.0))
 
-    check_autonomous_exits(db, trade_manager, _Settings())
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
 
     trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
     assert trade.status == TradeStatus.CLOSED
@@ -388,6 +393,7 @@ def test_check_exits_closes_trade_on_exit_decision(monkeypatch):
 
 def test_check_exits_leaves_trade_open_on_hold_decision(monkeypatch):
     import app.ai.autonomous as module
+    _before_cutoff(monkeypatch, module)
     db = _make_session()
     _add_trade(db, trade_id="t1", current_premium=105.0)
     trade_manager = _make_trade_manager()
@@ -395,7 +401,7 @@ def test_check_exits_leaves_trade_open_on_hold_decision(monkeypatch):
     monkeypatch.setattr(module, "_call_provider",
                          lambda *a, **k: module._RawCall('{"decision": "HOLD", "reasoning": "still developing"}', None, 5.0))
 
-    check_autonomous_exits(db, trade_manager, _Settings())
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
 
     trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
     assert trade.status == TradeStatus.OPEN
@@ -406,13 +412,14 @@ def test_check_exits_leaves_trade_open_when_provider_errors(monkeypatch):
     # mechanical backstop stop/target protects the position, not a forced
     # exit on a transient API failure.
     import app.ai.autonomous as module
+    _before_cutoff(monkeypatch, module)
     db = _make_session()
     _add_trade(db, trade_id="t1", current_premium=105.0)
     trade_manager = _make_trade_manager()
 
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: module._RawCall(None, "timeout", None))
 
-    check_autonomous_exits(db, trade_manager, _Settings())
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
 
     trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
     assert trade.status == TradeStatus.OPEN
@@ -432,8 +439,9 @@ def test_check_exits_never_touches_telegram_or_strategy_stats():
     assert trade.status == TradeStatus.CLOSED
 
 
-def test_check_exits_isolated_from_other_origins():
+def test_check_exits_isolated_from_other_origins(monkeypatch):
     import app.ai.autonomous as module
+    _before_cutoff(monkeypatch, module)
     db = _make_session()
     _add_trade(db, trade_id="t-signal", origin="SIGNAL", current_premium=200.0)
     trade_manager = _make_trade_manager()
@@ -441,14 +449,60 @@ def test_check_exits_isolated_from_other_origins():
     def _exploding(*a, **k):
         raise AssertionError("must never call the model for a non-Autonomous-AI trade")
 
-    original = module._call_provider
-    try:
-        module._call_provider = _exploding
-        check_autonomous_exits(db, trade_manager, _Settings())
-    finally:
-        module._call_provider = original
+    monkeypatch.setattr(module, "_call_provider", _exploding)
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
 
     trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t-signal").one()
+    assert trade.status == TradeStatus.OPEN
+
+
+def test_check_exits_squares_off_unconditionally_at_cutoff_with_no_model_call(monkeypatch):
+    import app.ai.autonomous as module
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 15, 0, tzinfo=IST))
+    db = _make_session()
+    _add_trade(db, trade_id="t1", current_premium=105.0)
+    trade_manager = _make_trade_manager()
+
+    def _exploding(*a, **k):
+        raise AssertionError("must not call the model once past the cutoff -- it's a hard square-off")
+
+    monkeypatch.setattr(module, "_call_provider", _exploding)
+
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
+
+    trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == "TIME_EXIT"
+    assert trade.exit_price == 105.0
+
+
+def test_check_exits_squares_off_after_cutoff_too_not_only_exactly_at_it(monkeypatch):
+    import app.ai.autonomous as module
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 15, 7, tzinfo=IST))
+    db = _make_session()
+    _add_trade(db, trade_id="t1", current_premium=105.0)
+    trade_manager = _make_trade_manager()
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no model call")))
+
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
+
+    trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == "TIME_EXIT"
+
+
+def test_check_exits_does_not_square_off_before_cutoff(monkeypatch):
+    import app.ai.autonomous as module
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 14, 59, tzinfo=IST))
+    db = _make_session()
+    _add_trade(db, trade_id="t1", current_premium=105.0)
+    trade_manager = _make_trade_manager()
+    monkeypatch.setattr(module, "_call_provider",
+                         lambda *a, **k: module._RawCall('{"decision": "HOLD", "reasoning": "still developing"}', None, 5.0))
+
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
+
+    trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
     assert trade.status == TradeStatus.OPEN
 
 
@@ -476,3 +530,51 @@ def test_run_autonomous_checks_skips_outside_market_hours(monkeypatch):
     monkeypatch.setattr(module, "get_settings", _exploding)
 
     run_autonomous_checks(FakeSmartAPI(), FakeOptionFinder(None), _make_trade_manager(), db=db)
+
+
+def test_run_autonomous_checks_blocks_new_entries_at_the_dedicated_3pm_cutoff(monkeypatch):
+    # Deliberately EARLIER than the shared Settings > General square-off
+    # time (15:15 default) other strategies use -- _TRADING_END is a
+    # dedicated, decoupled constant for this strategy alone (see its own
+    # comment in app/ai/autonomous.py).
+    import app.ai.autonomous as module
+    from app.ai.repository import create_settings
+
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 15, 0, tzinfo=IST))
+    db = _make_session()
+    db.add(_make_index())
+    create_settings(db, id=1, enabled=True, mode="LIVE", provider="openai")
+    db.commit()
+
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider",
+                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("no new entries at/after the 3pm cutoff")))
+
+    run_autonomous_checks(FakeSmartAPI(), option_finder, _make_trade_manager(), db=db)
+
+    assert option_finder.calls == 0
+
+
+def test_run_autonomous_checks_still_enters_before_the_3pm_cutoff(monkeypatch):
+    import app.ai.autonomous as module
+    from app.ai.repository import create_settings
+
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 12, 0, tzinfo=IST))
+    db = _make_session()
+    db.add(_make_index())
+    create_settings(db, id=1, enabled=True, mode="LIVE", provider="openai")
+    db.commit()
+
+    option_finder = FakeOptionFinder(_make_contract())
+    calls = []
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: calls.append(1) or module._RawCall('{"decision": "NONE", "reasoning": "nothing clear"}', None, 5.0),
+    )
+
+    run_autonomous_checks(FakeSmartAPI(price=57000.0), option_finder, _make_trade_manager(), db=db)
+
+    # The model WAS actually asked (declined) -- confirms 12:00 IST is
+    # correctly inside the trading window, not just "no trade opened" which
+    # would also be true if the cycle were skipped entirely.
+    assert len(calls) == 1
