@@ -295,6 +295,110 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Does AI Origination's exit construction show the same win/loss asymmetry the holdout found? Tooling built, not run (31 Aug 2026)
+
+**Requested**: second of the two "improve directional edge" angles agreed the same session ("Lets check
+both one by one") -- the first (`scripts/validated_setup_window_backtest.py`, previous entry) checks
+whether live decisions correlate with the one validated entry signal; this one checks the exit side. The
+31 Jul holdout test on that same entry signal, replayed as a rule-based strategy over 2-year archived
+candles, found win rate was fine (52-59%) but the win/loss RATIO was not (0.53-0.68) -- average win ~6%
+because the 8%/5% trail/target exits fired well before the wider fixed stop, average loss ~9-11% because
+the stop rarely got there first. That finding is about a simulated rule-based-strategy replay, a
+different exit engine from AI Origination's own (`STOPLOSS`/`TARGET`/`TRAIL_EXIT`/`STALL_EXIT`/`TIME_EXIT`,
+see CLAUDE.md's "Exit paths (AI Origination)" table) -- so whether the same asymmetry actually shows up
+in AI Origination's real trades is a genuinely separate, unanswered question, not something the holdout
+result can be assumed to transfer.
+
+**Built**: `scripts/exit_construction_check.py`. Reads every closed AI Origination trade (`origin LIKE
+'AI_ORIGIN_%'`) and reports, overall and broken down by `exit_reason`, the same shape the holdout finding
+used -- win rate, mean win % (wins only), mean |loss| % (losses only), and their ratio -- so it is
+directly comparable to the 0.53-0.68 figure. A bootstrap 90% CI on `mean(|loss|) - mean(win)` tests
+whether any asymmetry found is reliable rather than noise, same `MIN_BUCKET_LIVE=20` trust minimum and
+resampling shape as every other backtest in this project. **Deliberately descriptive, not a candidate-
+threshold sweep** -- no gate, stop/target/trail parameter, or exit-logic change is proposed or built here,
+only a measurement of whether the asymmetry is present, which is the real input a genuine exit-
+construction decision would need before touching `app/ai/originator.py`'s stop/target/trail constants.
+
+7 new tests (`tests/test_exit_construction_check.py`): the population filter (AI Origination only, closed
+only, excludes still-open trades), `exit_reason`/`result` read correctly, the win/loss-ratio computation
+against a hand-computed example, the zero-entries case, the bootstrap helper, and `run_check`'s empty-
+population and mixed-exit-reason smoke paths. Full suite: 581 passed (was 574). `python -c "import
+app.main"` and `python -c "import scripts.exit_construction_check"` both import cleanly; `python -m
+scripts.exit_construction_check --help` renders without error.
+
+**Not run** -- same standing constraint as every backtest script in this project. Run on the machine with
+real history:
+
+```bash
+python -m scripts.exit_construction_check --db data/trading.db
+```
+
+Read the per-exit-reason breakdown and the bootstrap CI before concluding anything. If `TARGET`/
+`TRAIL_EXIT` mean wins are meaningfully smaller than `STOPLOSS` mean losses, with the CI excluding zero
+and both sides at or above the trust minimum, that's real, sample-adequate evidence the same asymmetry
+the holdout found is costing AI Origination too -- and the next step would be a genuine, backtested
+proposal for widening the trail/target relative to the stop, not a unilateral parameter change. If the
+CI crosses zero or the sample is thin, "not yet enough evidence" is the correct, expected outcome at
+AI Origination's current history depth, same as every other live-history backtest in this project. **No
+change to `app/ai/originator.py`'s exit construction has been made or proposed from this pass.**
+
+### Does AI Origination's live trading exploit the one validated setup+window edge? Tooling built, not run (31 Aug 2026)
+
+**Requested**: after a real losing day (Bank Nifty -₹2226, 0W-1L; Nifty +₹24, 1W-0L), asked "what should we
+do to improve directional edge." Answered from this project's own backtest history rather than proposing
+something new: almost every candidate entry filter tried (ADX, DI-direction, trend-age, break-confirmation,
+reasoning-hedge) came back unsupported or inconclusive -- the one signal that has actually survived every
+check (31 Jul walk-forward, both indices, 6 windows) is midday setups (EMA_STACK/ST_ALIGNED/ORB_BREAK/
+PDH_PDL_BREAK) between 11:00-14:00 IST. The holdout test on exactly that signal found the entry timing
+wasn't the problem (win rate 52-59%) -- the risk construction was (win/loss ratio 0.53-0.68, average win
+~6% capped by trail/target exits against average loss ~9-11%). Offered two next steps: (a) check whether
+AI Origination's live decisions actually correlate with that validated combination, since the model already
+sees these setups in its prompt but nothing has ever measured whether it's using them; (b) revisit the
+exit/risk construction itself, since that's where the project's own numbers say the edge is being spent.
+User: "Lets check both one by one." This entry is (a).
+
+**Built**: `scripts/validated_setup_window_backtest.py`. For every closed AI Origination trade, reads its
+own logged `setups` (JSON list, already persisted per decision by `record_decision()`) and its own decision
+timestamp, and classifies it "validated" if BOTH a direction-matched setup from the 31 Jul finding was
+active (`EMA_STACK_UP`/`ST_ALIGNED_UP`/`ORB_BREAK_UP`/`PDH_BREAK` for `BUY_CE`;
+`EMA_STACK_DOWN`/`ST_ALIGNED_DOWN`/`ORB_BREAK_DOWN`/`PDL_BREAK` for `BUY_PE` -- `PDH_BREAK`/`PDL_BREAK`
+carry no `_UP`/`_DOWN` suffix, each is inherently one direction per `app/market_context.py`'s own naming)
+AND the decision fell inside 11:00-14:00 IST. Reuses the `db_timestamp_to_ist()` shift and MFE/MAE-from-
+ticks derivation every other real-history backtest in this project already uses (plain `sqlite3` reads a
+`DateTime(timezone=True)` column back with no offset marker, so the +5:30 shift always applies; ticks are
+used over `highest_price`/`lowest_price` since those columns are only reliably maintained since the 24 Aug
+fix and this population spans both sides of it). Same `MIN_BUCKET_LIVE=20` trust minimum and bootstrap
+90% CI shape as every other backtest tonight.
+
+Unlike most `setup_significance`-style scripts in this project, this is **not** an index-direction-only
+proxy -- it reads real closed trades with real premium P&L, since it only needs data already attached to
+trades that opened, not a reconstruction of what a blocked decision would have traded.
+
+14 new tests (`tests/test_validated_setup_window_backtest.py`): the timestamp shift, `_is_validated`'s
+direction-matching (including the no-suffix `PDH_BREAK`/`PDL_BREAK` asymmetry and the window's inclusive-
+start/exclusive-end boundary), `_load_entries` correctly marking validated vs not, MFE/MAE from ticks,
+the population filter (excludes `NONE` decisions and still-`OPEN` trades), the bootstrap helper, and
+`run_backtest`'s empty-population and mixed-population smoke paths. Full suite: 574 passed (was 560).
+`python -c "import app.main"` and `python -c "import scripts.validated_setup_window_backtest"` both import
+cleanly; `python -m scripts.validated_setup_window_backtest --help` renders without error.
+
+**Not run** -- same standing constraint as every backtest script in this project: this sandbox's
+`data/trading.db` has no schema. Run on the machine with real history:
+
+```bash
+python -m scripts.validated_setup_window_backtest --db data/trading.db
+```
+
+Read the bootstrap CI before concluding anything. A reliably-better "validated" bucket (CI excludes zero,
+both sides at or above the trust minimum) means the model is actually getting real value from the one
+signal this project has confirmed works; a reliably-worse or null result would mean the other signals it
+also weighs (most already found not predictive on their own) are diluting it, or that a real trade's
+entry timing doesn't line up with the setup+window combination as cleanly as the archived-candle backtest
+did. Given AI Origination's real history is still only a couple of months deep, expect a thin sample on
+the first run -- "not yet enough evidence" is the expected, correct outcome here, same as every other
+live-history backtest in this project. **Angle (b) -- revisiting the exit/risk construction -- is the
+next piece, not started in this pass.**
+
 ### "Today's activity" replaced with "Today's Highlights" -- AI Origination only, since strategies are no longer used (28 Aug 2026)
 
 **Requested**: "Today's activity just shows bnv7 started and bnv closed like messages. Dont show that
