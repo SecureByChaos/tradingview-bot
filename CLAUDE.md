@@ -295,6 +295,62 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Does entry freshness (trend age) predict AI Origination's win rate? Tooling built, not run (31 Aug 2026)
+
+**Requested**: after a real losing day (4 closed trades, -₹5737 net, 25% win rate), read the actual CSV
+export together. Two of the four losses were entered on very FRESH trends (`trend_duration_pct_of_session`
+4.8% and 3.2% -- 2-3 bars old); one had an MFE that never even turned positive before hitting stop. A
+third loss was on a moderately mature trend (62.5%) where the model's own reasoning explicitly named
+"the move is extended" and traded anyway. The single win was on a FULLY mature trend (100% of session).
+That is the *opposite* pattern from what every trend-age mechanism this project has built (the soft
+prompt caution, the 26 Aug self-consistency requirement, the repeatedly-shelved hard gate) exists to
+guard against -- all of them worry about the model treating an already-mature move as fresh. Nobody has
+ever tested the mirror-image question: are fresh entries any less reliable than mature ones, on AI
+Origination's own real trade history. User, after expressing real frustration at a stretch of losses:
+"I want to win" / "Do it. Just make me win." Answered plainly before building anything: there is no
+shortcut tonight, wanting to win is not evidence, and shipping an unvalidated change under that pressure
+is exactly the mistake this project's own history warns against. What's actually on offer is the same
+discipline as every other backtest here -- measure first, ship nothing until a real sample confirms it.
+
+**Built**: `scripts/trend_freshness_check.py`. For every closed AI Origination trade, reads its own
+logged `trend_duration_pct_of_session` (plus `trend_duration_bars`/`move_extent_atr` for context) from
+the `ai_origination_logs` row joined via `trade_id` -- the exact value the model's own prompt showed it
+at decision time, nothing recomputed. Buckets on `trend_duration_pct_of_session` (`<10%` very fresh,
+`10-40%` developing, `40-70%` moderately mature, `>=70%` fully mature -- explicit starting points, not
+validated, same status every new threshold in this project carries before a backtest looks at it).
+Reports win rate/mean P&L/mean MFE/MAE per bucket, plus a bootstrap 90% CI comparing the `<10%` bucket
+against everything else -- same `MIN_BUCKET_LIVE=20` trust minimum and MFE/MAE-from-ticks derivation as
+every other real-history backtest in this project. A trade with no recorded trend-age field is reported
+separately and excluded from every comparison, never defaulted to a side.
+
+**Deliberately descriptive.** No gate, threshold, or prompt change is proposed or built here -- this is
+the measurement a real decision would need first. If `<10%` comes back reliably worse (CI excludes zero,
+both sides at or above the trust minimum), that would be real, specific support for a minimum-trend-age
+floor -- a genuinely new idea, not a rehash of the freshness-resolution work already shipped, since that
+work only ever addressed the model *misdescribing* an old move as new, never whether young moves are
+themselves less reliable. If the CI crosses zero, "not yet enough evidence" is the correct, expected
+outcome given AI Origination's real history is still only a couple of months deep -- not a failure of
+the check, and not something to override with a same-day gate.
+
+10 new tests (`tests/test_trend_freshness_check.py`): the four bucket boundaries, `_load_entries` reading
+the trend-age fields correctly, MFE/MAE from ticks matching the trigger trades' own real numbers, the
+population filter (excludes `NONE` decisions and still-open trades), missing-trend-age entries reported
+separately, the bootstrap helper, and `run_check`'s empty-population and mixed-bucket smoke paths. Full
+suite: 591 passed (was 581). `python -c "import app.main"` and `python -c "import scripts.trend_
+freshness_check"` both import cleanly.
+
+**Not run** -- same standing constraint as every backtest script in this project. Run on the machine
+with real history:
+
+```bash
+python -m scripts.trend_freshness_check --db data/trading.db
+```
+
+Read the bootstrap CI before concluding anything, and remember today's 4-trade pattern is exactly that
+-- one day, not evidence on its own. This needs real sample size before it means anything, and per this
+project's own discipline, "not yet enough evidence" on the first run is the expected, correct outcome,
+not a disappointment. **No change to `app/ai/originator.py` has been made or proposed from this pass.**
+
 ### Does AI Origination's exit construction show the same win/loss asymmetry the holdout found? Tooling built, not run (31 Aug 2026)
 
 **Requested**: second of the two "improve directional edge" angles agreed the same session ("Lets check
