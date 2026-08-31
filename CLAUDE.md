@@ -295,6 +295,59 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI square-off tightened to 3pm, decoupled from the shared platform setting (31 Aug 2026)
+
+**Requested**, same day as the entry above, after asking whether Autonomous AI is gated to market hours
+(it is -- `check_market_hours()`, same as every other AI job): *"Make work till 3 pm only... should not
+[take] fake trades after 3 pm and square off at 3 pm only."* Confirmed via `AskUserQuestion` this should
+scope to Autonomous AI alone, not the shared `PlatformSettings.square_off_time` (15:15 default) every
+rule-based strategy, AI Origination, and Validated Signal also read -- changing that shared value would
+have silently moved the exit time for strategies that are currently profitable and have real trading
+history, which this project's own standing discipline treats as something to never touch casually.
+
+**Implementation**: new module constant `_TRADING_END = (15, 0)` in `app/ai/autonomous.py`, deliberately
+NOT wired to `PlatformSettings.square_off_time` -- a plain constant rather than a new admin-configurable
+field, since only this one strategy needs it. Two effects, both from this single constant:
+
+- **Entries**: `run_autonomous_checks` now compares against `_TRADING_END` instead of the shared
+  `platform_settings.square_off_time`, so no new position opens at or after 3pm regardless of what the
+  general Settings > General square-off time is configured to.
+- **Exits**: `check_autonomous_exits` gained a hard, unconditional branch -- at or after `_TRADING_END`,
+  every open `AUTONOMOUS_AI` position is closed immediately via `ExitReason.TIME_EXIT`, with **no model
+  call at all**. This is a real behavioral change from the entry above: previously the model's own HOLD
+  answer could keep a position open right up to the shared 15:15 mechanical backstop; now 3pm is a hard
+  cutoff the model cannot override by saying HOLD, checked before the per-cycle AI exit call, not after.
+
+**Two square-off layers now, not one, and the docstring says so.** The 3pm cutoff inside
+`check_autonomous_exits` is the intended, normal path. `monitor_open_trades`' shared `TIME_EXIT` at the
+platform's own square-off time (15:15 default) still exists underneath as a second, later fallback --
+it would only ever fire if this strategy's own job failed to run for a whole cycle (scheduler down, an
+unhandled error). Nothing in `app/multi_strategy.py` was touched to make this true; the shared branch's
+existing origin-agnostic `TIME_EXIT` check already covered `AUTONOMOUS_AI` before this pass, and still
+does, unchanged.
+
+5 new tests in `tests/test_autonomous_ai.py` (31 -> 36): three at the `check_autonomous_exits` level --
+the forced square-off fires exactly at 15:00 and after (15:07) with the model never called (an exploding
+`_call_provider` stand-in confirms this), and does NOT fire one minute before (14:59, the existing
+HOLD-respecting path still runs) -- and two at the `run_autonomous_checks` end-to-end level, confirming
+the cycle itself blocks a new entry at 15:00 (`option_finder.calls == 0`) while still reaching a real
+entry decision at 12:00 (the model was actually asked, not just "no trade happened"). The four pre-existing
+`check_autonomous_exits` tests needed a frozen clock added (`monkeypatch.setattr(module, "utc_now", ...)`
+at a fixed 12:00 IST) since they now pass through the new cutoff comparison before reaching the behaviour
+they were actually testing -- same pattern `tests/test_nv1_dte_floor.py` already established elsewhere in
+this project for an analogous case. Full suite: 664 passed (was 659). `python -c "import app.main"` and
+`python -c "import app.ai.autonomous"` both import cleanly.
+
+The page's own banner (`app/templates/autonomous_ai.html`) updated to state the new 3pm cutoff plainly
+instead of the now-inaccurate "the same end-of-day square-off every trade in this app gets" line --
+re-screenshotted via Playwright/Chromium to confirm it renders correctly with real seeded data (no
+console errors from the page itself, same CDN-blocked-in-this-sandbox chart panels as before).
+
+**Not verified live** -- this sandbox cannot run a real 5-minute cycle across the 3pm boundary. After
+deploying, confirm no new `AUTONOMOUS_AI` trade opens after 15:00 IST, and confirm any position still
+open at 15:00 closes with `exit_reason='TIME_EXIT'` at that time specifically, not the later 15:15 the
+rest of the app still uses.
+
 ### Autonomous AI -- a fourth AI subsystem where the model decides both entry AND exit, no indicators, no signal (31 Aug 2026)
 
 **Requested**: same session as Validated Signal, directly after it merged -- "I also want to build another

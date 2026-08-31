@@ -57,13 +57,23 @@ SAFETY BACKSTOP -- THE MODEL'S OWN EXIT CALL IS NOT THE ONLY WAY OUT
 "Exits on its own" describes the INTENDED path, not the ONLY path. Every
 trade still gets a wide stop/target (_BACKSTOP_STOP_PERCENT /
 _BACKSTOP_TARGET_PERCENT, CE/PE-rescaled the same way every other strategy's
-stop is) and the same end-of-day square-off every trade in this app already
-gets. sl_mode=SLMode.FIXED with an origin that is neither "SIGNAL" nor
+stop is). sl_mode=SLMode.FIXED with an origin that is neither "SIGNAL" nor
 "AI_ORIGIN_*" means app.multi_strategy's shared monitor_open_trades branch
 already enforces this mechanically with no code change there -- confirmed by
 reading that function, the same way app.validated_signal's module docstring
-already confirmed it. These backstops are meant to almost never fire; the
-model's own per-cycle EXIT call is expected to act first in the overwhelming
+already confirmed it.
+
+Square-off is two layers, not one. The INTENDED cutoff is _TRADING_END
+(15:00 IST, dedicated to this strategy -- see that constant's own comment
+for why it is not the shared Settings > General square-off time every other
+strategy uses): check_autonomous_exits closes every open position
+unconditionally at or after that time, no model call, every ~5-minute
+cycle. The shared monitor_open_trades TIME_EXIT at the platform's own
+square-off time (15:15 default) is a second, later fallback only -- it
+would catch a position this module's own cutoff somehow missed (the
+scheduler down, this job erroring out for a whole cycle), not the normal
+path. These backstops are meant to almost never fire; the model's own
+per-cycle EXIT call is expected to act first in the overwhelming
 majority of cases. A cycle where the exit call errors or times out leaves
 the position open (fails to a no-op, not a forced exit) -- the backstop is
 what protects it, not a retry.
@@ -132,7 +142,20 @@ _BACKSTOP_STOP_PERCENT_NOMINAL = 35.0
 _BACKSTOP_TARGET_PERCENT_NOMINAL = 50.0
 
 _DEFAULT_TRADING_START = (9, 45)
-_DEFAULT_TRADING_END = (15, 15)
+
+# 31 Aug 2026: a dedicated, EARLIER cutoff for this strategy specifically --
+# "should not take trades after 3pm and square off at 3pm only". Deliberately
+# NOT the shared Settings > General square-off time (PlatformSettings.
+# square_off_time, 15:15 default) every other strategy in this app reads --
+# that setting is shared by the rule-based strategies, AI Origination, and
+# Validated Signal, and changing it would have moved their exit/square-off
+# time too. A plain module constant rather than a new admin-configurable
+# field, since only Autonomous AI needs it and this keeps the change scoped
+# to this module alone. Used both to block new entries at/after 15:00 and,
+# in check_autonomous_exits, to unconditionally square off every open
+# AUTONOMOUS_AI position at that time -- a hard cutoff the model's own HOLD
+# answer cannot override.
+_TRADING_END = (15, 0)
 
 SYSTEM_PROMPT_ENTRY = (
     "You are an autonomous options trading assistant running an independent, "
@@ -497,14 +520,20 @@ def check_autonomous_entry(
     return open_autonomous_trade(db, index, decision.action, decision.reasoning, smartapi, option_finder)
 
 
-def check_autonomous_exits(db: Session, trade_manager, settings: AISettings) -> None:
+def check_autonomous_exits(db: Session, trade_manager, settings: AISettings, end_hm: tuple[int, int]) -> None:
     """Re-asks the model, for every currently open AUTONOMOUS_AI trade,
     whether to HOLD or EXIT -- and actually closes the trade on EXIT via
     trade_manager.close_trade (the same helper monitor_open_trades' own
     backstop uses), so the two exit paths never disagree about how a close
     is recorded. A call that errors leaves the trade open -- see module
     docstring's "SAFETY BACKSTOP" section for why that's the safe default,
-    not a forced exit."""
+    not a forced exit.
+
+    At or past end_hm, every open position is squared off unconditionally
+    (ExitReason.TIME_EXIT) with no model call -- this is a hard cutoff, not
+    a suggestion the model can override by saying HOLD. See _TRADING_END's
+    own comment for why this is a dedicated, earlier cutoff rather than the
+    shared Settings > General square-off time every other strategy uses."""
     trades = list(
         db.scalars(
             select(StrategyTrade).where(
@@ -514,9 +543,22 @@ def check_autonomous_exits(db: Session, trade_manager, settings: AISettings) -> 
         )
     )
     now_ist = to_ist(utc_now())
+    past_cutoff = (now_ist.hour, now_ist.minute) >= end_hm
     for trade in trades:
         try:
             if trade.current_premium is None:
+                continue
+            if past_cutoff:
+                trade_manager.close_trade(db, trade, trade.current_premium, ExitReason.TIME_EXIT)
+                log_event(
+                    db, "AUTONOMOUS_AI",
+                    f"[{trade.strategy_name}] squared off at {end_hm[0]:02d}:{end_hm[1]:02d} IST cutoff",
+                    payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent},
+                )
+                logger.info(
+                    "[AUTONOMOUS_AI] %s squared off at %02d:%02d IST cutoff (%.2f%%)",
+                    trade.trade_id, end_hm[0], end_hm[1], trade.pnl_percent or 0.0,
+                )
                 continue
             user_prompt = _build_exit_prompt(trade, now_ist)
             raw = _call_provider(settings.provider, _provider_view(settings), SYSTEM_PROMPT_EXIT, user_prompt)
@@ -573,11 +615,11 @@ def run_autonomous_checks(
         # Exits first: closing a stale position before considering a fresh
         # entry means a freed-up index slot can be re-entered the same cycle
         # rather than waiting a full 5 minutes.
-        check_autonomous_exits(session, trade_manager, settings)
+        check_autonomous_exits(session, trade_manager, settings, _TRADING_END)
 
         platform_settings = get_or_create_settings(session)
         start_hm = parse_hhmm(platform_settings.trading_start_time, _DEFAULT_TRADING_START)
-        end_hm = parse_hhmm(platform_settings.square_off_time, _DEFAULT_TRADING_END)
+        end_hm = _TRADING_END
         now_ist = to_ist(utc_now())
         if (now_ist.hour, now_ist.minute) < start_hm or (now_ist.hour, now_ist.minute) >= end_hm:
             return
