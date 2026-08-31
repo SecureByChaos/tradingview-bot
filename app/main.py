@@ -26,6 +26,7 @@ from app.platform import get_or_create_settings, get_or_create_strategy_stats, l
 from sqlalchemy import select
 from app.risk import RiskProtectionService
 from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
+from app.ai.autonomous import run_autonomous_checks
 from app.ai.originator import run_origination_checks
 from app.live_feed import IndexFeed, LiveFeedStore
 from app.market_data import capture_closing_auction
@@ -89,6 +90,7 @@ scheduler = create_scheduler(
     ),
     option_chain_interval_minutes=settings.option_chain_interval_minutes,
     closing_auction_job=lambda: capture_closing_auction(smartapi, SessionLocal),
+    autonomous_job=lambda: run_autonomous_checks(smartapi, option_finder, multi_strategy_manager, live_feed_store),
 )
 health_manager.scheduler = scheduler
 

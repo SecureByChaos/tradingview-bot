@@ -889,6 +889,20 @@ def get_validated_signal_trades(db: Session) -> list[StrategyTrade]:
     )
 
 
+def get_autonomous_ai_trades(db: Session) -> list[StrategyTrade]:
+    """All Autonomous AI trades (app.ai.autonomous), open and closed, newest
+    first -- the sole population behind the /autonomous-ai page. Same exact
+    == match convention as get_validated_signal_trades, for the same reason:
+    one single fixed origin value, not a provider-suffixed family."""
+    return list(
+        db.scalars(
+            select(StrategyTrade)
+            .where(StrategyTrade.origin == "AUTONOMOUS_AI")
+            .order_by(StrategyTrade.entry_time.desc())
+        )
+    )
+
+
 def get_ai_origination_today_highlights(db: Session) -> dict[str, Any]:
     """Replaces the old SIGNAL-strategy activity feed (get_today_activity,
     removed 28 Aug 2026) now that AI Origination is the only thing actually

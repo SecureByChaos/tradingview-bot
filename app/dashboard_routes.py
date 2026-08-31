@@ -38,6 +38,7 @@ from app.platform import (
     strategy_metrics,
     strategy_trades_query_for_filter,
     get_validated_signal_trades,
+    get_autonomous_ai_trades,
 )
 from sqlalchemy import func, select
 from app.signal_validation import check_market_hours
@@ -239,6 +240,35 @@ def validated_signal_page(
     performance = compute_performance_kpis(closed_trades)
     return templates.TemplateResponse(
         "validated_signal.html",
+        {
+            "request": request,
+            "trades": trades,
+            "open_trades": open_trades,
+            "closed_count": len(closed_trades),
+            "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
+            **performance,
+        },
+    )
+
+
+@router.get("/autonomous-ai", response_class=HTMLResponse)
+def autonomous_ai_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    """Dedicated tracking page for app.ai.autonomous -- a separate strategy
+    where the model decides both entries and exits itself, with no technical
+    indicators and no external trading signal (see that module's own
+    docstring for the full design and its known, named risks). All-time, no
+    filters, same reasoning as /validated-signal: the population is small
+    and new by construction."""
+    trades = get_autonomous_ai_trades(db)
+    open_trades = [trade for trade in trades if trade.status == TradeStatus.OPEN]
+    closed_trades = [trade for trade in trades if trade.status == TradeStatus.CLOSED]
+    performance = compute_performance_kpis(closed_trades)
+    return templates.TemplateResponse(
+        "autonomous_ai.html",
         {
             "request": request,
             "trades": trades,

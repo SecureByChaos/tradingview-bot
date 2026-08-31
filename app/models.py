@@ -32,6 +32,13 @@ class ExitReason(str, Enum):
     # them together would make the trailing-stop change unmeasurable -- you
     # could not tell a rescued winner from a plain loss in exit_reason.
     TRAIL_EXIT = "TRAIL_EXIT"
+    # Autonomous AI only (app.ai.autonomous) -- the model's own voluntary
+    # HOLD/EXIT decision, re-asked every cycle, actually closing the trade.
+    # Distinct from STOPLOSS/TARGET (the wide safety-net backstop that
+    # mechanically closes a trade the model never got around to exiting) so
+    # reporting can tell "the model chose to leave" from "the backstop had to
+    # catch it".
+    AI_DISCRETION_EXIT = "AI_DISCRETION_EXIT"
 
 
 class WebhookPayload(BaseModel):
