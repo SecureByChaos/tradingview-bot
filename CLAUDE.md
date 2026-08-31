@@ -295,6 +295,120 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Validated Signal -- a new, deterministic, paper-only strategy, plus its own tracking page (31 Aug 2026)
+
+**Requested**: after a string of AI Origination losses and the entry-freshness investigation directly
+below this one, "build a new strategy which can win... make a separate strategy for paper trading...
+analyse all the strategies available and make a solid strategy out of it... I give you a free hand
+whatever you want. Just build best strategy."
+
+**That request cannot be honestly delivered as stated, and was not.** Nothing in this project's two years
+of backtesting -- a spent holdout, dozens of candidate gates, most rejected -- has found a strategy proven
+to win, and no amount of design effort in one session changes that. Said so directly before building
+anything. What was built instead: the single entry signal this project's own backtesting has actually
+found and replicated, wired up as its own small, fully isolated, deterministic, paper-only strategy so it
+can be watched against real live conditions -- explicitly not a guarantee, reported as such everywhere it
+appears (the strategy's own module docstring, the trade's own stored `ai_reasoning`, and the new page's
+own banner).
+
+**The signal**: EMA_STACK / ST_ALIGNED / ORB_BREAK / PDH_PDL_BREAK, direction-matched, between 11:00 and
+14:00 IST -- the 31 Jul 2026 walk-forward finding (see "Indicator setups showed a fit-window edge" /
+"Walk-forward revised this" above), the only candidate in this project's entire backtest history to clear
+a Bonferroni threshold across six windows on both indices. `app.validated_signal.validated_action()`
+reads `market_context.setups` (the same dict AI Origination's own prompt already shows the model every
+cycle -- no new indicator math) and returns `BUY_CE`/`BUY_PE`/`None`, failing closed on every ambiguous
+case: no context, outside the window, no direction-matched setup active, or both directions active at
+once (a genuine conflict, not something to guess through).
+
+**Why this is not just the holdout strategy replayed live.** The 31 Jul holdout test replayed this exact
+signal with an 8%-activate/5%-width trail and a 20% target, and failed -- not on win rate (52-59%, fine)
+but on win/loss RATIO (0.53-0.68): the trail closed winners around ~6% while losers ran to the full
+~9-11% stop, because the trail exited well before the wider fixed stop could. This strategy deliberately
+uses `sl_mode=FIXED` with an origin that is neither `SIGNAL` nor `AI_ORIGIN_*` -- confirmed by reading
+`monitor_open_trades` (`app/multi_strategy.py`), that combination gets a plain stop/target/time-exit only,
+since trailing and `STALL_EXIT` are both explicitly gated to `trade.origin.startswith("AI_ORIGIN_")` in
+that function. A winner here runs uninterrupted until it hits the target or the session ends -- no code
+change to `multi_strategy.py` was needed at all, this behavior falls out of the origin/sl_mode choice.
+This directly removes the mechanism the holdout blamed, which is a real, reasoned change from what already
+failed -- but the stop (12%, matching the user's own current AI Origination max-stop setting) and target
+(20%, matching the holdout's own target so the *change under test* is isolated to "no early trail-clip",
+not also a different target) are still a starting choice, not a backtested pair, and are named as such
+everywhere.
+
+**Where it runs**: hooked into AI Origination's existing 5-minute cycle (`app.ai.originator.
+run_origination_checks`, right after the `[AI][ORIGIN][CTX]` log line) rather than a separate poller --
+reuses the `market_context` already built that cycle, so this costs zero additional SmartAPI calls beyond
+the contract-resolution/LTP calls a real entry actually needs. The call is wrapped in its own try/except
+at the call site specifically so a failure here can never take down AI Origination's own per-provider
+decision loop that follows it -- same isolation this project applies to every other subsystem sharing a
+cycle (see "Market Conditions panel froze" above for why that isolation matters in practice).
+
+**Isolation**: `origin="VALIDATED_SIGNAL"` -- neither `SIGNAL` (so it never touches risk locks, stats, or
+Telegram) nor `AI_ORIGIN_*`/`AI_ALT_*` (so it's never counted in any existing AI Origination report,
+backtest, or dashboard filter -- confirmed by grep that every existing `AI_ORIGIN_%`/`origin ==
+"SIGNAL"` query in this codebase is unaffected). Its own fourth-plus population, matched with `==`, never
+`LIKE`, since it's one single fixed value rather than a provider-suffixed family.
+
+**Structurally paper-only, stricter than AI Origination's own two-key gate.** `mode` is hardcoded to
+`TradingMode.PAPER`; `smartapi.place_market_order` is never called anywhere in `app/validated_signal.py`
+-- there is no live-order code path to gate in the first place, not just one that's off by default. This
+construction has not earned the option to risk real money, so the option does not exist in the code.
+
+**One position at a time per index** (`_has_open_validated_trade`) -- this is a single deterministic
+engine, not multiple independent providers each entitled to their own slot the way AI Origination's
+Claude/OpenAI split works, so there's no analogous reason to allow more than one open position per index.
+
+**New tracking page, `/validated-signal`** (nav link added next to Trade History). All-time, no filters --
+the population is small and new by construction, so a date/origin filter would be UI for a table with
+nothing yet to filter. Reuses `compute_performance_kpis()` unmodified (the same capital-weighted KPI
+function fixed for Trade History on 28 Aug) via a new `get_validated_signal_trades()` helper in
+`app/platform.py` (`origin == "VALIDATED_SIGNAL"`, open and closed, newest first). Shows: an explicit
+"what this is / what this is not" banner restating the caveats above in plain language (not just in code
+comments no one but a future Claude session will read), the same KPI/equity-curve/daily-P&L/win-loss chart
+set Trade History uses, an open-position card per open trade (strike, entry/current premium, stop,
+target, the matched-setups reasoning text), and a full trade history table.
+
+29 new tests: `tests/test_validated_signal.py` (22 -- `validated_action`'s window boundaries [11:00
+inclusive, 14:00 exclusive] and direction-matching including the no-suffix `PDH_BREAK`/`PDL_BREAK`
+asymmetry and the both-directions-active ambiguous case, `_has_open_validated_trade`'s isolation from
+other origins/indices/closed trades, `open_validated_trade`'s stop/target computation and matched-setups
+text, the DTE-floor/contract-resolution/missing-LTP decline paths, and confirmation the fake SmartAPI's
+`place_market_order` -- which raises if ever called -- is never touched), `tests/test_validated_signal_
+trades_query.py` (4 -- the new platform helper's origin isolation and ordering), and `tests/test_
+validated_signal_hook.py` (3 -- an end-to-end open through `run_origination_checks` with a stubbed option
+finder, confirming a broken Validated Signal check does NOT take down AI Origination's own decision loop
+in the same cycle, and confirming the hook is a genuine no-op -- never touches the option finder at all --
+when no setup matches). Full suite: 621 passed (was 592). `python -c "import app.main"` and
+`python -c "import app.validated_signal"` both import cleanly.
+
+**Verified live**: seeded a scratch SQLite DB with one open and three closed `VALIDATED_SIGNAL` trades (a
+realistic mix of wins/losses across both indices) and screenshotted the actual rendered `/validated-signal`
+page via Playwright/Chromium (pre-installed in this sandbox). Confirmed: the nav link highlights
+correctly, the banner renders, KPI cards show the correct capital-weighted numbers (2.62% net return,
+₹398.18 net P&L, 67% win rate matching 2/3 closed wins, -19.76% max drawdown), the open-position card
+shows real entry/current/stop/target/reasoning, and the trade table renders all four trades with correct
+P&L/exit-reason/result columns. No JS console errors. The three Chart.js panels rendered empty --
+confirmed this is the sandbox's egress proxy blocking `cdnjs.cloudflare.com` entirely (same CDN dependency
+Trade History's own charts already use), not a defect in this page's own data: `curl` to the same CDN URL
+fails with `connect_rejected` independent of this change.
+
+**Not verified against real live conditions** -- this sandbox cannot run a real origination cycle end to
+end. After deploying: confirm `/validated-signal` shows real activity only inside the 11:00-14:00 IST
+window on a day the matched-setup combination is genuinely active (correctly silent otherwise -- this is
+a narrow, deliberately rare-firing strategy, not a replacement for AI Origination's own broader trading),
+confirm the charts render for real once `cdnjs.cloudflare.com` is reachable from production, and watch the
+first few real trades' stored `stoploss`/`target` against their `entry_price` to confirm the 12%/20%
+fixed construction is behaving as designed (no trail, no early exit before stop or target).
+
+**What this is not, restated once more here rather than only in the code**: a validated strategy, or a
+promise of a win. Every number this strategy produces from here forward is a live, ongoing measurement
+with no minimum sample size met yet -- exactly the same "not yet enough evidence" standard this project
+holds every other backtest to, now running in real time instead of against archived history. If real
+results eventually clear the same bootstrap-CI bar (a reliable edge, both sides at or above the trust
+minimum) every other gate and signal in this project has been held to before being trusted, that would be
+the first genuinely validated strategy this project has produced -- and until then, "we don't know yet" is
+the correct, honest answer to "does this win," not something this pass tries to shortcut around.
+
 ### Does entry freshness (trend age) predict AI Origination's win rate? Tooling built, not run (31 Aug 2026)
 
 **Requested**: after a real losing day (4 closed trades, -₹5737 net, 25% win rate), read the actual CSV

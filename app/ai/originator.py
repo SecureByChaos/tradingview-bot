@@ -33,6 +33,7 @@ from app.platform import get_or_create_settings, list_index_configs, log_event, 
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
 from app.time_utils import format_ist, parse_hhmm, to_ist, utc_now
+from app.validated_signal import check_validated_signal
 
 logger = logging.getLogger(__name__)
 
@@ -1568,6 +1569,21 @@ def run_origination_checks(
                     market_context.cpr.classification if market_context.cpr else None,
                     sorted(k for k, v in market_context.setups.items() if v),
                 )
+
+                # Validated Signal: a separate, deterministic, paper-only
+                # strategy (app.validated_signal) reusing the market_context
+                # already built above -- zero extra SmartAPI cost. Wrapped in
+                # its own try/except so a failure here can never take down
+                # AI Origination's own per-provider decision loop right below
+                # it -- same isolation this project applies to every other
+                # subsystem sharing this cycle.
+                try:
+                    check_validated_signal(session, index, market_context, now_ist, smartapi, option_finder)
+                except Exception:
+                    logger.exception(
+                        "[VALIDATED_SIGNAL] %s: check failed, isolated from AI Origination's own cycle",
+                        index.symbol,
+                    )
 
                 provider_evaluated = False
                 for turn, provider_name, view in provider_order:

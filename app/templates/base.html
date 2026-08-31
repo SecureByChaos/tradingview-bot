@@ -19,6 +19,7 @@
       {% set path = request.url.path %}
       <a class="{% if path == '/' %}active{% endif %}" href="/">Dashboard</a>
       <a class="{% if path == '/history' %}active{% endif %}" href="/history">Trade History</a>
+      <a class="{% if path == '/validated-signal' %}active{% endif %}" href="/validated-signal">Validated Signal</a>
       <a class="{% if path == '/smartapi-health' %}active{% endif %}" href="/smartapi-health">SmartAPI Health</a>
       <a class="{% if path == '/control' %}active{% endif %}" href="/control">Bot Control</a>
       <a class="{% if path == '/settings' %}active{% endif %}" href="/settings">Settings</a>
