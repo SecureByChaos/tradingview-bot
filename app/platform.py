@@ -874,6 +874,20 @@ def get_open_trades_with_ticks(db: Session, tick_limit: int = 20) -> list[dict[s
     return result
 
 
+def get_validated_signal_trades(db: Session) -> list[StrategyTrade]:
+    """All Validated Signal trades (app.validated_signal), open and closed,
+    newest first -- the sole population behind the /validated-signal page.
+    origin == "VALIDATED_SIGNAL" exactly (not a LIKE match) since it is one
+    single fixed value, not a family of provider-suffixed values the way
+    AI_ORIGIN_*/AI_ALT_* are."""
+    return list(
+        db.scalars(
+            select(StrategyTrade)
+            .where(StrategyTrade.origin == "VALIDATED_SIGNAL")
+            .order_by(StrategyTrade.entry_time.desc())
+        )
+    )
+
 
 def get_ai_origination_today_highlights(db: Session) -> dict[str, Any]:
     """Replaces the old SIGNAL-strategy activity feed (get_today_activity,

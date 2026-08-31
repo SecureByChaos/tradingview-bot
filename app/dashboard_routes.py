@@ -37,6 +37,7 @@ from app.platform import (
     signal_strategy_names,
     strategy_metrics,
     strategy_trades_query_for_filter,
+    get_validated_signal_trades,
 )
 from sqlalchemy import func, select
 from app.signal_validation import check_market_hours
@@ -215,6 +216,35 @@ def history(
             "strategy_names": signal_strategy_names(db),
             "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
             "closed_count": len(closed_trades),
+            **performance,
+        },
+    )
+
+
+@router.get("/validated-signal", response_class=HTMLResponse)
+def validated_signal_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    """Dedicated tracking page for app.validated_signal -- a separate,
+    deterministic, paper-only strategy built from this project's single
+    most evidence-backed entry signal (see that module's own docstring).
+    All-time, no filters: the whole population is small and new by
+    construction, so a date/origin filter would just be UI for a table with
+    nothing to filter yet."""
+    trades = get_validated_signal_trades(db)
+    open_trades = [trade for trade in trades if trade.status == TradeStatus.OPEN]
+    closed_trades = [trade for trade in trades if trade.status == TradeStatus.CLOSED]
+    performance = compute_performance_kpis(closed_trades)
+    return templates.TemplateResponse(
+        "validated_signal.html",
+        {
+            "request": request,
+            "trades": trades,
+            "open_trades": open_trades,
+            "closed_count": len(closed_trades),
+            "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
             **performance,
         },
     )
