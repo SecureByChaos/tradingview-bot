@@ -295,6 +295,53 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Does AI Origination's exit construction show the same win/loss asymmetry the holdout found? Tooling built, not run (31 Aug 2026)
+
+**Requested**: second of the two "improve directional edge" angles agreed the same session ("Lets check
+both one by one") -- the first (`scripts/validated_setup_window_backtest.py`, previous entry) checks
+whether live decisions correlate with the one validated entry signal; this one checks the exit side. The
+31 Jul holdout test on that same entry signal, replayed as a rule-based strategy over 2-year archived
+candles, found win rate was fine (52-59%) but the win/loss RATIO was not (0.53-0.68) -- average win ~6%
+because the 8%/5% trail/target exits fired well before the wider fixed stop, average loss ~9-11% because
+the stop rarely got there first. That finding is about a simulated rule-based-strategy replay, a
+different exit engine from AI Origination's own (`STOPLOSS`/`TARGET`/`TRAIL_EXIT`/`STALL_EXIT`/`TIME_EXIT`,
+see CLAUDE.md's "Exit paths (AI Origination)" table) -- so whether the same asymmetry actually shows up
+in AI Origination's real trades is a genuinely separate, unanswered question, not something the holdout
+result can be assumed to transfer.
+
+**Built**: `scripts/exit_construction_check.py`. Reads every closed AI Origination trade (`origin LIKE
+'AI_ORIGIN_%'`) and reports, overall and broken down by `exit_reason`, the same shape the holdout finding
+used -- win rate, mean win % (wins only), mean |loss| % (losses only), and their ratio -- so it is
+directly comparable to the 0.53-0.68 figure. A bootstrap 90% CI on `mean(|loss|) - mean(win)` tests
+whether any asymmetry found is reliable rather than noise, same `MIN_BUCKET_LIVE=20` trust minimum and
+resampling shape as every other backtest in this project. **Deliberately descriptive, not a candidate-
+threshold sweep** -- no gate, stop/target/trail parameter, or exit-logic change is proposed or built here,
+only a measurement of whether the asymmetry is present, which is the real input a genuine exit-
+construction decision would need before touching `app/ai/originator.py`'s stop/target/trail constants.
+
+7 new tests (`tests/test_exit_construction_check.py`): the population filter (AI Origination only, closed
+only, excludes still-open trades), `exit_reason`/`result` read correctly, the win/loss-ratio computation
+against a hand-computed example, the zero-entries case, the bootstrap helper, and `run_check`'s empty-
+population and mixed-exit-reason smoke paths. Full suite: 581 passed (was 574). `python -c "import
+app.main"` and `python -c "import scripts.exit_construction_check"` both import cleanly; `python -m
+scripts.exit_construction_check --help` renders without error.
+
+**Not run** -- same standing constraint as every backtest script in this project. Run on the machine with
+real history:
+
+```bash
+python -m scripts.exit_construction_check --db data/trading.db
+```
+
+Read the per-exit-reason breakdown and the bootstrap CI before concluding anything. If `TARGET`/
+`TRAIL_EXIT` mean wins are meaningfully smaller than `STOPLOSS` mean losses, with the CI excluding zero
+and both sides at or above the trust minimum, that's real, sample-adequate evidence the same asymmetry
+the holdout found is costing AI Origination too -- and the next step would be a genuine, backtested
+proposal for widening the trail/target relative to the stop, not a unilateral parameter change. If the
+CI crosses zero or the sample is thin, "not yet enough evidence" is the correct, expected outcome at
+AI Origination's current history depth, same as every other live-history backtest in this project. **No
+change to `app/ai/originator.py`'s exit construction has been made or proposed from this pass.**
+
 ### Does AI Origination's live trading exploit the one validated setup+window edge? Tooling built, not run (31 Aug 2026)
 
 **Requested**: after a real losing day (Bank Nifty -₹2226, 0W-1L; Nifty +₹24, 1W-0L), asked "what should we
