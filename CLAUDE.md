@@ -295,6 +295,130 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI -- a fourth AI subsystem where the model decides both entry AND exit, no indicators, no signal (31 Aug 2026)
+
+**Requested**: same session as Validated Signal, directly after it merged -- "I also want to build another
+page where ai will take its own decision regardless of any adx or signal. Just it take trades and exit on
+its own." Investigated before building: most of "regardless of any signal" already describes AI
+Origination -- it already opens on its own judgment with no TradingView signal, and there is no live ADX
+gate today (the one chop+ADX gate is off by default). The two genuinely new pieces: an entry prompt with
+*zero* indicator context (AI Origination's own prompt is built entirely from `market_context` -- regime,
+ADX, ATR, Supertrend, EMA stack, CPR, setups), and exits the model actually re-decides itself -- AI
+Origination's exits are mechanical (a stop/target percentage proposed once at entry, closed by
+`monitor_open_trades` when either is hit; it is never asked again).
+
+**Asked before building, since the exit design materially changes cost and architecture:**
+1. Exit method -- re-ask the model every cycle whether to hold or exit (real per-cycle LLM cost, genuinely
+   autonomous) vs. a fixed stop/target set once at entry (cheaper, same shape AI Origination already
+   uses). Chose: **re-ask every cycle.**
+2. Scope -- a new, fully isolated strategy (own page/origin/prompt, AI Origination's 600+ trades of
+   history untouched) vs. modifying AI Origination directly. Chose: **new, isolated strategy**, same
+   precedent as Validated Signal.
+
+**What the model sees at entry**: `app.platform.get_index_live_figures()` -- current price, change vs
+previous close, today's range -- the same numbers a human glancing at the dashboard's price ticker would
+see, reused rather than adding a second candle-fetch cost alongside AI Origination's own (prefers the free
+WebSocket feed, near-zero SmartAPI cost either way). No ADX, EMA, RSI, Supertrend, CPR, regime, or setups.
+`SYSTEM_PROMPT_ENTRY` (`app/ai/autonomous.py`) states this plainly to the model too, and that NONE is a
+completely acceptable answer most of the time.
+
+**A known risk, named rather than hidden**: this project's own 30 Jul 2026 two-year backtest ("AI
+Origination's entry signal does not work") already found *zero* positive directional edge in a 45-minute
+price-drift rule, on either index, at any horizon -- six of sixteen drift bands were reliably negative.
+The input this module gives the model (recent price action, nothing else) is the same class of signal
+that backtest already found doesn't predict direction. Genuine LLM judgment with the freedom to mostly say
+NONE is not the same as a mechanical drift rule replayed against archived candles, so the finding doesn't
+mechanically transfer -- but it means this module's own real results are a fair, still-open question, not
+a foregone conclusion either way. Said so directly in the module's own docstring and on the page itself,
+not just here.
+
+**Exits, the genuinely new mechanism**: every ~5 minutes, `check_autonomous_exits()` re-asks the model
+HOLD or EXIT for every open `AUTONOMOUS_AI` position (`SYSTEM_PROMPT_EXIT`, position's own numbers only --
+entry/current premium, running P&L, holding time -- again no indicators). An EXIT answer actually closes
+the trade via `MultiStrategyTradeManager.close_trade()` (the same helper `monitor_open_trades`'s own
+backstop uses, reused rather than reimplemented -- confirmed by reading it: `is_ai_alternative = trade.
+origin != "SIGNAL"` already correctly skips Telegram/strategy-stats/risk-lock for any non-SIGNAL origin,
+so this needed zero changes there either). A new `ExitReason.AI_DISCRETION_EXIT` distinguishes a voluntary
+model exit from the mechanical backstop firing, so reporting can always tell which one actually happened.
+
+**"Exits on its own" describes the intended path, not the only path.** Every trade still gets a wide
+backstop stop/target (35%/50% nominal, CE/PE-rescaled the same way every other strategy's stop is --
+`_BACKSTOP_STOP_PERCENT_NOMINAL`/`_BACKSTOP_TARGET_PERCENT_NOMINAL`, not backtested, a reasoned starting
+point same as every new threshold in this project) and the same end-of-day square-off every trade in this
+app already gets. `sl_mode=SLMode.FIXED` with an origin that is neither `SIGNAL` nor `AI_ORIGIN_*` means
+`monitor_open_trades`' shared branch enforces this mechanically with no code change there, same pattern
+Validated Signal already established. A cycle where the exit call errors or times out leaves the position
+open -- fails to a no-op, not a forced exit -- since the backstop is what protects it, not a retry.
+
+**Structurally paper-only**, same construction and same reasoning as Validated Signal: `mode` hardcoded to
+`TradingMode.PAPER`, `smartapi.place_market_order` never called anywhere in `app/ai/autonomous.py`. Of
+every experimental strategy in this project, this is the least validated and the most expensive to run
+wrong, so it gets the same strict treatment, not a lighter one.
+
+**Isolation**: `origin="AUTONOMOUS_AI"`, matched with `==`, its own population -- never counted in any AI
+Origination or Validated Signal report/backtest/dashboard filter. One open position at a time per index
+(`_has_open_autonomous_trade`), same reasoning as Validated Signal -- a single decision-maker, not
+multiple provider slots. Single-provider only (whichever `AISettings.provider` is configured) -- a
+deliberate scope decision, not an oversight: this module is already more expensive per-cycle than AI
+Origination without also adding a second Claude/OpenAI dimension on top.
+
+**Where it runs**: its own scheduler job, `autonomous-ai-check` (`app/scheduler.py`), same 5-minute
+cron/market-hours-gate shape as `ai-origination-check` -- NOT hooked into `run_origination_checks`, unlike
+Validated Signal. This needed its own price-context source (`get_index_live_figures`, not
+`market_context`) and its own per-open-trade exit loop, different enough in shape from originator.py's
+cycle that piggybacking would have meant threading a second, unrelated concern through an already long
+function. Wired into `app/main.py` alongside the other scheduler jobs, reusing the existing
+`multi_strategy_manager`/`live_feed_store` singletons rather than constructing new ones.
+
+**New tracking page, `/autonomous-ai`** (nav link next to Validated Signal). Same shape as Validated
+Signal's page (reuses `compute_performance_kpis()` via a new `get_autonomous_ai_trades()` helper in
+`app/platform.py`), plus an exit-reason badge distinguishing "AI discretion" from a backstop firing, and
+an explicit banner restating the design, the cost tradeoff, and the named risk above in plain language.
+Per-cycle hold/exit reasoning is logged via `log_event` (visible on the Logs page) rather than a new
+dedicated table -- a real per-cycle audit table like `AIOriginationLog` would be a reasonable future
+addition if this proves worth deepening, deliberately out of scope for this pass to keep the build bounded
+given it already adds a new, more expensive exit mechanism.
+
+37 new tests: `tests/test_autonomous_ai.py` (31 -- entry/exit response parsing including markdown-fence
+unwrapping, the no-indicator-language prompt check, the backstop-informational exit prompt, the one-
+position-per-index guard, `open_autonomous_trade`'s stop/target computation and DTE-floor/contract/LTP
+decline paths, `check_autonomous_entry`'s skip conditions (position already open, no live price, NONE
+decision, provider error) each confirmed to never touch the option finder, `check_autonomous_exits`'
+EXIT/HOLD/provider-error paths using the *real* `MultiStrategyTradeManager.close_trade` -- not a mock --
+confirming the reuse actually works and that Telegram is genuinely never touched (a `FakeTelegram.send`
+that raises if called), and isolation from other origins), `tests/test_autonomous_ai_trades_query.py` (4
+-- origin isolation and ordering, mirroring Validated Signal's own query test), and 2 new tests in
+`tests/test_scheduler.py` (the new cron job's schedule and its not-registered-without-a-job case, mirroring
+`ai-origination-check`'s own existing tests). Full suite: 659 passed (was 622). `python -c "import
+app.main"` and `python -c "import app.ai.autonomous"` both import cleanly -- 9 scheduled jobs now, not 8.
+
+**Verified live**: seeded a scratch SQLite DB with one open and two closed `AUTONOMOUS_AI` trades (one
+closed via `AI_DISCRETION_EXIT`, one via the `STOPLOSS` backstop) and screenshotted the actual rendered
+`/autonomous-ai` page via Playwright/Chromium. Confirmed: the nav link highlights correctly, the banner
+renders in full, KPI cards show the correct capital-weighted numbers, the open-position card shows real
+entry/current/backstop-stop/backstop-target/reasoning, and the trade table correctly badges the two exit
+reasons differently ("AI discretion" vs "STOPLOSS (backstop)"). No JS console errors from the page itself
+(the same CDN-blocked-in-this-sandbox console noise as Validated Signal's own verification, confirmed
+environmental not a page defect).
+
+**Not verified against real live conditions** -- this sandbox cannot run a real autonomous cycle end to
+end, and specifically cannot observe how either provider actually behaves when given this much less
+structured a prompt than AI Origination's own. After deploying: confirm the entry prompt genuinely never
+mentions an indicator (spot-check a few real `[AUTONOMOUS_AI]` log lines), confirm an EXIT decision
+actually closes the trade with `exit_reason='AI_DISCRETION_EXIT'` while a HOLD leaves it open, watch
+whether the backstop ever actually fires (it should be rare if the model's own exit calls are working as
+intended -- a high backstop-fire rate would mean the model is effectively not managing its own exits
+despite being asked), and watch API cost specifically -- this is the first strategy in this project that
+calls a real provider on every monitor-adjacent cycle for every open position, not just once at entry.
+
+**What this is not, restated once more here rather than only in the code**: a validated strategy, evidence
+that indicator-free trading works, or evidence that it doesn't. This project's own backtest history gives
+real reason to expect a null result from the entry side specifically -- reported plainly rather than
+buried, per this project's standing discipline of naming a known risk before building anyway when asked
+to. Read every number this page produces the same way: not yet enough evidence, on both the entry
+question and the still-completely-untested "does the model's own per-cycle exit judgment actually
+outperform a mechanical one" question this module is the first real chance to measure.
+
 ### Validated Signal -- a new, deterministic, paper-only strategy, plus its own tracking page (31 Aug 2026)
 
 **Requested**: after a string of AI Origination losses and the entry-freshness investigation directly

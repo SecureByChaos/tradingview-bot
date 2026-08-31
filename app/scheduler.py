@@ -37,6 +37,7 @@ def create_scheduler(
     option_chain_job: Callable[[], None] | None = None,
     option_chain_interval_minutes: int = 5,
     closing_auction_job: Callable[[], None] | None = None,
+    autonomous_job: Callable[[], None] | None = None,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(
@@ -64,6 +65,20 @@ def create_scheduler(
             originator_job,
             trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
             id="ai-origination-check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+    if autonomous_job is not None:
+        # Same coarse-cron-plus-in-job-market-hours-gate shape as
+        # ai-origination-check directly above -- app.ai.autonomous.
+        # run_autonomous_checks calls check_market_hours() itself as its
+        # first real gate, this cron is only here to stop the job waking up
+        # 24/7 the way ai-origination-check used to before 18 Aug 2026.
+        scheduler.add_job(
+            autonomous_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
+            id="autonomous-ai-check",
             replace_existing=True,
             max_instances=1,
             coalesce=True,

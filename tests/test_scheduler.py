@@ -85,6 +85,22 @@ def test_ai_origination_check_not_registered_without_a_job():
     assert scheduler.get_job("ai-origination-check") is None
 
 
+def test_autonomous_ai_check_uses_the_same_weekday_session_hours_cron():
+    scheduler = create_scheduler(_FakeMonitor(), autonomous_job=lambda: None)
+    job = scheduler.get_job("autonomous-ai-check")
+
+    assert isinstance(job.trigger, CronTrigger)
+    fields = _trigger_fields(job.trigger)
+    assert fields["day_of_week"] == "mon-fri"
+    assert fields["hour"] == "9-15"
+    assert fields["minute"] == "*/5"
+
+
+def test_autonomous_ai_check_not_registered_without_a_job():
+    scheduler = create_scheduler(_FakeMonitor(), autonomous_job=None)
+    assert scheduler.get_job("autonomous-ai-check") is None
+
+
 def test_pre_market_health_job_wired_through_the_scheduler():
     health_manager = _FakeHealthManager()
     scheduler = create_scheduler(_FakeMonitor(), health_manager=health_manager)
