@@ -295,6 +295,111 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp -- a deterministic, no-AI, paper-only scalping strategy (31 Aug 2026)
+
+**Requested**, same session as Autonomous AI: "I also want to implement quick scalping to make quick small
+profits. A separate page for the same. Let's discuss before building." Discussed before writing any code
+(`AskUserQuestion`, two rounds): confirmed no LLM (deterministic, matching Validated Signal's shape, not
+Autonomous AI's), confirmed EMA_RSI_CROSS as the entry signal (already built for the 10 Aug "scalping-
+horizon" scoping pass, never backtested), and worked through the target/stop shape directly with the user
+-- "1 to 5 percent profit and max stoploss 3%," then "something which grind on profits and quick sell
+while losing" once asked whether that meant a fixed target or a trailing mechanism. Given this project's
+own two separate, already-documented findings against trailing at this scale (the 31 Jul holdout's early-
+clip problem, and `scripts/scalp_stop_sweep.py`'s own named noise-hit-rate risk at tight stop distances),
+proposed and built a fixed target at the TOP of the requested range (5%, not clipped early at 1-2%) plus a
+firm, immediately-enforced 3% stop -- "grind on profits" satisfied by not exiting early, "quick sell while
+losing" satisfied by a stop with no discretion, no trailing mechanism either side.
+
+**The signal**: `app.quick_scalp.quick_scalp_action()` is a live re-implementation of
+`scripts/backtest/setups.py`'s `EMA_RSI_CROSS` (entry_offset=0) -- EMA9 crosses EMA21 on a 1-minute bar,
+confirmed by RSI(14) > 55 (bullish) or < 45 (bearish) on that same bar. Reuses `app.indicators`' pure
+`ema()`/`rsi()` functions (the same ones the 5-minute AI cycles already call) rather than new indicator
+math -- this is a new, faster caller of existing arithmetic, not a new computation.
+
+**Cadence, genuinely tighter than everything else in this app**: own scheduler job at 1-minute resolution
+(`quick-scalp-check`, `app/scheduler.py`), not 5 -- there is no LLM cost to amortize against a slower
+cycle here, so "quick" gets a decision loop to match. This needed its own dedicated candle refresh (a real
+`smartapi.get_candles()` call per enabled index, same pattern `app.ai.originator`'s own `_load_market_
+context` already uses) since AI Origination's/Autonomous AI's own 5-minute refreshes would be too stale
+for a 1-minute-cadence signal. Checked against `_throttle_quote_call()`'s shared 1.3s-minimum-spacing
+budget before shipping -- a 60-second window has room for far more than the handful of calls this adds,
+so this is not a new unthrottled call, just ordinary additional spacing inside the existing throttle.
+
+**Max hold time, the genuinely new mechanism**: a trade that hits neither the 3% stop nor the 5% target
+within 15 minutes is squared off unconditionally -- "quick" enforced on the time axis, not just price.
+New `ExitReason.MAX_HOLD_EXIT` (`app/models.py`), deliberately NOT reusing the existing `STALL_EXIT` value
+-- that one is tied specifically to AI Origination's own 60-minute/5%-band check inside
+`monitor_open_trades`, gated to `trade.origin.startswith("AI_ORIGIN_")`; this is a different mechanism
+with different parameters, enforced entirely inside `app.quick_scalp`'s own cycle (`check_quick_scalp_
+exits()`), not the shared monitor. Reuses `MultiStrategyTradeManager.close_trade()` (the same helper every
+other strategy's backstop and Autonomous AI's own discretionary exit already use) so every exit path
+records a close identically.
+
+**The mechanical stop/target need zero changes to `app/multi_strategy.py`**, same pattern Validated
+Signal and Autonomous AI already established: `sl_mode=SLMode.FIXED` with an origin that is neither
+`SIGNAL` nor `AI_ORIGIN_*` already gets a plain stop/target/time-exit backstop from
+`monitor_open_trades`' shared branch, confirmed by reading that function -- no trailing, no STALL_EXIT.
+
+**Structurally paper-only**, same construction and reasoning as every other experimental strategy here:
+`mode` hardcoded to `TradingMode.PAPER`, `smartapi.place_market_order` never called anywhere in
+`app/quick_scalp.py`.
+
+**A known, deliberate gap, named rather than hidden**: unlike every other strategy in this app, Quick
+Scalp has no admin-facing enable/disable of its own -- it has no AI dependency, so it inherits none of
+`AISettings.enabled`'s transitive gating the way Validated Signal (hooked into AI Origination's cycle) and
+Autonomous AI do. Today the only way to stop it is a code deploy or disabling the relevant index in
+Settings > Instruments. Scoped out of this pass deliberately to keep the build bounded -- worth a real
+per-strategy kill switch later if this or a future no-AI strategy needs one.
+
+**Not validated, stated plainly in the module docstring and on the page itself.** Both `EMA_RSI_CROSS`
+and `scripts/scalp_breakeven.py` (the cost-floor check built the same day, 10 Aug 2026, specifically to
+answer whether a scalp signal even clears real round-trip costs before trusting it) have never been run
+against real data. At a 3%/5% band, transaction costs are a much larger fraction of the move than they
+are for any other strategy in this app -- recommended running `scalp_breakeven.py` before trusting this
+module's own results, not just watching the page:
+
+```bash
+python -m scripts.scalp_breakeven --candles data/option_candles
+```
+
+**New tracking page, `/quick-scalp`** (nav link next to Autonomous AI). Same shape as Validated Signal/
+Autonomous AI's pages -- `compute_performance_kpis()` via a new `get_quick_scalp_trades()` helper in
+`app/platform.py` (`origin == "QUICK_SCALP"`, open and closed, newest first), an explicit "what this is /
+what this is not" banner, the same KPI/chart set, an open-position card, and a full trade table.
+
+30 new tests: `tests/test_quick_scalp.py` (26 -- `quick_scalp_action`'s crossover/RSI-confirmation logic
+via monkeypatched `ema`/`rsi` return values rather than hand-constructing real crossing price series,
+the cold-indicator and too-few-bars decline paths, `open_quick_scalp_trade`'s stop/target computation and
+DTE-floor/contract/LTP decline paths, `check_quick_scalp_exits`' max-hold square-off firing and NOT
+firing before the window, isolation from other origins, confirmation Telegram is genuinely never touched
+via the real `MultiStrategyTradeManager.close_trade`, and an end-to-end `run_quick_scalp_checks` open) and
+`tests/test_quick_scalp_trades_query.py` (4 -- origin isolation and ordering). 2 more in `tests/test_
+scheduler.py` (the new every-minute cron job's schedule and its not-registered-without-a-job case).
+**A real timezone bug surfaced and was fixed while writing the max-hold tests**: SQLite doesn't round-
+trip tzinfo (same documented gotcha as everywhere else in this project) -- a test that constructed both
+the monkeypatched "now" and a trade's `entry_time` as IST-tzinfo datetimes computed a wildly wrong holding
+duration once `entry_time` came back naive-and-reinterpreted-as-UTC on read; fixed by expressing both in
+real UTC in the test, matching how every other duration-sensitive test in this project already has to.
+Full suite: 697 passed (was 664). `python -c "import app.main"` and `python -c "import app.quick_scalp"`
+both import cleanly -- 10 scheduled jobs now, not 9.
+
+**Verified live**: seeded a scratch SQLite DB with one open and three closed `QUICK_SCALP` trades (one via
+`TARGET`, one via `STOPLOSS`, one via the new `MAX_HOLD_EXIT`) and screenshotted the actual rendered
+`/quick-scalp` page via Playwright/Chromium. Confirmed: the nav link highlights correctly, the banner
+renders in full, KPI cards show the correct capital-weighted numbers, the open-position card shows real
+entry/current/stop/target/reasoning, and the trade table shows all four trades with the correct exit
+reasons including `MAX_HOLD_EXIT`. No JS console errors from the page itself (same CDN-blocked-in-this-
+sandbox chart panels as every other new page this session).
+
+**Not verified against real live conditions** -- this sandbox cannot run a real 1-minute cycle against a
+live index feed. After deploying: confirm `[QUICK_SCALP]` log lines show real candle refreshes happening
+every minute without contending with AI Origination's/Autonomous AI's own SmartAPI calls (watch for any
+new "Access denied because of exceeding access rate" lines specifically in the minutes this job runs),
+confirm a real `EMA_RSI_CROSS` firing actually opens a trade with the correct rescaled 3%/5% stop/target,
+and confirm a trade that reaches neither level closes with `exit_reason='MAX_HOLD_EXIT'` at 15 minutes,
+not later. Then run `scalp_breakeven.py` against real history as described above before trusting any of
+this page's own numbers.
+
 ### Autonomous AI square-off tightened to 3pm, decoupled from the shared platform setting (31 Aug 2026)
 
 **Requested**, same day as the entry above, after asking whether Autonomous AI is gated to market hours

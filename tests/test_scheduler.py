@@ -101,6 +101,22 @@ def test_autonomous_ai_check_not_registered_without_a_job():
     assert scheduler.get_job("autonomous-ai-check") is None
 
 
+def test_quick_scalp_check_uses_a_weekday_session_hours_every_minute_cron():
+    scheduler = create_scheduler(_FakeMonitor(), quick_scalp_job=lambda: None)
+    job = scheduler.get_job("quick-scalp-check")
+
+    assert isinstance(job.trigger, CronTrigger)
+    fields = _trigger_fields(job.trigger)
+    assert fields["day_of_week"] == "mon-fri"
+    assert fields["hour"] == "9-15"
+    assert fields["minute"] == "*"
+
+
+def test_quick_scalp_check_not_registered_without_a_job():
+    scheduler = create_scheduler(_FakeMonitor(), quick_scalp_job=None)
+    assert scheduler.get_job("quick-scalp-check") is None
+
+
 def test_pre_market_health_job_wired_through_the_scheduler():
     health_manager = _FakeHealthManager()
     scheduler = create_scheduler(_FakeMonitor(), health_manager=health_manager)

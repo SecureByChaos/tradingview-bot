@@ -39,6 +39,14 @@ class ExitReason(str, Enum):
     # reporting can tell "the model chose to leave" from "the backstop had to
     # catch it".
     AI_DISCRETION_EXIT = "AI_DISCRETION_EXIT"
+    # Quick Scalp only (app.quick_scalp) -- neither the 3% stop nor the 5%
+    # target was hit within the strategy's own configured max-hold window.
+    # Deliberately NOT reusing STALL_EXIT: that value is tied specifically to
+    # AI Origination's own 60-minute/5%-band check in monitor_open_trades,
+    # gated to trade.origin.startswith("AI_ORIGIN_") -- a different mechanism
+    # with different parameters. This is enforced entirely inside
+    # app.quick_scalp's own cycle, not the shared monitor.
+    MAX_HOLD_EXIT = "MAX_HOLD_EXIT"
 
 
 class WebhookPayload(BaseModel):

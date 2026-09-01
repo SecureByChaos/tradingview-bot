@@ -903,6 +903,20 @@ def get_autonomous_ai_trades(db: Session) -> list[StrategyTrade]:
     )
 
 
+def get_quick_scalp_trades(db: Session) -> list[StrategyTrade]:
+    """All Quick Scalp trades (app.quick_scalp), open and closed, newest
+    first -- the sole population behind the /quick-scalp page. Same exact
+    == match convention as get_validated_signal_trades/get_autonomous_ai_
+    trades, for the same reason: one single fixed origin value."""
+    return list(
+        db.scalars(
+            select(StrategyTrade)
+            .where(StrategyTrade.origin == "QUICK_SCALP")
+            .order_by(StrategyTrade.entry_time.desc())
+        )
+    )
+
+
 def get_ai_origination_today_highlights(db: Session) -> dict[str, Any]:
     """Replaces the old SIGNAL-strategy activity feed (get_today_activity,
     removed 28 Aug 2026) now that AI Origination is the only thing actually

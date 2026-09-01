@@ -38,6 +38,7 @@ def create_scheduler(
     option_chain_interval_minutes: int = 5,
     closing_auction_job: Callable[[], None] | None = None,
     autonomous_job: Callable[[], None] | None = None,
+    quick_scalp_job: Callable[[], None] | None = None,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(
@@ -79,6 +80,20 @@ def create_scheduler(
             autonomous_job,
             trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
             id="autonomous-ai-check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+    if quick_scalp_job is not None:
+        # 1-minute resolution, not 5 -- see app.quick_scalp's own module
+        # docstring for why: there is no LLM cost to amortize against a
+        # slower cadence here, so "quick" scalping gets a genuinely quick
+        # decision loop. Same coarse-cron-plus-in-job-check_market_hours-gate
+        # shape as every other AI-adjacent job in this file.
+        scheduler.add_job(
+            quick_scalp_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*", timezone=IST),
+            id="quick-scalp-check",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
