@@ -39,6 +39,7 @@ from app.platform import (
     strategy_trades_query_for_filter,
     get_validated_signal_trades,
     get_autonomous_ai_trades,
+    get_quick_scalp_trades,
 )
 from sqlalchemy import func, select
 from app.signal_validation import check_market_hours
@@ -269,6 +270,34 @@ def autonomous_ai_page(
     performance = compute_performance_kpis(closed_trades)
     return templates.TemplateResponse(
         "autonomous_ai.html",
+        {
+            "request": request,
+            "trades": trades,
+            "open_trades": open_trades,
+            "closed_count": len(closed_trades),
+            "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
+            **performance,
+        },
+    )
+
+
+@router.get("/quick-scalp", response_class=HTMLResponse)
+def quick_scalp_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    """Dedicated tracking page for app.quick_scalp -- a deterministic,
+    no-AI, paper-only scalping strategy (see that module's own docstring
+    for the full design). All-time, no filters, same reasoning as
+    /validated-signal and /autonomous-ai: the population is small and new
+    by construction."""
+    trades = get_quick_scalp_trades(db)
+    open_trades = [trade for trade in trades if trade.status == TradeStatus.OPEN]
+    closed_trades = [trade for trade in trades if trade.status == TradeStatus.CLOSED]
+    performance = compute_performance_kpis(closed_trades)
+    return templates.TemplateResponse(
+        "quick_scalp.html",
         {
             "request": request,
             "trades": trades,
