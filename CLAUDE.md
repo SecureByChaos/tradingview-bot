@@ -295,6 +295,49 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp traded after 3pm in production -- no trading-window gate had ever been wired in (1 Sep 2026)
+
+**Reported**: a real Quick Scalp trade in the first day's live production data (`strikevault_trade_history_
+today_20260901.numbers`, analyzed together the same day) opened at 15:04 IST. Investigated and confirmed:
+`run_quick_scalp_checks` (`app/quick_scalp.py`) never checked any trading-window setting at all -- only the
+broad `check_market_hours()` gate (09:15-15:30) and the scheduler's own `hour="9-15"` cron (which fires
+every minute through 15:59). The module's own design discussion the same day had stated an intent to reuse
+the shared Settings > General window as a default, but that code was never actually written -- a real gap
+between what was planned and what shipped, not a misreading of the data.
+
+**Fixed with something more specific than "just add the shared window check".** A plain reuse of
+`PlatformSettings.trading_start_time`/`square_off_time` (default 15:15) would NOT have caught the exact
+reported case -- 15:04 is still before 15:15. The real, sharper problem: Quick Scalp is the only strategy
+in this app with its OWN independent time-based exit (`_MAX_HOLD_MINUTES = 15`, `check_quick_scalp_exits`).
+Every other strategy's entry-window logic only has to avoid the shared `TIME_EXIT` catching a fresh trade
+next cycle at breakeven (see `_past_trading_end`'s own comment in `app/ai/originator.py`); Quick Scalp also
+has to leave its own 15-minute mechanism room to actually run. A trade opened at 15:04 gets caught by the
+shared square-off at 15:15 -- 11 minutes later, not 15 -- before its own max-hold logic ever gets a real
+chance to fire. New `_entry_cutoff(square_off_hm)` computes the entry window's own end as
+`square_off_time - _MAX_HOLD_MINUTES` (15:15 -> 15:00 at the current defaults, clamped at 00:00 rather than
+going negative for a pathological config), so every Quick Scalp trade that opens gets its full intended
+window before the shared backstop could ever preempt it. Reuses `PlatformSettings.trading_start_time` for
+the window's start, unchanged.
+
+**Exits are NOT gated by this window, on purpose.** `check_quick_scalp_exits` still runs on every cycle
+regardless of the entry cutoff -- a position already open when the window closes still needs its own
+max-hold check to keep enforcing "quick" on the time axis; the shared TIME_EXIT backstop is a fallback for
+if this job fails to run, not a reason to stop checking.
+
+5 new tests (`tests/test_quick_scalp.py`, 26 -> 31): `_entry_cutoff`'s arithmetic (15:15 -> 15:00, and a
+pathological near-midnight square-off clamped at 00:00 rather than negative), a direct reproduction of the
+real reported case (15:04 IST correctly blocks the entry check, confirmed via an exploding `quick_scalp_
+action` stand-in that fails the test if the signal is ever checked at all), confirmation entries still open
+one minute before the new cutoff (14:59), and confirmation an already-open trade still gets its max-hold
+exit checked and enforced at a time inside the window (unaffected by the entry-side change). Full suite:
+702 passed (was 697). `python -c "import app.main"` and `python -c "import app.quick_scalp"` both import
+cleanly.
+
+**Not verified live** -- this sandbox cannot run a real Quick Scalp cycle across the entry-cutoff boundary.
+After deploying, confirm no new `QUICK_SCALP` trade opens at or after 15:00 IST (or `square_off_time -
+15 minutes` if that setting has been changed from its default), and confirm a trade opened just before the
+cutoff still gets its full 15-minute window rather than being caught early by the shared square-off.
+
 ### Quick Scalp -- a deterministic, no-AI, paper-only scalping strategy (31 Aug 2026)
 
 **Requested**, same session as Autonomous AI: "I also want to implement quick scalping to make quick small

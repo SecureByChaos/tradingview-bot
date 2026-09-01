@@ -111,11 +111,11 @@ from app.indicators import ema, rsi
 from app.market_data import ONE_MINUTE, Bar, load_bars, parse_smartapi_row, store_bars
 from app.models import ExitReason, Signal
 from app.option_finder import OptionFinder
-from app.platform import list_index_configs, log_event
+from app.platform import get_or_create_settings, list_index_configs, log_event
 from app.premium_model import days_to_expiry, symmetric_premium_percent
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIClient
-from app.time_utils import to_ist, utc_now
+from app.time_utils import parse_hhmm, to_ist, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,33 @@ _TARGET_PERCENT_NOMINAL = 5.0
 # "Quick" enforced on the time axis too, not just price -- a trade that
 # hits neither level in this window is squared off regardless of P&L.
 _MAX_HOLD_MINUTES = 15
+
+# 1 Sep 2026: a real trade opened at 3:04 PM IST in production -- this
+# module had no trading-window check of its own at all, only the broad
+# check_market_hours() gate (09:15-15:30) and the scheduler's own 9-15
+# cron. Fixed by reusing the same shared Settings > General start time
+# every other new-entry-taking strategy in this app respects
+# (PlatformSettings.trading_start_time), falling back to this default when
+# no settings row exists yet. The END of the entry window is NOT simply
+# the shared square_off_time -- see _entry_cutoff() below for why.
+_DEFAULT_TRADING_START = (9, 45)
+_DEFAULT_TRADING_END = (15, 15)
+
+
+def _entry_cutoff(square_off_hm: tuple[int, int]) -> tuple[int, int]:
+    """New entries stop _MAX_HOLD_MINUTES before the shared square-off time,
+    not AT it. Quick Scalp has its own independent max-hold mechanism
+    (check_quick_scalp_exits), unlike AI Origination/Validated Signal, which
+    only ever get caught by the shared TIME_EXIT backstop and have nothing
+    of their own to lose by stopping entries exactly at square-off. A scalp
+    trade opened in the last few minutes before square-off would have its
+    own 15-minute window preempted by the shared TIME_EXIT firing first,
+    defeating the reason the max-hold mechanism exists. Confirmed against
+    the real 1 Sep 2026 case: a trade opened at 15:04 IST, 11 minutes before
+    the default 15:15 square-off, never got anything close to its intended
+    15-minute run."""
+    total_minutes = max(square_off_hm[0] * 60 + square_off_hm[1] - _MAX_HOLD_MINUTES, 0)
+    return divmod(total_minutes, 60)
 
 # Matches scripts/backtest/setups.py's EMA_RSI_CROSS exactly, so a live
 # decision here means the same thing its own (never-run) backtest measured.
@@ -378,8 +405,19 @@ def run_quick_scalp_checks(
     owns_session = db is None
     session = db or SessionLocal()
     try:
+        # Exits run regardless of the entry window -- a still-open position
+        # must keep being checked for the max-hold cutoff (and, near close,
+        # the shared TIME_EXIT backstop takes over anyway).
         check_quick_scalp_exits(session, trade_manager)
+
         now_ist = to_ist(utc_now())
+        platform_settings = get_or_create_settings(session)
+        start_hm = parse_hhmm(platform_settings.trading_start_time, _DEFAULT_TRADING_START)
+        square_off_hm = parse_hhmm(platform_settings.square_off_time, _DEFAULT_TRADING_END)
+        entry_end_hm = _entry_cutoff(square_off_hm)
+        if (now_ist.hour, now_ist.minute) < start_hm or (now_ist.hour, now_ist.minute) >= entry_end_hm:
+            return
+
         for index in list_index_configs(session):
             if not index.enabled:
                 continue

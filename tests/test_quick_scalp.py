@@ -12,6 +12,7 @@ from app.multi_strategy import MultiStrategyTradeManager
 from app.time_utils import IST, to_ist, utc_now
 from app.quick_scalp import (
     ORIGIN,
+    _entry_cutoff,
     _has_open_quick_scalp_trade,
     check_quick_scalp_entry,
     check_quick_scalp_exits,
@@ -390,3 +391,77 @@ def test_run_quick_scalp_checks_opens_a_trade_end_to_end(monkeypatch):
     trades = db.query(StrategyTrade).filter(StrategyTrade.origin == ORIGIN).all()
     assert len(trades) == 1
     assert trades[0].signal == "BUY_CE"
+
+
+# ---------------------------------------------------------------------------
+# _entry_cutoff / the trading-window gate (1 Sep 2026 production bug)
+# ---------------------------------------------------------------------------
+
+def test_entry_cutoff_is_max_hold_minutes_before_square_off():
+    assert _entry_cutoff((15, 15)) == (15, 0)
+
+
+def test_entry_cutoff_clamps_at_midnight_rather_than_going_negative():
+    assert _entry_cutoff((0, 5)) == (0, 0)
+
+
+def test_run_quick_scalp_checks_blocks_a_new_entry_at_the_real_reported_time(monkeypatch):
+    # Reproduces the exact real production case: a trade opened at 15:04
+    # IST, 11 minutes before the default 15:15 square-off -- inside the
+    # dead zone _entry_cutoff exists to close off.
+    import app.quick_scalp as module
+
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 15, 4, tzinfo=IST))
+    db = _make_session()
+    db.add(_make_index())
+    db.commit()
+
+    monkeypatch.setattr(module, "_refresh_bars", lambda *a, **k: _bars(30))
+    monkeypatch.setattr(module, "quick_scalp_action", lambda bars: (_ for _ in ()).throw(AssertionError("must not check signal at 15:04")))
+    option_finder = FakeOptionFinder(_make_contract())
+
+    run_quick_scalp_checks(FakeSmartAPI(price=100.0), option_finder, _make_trade_manager(), db=db)
+
+    assert option_finder.calls == 0
+    assert db.query(StrategyTrade).filter(StrategyTrade.origin == ORIGIN).count() == 0
+
+
+def test_run_quick_scalp_checks_still_enters_just_before_the_cutoff(monkeypatch):
+    import app.quick_scalp as module
+
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 14, 59, tzinfo=IST))
+    db = _make_session()
+    db.add(_make_index())
+    db.commit()
+
+    monkeypatch.setattr(module, "_refresh_bars", lambda *a, **k: _bars(30))
+    monkeypatch.setattr(module, "quick_scalp_action", lambda bars: "BUY_CE")
+    option_finder = FakeOptionFinder(_make_contract())
+
+    run_quick_scalp_checks(FakeSmartAPI(price=100.0), option_finder, _make_trade_manager(), db=db)
+
+    assert db.query(StrategyTrade).filter(StrategyTrade.origin == ORIGIN).count() == 1
+
+
+def test_run_quick_scalp_checks_still_squares_off_open_trades_past_the_entry_cutoff(monkeypatch):
+    # Exits must not be gated by the entry window -- a trade already open
+    # when the cutoff hits still needs its own max-hold check to keep
+    # running (the shared TIME_EXIT backstop is a fallback, not a reason to
+    # stop checking).
+    import app.quick_scalp as module
+
+    now = datetime(2026, 8, 31, 6, 30, tzinfo=UTC)  # 12:00 IST -- inside the window, uneventful
+    monkeypatch.setattr(module, "utc_now", lambda: now)
+    db = _make_session()
+    db.add(_make_index())
+    _add_trade(db, trade_id="t1", current_premium=101.0, entry_time=now - timedelta(minutes=20))
+    db.commit()
+
+    monkeypatch.setattr(module, "_refresh_bars", lambda *a, **k: _bars(30))
+    monkeypatch.setattr(module, "quick_scalp_action", lambda bars: None)
+
+    run_quick_scalp_checks(FakeSmartAPI(price=100.0), FakeOptionFinder(_make_contract()), _make_trade_manager(), db=db)
+
+    trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == "MAX_HOLD_EXIT"
