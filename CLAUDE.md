@@ -295,6 +295,75 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Proportional giveback-ratio stop -- a second, broader MFE-capture technique built and tested against real 2-month data (2 Sep 2026)
+
+**Trigger**: the 2-month cross-strategy review (`scripts/strategy_review.py`, run for real: 330 trades,
+60 days) confirmed the giveback pattern is structural, not two bad days -- 84% of losses (129/153) had a
+positive MFE first. The near-target lock (previous entry) only ever touches ~14% of trades (those that
+get within 10% of their own target) -- it cannot help a trade that had a real, meaningful move but whose
+target was simply set wide (Autonomous AI's 39-55% nominal backstops, rarely approached) or that reversed
+well before reaching 90% of target (the 2 Sep Validated Signal trigger trade itself, at 72.7% of the way
+there, is exactly this case -- see the previous entry's own cross-check). Asked to "invent techniques" to
+capture more of the 84% giveback population, not just the narrow slice near-target already covers.
+
+**Built**: `scripts/giveback_ratio_backtest.py`, a second, structurally different mechanism from
+`near_target_lock_backtest.py`, not a retest of the same idea. Two parts:
+
+- **PART 1, descriptive**: every closed trade (wins included, not just losses) bucketed by its own real
+  MFE band (0-2/2-5/5-10/10-20/20%+, from `strategy_trade_ticks`) -- win rate, mean final P&L, and for
+  the losses in each band, mean giveback ratio. Meant to be read before PART 2's numbers, not instead of
+  them: a floor sitting in a band where losses already give back most of their MFE is the one worth
+  trusting if PART 2 also clears the bar there.
+- **PART 2, candidate**: a *proportional* trailing stop, scoped to the size of the move itself rather than
+  distance to target. Once a trade's running peak clears an absolute MFE floor (swept 5/8/12%), the stop
+  trails continuously at `peak - giveback_ratio * (peak - entry)` (swept 30/50/70%), re-ratcheting up as
+  new peaks form -- works on any trade regardless of how far its target sits, unlike the near-target lock.
+
+**Deliberately not just the already-falsified trail wearing a new name -- the width shape is the real
+difference, stated plainly rather than assumed.** The 31 Jul holdout's trail was 8%-activate / 5%-WIDTH:
+a FIXED number of percentage points of room no matter how far past 8% price had run -- at 8.1% MFE that
+leaves ~3.1% of room (clips almost immediately), at 30% MFE the same fixed 5 points is a much smaller
+share of the move. That mismatch between a growing move and constant room is the documented mechanism
+behind "average win ~6%, losses still ran the full stop." This mechanism's width is a RATIO of the peak
+gain instead, so room grows proportionally with the size of the move -- whether that actually avoids the
+early-clip failure right at the activation floor, rather than just relocating it, is what a real run
+measures, not assumed going in. Same `MIN_BUCKET_LIVE=20` trust minimum, bootstrap-90%-CI-on-mean-delta,
+and `--origin-like`-parameterized population as `near_target_lock_backtest.py`, reusing the identical
+ticks-based replay approach (no option-candle archive, no elasticity model) for the same reason that
+script already established.
+
+20 new tests (`tests/test_giveback_ratio_backtest.py`): the MFE-band boundary function and confirmation
+the five bands tile 0 to infinity with no gaps, the replay never arming below the floor (falls through to
+a plain stop), arming and trailing proportionally to the peak gain (a hand-computed example: peak 112 off
+a 100 entry, 50% giveback ratio -> trail stop 106, a drop to 105 triggers there), the trail ratcheting up
+as a second, higher peak forms rather than staying pinned to the first arming peak, still exiting at
+target once reached, and a corrected test proving the `max(stop_price, trail_stop)` clamp against the
+original stop is provably always satisfied (trail_stop ranges from `entry` at ratio=1.0 up to `peak` at
+ratio=0.0, always above a real sub-entry stop) rather than assuming a scenario that can't actually occur
+by construction -- caught by running the test itself, not by review. Plus the population filter, tick
+loading, cost computation, and the bootstrap helper on a real synthetic effect and a null case. Full
+suite: 759 passed (was 739). `python -c "import app.main"` and `python -c "import scripts.giveback_
+ratio_backtest"` both import cleanly; `python -m scripts.giveback_ratio_backtest --help` renders without
+error. Smoke-tested the full CLI against a seeded scratch DB (a near-miss reversal trade -- peaks at +15%,
+reverses to stop -- correctly caught by every floor/ratio combination, flagged `[THIN]` at n=2 as
+expected) -- ran clean.
+
+**Not run against real data** -- same standing constraint as every backtest script in this project. Run
+on the machine with the real 3-month AI Origination population, then re-point at the other strategies:
+
+```bash
+python -m scripts.giveback_ratio_backtest --db data/trading.db
+python -m scripts.giveback_ratio_backtest --db data/trading.db --origin-like VALIDATED_SIGNAL
+python -m scripts.giveback_ratio_backtest --db data/trading.db --origin-like QUICK_SCALP
+```
+
+Read PART 1 before PART 2 -- if a floor sits in an MFE band where losses are already giving back most of
+their gain (per PART 1), that's the floor worth taking PART 2's bootstrap result seriously for. Per the
+same standing discipline as every other candidate mechanism in this project: nothing ships into
+`app/ai/originator.py`, `app/validated_signal.py`, or `app/quick_scalp.py` from this pass regardless of
+what the run shows -- report the (floor, ratio) cells that clear the bar, and treat that as the next
+decision point, not an automatic green light.
+
 ### Near-target profit-lock backtest tooling built from real production data -- not run, deliberately narrower than the already-falsified trailing stop (2 Sep 2026)
 
 **Trigger**: two real trading days' data read together. 1 Sep: 11 of 16 closed-day losses (69%) had a
