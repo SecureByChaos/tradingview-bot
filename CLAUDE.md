@@ -295,6 +295,81 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Near-target profit-lock backtest tooling built from real production data -- not run, deliberately narrower than the already-falsified trailing stop (2 Sep 2026)
+
+**Trigger**: two real trading days' data read together. 1 Sep: 11 of 16 closed-day losses (69%) had a
+positive MFE before finishing negative. 2 Sep: 11 of 13 (85%). Combined 22 of 29 losses across both days
+gave back a real favorable move rather than being wrong from the start. The sharpest instance repeated in
+the same strategy on consecutive days: Validated Signal, Nifty 50 CE, 1 Sep, MFE +19.02% (target was 20%)
+-> exit -12.59% STOPLOSS; Validated Signal, Nifty 50 PE, 2 Sep, MFE +21.06% (target was 28.98%) -> exit
+-18.77% STOPLOSS. Both ran to within a few points of their own target, then fully reversed past entry to
+the stop. Asked "how can we convert these MFE to profit" -- answered before building anything: a general
+trailing stop is not the fix. That exact shape (8% activate / 5% width) was already tested in the 31 Jul
+holdout and backfired -- winners clipped to ~6% while losers still ran the full 9-11% stop, win/loss ratio
+0.53-0.68, net negative even at a 52-59% win rate. That finding is precisely why Validated Signal and Quick
+Scalp were both built `sl_mode=FIXED` with no trailing at all (see their own entries below). What the two
+repeat trades actually show is narrower than "trail arms too early" -- both got close to target before
+reversing, not close to entry. User: continue observing live for two weeks per the standing plan, but
+pointed out AI Origination alone already has ~3 months of real history -- use it now rather than wait on
+paper accumulation for a question it can already answer.
+
+**Built**: `scripts/near_target_lock_backtest.py`. Replays every closed FIXED-mode trade matching
+`--origin-like` (default `AI_ORIGIN_%`, the only population with real statistical power today) from its
+own real `entry_price`/`target`/`stoploss`, using its own real `strategy_trade_ticks` rows -- the 30s
+premium samples the live monitor already records for every open trade's whole lifetime. This is a
+deliberate departure from `stall_exit_backtest.py`/`stop_distance_backtest.py`'s option-candle-archive
+approach: no archive dependency, no elasticity model, no DTE-coverage gap, because both trigger trades'
+entire round trip (peak near target, then reversal to the stop) already happened inside ticks the app
+collected in the ordinary course of monitoring the trade -- exactly the "3 months of MFE data" already on
+the machine. Tick-based replay is a point-sample check (~30s spacing), not an OHLC bar, so it can miss a
+touch between two samples -- both the no-lock baseline and the locked replay share that blind spot, so
+the DELTA between them stays a fair comparison even though absolute hit-rates read conservative.
+
+**The mechanism tested is scoped narrowly on purpose.** Nothing changes until a trade's running peak
+clears `threshold` (swept 70/80/90%) of the entry-to-target distance -- every small-MFE giveback loss,
+which this project's own two-day data shows is most of them, is completely untouched. Once armed, the
+stop ratchets to `entry + lock_fraction * (peak_at_activation - entry)` (swept 0%=breakeven / 25% / 50%
+of the gain already made) -- always above the original stop, never below it. Only trades whose peak
+actually reached a given threshold are counted in that threshold's comparison; a trade that never got
+close to target behaves identically with or without the lock and would only dilute the result. Same
+`MIN_BUCKET_LIVE=20` trust minimum and bootstrap-90%-CI-on-the-mean-delta shape as every other live-history
+backtest in this project (`confidence_sizing_backtest.py`, `break_confirmation_backtest.py`).
+
+23 new tests (`tests/test_near_target_lock_backtest.py`): the replay's baseline target/stop paths, the
+lock activating and catching a reversal at breakeven (reproducing the trigger shape directly -- peak
+clears the threshold, then reverses, and the lock must exit at breakeven rather than let it run to the
+original stop), the lock never activating when the threshold isn't reached (falls through to the
+unmodified baseline), a partial (0.5) lock fraction protecting only half the gain-at-activation, the
+incomplete/no-ticks-at-all fallback, cost computation, the `_load_trades` population filter (FIXED-mode
+only, matching origin, excludes open trades, excludes a malformed `target <= entry_price` row), a
+different `--origin-like` pattern actually changing which trades are selected (so this is ready to
+re-point at Validated Signal/Quick Scalp once either has enough closed history on its own), tick loading
+and ordering, and the bootstrap helper on both a clear synthetic effect and a straddles-zero null case.
+Full suite: 725 passed (was 702). `python -c "import app.main"` and
+`python -c "import scripts.near_target_lock_backtest"` both import cleanly (`scripts.` stays outside
+`app.main`'s import graph, confirmed by `tests/test_module_imports.py`'s existing isolation check);
+`python -m scripts.near_target_lock_backtest --help` renders without error.
+
+**Not run** -- same standing constraint as every backtest script in this project: this sandbox's
+`data/trading.db` has no real trade history. Run on the machine with the real 3-month AI Origination
+population:
+
+```bash
+python -m scripts.near_target_lock_backtest --db data/trading.db
+```
+
+Read the bootstrap CI on each (threshold, lock_fraction) cell before concluding anything -- per this
+project's own standard, only a cell where the CI excludes zero on the positive side, with `n >= 20`,
+counts as real support for shipping that combination. Per the standing discipline every other risk-
+construction change in this project has been held to (the trailing-stop holdout very much included),
+"nothing clears the bar" is an expected, reportable outcome on the first run, not a failure of the
+tooling. **No change to `app/ai/originator.py`, `app/validated_signal.py`, or `app/quick_scalp.py` has
+been made or proposed from this pass** -- this is measurement only, continuing to run in parallel with
+the two-week live observation window already agreed, not a replacement for it. Re-run with
+`--origin-like VALIDATED_SIGNAL` or `--origin-like QUICK_SCALP` once either population is large enough
+to stand on its own, since both are the strategies that would actually receive this mechanism if it's
+ever validated (they're the ones with no existing trailing/discretionary exit to conflict with it).
+
 ### Quick Scalp traded after 3pm in production -- no trading-window gate had ever been wired in (1 Sep 2026)
 
 **Reported**: a real Quick Scalp trade in the first day's live production data (`strikevault_trade_history_
