@@ -240,6 +240,7 @@ def _ensure_columns() -> None:
         existing_settings_columns = {column["name"] for column in inspector.get_columns("settings")}
         settings_statements = {
             "trading_start_time": "ALTER TABLE settings ADD COLUMN trading_start_time VARCHAR(8) NOT NULL DEFAULT '09:45'",
+            "giveback_ratio_stop_enabled": "ALTER TABLE settings ADD COLUMN giveback_ratio_stop_enabled BOOLEAN NOT NULL DEFAULT 0",
         }
         with engine.begin() as connection:
             for column, statement in settings_statements.items():

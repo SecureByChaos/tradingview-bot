@@ -32,6 +32,14 @@
         <div><label class="form-label">Trading Start Time</label><input class="form-control" type="time" name="trading_start_time" value="{{ settings.trading_start_time }}"><div class="form-text">No new strategy or AI Origination entries before this time. Default 09:45.</div></div>
         <div><label class="form-label">Square Off Time</label><input class="form-control" type="time" name="square_off_time" value="{{ settings.square_off_time }}"><div class="form-text">Every open strategy and AI Origination trade closes at or after this time. Max 15:15.</div></div>
       </div>
+      <h5 class="mt-4">Giveback-Ratio Stop <span class="badge bg-warning text-dark">Temporary 2-week trial</span></h5>
+      <div class="form-grid">
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" name="giveback_ratio_stop_enabled" id="giveback_ratio_stop_enabled" {% if settings.giveback_ratio_stop_enabled %}checked{% endif %}>
+          <label class="form-check-label" for="giveback_ratio_stop_enabled">Enable giveback-ratio stop</label>
+          <div class="form-text">Once a trade's own peak clears 12% above entry, its stop ratchets up to protect 70% of the gain made so far (i.e. never gives back more than 30% of the peak). Applies only to Validated Signal, Quick Scalp, and Autonomous AI trades -- AI Origination already has its own trailing stop, and rule-based signal strategies are never touched. Validated against 227 real closed AI Origination trades (scripts/giveback_ratio_backtest.py): n=57 armed, 90% CI on mean P&amp;L delta [+1.07%, +3.64%]. This toggle is meant to run for a two-week trial on the three included strategies, then be reviewed and either kept permanently or removed.</div>
+        </div>
+      </div>
       <button class="btn btn-primary mt-4" type="submit">Save Settings</button>
     </form>
   </div>
@@ -40,6 +48,7 @@
     <form class="metric" method="post" action="/settings">
       <input type="hidden" name="square_off_time" value="{{ settings.square_off_time }}">
       <input type="hidden" name="trading_start_time" value="{{ settings.trading_start_time }}">
+      {% if settings.giveback_ratio_stop_enabled %}<input type="hidden" name="giveback_ratio_stop_enabled" value="on">{% endif %}
       <input type="hidden" name="active_tab" value="notifications">
       <h5>Telegram Notifications</h5>
       <div class="form-grid">
