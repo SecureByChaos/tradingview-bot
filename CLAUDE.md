@@ -370,6 +370,77 @@ the two-week live observation window already agreed, not a replacement for it. R
 to stand on its own, since both are the strategies that would actually receive this mechanism if it's
 ever validated (they're the ones with no existing trailing/discretionary exit to conflict with it).
 
+**Run for real, same day, on 227 closed AI Origination trades (189 usable, >= 3 recorded ticks).** Real,
+but much narrower than the trigger anecdotes implied. Only `threshold>=90%, lock=25%` and `threshold>=90%,
+lock=50%` cleared the bar (n=26, CI excludes zero both cells, mean improvement +0.72% to +1.42% net% on
+qualifying trades). Every looser combination either did nothing (CI straddles zero) or actively hurt:
+`threshold>=70%, lock=0%` (breakeven) showed delta -1.08% and dropped win rate from 95% to 79% -- an early
+breakeven lock clips trades that were already headed to a clean TARGET win, the same "clip too early"
+failure shape the general trailing stop was already rejected for, just at smaller scale. The base
+population here is heavily winners already (94-96% win rate for any trade that reaches 70%+ of its own
+target) -- this mechanism's real, validated job is narrow insurance against a late reversal in roughly the
+final 10% of the move, not a broad fix for the giveback pattern.
+
+**Cross-checked against the two trigger trades directly, and it does not fully cover them.** 1 Sep
+(MFE 19.02% / target 20% = 95.1% of the way there) would have been caught by the validated `>=90%` lock.
+2 Sep (MFE 21.06% / target 28.98% = **72.7%** of the way there) would NOT -- it reversed before reaching
+even the untested-favorably 80% bucket, and it's the more dramatic of the two (-18.77%). Given the modest
+effect size, the narrow applicable population (26 of 189, ~14%), and that it only covers one of its own
+two motivating trades, this was not shipped into `app/ai/originator.py` from this pass -- held for the
+2-week review alongside whatever `scripts/strategy_review.py` (next entry) turns up over a longer window,
+rather than wired in alone on a narrow win.
+
+### Cross-strategy review tooling built -- fetches and analyzes a real rolling window across all four strategies at once (2 Sep 2026)
+
+**Requested**: "Lets fetch 2 months of data from database from bot and analyze it." This sandbox has no
+direct access to the production server's `data/trading.db` -- every real-data analysis in this project
+goes through a script run on the server with its output pasted back (the near-target-lock backtest just
+above), or an uploaded export. Built the fetch-and-analyze step as one script rather than two, so running
+it on the server produces the report directly.
+
+**Built**: `scripts/strategy_review.py --db data/trading.db --days 60` (default 60, overridable). Loads
+every CLOSED trade in the window, bucketed by the same origin-isolation rule CLAUDE.md states repeatedly
+(`LIKE 'AI_ORIGIN_%'` split by provider, never `!= 'SIGNAL'`; `AI_ALT_*` shadow trades excluded outright
+-- they were never a real position, same reasoning the removed AI Alternatives comparison page already
+established). Per bucket: trade count, win rate, net P&L (sum and capital-weighted return%), mean P&L%,
+and an exit-reason breakdown. A second section repeats the giveback check already run by hand on 1-2 Sep
+(does a loss's own MFE run positive before finishing negative) across the whole window and every bucket,
+not just two days and two strategies -- so whatever showed up there can be read as a real trend or ruled
+out as two unlucky days, not guessed at either way.
+
+**MFE/MAE from `strategy_trade_ticks`, not `highest_price`/`lowest_price`** -- same reason
+`near_target_lock_backtest.py` and every confidence/exit-outcome backtest in this project already made
+this choice: `lowest_price` was pinned at its entry-time seed value for every long trade until the 24 Aug
+fix (see that entry below), so a `highest_price`/`lowest_price`-derived MAE is unreliable for anything
+opened before that date. A 60-day window spans both sides of that fix; ticks have no such history. A loss
+with fewer than 2 recorded ticks is excluded from the giveback check and reported separately (the gap
+between its bucket's `losses` and `w/ tick data` columns), never silently treated as "no favorable move."
+
+14 new tests (`tests/test_strategy_review.py`): the bucket-naming rule for every origin including the
+provider split and the `AI_ALT_*` exclusion, the `_load_trades` population filter (excludes `AI_ALT_*`
+and open trades, respects the `--days` cutoff), tick loading/ordering, and `_summarize`'s win/loss/exit-
+reason counting plus the giveback detector (a loss that ran positive before finishing negative is flagged
+with its own MFE; a loss that never traded positive is not; a loss with too few ticks is excluded from
+the check but still counted in `losses`; a WIN is never run through the giveback check at all). Full
+suite: 739 passed (was 725). `python -c "import app.main"` and `python -c "import scripts.strategy_
+review"` both import cleanly; `python -m scripts.strategy_review --help` renders without error. Smoke-
+tested the full CLI path against a seeded scratch DB (5 trades across 3 buckets, one deliberately
+`AI_ALT_OPENAI` to confirm exclusion) -- ran clean, correctly reported 4 of 5 trades and flagged both
+seeded losses' real giveback shape.
+
+**Not run against real data** -- same standing constraint as every analysis script in this project: this
+sandbox has no real `data/trading.db`. Run on the machine with the real history:
+
+```bash
+python -m scripts.strategy_review --db data/trading.db
+python -m scripts.strategy_review --db data/trading.db --days 14   # matches the 2-week review window
+```
+
+Read the giveback section's OVERALL line first -- if it's still in the 70-85% range the two hand-analyzed
+days showed, that's a real, wide-window-confirmed pattern worth acting on beyond just the narrow near-
+target lock above. If it's meaningfully lower over 2 months, 1-2 Sep may have been an unusually bad
+stretch rather than the norm -- report either outcome plainly, per this project's own standing discipline.
+
 ### Quick Scalp traded after 3pm in production -- no trading-window gate had ever been wired in (1 Sep 2026)
 
 **Reported**: a real Quick Scalp trade in the first day's live production data (`strikevault_trade_history_
