@@ -100,6 +100,18 @@ def test_apply_settings_sets_trading_start_time() -> None:
     assert settings.square_off_time == "14:30"
 
 
+def test_apply_settings_defaults_giveback_ratio_stop_to_off() -> None:
+    settings = PlatformSettings(id=1)
+    apply_settings(settings, "14:30", "10:00", "token", "chat")
+    assert settings.giveback_ratio_stop_enabled is False
+
+
+def test_apply_settings_can_enable_giveback_ratio_stop() -> None:
+    settings = PlatformSettings(id=1)
+    apply_settings(settings, "14:30", "10:00", "token", "chat", giveback_ratio_stop_enabled=True)
+    assert settings.giveback_ratio_stop_enabled is True
+
+
 # ---------------------------------------------------------------------------
 # app.ai.originator: _still_observing / _past_trading_end now take explicit
 # (hour, minute) tuples instead of reading hardcoded module constants.

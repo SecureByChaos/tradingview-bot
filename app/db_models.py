@@ -69,6 +69,17 @@ class PlatformSettings(Base):
     trading_start_time: Mapped[str] = mapped_column(String(8), default="09:45", nullable=False)
     telegram_bot_token: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     telegram_chat_id: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    # 3 Sep 2026: temporary 2-week live trial of the proportional giveback-
+    # ratio stop (scripts/giveback_ratio_backtest.py) -- the one (floor=12%,
+    # ratio=30%) cell that cleared the bootstrap CI against 227 real AI
+    # Origination trades. Off by default; deploying this column changes
+    # nothing until an admin opts in from Settings > General. Scoped in
+    # monitor_open_trades to VALIDATED_SIGNAL/QUICK_SCALP/AUTONOMOUS_AI only
+    # -- see the constants and comment there for why AI Origination and
+    # SIGNAL are excluded. Meant to be reviewed and either embedded
+    # permanently or discarded after the trial window, not left toggled on
+    # indefinitely.
+    giveback_ratio_stop_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

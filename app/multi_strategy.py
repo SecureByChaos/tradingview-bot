@@ -54,6 +54,41 @@ _STALL_BAND_PERCENT = 5.0
 _AI_ORIGIN_TRAIL_ACTIVATION_PERCENT = 8.0
 _AI_ORIGIN_TRAIL_OFFSET_PERCENT = 5.0
 
+# Temporary 2-week live trial (3 Sep 2026), admin-toggleable via
+# PlatformSettings.giveback_ratio_stop_enabled, off by default. The real
+# 2-month cross-strategy review (scripts/strategy_review.py) found 84% of
+# losses across every strategy had a positive MFE before finishing negative
+# -- scripts/giveback_ratio_backtest.py then tested a proportional trailing
+# stop (protected room scales with the size of the move, unlike the already-
+# falsified fixed-point trail) against 227 real closed AI Origination
+# trades. Exactly one (floor, ratio) cell cleared the bootstrap CI: floor=12%
+# of entry, ratio=30% of the peak gain protected once armed (n=57 armed,
+# 90% CI on mean delta [+1.07%, +3.64%]).
+#
+# Scoped to VALIDATED_SIGNAL/QUICK_SCALP/AUTONOMOUS_AI only, NOT AI_ORIGIN_*
+# or SIGNAL:
+#   - AI_ORIGIN_* already has its own trailing mechanism just above (trail_
+#     activate_percent/trail_width_percent, arms ~8%) -- the backtest never
+#     modeled stacking a second, independent trail on top of that, so
+#     applying this there would be deploying an untested interaction, not
+#     the validated result.
+#   - SIGNAL is off-limits per this file's own "shared-FIXED-branch hazard"
+#     precedent: BNV5.1/BNV6/BNV7/NV1 are the currently profitable
+#     strategies and changing their exit logic risks both breaking what
+#     works and confounding the single-variable measurement this trial
+#     needs. Every prior AI-Origination-only mechanism in this file (STALL_
+#     EXIT, the trail above) drew the same line.
+# The three included origins currently have no trailing/discretionary exit
+# of their own on their FIXED-mode trades, so this is the only protective
+# mechanism active for them -- no interaction to reason about.
+#
+# Review after the 2-week trial: if the real outcome supports it, this
+# becomes a permanent, unconditional mechanism for these origins; if not,
+# delete this block and the admin toggle rather than leaving it dormant.
+_GIVEBACK_STOP_FLOOR_PERCENT = 12.0
+_GIVEBACK_STOP_RATIO = 0.30
+_GIVEBACK_STOP_ORIGINS = frozenset({"VALIDATED_SIGNAL", "QUICK_SCALP", "AUTONOMOUS_AI"})
+
 # Fallback only -- PlatformSettings.trading_start_time/square_off_time (Settings
 # > General) are the real, admin-editable values. These match what was
 # hardcoded before 19 Aug 2026 (AI Origination's own _TRADING_START_HOUR/
@@ -391,8 +426,9 @@ class MultiStrategyTradeManager:
         now_ist = datetime.now(IST)
         # Fetched once per tick, not per trade -- Settings > General's
         # square_off_time (19 Aug 2026) replaces what was a hardcoded 15:15
-        # literal below.
-        square_off_hm = parse_hhmm(get_or_create_settings(db).square_off_time, _DEFAULT_TRADING_END)
+        # literal below. Also carries giveback_ratio_stop_enabled (3 Sep 2026).
+        platform_settings = get_or_create_settings(db)
+        square_off_hm = parse_hhmm(platform_settings.square_off_time, _DEFAULT_TRADING_END)
         for trade in trades:
             try:
                 strategy = strategies_by_name.get(trade.strategy_name)
@@ -479,10 +515,33 @@ class MultiStrategyTradeManager:
                                 trade.trailing_stop = round(
                                     trade.highest_price - (trade.entry_price * (width_pct / 100)), 2
                                 )
+
+                        # See _GIVEBACK_STOP_* constants' comment above for
+                        # scope and the real backtest result behind this.
+                        # giveback_stop_level stays None (operative_stop ==
+                        # trade.stoploss, byte-identical to before this
+                        # existed) for every trade not in the trial's three
+                        # origins, or while the toggle is off, or before the
+                        # trade's own MFE has cleared the floor.
+                        giveback_stop_level: float | None = None
+                        if (
+                            platform_settings.giveback_ratio_stop_enabled
+                            and trade.origin in _GIVEBACK_STOP_ORIGINS
+                            and trade.entry_price > 0
+                        ):
+                            mfe_percent = (trade.highest_price - trade.entry_price) / trade.entry_price * 100.0
+                            if mfe_percent >= _GIVEBACK_STOP_FLOOR_PERCENT:
+                                giveback_stop_level = trade.highest_price - _GIVEBACK_STOP_RATIO * (
+                                    trade.highest_price - trade.entry_price
+                                )
+                        operative_stop = trade.stoploss
+                        if giveback_stop_level is not None:
+                            operative_stop = max(operative_stop, giveback_stop_level)
+
                         if trade.trailing_active and trade.trailing_stop is not None and premium <= trade.trailing_stop:
                             reason = ExitReason.TRAIL_EXIT
-                        elif premium <= trade.stoploss:
-                            reason = ExitReason.STOPLOSS
+                        elif premium <= operative_stop:
+                            reason = ExitReason.GIVEBACK_STOP if operative_stop > trade.stoploss else ExitReason.STOPLOSS
                         elif premium >= trade.target:
                             reason = ExitReason.TARGET
 

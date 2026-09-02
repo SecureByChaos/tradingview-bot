@@ -47,6 +47,15 @@ class ExitReason(str, Enum):
     # with different parameters. This is enforced entirely inside
     # app.quick_scalp's own cycle, not the shared monitor.
     MAX_HOLD_EXIT = "MAX_HOLD_EXIT"
+    # Temporary 2-week live trial (3 Sep 2026), admin-toggleable, off by
+    # default -- see PlatformSettings.giveback_ratio_stop_enabled and
+    # monitor_open_trades in app/multi_strategy.py. Scoped to VALIDATED_SIGNAL/
+    # QUICK_SCALP/AUTONOMOUS_AI only. Distinct from STOPLOSS and TRAIL_EXIT so
+    # reporting can isolate exactly which trades this specific mechanism
+    # closed, matching the real (floor=12%, ratio=30%) cell validated in
+    # scripts/giveback_ratio_backtest.py against 227 real AI Origination
+    # trades (n=57 armed, 90% CI on mean delta [+1.07%, +3.64%]).
+    GIVEBACK_STOP = "GIVEBACK_STOP"
 
 
 class WebhookPayload(BaseModel):

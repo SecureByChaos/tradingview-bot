@@ -746,6 +746,7 @@ def update_settings_page(
     trading_start_time: Annotated[str, Form()] = "09:45",
     telegram_bot_token: Annotated[str, Form()] = "",
     telegram_chat_id: Annotated[str, Form()] = "",
+    giveback_ratio_stop_enabled: Annotated[str | None, Form()] = None,
     active_tab: Annotated[str, Form()] = "general",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> RedirectResponse:
@@ -772,6 +773,7 @@ def update_settings_page(
         trading_start_time,
         telegram_bot_token,
         telegram_chat_id,
+        giveback_ratio_stop_enabled == "on",
     )
     db.commit()
     log_event(db, "BOT", "Settings updated from dashboard")
@@ -1011,11 +1013,13 @@ def apply_settings(
     trading_start_time: str,
     telegram_bot_token: str,
     telegram_chat_id: str,
+    giveback_ratio_stop_enabled: bool = False,
 ) -> None:
     settings.square_off_time = square_off_time
     settings.trading_start_time = trading_start_time
     settings.telegram_bot_token = telegram_bot_token
     settings.telegram_chat_id = telegram_chat_id
+    settings.giveback_ratio_stop_enabled = giveback_ratio_stop_enabled
 
 
 

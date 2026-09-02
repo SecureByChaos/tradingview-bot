@@ -295,6 +295,87 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Giveback-ratio stop shipped as a live, admin-toggleable 2-week trial (3 Sep 2026)
+
+**Run for real, same day.** `scripts/giveback_ratio_backtest.py` against 227 real closed AI Origination
+trades: `floor=12%, ratio=30%` cleared the bootstrap CI (n=57 armed, delta +2.32%, 90% CI
+`[+1.07%, +3.64%]`) -- the strongest validated result across every MFE-capture technique tested this
+week, ahead of the near-target lock's best cell. PART 1's real MFE-band distribution showed a clean,
+near-monotonic relationship between MFE band and eventual win rate (4.2% -> 12.8% -> 47.1% -> 92.3% ->
+100% from the 0-2% band to 20%+). Requested: "Lets make a temporary toggle for this and i will make it
+enable for 2 weeks to check if this works or not... Make this for all trades."
+
+**"All trades" does not mean every trade in this app -- flagged before building, not silently narrowed.**
+This file's own "shared-FIXED-branch hazard" section exists specifically to prevent exactly this: an
+exit-logic change to `monitor_open_trades`'s shared FIXED branch applied wholesale would also touch
+BNV5.1/BNV6/BNV7/NV1 (the currently profitable rule-based strategies) and every other live-configured
+SIGNAL strategy (BNV11, V6, V7, V5.1 -- confirmed real via `strategy_review.py`'s real output, still with
+no corresponding code in this repo). Every prior AI-Origination-only mechanism in this file (STALL_EXIT,
+the AI-origin trail) drew that same line. Scoped instead to every population that ISN'T rule-based SIGNAL
+and doesn't already have its own trailing mechanism: `VALIDATED_SIGNAL`, `QUICK_SCALP`, `AUTONOMOUS_AI`.
+**AI Origination is deliberately excluded too**, not just SIGNAL -- it already has its own trail (arms
+~8%, admin-configurable `trail_activate_percent`), and the backtest never modeled stacking a second,
+independent mechanism on top of that; applying it there would be deploying an untested interaction, not
+the validated result. The three included origins have zero trailing/discretionary protection today, so
+this is the only mechanism active for them -- no interaction to reason about, and the backtest's
+"no-mechanism baseline" assumption is actually true for them in production, unlike for AI Origination.
+
+**Implementation, `app/multi_strategy.py`'s shared FIXED branch (`monitor_open_trades`)**: new
+`_GIVEBACK_STOP_FLOOR_PERCENT = 12.0`, `_GIVEBACK_STOP_RATIO = 0.30`, `_GIVEBACK_STOP_ORIGINS =
+frozenset({"VALIDATED_SIGNAL", "QUICK_SCALP", "AUTONOMOUS_AI"})` -- the constants are NOT admin-editable
+(only this one exact cell cleared the bar; exposing free-form floor/ratio fields would invite an admin
+picking an unvalidated combination). Computes `giveback_stop_level` from `trade.highest_price` (already
+tracked every tick, no new column) only when the toggle is on, the origin matches, and MFE has cleared
+the floor; `operative_stop = max(trade.stoploss, giveback_stop_level)`, checked once, with `exit_reason`
+set to the new `ExitReason.GIVEBACK_STOP` only when the giveback level -- not the original stop -- is what
+actually triggered. For every trade outside the three origins, or with the toggle off,
+`giveback_stop_level` stays `None` and `operative_stop == trade.stoploss` always -- byte-identical to the
+pre-change STOPLOSS/TARGET check, confirmed by a dedicated regression test.
+
+**New `PlatformSettings.giveback_ratio_stop_enabled`** (bool, default `False` -- deploying this changes
+nothing until an admin opts in), Settings > General checkbox with the real backtest numbers in its own
+tooltip, `/api/settings` GET/POST parity (same precedent as `trading_start_time`). The Notifications tab's
+own form (which also POSTs to `/settings`) gained a matching hidden passthrough, same pattern
+`square_off_time`/`trading_start_time` already use, so saving from that tab doesn't silently turn the
+trial off.
+
+13 new tests (`tests/test_giveback_ratio_stop.py`, `tests/test_trading_window.py` extended): toggle off
+behaves exactly as before (a trade that peaks +20% then reverses still hits the plain original stop),
+toggle on arms and catches a reversal above the original stop (closes at the real tick price, not the
+theoretical level -- corrected during writing after the first version wrongly assumed exit price equals
+the computed stop/target level, which live code does not do), never arms below the floor, still exits at
+TARGET when reached, confirmed **inert** for `AI_ORIGIN_*` (closes via the pre-existing `TRAIL_EXIT`
+instead, which fires first since it arms earlier at ~8% -- proving the new mechanism adds nothing there,
+not just that nothing happened), confirmed inert for `SIGNAL`, applies correctly to all three included
+origins individually, and the giveback level computes correctly above the original stop. Full suite: 772
+passed (was 759). Migration verified against a simulated pre-migration DB (dropped the column, ran
+`_ensure_columns()`, confirmed it reappears, confirmed a second run is a clean no-op).
+`python -c "import app.main"` imports cleanly.
+
+**Verified live**: started the app against a scratch SQLite DB, logged in, confirmed the checkbox renders
+on Settings > General with the real backtest numbers in its tooltip, saved it on and confirmed it persists
+across a reload, confirmed saving from the Notifications tab (which has no visible giveback checkbox, only
+the hidden passthrough) does NOT silently turn the trial off when it was on, and confirmed the reverse
+(saving from Notifications while off does not accidentally turn it on).
+
+**Not verified against a real live cycle** -- this sandbox cannot run a real 30s monitor tick against an
+open production trade. After deploying, enable the toggle from Settings > General and, over the two-week
+trial, watch for `exit_reason='GIVEBACK_STOP'` rows specifically on `VALIDATED_SIGNAL`/`QUICK_SCALP`/
+`AUTONOMOUS_AI` trades, and confirm `AI_ORIGIN_*`/`SIGNAL` trades show zero (should be structurally
+impossible per the origin scoping, but worth confirming against real data once):
+
+```sql
+SELECT origin, exit_reason, COUNT(*) FROM strategy_trades
+WHERE exit_time > '<toggle-on timestamp, UTC>' GROUP BY origin, exit_reason ORDER BY origin;
+```
+
+At the end of the two-week trial, re-run `scripts/strategy_review.py`/`giveback_ratio_backtest.py` scoped
+to `--days 14` (or the exact trial window) on the three included origins and decide: if the real outcome
+supports it, make the mechanism permanent and unconditional for these origins (delete the toggle and
+`giveback_ratio_stop_enabled` column); if not, remove the block and the toggle entirely rather than
+leaving it dormant. Either outcome is a real, useful answer -- per this project's standing discipline,
+"it didn't hold up live" is not a failure of the trial.
+
 ### Proportional giveback-ratio stop -- a second, broader MFE-capture technique built and tested against real 2-month data (2 Sep 2026)
 
 **Trigger**: the 2-month cross-strategy review (`scripts/strategy_review.py`, run for real: 330 trades,

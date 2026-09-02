@@ -43,6 +43,7 @@ class SettingsPayload(BaseModel):
     trading_start_time: str = "09:45"
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    giveback_ratio_stop_enabled: bool = False
 
 
 def manager() -> TradeManager:
@@ -388,6 +389,7 @@ def get_settings_api(
             "trading_start_time",
             "telegram_bot_token",
             "telegram_chat_id",
+            "giveback_ratio_stop_enabled",
         ]
     }
 
