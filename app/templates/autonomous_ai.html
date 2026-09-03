@@ -20,6 +20,14 @@
   open position is squared off unconditionally at 3:00 PM regardless of what the model says -- an
   earlier, dedicated cutoff for this strategy specifically, not the later time every other strategy in
   this app uses. Paper trading only -- no live-order code path exists for this strategy.</p>
+  <p class="mb-0"><strong>Two more mechanical safety nets, added 3 Sep 2026, both checked before the
+  model is ever asked:</strong> a stagnation exit closes a position that has sat 60+ minutes within
+  &plusmn;5% of entry, so a flat trade doesn't just keep running until 3 PM -- built after a real trade
+  sat open 4h44m at only +2.27% peak gain before the model's own exit call finally fired at -11.24%.
+  Separately, an admin-toggleable giveback-ratio stop (currently on a 2-week live trial, off unless
+  enabled from Settings &gt; General) protects part of a real gain once a trade's peak clears 12% above
+  entry, so it can't fully round-trip back to a loss. Neither replaces the model's own judgment as the
+  intended exit -- both are backstops, same as the wide stop/target above.</p>
   <p class="mb-0"><strong>Cost note:</strong> re-asking the model every cycle for every open position is
   real, ongoing API spend beyond a normal one-shot entry decision -- accepted deliberately for this
   strategy, not something every strategy in this app does.</p>
@@ -99,6 +107,8 @@
         <td data-label="P&amp;L (₹)" class="{% if trade.status == 'CLOSED' %}{% if trade.profit_loss >= 0 %}profit{% else %}loss{% endif %}{% endif %}">{% if trade.status == 'CLOSED' %}₹{{ "%.2f"|format(trade.profit_loss) }}{% else %}—{% endif %}</td>
         <td data-label="Exit Reason">
           {% if trade.exit_reason == 'AI_DISCRETION_EXIT' %}<span class="badge text-bg-info">AI discretion</span>
+          {% elif trade.exit_reason == 'AUTONOMOUS_STALL_EXIT' %}<span class="badge text-bg-warning text-dark">Stagnation exit (backstop)</span>
+          {% elif trade.exit_reason == 'GIVEBACK_STOP' %}<span class="badge text-bg-warning text-dark">Giveback stop (backstop)</span>
           {% elif trade.exit_reason %}<span class="badge text-bg-secondary">{{ trade.exit_reason }} (backstop)</span>
           {% endif %}
         </td>

@@ -358,6 +358,16 @@ specific module, that needs its own backtest against Autonomous AI's own real hi
 trades to clear this project's trust minimum (currently 6, nowhere close) -- not an import of a generic
 assumption this project's own data already argues against.
 
+**Follow-up same day**: "Notes in autonomous ai didnt change." Correct -- the module docstring was
+updated but `app/templates/autonomous_ai.html`'s own explanatory banner was not, same class of miss this
+file already warns against (the 31 Aug 3pm-cutoff entry updated this exact banner for exactly this
+reason). Fixed: the banner now names both new backstops (the stagnation exit and the giveback-ratio
+trial) in plain language, and the trade table's exit-reason column gives `AUTONOMOUS_STALL_EXIT`/
+`GIVEBACK_STOP` their own distinct badges instead of folding them into the generic "(backstop)" label
+every other mechanical exit already used. Verified live: seeded a scratch DB with one trade per new exit
+reason plus one `AI_DISCRETION_EXIT`, confirmed the updated banner text and both new badges render
+correctly. No Python logic touched -- full suite still 775 passed.
+
 ### Giveback-ratio stop shipped as a live, admin-toggleable 2-week trial (3 Sep 2026)
 
 **Run for real, same day.** `scripts/giveback_ratio_backtest.py` against 227 real closed AI Origination
