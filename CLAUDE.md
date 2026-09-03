@@ -295,6 +295,158 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp replaced entirely -- VWAP 2-sigma mean-reversion, built exactly to a pasted spec (4 Sep 2026)
+
+**Requested**: "Replace scalping to following logic. Build exactly as said. Do not skip anything," pasting a
+full implementation spec titled "NIFTY 50 VWAP 2-sigma Mean-Reversion Scalp -- SmartAPI Implementation
+Spec" -- ingestion/instrument setup, the VWAP/sigma/RSI7/wick-geometry math, a six-state arm-and-trigger
+signal machine, a full risk table (structural stop, option-point stop, two-target dual-leg split,
+breakeven move, hard time stop), and six numbered edge cases. Same posture as the Autonomous AI rebuild two
+entries below this one: implement the document as written, name every place this codebase's real
+architecture requires a faithful substitution rather than the literal wording, never silently drop a rule.
+
+**What shipped, replacing `app/quick_scalp.py` and `tests/test_quick_scalp.py` completely** (kept
+`ORIGIN="QUICK_SCALP"`, the `/quick-scalp` route/page, and `run_quick_scalp_checks`'s external signature --
+this replaces the STRATEGY's logic, not its identity, so existing trade history and every external caller
+(`app/main.py`, `app/scheduler.py`, `app/platform.py`) needed zero changes):
+
+- **Session VWAP + 2-sigma bands**, computed incrementally per bar from the spec's own formulas via the
+  standard weighted mean-of-squares-minus-square-of-mean identity (`Var_t = sum(V_i*TP_i^2)/sum(V_i) -
+  VWAP_t^2`, algebraically identical to the spec's own `sum(V_i*(TP_i-VWAP_t)^2)/sum(V_i)` form, O(1) per
+  bar instead of an O(n) rescan). Volume comes from the underlying's near-month FUTIDX contract (new
+  `OptionFinder.find_current_futures_contract`, already built for the Autonomous AI rebuild and reused
+  here unmodified) since index instruments themselves report volume=0 -- falls back per-bar to equal
+  weighting, exactly the spec's own explicit contingency, when a futures contract can't be resolved.
+- **RSI(7) via the existing `app.indicators.rsi()`**, already Wilder's-smoothed and already period-
+  parameterized -- no new indicator math needed, just a different `period` argument than every other
+  strategy's RSI(14).
+- **The six-state arm-and-trigger machine built stateless, not with a persisted "armed" flag.** `C0`
+  (the setup bar) and `C1` (the very next completed bar) are re-evaluated fresh every cycle from stored bar
+  history: `vwap_scalp_action()` checks all four `BUY_CE`/`BUY_PE` setup criteria on `C0` (band
+  breach, inside close, >=30% rejection wick, RSI7 exhaustion) AND whether `C1` crossed `C0`'s opposite
+  extreme, in one pass. This is provably equivalent to the spec's literal state machine: an "armed" state
+  valid for exactly one subsequent bar, checked exactly once, needs no separate expiry mechanism when the
+  check IS that one-bar window -- and it directly satisfies the spec's own "never evaluate a new position
+  while an armed state is pending" rule, since there is nothing left pending to concurrently manage.
+- **Deep ITM contract resolution**, new `OptionFinder.find_deep_itm_contract` -- strike offset ~100 points
+  from ATM in the intrinsic-value direction (CE below spot, PE above; this codebase has no live per-
+  contract Greeks feed, so the point offset stands in for the spec's own "~0.65-0.75 delta" language,
+  which itself treats the offset as the operative rule). Current weekly expiry, with the spec's own
+  explicit same-day rollover (`_EXPIRY_ROLL_HOUR_MINUTE = (13, 30)`) to the next weekly when trading on
+  expiry day past 13:30 IST -- a different rule from `find_atm_contract`'s DTE-floor roll, not reused.
+  Deliberately no DTE floor at all otherwise (every other strategy's `_MIN_DTE_TO_TRADE=5` doesn't apply
+  here -- that finding is about ATM stop survivability; a Deep ITM contract's premium is mostly intrinsic
+  value, a structurally different risk profile the spec itself is built around).
+- **Dual-leg entry, the spec's own 50%/50% split**: one signal opens two `StrategyTrade` rows sharing a
+  group UUID, distinguished only by a trailing `A`/`B` on `trade_id` (`_sibling_trade_id`, no new linking
+  column needed). Leg A gets a flat `+13` option-point target (`_TARGET1_OPTION_POINTS`, the spec's own
+  "12-14" midpoint) enforced by the EXISTING shared 30-second `monitor_open_trades` backstop -- zero new
+  code there, since `trade.stoploss`/`trade.target` are already checked as plain absolute premium levels
+  regardless of how they were derived. Leg B ("Runner") gets a deliberately unreachable target sentinel
+  (`entry * 5`) so that same shared check never preempts its real exit, which is a live VWAP-cross,
+  checked in this module's own cycle. A lot too small to split (e.g. `lot_size=1`) falls back to a single
+  undivided trade with no runner/breakeven mechanics, rather than opening a zero-quantity leg.
+- **Option-premium stop, flat points not percent**: `entry - 9` (`_OPTION_SL_POINTS`, the spec's own "8-10"
+  midpoint) on BOTH legs at open -- deliberately NOT run through `symmetric_premium_percent`'s CE/PE
+  rescale like every other strategy's stop, since the spec's own number is already an absolute option-
+  point value, not a nominal percent needing that conversion.
+- **A genuinely new concept, `StrategyTrade.structural_stop_level`** (new nullable column, additive
+  migration): the underlying INDEX price level that invalidates the thesis structurally (`C0`'s rejection
+  extreme +-1pt, capped at 14 points from the trigger price -- `_structural_stop_level()`), checked each
+  cycle against the live spot, independent of and in addition to the premium-based stop. Two new checks in
+  `check_quick_scalp_exits`, run before the hard time stop: the structural breach (either leg, new
+  `ExitReason.SCALP_STRUCTURAL_STOP`) and the Runner leg's VWAP-cross target (new
+  `ExitReason.SCALP_VWAP_TARGET`) -- both fall through gracefully (no crash, no guess) when this cycle's
+  current spot/VWAP aren't available. A breakeven move (`ExitReason` unchanged, just tightens
+  `trade.stoploss` to `entry+1`) fires on the Runner leg once its sibling leg's Target 1 has actually
+  closed, read directly off the sibling row rather than any new state.
+- **Hard 3-minute time stop** (`_HARD_TIME_STOP_MINUTES = 3`, the spec's own "3 completed candles /
+  180 seconds"), new `ExitReason.SCALP_TIME_STOP`, applied to whichever leg(s) haven't already resolved --
+  the most conservative reading of an ambiguous spec line ("if Target 1 is not hit... exit at market"),
+  consistent with every other "max hold" mechanism already in this project closing the WHOLE position, not
+  just one leg.
+- **Timing, all hardcoded to the spec's own literal clock times** rather than reading the shared
+  `PlatformSettings.trading_start_time`/`square_off_time` every other strategy uses: warmup blocks entries
+  before 09:30 IST (plus a `_MIN_WARMUP_BARS=15` floor, independent of the clock, for the spec's own
+  "minimum 15 bars for VWAP variance stability" reasoning), entries stop at 15:10 IST, and every open
+  position is squared off unconditionally at 15:15 IST (reusing the existing `ExitReason.TIME_EXIT`, same
+  meaning as every other strategy's end-of-day cutoff, new `_square_off_all()` replacing the nuanced exit
+  checks entirely once past that time rather than running alongside them).
+
+**Five places the literal spec cannot be built as worded in this codebase, named rather than hidden (all
+in the new module's own docstring, "NAMED DEVIATIONS"):**
+
+1. **Data ingestion is REST 1-minute candle polling, not WebSocket tick synthesis.** The spec's own
+   signal/risk logic is entirely bar-based; only "aggregate ticks into bars, finalize on the first tick of
+   the next second" is genuinely tick-level, and this codebase's entire live-data architecture (every
+   other strategy, AI Origination included) already runs on `smartapi.get_candles()` polling -- building a
+   new raw tick-aggregation pipeline (`app/live_feed.py`'s own WS connection is index LTP only, no depth,
+   no bar synthesis) is a materially larger, separate infrastructure project. The bar-level LOGIC is
+   unchanged; only how a completed bar arrives differs.
+2. **The ~0.65-0.75 delta target is the point-offset itself, not a computed Greek** -- no live per-contract
+   Greeks feed exists in this codebase to compute one.
+3. **"Market order" and "limit order with a 2-point marketable buffer" both resolve to a fetched LTP
+   fill**, same as every other paper strategy here -- no synthetic slippage added either direction, since
+   an order-TYPE distinction has no real execution consequence in a module with no order-placement path.
+4. **"Hard broker-level SL-M" is a fast, deterministic PAPER stop, not a real exchange order.** This
+   project's standing rule -- every experimental strategy has NO order-placement code path at all, not
+   just one gated off by default (see "Live-trading safety" below) -- is not something this task's own
+   instruction (about strategy LOGIC) asked to break, and wasn't broken. The safety PROPERTY the spec
+   wants (fast, deterministic, unconditional) is real: the option-point stop is enforced by the existing
+   shared 30-second monitor, the fastest check this codebase has.
+5. **The WebSocket-disconnect handler is mapped onto this module's real, non-WS architecture.** "If ticks
+   cease >5s, halt new signals" -> if this module's own candle refresh fails, `run_quick_scalp_checks`
+   skips new entries for that cycle (`refresh_failed`, threaded through from `_compute_scalp_features`).
+   "Place a fallback SL-M" needs no extra code: the option-premium stop is already checked by the shared
+   30-second monitor's OWN, independent SmartAPI call path, unaffected by a failure in this module's index-
+   candle pull.
+
+**STRUCTURALLY PAPER-ONLY, unchanged**: `mode` hardcoded to `TradingMode.PAPER`,
+`smartapi.place_market_order` never called anywhere in this module -- same construction as the superseded
+build and every other experimental strategy in this project.
+
+54 tests in `tests/test_quick_scalp.py` (full replacement, was ~30): the VWAP/sigma incremental-computation
+formula against hand-computed equal- and volume-weighted examples, every one of the four `BUY_CE`/`BUY_PE`
+setup criteria firing and failing independently plus the disarm-on-no-cross case, the structural-stop
+level's raw-vs-capped boundary on both sides, sibling-trade-id round-tripping, the dual-leg split's exact
+quantities/stop/target/structural-level values and the not-splittable single-leg fallback, contract-
+resolution/missing-LTP/non-positive-option-stop decline paths, the breakeven move firing only after the
+sibling's real Target 1 close, the structural stop and VWAP-cross-runner firing on their exact boundary
+and NOT firing before it (including confirmation the VWAP-cross check never fires for the Target-1 leg),
+the hard time stop's 3-minute boundary, isolation from other origins, `_square_off_all`'s unconditional
+close, and `run_quick_scalp_checks` end-to-end (warmup/cutoff timing including the exact real 15:04
+production-bug shape from the superseded build re-verified against the new literal 15:10 cutoff, exits
+continuing to run outside the entry window, and the refresh-failure entry halt). Full suite: 829 passed
+(was 806). `python -c "import app.main"` and `python -c "import app.quick_scalp"` both import cleanly.
+Migration verified via the standard `_ensure_columns()` additive-ALTER pattern (same mechanism every other
+new nullable column in this table already uses).
+
+The `/quick-scalp` page's own banner rewritten to describe the VWAP 2-sigma logic, the risk construction,
+and the named architecture deviations in plain language. New distinct badges for `SCALP_STRUCTURAL_STOP`/
+`SCALP_VWAP_TARGET`/`SCALP_TIME_STOP` plus friendlier labels for the reused `TARGET`/`STOPLOSS`/`TIME_EXIT`
+values on this page specifically, matching the badge-per-mechanism pattern Autonomous AI's own page
+already established.
+
+**Verified live**: seeded a scratch SQLite DB with two open legs and one closed trade per exit reason
+(`TARGET`, `STOPLOSS`, `SCALP_STRUCTURAL_STOP`, `SCALP_VWAP_TARGET`, `SCALP_TIME_STOP`, `TIME_EXIT`),
+started the app, logged in, and confirmed `/quick-scalp` renders 200 with the new banner text and all six
+distinct badges, the KPI grid, and the open-positions card -- no Jinja errors, no unhandled exceptions in
+the server log (the only ERROR-level line is the expected `SmartAPIError`/proxy failure from dummy
+credentials having no real network path, unrelated to this change).
+
+**Not verified against real live conditions** -- this sandbox cannot run a real 1-minute cycle against a
+live index feed or a real futures contract's real volume. After deploying: confirm the feature engine
+resolves a real FUTIDX contract for Nifty and produces a real, sane VWAP for most of a normal session
+(falling back to equal-weighted only on a genuine resolution failure); confirm a real setup-and-trigger
+sequence actually opens a two-leg trade with the correct 50/50 split and matching structural-stop level on
+both legs; watch the first few real closes for `SCALP_STRUCTURAL_STOP`/`SCALP_VWAP_TARGET`/
+`SCALP_TIME_STOP` firing at plausible moments (an immediate-post-entry `SCALP_STRUCTURAL_STOP` would
+suggest a units mismatch between the index-point structural level and the live spot read); and confirm the
+breakeven move actually tightens the Runner leg's stop the first time a real Target 1 closes. Given this
+strategy trades on a genuinely different, tighter, more mechanically complex construction than the
+superseded EMA/RSI build and has zero real trade history of its own, read this page's results with the
+same "not yet enough evidence" standard as every other experimental strategy in this project.
+
 ### Autonomous AI rebuilt per the external design document, implemented "without any judgement" -- overrides the adapted decision below (3 Sep 2026)
 
 **Same day, directly after the entry below shipped and merged.** Asked "What should i expect from

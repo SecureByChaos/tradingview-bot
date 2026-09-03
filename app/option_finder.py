@@ -32,6 +32,12 @@ IST = ZoneInfo("Asia/Kolkata")
 _INSTRUMENT_FETCH_ATTEMPTS = 2
 _INSTRUMENT_FETCH_BACKOFF_SECONDS = 2.0
 
+# 4 Sep 2026, app.quick_scalp's VWAP 2-sigma mean-reversion rebuild: "switch
+# to next weekly if trading on expiry day past 13:30 IST." A plain module
+# constant, not threaded from a caller, since this rule is specific to that
+# one strategy's own literal spec, not a general expiry-selection policy.
+_EXPIRY_ROLL_HOUR_MINUTE = (13, 30)
+
 
 def get_atm_option_token(spot_price: float, signal_type: str) -> dict:
     if signal_type not in {"BUY_CE", "BUY_PE"}:
@@ -205,6 +211,81 @@ class OptionFinder:
             "symboltoken": str(nearest["token"]),
             "expiry": str(nearest["expiry"]),
         }
+
+    def find_deep_itm_contract(
+        self,
+        signal: Signal,
+        index: Any,
+        offset_points: float,
+        min_dte: int = 0,
+        now_ist: datetime | None = None,
+    ) -> OptionContract:
+        """A Deep ITM contract `offset_points` away from ATM, in the
+        intrinsic-value direction -- CE strikes are picked BELOW spot, PE
+        strikes ABOVE, opposite of find_atm_contract's plain nearest-strike
+        pick. Built 4 Sep 2026 for app.quick_scalp's VWAP 2-sigma
+        mean-reversion rebuild, whose own spec asks for `Current Spot - 100`
+        (CE) / `Current Spot + 100` (PE) as a delta-~0.65-0.75 proxy -- this
+        codebase has no live per-contract Greeks feed, so the point offset
+        stands in for a delta target rather than a computed one.
+
+        Expiry: nearest available (optionally floored by min_dte, same
+        roll-forward-not-skip behaviour as find_atm_contract), UNLESS that
+        nearest expiry IS today and now_ist is at or past
+        _EXPIRY_ROLL_HOUR_MINUTE -- the spec's own explicit same-day weekly
+        rollover, a different rule from find_atm_contract's DTE-floor roll
+        and deliberately not reusing it.
+        """
+        index = index or self._default_index()
+        now_ist = now_ist or datetime.now(IST)
+        spot_price = self.smartapi.get_index_spot(index)
+        strike_interval = index.strike_interval or 100
+        atm_strike = int(round(spot_price / strike_interval) * strike_interval)
+        option_type = "CE" if signal.value.endswith("CE") else "PE"
+        instruments = self._load_instruments()
+        matches = self._filter_index_options(instruments, index, option_type)
+        if matches.empty:
+            raise ValueError(f"No {index.symbol} {option_type} contracts found in instrument master")
+
+        if min_dte > 0:
+            eligible = matches[(matches["expiry_dt"] - now_ist.date()).apply(lambda d: d.days) >= min_dte]
+            if not eligible.empty:
+                matches = eligible
+
+        expiries = sorted(matches["expiry_dt"].unique())
+        selected_expiry = expiries[0]
+        if (
+            selected_expiry == now_ist.date()
+            and (now_ist.hour, now_ist.minute) >= _EXPIRY_ROLL_HOUR_MINUTE
+            and len(expiries) > 1
+        ):
+            logger.info(
+                "%s: rolled from %s to %s -- trading on expiry day past %02d:%02d IST",
+                index.symbol, selected_expiry, expiries[1],
+                _EXPIRY_ROLL_HOUR_MINUTE[0], _EXPIRY_ROLL_HOUR_MINUTE[1],
+            )
+            selected_expiry = expiries[1]
+
+        strike_offset = round(offset_points / strike_interval) * strike_interval
+        target_strike = atm_strike - strike_offset if option_type == "CE" else atm_strike + strike_offset
+
+        expiry_contracts = matches[matches["expiry_dt"] == selected_expiry].copy()
+        expiry_contracts = expiry_contracts.assign(strike_diff=(expiry_contracts["strike_normalized"] - target_strike).abs())
+        selected = expiry_contracts.sort_values(["strike_diff", "strike_normalized"]).iloc[0]
+        logger.info(
+            "Selected deep-ITM %s (%s) at spot %.2f: %s strike=%s (target %s) expiry=%s",
+            signal, index.symbol, spot_price, selected["symbol"], int(selected["strike_normalized"]), target_strike, selected["expiry"],
+        )
+        return OptionContract(
+            exchange=selected.get("exch_seg", index.exchange_segment),
+            tradingsymbol=selected["symbol"],
+            symboltoken=str(selected["token"]),
+            strike=int(selected["strike_normalized"]),
+            expiry=str(selected["expiry"]),
+            option_type=option_type,
+            lot_size=int(float(selected.get("lotsize") or index.lot_size)),
+            spot_price=round(spot_price, 2),
+        )
 
     def _default_index(self) -> Any:
         """Fallback used only by legacy/unreachable call sites that predate multi-index
