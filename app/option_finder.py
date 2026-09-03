@@ -162,6 +162,50 @@ class OptionFinder:
             spot_price=round(spot_price, 2),
         )
 
+    def find_current_futures_contract(self, index: Any) -> dict[str, Any] | None:
+        """The near-month FUTIDX contract for this index, or None if the
+        instrument master has nothing suitable.
+
+        Built 3 Sep 2026 for one specific reason: index candles report
+        volume=0 (see CLAUDE.md -- the same wall BNV5.1/BNV6's VWAP gate
+        already hits), so a real intraday VWAP cannot be computed from
+        index-instrument candles at all. A futures contract on the same
+        underlying trades with real, non-zero volume, so its 1-minute candles
+        are what app.ai.autonomous's VWAP feature is built from -- a
+        different instrument standing in for the index's own volume, not the
+        index's own price (its close still tracks the index closely enough
+        for a VWAP *relative-position* read, which is all it's used for).
+
+        Returns a plain dict rather than OptionContract -- there is no
+        strike/option_type/lot_size question for a futures contract, so the
+        options-specific model doesn't fit.
+        """
+        instruments = self._load_instruments()
+        required = {"exch_seg", "instrumenttype", "name", "symbol", "expiry", "token"}
+        missing = required - set(instruments.columns)
+        if missing:
+            raise ValueError(f"Instrument master missing columns: {', '.join(sorted(missing))}")
+
+        frame = instruments[
+            (instruments["exch_seg"] == index.exchange_segment)
+            & (instruments["instrumenttype"] == "FUTIDX")
+            & (instruments["name"].astype(str).str.upper() == index.instrument_name.upper())
+        ].copy()
+        if frame.empty:
+            return None
+        frame["expiry_dt"] = pd.to_datetime(frame["expiry"], format="%d%b%Y", errors="coerce").dt.date
+        today = datetime.now(IST).date()
+        frame = frame[frame["expiry_dt"].notna() & (frame["expiry_dt"] >= today)]
+        if frame.empty:
+            return None
+        nearest = frame.sort_values("expiry_dt").iloc[0]
+        return {
+            "exchange": nearest.get("exch_seg", index.exchange_segment),
+            "tradingsymbol": str(nearest["symbol"]),
+            "symboltoken": str(nearest["token"]),
+            "expiry": str(nearest["expiry"]),
+        }
+
     def _default_index(self) -> Any:
         """Fallback used only by legacy/unreachable call sites that predate multi-index
         support (find_atm_contract without an explicit index argument)."""

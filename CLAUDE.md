@@ -295,6 +295,137 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI rebuilt per the external design document, implemented "without any judgement" -- overrides the adapted decision below (3 Sep 2026)
+
+**Same day, directly after the entry below shipped and merged.** Asked "What should i expect from
+automonus ai after this change" and "What about entry point and timings" (both answered directly, no code
+-- confirmed entries were completely untouched by the stagnation-exit-only change), then: **"Do whatever
+said in md file i shared without any judgement."** An explicit, unambiguous instruction to override the
+adapted decision immediately below -- built with the full risk/tradeoff breakdown already in the user's
+hands from that same conversation, not a case of the reasoning never having been heard.
+
+**Why this is not the same kind of risk as it would be for almost any other module in this app.** Two
+things make implementing a previously-declined design "without judgement" a defensible choice here
+specifically, named rather than glossed over: (1) this strategy is structurally paper-only -- no live
+order path exists to gate, not just one that's off by default, so the blast radius of a wrong design
+choice is paper P&L and API spend, never real capital; (2) the previously-rejected findings that argued
+against parts of the document were about OTHER populations -- the ADX-gate rejection
+(`scripts/adx_gate_backtest.py`) was against AI Origination's own decisions, the fixed-width-trail
+rejection was the 31 Jul holdout's rule-based-strategy replay, and the mid-session-block conflict was
+against the *setups* population's own validated edge, not Autonomous AI's. Autonomous AI's own real
+track record (6 closed trades as of 3 Sep) has never been large enough to confirm or refute any of this
+on its own terms -- so "already tested and rejected" was true of the mechanisms in the abstract, not of
+this specific module's own future results, which remain the only real way to answer the question.
+
+**What shipped, per the document as written (`app/ai/autonomous.py`, `app/option_finder.py`,
+`app/models.py`, full rewrite):**
+
+- **A real deterministic feature engine**, reusing `app.market_context.build_market_context()` for
+  ADX(14)/EMA9/EMA21/PDH-PDL (not recomputed) plus one genuinely new capability: a real intraday VWAP.
+  Index instruments report volume as zero in this pipeline (the same wall BNV5.1/BNV6's own VWAP gate
+  already hits, per this file's own "Backtest tooling" note) -- so VWAP is computed from a **FUTIDX
+  futures contract's real volume** instead. New `OptionFinder.find_current_futures_contract(index)`
+  filters the same instrument master `find_atm_contract` already uses, for `instrumenttype == "FUTIDX"`
+  rather than `OPTIDX`/`OPTSTK`, picking the soonest expiry. Futures 1-minute candles are stored under a
+  synthetic `f"{index.symbol}_FUT"` `index_symbol` key in the existing `Candle` table -- deliberately
+  never the real index's own key, so this can never mix into the real index candle history every other
+  consumer (`build_market_context`, CPR, PDH/PDL, AI Origination) relies on. VWAP itself fails closed
+  (`None`, never fabricated) when the futures contract can't be resolved or has no real volume yet that
+  session; this does not fail the rest of the feature set, since ADX/EMA/PDH-PDL come from the index's own
+  candles independently.
+- **Two deterministic hard gates before any LLM call**, matching the document's own
+  `AutonomousOptionsAgent.evaluate_entry` sample code specifically (not every criterion its prompt text
+  lists): session phase in `{CHOP_ZONE, OPENING_VOLATILITY, SQUARE_OFF_ZONE}` blocks outright, and
+  `ADX < 18` blocks outright. Session phases are the document's own literal boundaries: OPENING_VOLATILITY
+  (<09:30), MORNING_MOMENTUM (09:30-11:15), CHOP_ZONE (11:15-13:30 -- the exact mid-session block the
+  adapted version below declined), AFTERNOON_TREND (13:30-15:00), SQUARE_OFF_ZONE (>=15:00, anchored to
+  the existing `_TRADING_END` constant so the two can never drift apart). `ADX >= 20`, VWAP relation, and
+  PDH/PDL proximity remain the model's own stated criteria in a fully rewritten, rule-based
+  `SYSTEM_PROMPT_ENTRY` (verbatim from the document) -- the document itself only hard-gates the 18 floor
+  in Python, so the 18-20 band is deliberately left to the model's own judgment, not tightened further.
+- **A six-rule deterministic exit matrix**, checked in order, each one closing the trade immediately and
+  skipping the LLM call if it fires -- matching the document's own instruction to "hard code these so
+  network/model downtime never blows up your account": (1) the existing unconditional 15:00 IST cutoff,
+  unchanged; (2) a new session-close warning at 15 minutes to square-off (`ExitReason.
+  AUTONOMOUS_SESSION_CLOSE`); (3) a new **fixed-width** peak-giveback exit (peak >=20%, gives back >=8
+  points, `ExitReason.AUTONOMOUS_TRAIL_EXIT`) -- implemented now despite being the exact shape the 31 Jul
+  holdout found clips winners early, per the explicit override, and deliberately kept a DISTINCT exit
+  reason from the already-shipped PROPORTIONAL giveback-ratio stop (`GIVEBACK_STOP`, floor=12%/ratio=30%)
+  so either mechanism's real effect on this population stays separately measurable even though both can
+  fire on the same trades; (4) a new break-even-violation exit (peak >=15%, current <=1%, `ExitReason.
+  AUTONOMOUS_BREAKEVEN_EXIT`); (5) the existing stagnation exit, window shortened 60 -> 25 minutes to match
+  the document's own number (superseding the earlier build's choice to reuse AI Origination's window,
+  band unchanged at +-5%); (6) a new structural-invalidation exit (`ExitReason.AUTONOMOUS_STRUCTURAL_
+  EXIT`) when the position's own side contradicts the underlying's current spot-vs-VWAP relation, skipped
+  gracefully (falls through to the model) when this cycle's VWAP feature is unavailable rather than
+  guessing. `SYSTEM_PROMPT_EXIT` is the document's own rule-based text verbatim, and its exit JSON schema's
+  `exit_reason` field is now parsed and logged (`_ExitDecision.exit_rule`) for audit -- but never used to
+  pick the stored `ExitReason`; a voluntary model EXIT is still always recorded as `AI_DISCRETION_EXIT`,
+  keeping that distinction intact from the backstop matrix that actually enforces the named rules.
+- **Two of the document's own operational checkpoints needed zero new code**: "Max Loss per Trade" and
+  "Profit Target" already fall out of the existing shared `monitor_open_trades` FIXED-branch backstop
+  (every 30 seconds, faster than this module's own ~5-minute cycle) once `_BACKSTOP_STOP_PERCENT_NOMINAL`/
+  `_BACKSTOP_TARGET_PERCENT_NOMINAL` were tightened from 35.0/50.0 to 15.0/30.0 -- matching the document's
+  own `PositionTracker(stop_loss_pct=15.0, target_pnl_pct=30.0)` defaults exactly.
+- **Deliberately NOT built**: the document's own `PositionTracker`/`AutonomousOptionsAgent` class
+  structure. Equivalent state already exists on the `StrategyTrade` ORM row (`highest_price` for the
+  running peak, `pnl_percent`, `entry_time`) and this project's established convention is to compute
+  derived values inline from that row rather than duplicate state in a parallel object -- the document's
+  own *rules* were implemented in full; its specific *code shape* for holding position state was not,
+  since this codebase already has a shape for that.
+
+**Feature engine now runs once per enabled index per cycle**, shared between entry evaluation and exit
+management's structural-invalidation check (`run_autonomous_checks` computes `features_by_index` up
+front, before either exits or entries), rather than computed twice -- real added SmartAPI cost versus the
+original build (an index candle refresh plus a futures candle refresh per index per cycle, every ~5
+minutes, on top of the per-open-position exit call), accepted deliberately per the override, same
+category of accepted cost as the original build's own per-cycle exit re-ask.
+
+35 new/changed tests (`tests/test_autonomous_ai.py`, 39 -> 70): `_session_phase`'s five-boundary walk,
+`_vwap_relation`'s above/below/chop-band cases, `_trend_regime`, `_structural_invalidation`'s CE/PE
+contradiction cases and its no-op-on-unknown-VWAP case, `_peak_pnl_percent`, `_compute_futures_vwap`
+(real volume-weighted computation matching a hand-computed example, `None` on no futures contract, `None`
+on zero volume, and confirmation it never writes to the real index's own candle history), the two
+deterministic entry gates (each blocked session phase, the ADX hard floor boundary, and a case that
+correctly reaches the LLM at/above the floor in an allowed phase), each of the four new deterministic
+exit rules firing at its exact boundary and NOT firing just below it, the stagnation window's new 25-minute
+value, and `run_autonomous_checks` end-to-end (a new `_TrendingSmartAPI` test stand-in providing a real,
+ADX-warm synthetic 1-minute series so entries can reach the feature-engine-gated path at all, confirming a
+noon entry attempt is now correctly blocked by CHOP_ZONE where the old test suite had assumed it would be
+allowed -- a real behavior change from the rebuild, not a test artifact). Full suite: 806 passed (was 775).
+`python -c "import app.main"` and `python -c "import app.ai.autonomous"` both import cleanly.
+
+The `/autonomous-ai` page's own banner (`app/templates/autonomous_ai.html`) rewritten to describe the new
+feature engine, both hard gates, and the full six-rule exit matrix in plain language rather than the old
+"no indicators at all" description -- learned from the same-day lesson two entries below this one that a
+docstring update alone is not enough. New distinct badges added for `AUTONOMOUS_TRAIL_EXIT`/`AUTONOMOUS_
+BREAKEVEN_EXIT`/`AUTONOMOUS_STRUCTURAL_EXIT`/`AUTONOMOUS_SESSION_CLOSE` in the trade table's exit-reason
+column, matching the existing distinct-badge-per-mechanism pattern rather than folding them into the
+generic "(backstop)" label.
+
+**Verified live**: seeded a scratch SQLite DB with one open trade and one closed trade per new exit
+reason (`AI_DISCRETION_EXIT`, `AUTONOMOUS_STALL_EXIT`, `AUTONOMOUS_TRAIL_EXIT`, `AUTONOMOUS_BREAKEVEN_
+EXIT`, `AUTONOMOUS_STRUCTURAL_EXIT`, `AUTONOMOUS_SESSION_CLOSE`, plus the pre-existing `TIME_EXIT`),
+started the app, logged in, and confirmed `/autonomous-ai` renders 200 with the new banner text and all
+six distinct badges, the KPI grid, and the open-position card -- no Jinja errors, no unhandled exceptions
+in the server log (the only ERROR-level log line is the expected `SmartAPIError` from dummy credentials
+having no real network path, unrelated to this change).
+
+**Not verified against real live conditions** -- this sandbox cannot run a real 5-minute cycle against a
+live index feed or a real futures contract's real volume. After deploying: confirm the feature engine
+actually resolves a real FUTIDX contract for each enabled index (`OptionFinder.find_current_futures_
+contract` against the real instrument master) and that `_compute_futures_vwap` produces a real, sane
+value rather than `None` for most of a normal trading day; confirm the CHOP_ZONE/OPENING_VOLATILITY/
+ADX<18 blocks actually suppress entries during 11:15 AM-1:30 PM and produce the expected `[AUTONOMOUS_AI]
+... Deterministic block` log lines; and watch the first few real closed trades for `AUTONOMOUS_TRAIL_
+EXIT`/`AUTONOMOUS_BREAKEVEN_EXIT`/`AUTONOMOUS_STRUCTURAL_EXIT` firing at plausible moments, not
+immediately after entry (which would suggest a units/percent mismatch somewhere in the new deterministic
+checks). Given this rebuild reintroduces two mechanisms (`ADX` gate, fixed-width trail) this project had
+previously found unsupported for OTHER populations, and this module's own real history is still only 6
+trades deep, read this page's own results with the same "not yet enough evidence, watch closely" standard
+as every other experimental strategy in this project -- more so here, since the construction itself is
+now carrying more previously-flagged risk than the adapted version it replaces.
+
 ### Autonomous AI gets a real stagnation exit -- an external redesign proposal partly adapted, most of it declined with reasons (3 Sep 2026)
 
 **Requested**: a full external design document (VWAP/EMA/ADX pre-filter, hard mid-session entry block, LLM
