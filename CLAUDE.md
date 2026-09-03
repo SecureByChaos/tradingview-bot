@@ -295,6 +295,69 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI gets a real stagnation exit -- an external redesign proposal partly adapted, most of it declined with reasons (3 Sep 2026)
+
+**Requested**: a full external design document (VWAP/EMA/ADX pre-filter, hard mid-session entry block, LLM
+as a secondary gate, a fixed-width trailing stop, a `PositionTracker`/`AutonomousOptionsAgent` rewrite) for
+Autonomous AI, asked to be implemented directly. Read closely before building anything -- it reads
+confidently but wasn't written against this codebase's real data or history, and three of its four
+mechanisms directly repeat things this project has already tested or already knows are infeasible:
+
+- **VWAP has no real data to compute from.** Index candles report volume as zero -- the exact reason
+  BNV5.1/BNV6, which already gate on VWAP, can't be backtested at all (see this file's own "Backtest
+  tooling" section). The proposal's core `Spot > VWAP` gate has nothing to run on without a new data
+  source (e.g. the futures contract, which does carry volume) -- a data-sourcing decision, not a code fix.
+- **The ADX>=20 gate is already tested and NOT SUPPORTED.** `adx_gate_backtest.py` ran this exact
+  question -- both candidate floors, real AI Origination trade history *and* the full 2-year index-level
+  archive, every registered setup, both indices. Re-adding it for a different population with zero new
+  evidence would repeat a conclusion this project already spent real effort reaching.
+- **The proposed mid-session block (roughly 11:15-13:30 as "institutional chop") contradicts the ONE
+  Bonferroni-significant finding this project's entire two-year backtest history has produced** --
+  setups have a real, replicated edge specifically in 11:00-14:00 (see "Indicator setups showed a
+  fit-window edge" below; Validated Signal exists because of that finding). Autonomous AI's own
+  time-of-day pattern has never been measured (6 closed trades total) -- there is no evidence for a block
+  here yet, in either direction, and importing one built on generic folklore would import an assumption
+  this project's own data already argues against.
+- **The proposed fixed-width trailing stop (20%-activate/8%-width) is the same shape the 31 Jul holdout
+  already found clips winners early.** The giveback-ratio stop (previous entry, `app/multi_strategy.py`)
+  is the validated, proportional alternative -- and it already includes `AUTONOMOUS_AI` in its scope
+  (`_GIVEBACK_STOP_ORIGINS`), so it needed zero new code here.
+
+Flagged all four to the user with a direct question on how to proceed (`AskUserQuestion`) rather than
+either silently implementing untested tool output into a live-money-adjacent system or silently deciding
+for them. Chosen: **adapted, evidence-aware version** -- keep the genuinely new, well-grounded idea
+(stagnation exit), drop the rest.
+
+**What shipped**: a real stagnation exit for Autonomous AI, which had none before beyond the 3pm hard
+cutoff -- motivated by a real 3 Sep trade that sat open 4h44m at only +2.27% MFE before the model's own
+EXIT call finally fired at -11.24%. New `_STALL_WINDOW_MINUTES = 60` / `_STALL_BAND_PERCENT = 5.0` in
+`app/ai/autonomous.py`, reusing AI Origination's own already-established STALL_EXIT window rather than
+inventing a fresh, unvalidated number. Checked inside `check_autonomous_exits` itself, right after the
+existing 3pm-cutoff check and before the model is ever asked (no LLM cost on a trade this catches) --
+new `ExitReason.AUTONOMOUS_STALL_EXIT`, deliberately not reusing AI Origination's own `STALL_EXIT` value
+(that one is hard-gated to `trade.origin.startswith("AI_ORIGIN_")` in a different module entirely), so the
+two mechanisms stay separately measurable in reporting.
+
+3 new tests (`tests/test_autonomous_ai.py`, 36 -> 39): a stalled trade (90 min elapsed, +1.5% P&L) closes
+via `AUTONOMOUS_STALL_EXIT` with an exploding `_call_provider` stand-in confirming the model is never
+asked; a trade only 30 minutes in still reaches the model's own HOLD/EXIT judgment unaffected; a trade
+that's moved a real +8% (outside the +-5% band) at 90 minutes also still reaches the model, confirming
+the stagnation check only catches genuinely flat trades, not just old ones. Entry/exit times constructed
+with real UTC tzinfo per this file's own SQLite-tzinfo-round-trip gotcha, same fix Quick Scalp's own
+max-hold tests already needed. Full suite: 775 passed (was 772). `python -c "import app.main"` and
+`python -c "import app.ai.autonomous"` both import cleanly.
+
+**Not verified live** -- this sandbox cannot run a real 5-minute Autonomous AI cycle across the stall
+window. After deploying, confirm a real trade sitting flat for 60+ minutes closes with
+`exit_reason='AUTONOMOUS_STALL_EXIT'` rather than continuing to hold, and that a trade with a real move
+still reaches the model's own exit judgment as before.
+
+**Declined, not silently dropped**: the VWAP/ADX pre-filter and the mid-session block remain unbuilt for
+Autonomous AI, for the reasons stated above. If a mid-session entry pattern is ever worth testing for this
+specific module, that needs its own backtest against Autonomous AI's own real history once it has enough
+trades to clear this project's trust minimum (currently 6, nowhere close) -- not an import of a generic
+assumption this project's own data already argues against.
+
 ### Giveback-ratio stop shipped as a live, admin-toggleable 2-week trial (3 Sep 2026)
 
 **Run for real, same day.** `scripts/giveback_ratio_backtest.py` against 227 real closed AI Origination

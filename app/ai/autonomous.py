@@ -78,6 +78,14 @@ majority of cases. A cycle where the exit call errors or times out leaves
 the position open (fails to a no-op, not a forced exit) -- the backstop is
 what protects it, not a retry.
 
+Two more backstops added 3 Sep 2026, both checked before the model is asked
+anything: a stagnation exit (60 min / +-5%, reusing AI Origination's own
+STALL_EXIT window -- see _STALL_WINDOW_MINUTES' own comment for why a real
+trade sitting open 4h44m at +2.27% MFE motivated this), and the giveback-
+ratio stop (app/multi_strategy.py, admin-toggleable, floor=12%/ratio=30%,
+already scoped to include AUTONOMOUS_AI's FIXED-mode trades -- no new code
+needed here for that one).
+
 ISOLATION
 ----------
 origin="AUTONOMOUS_AI" -- its own population, matched with ==, never counted
@@ -156,6 +164,48 @@ _DEFAULT_TRADING_START = (9, 45)
 # AUTONOMOUS_AI position at that time -- a hard cutoff the model's own HOLD
 # answer cannot override.
 _TRADING_END = (15, 0)
+
+# Adapted from an external design proposal (3 Sep 2026) that also included a
+# VWAP/EMA/ADX pre-filter, a mid-session hard entry block, and a fixed-width
+# trailing stop -- all three dropped, and dropped deliberately rather than
+# silently:
+#   - VWAP has no real data to compute from for these instruments -- index
+#     candles report volume as zero (see CLAUDE.md: this is the same reason
+#     BNV5.1/BNV6, which already gate on VWAP, can't be backtested at all).
+#   - The mid-session block (proposed as "chop" between roughly 11:15 and
+#     13:30) directly contradicts the ONE Bonferroni-significant finding
+#     this project's entire two-year backtest history has produced: setups
+#     have a REAL edge specifically in the 11:00-14:00 window (see the
+#     "Indicator setups showed a fit-window edge" entry in CLAUDE.md --
+#     Validated Signal exists because of that finding). Autonomous AI's own
+#     time-of-day pattern has never been measured (6 closed trades total as
+#     of 3 Sep, far below any trust minimum this project uses) -- there is
+#     no evidence for a block here yet, in either direction.
+#   - A fixed-width trail (proposed as 20%-activate/8%-width) is the same
+#     shape the 31 Jul holdout already found clips winners early. The
+#     giveback-ratio stop (app/multi_strategy.py's _GIVEBACK_STOP_* constants,
+#     already scoped to include AUTONOMOUS_AI) is the validated, proportional
+#     alternative and needs no new code here -- see that module for the real
+#     backtest result behind it.
+#   - An ADX>=20 entry gate was also proposed. Already tested and NOT
+#     SUPPORTED at any floor or population (scripts/adx_gate_backtest.py,
+#     both real AI Origination history and the full 2-year index archive) --
+#     re-adding it here for a different population with no new evidence
+#     would repeat a mistake this project already spent real effort ruling
+#     out.
+#
+# What's genuinely new and well-grounded: a real stagnation exit. Today this
+# module has none beyond the 3pm hard cutoff, and a real 3 Sep trade sat open
+# 4h44m at only +2.27% MFE before the model's own EXIT call finally fired at
+# -11.24%. Reuses AI Origination's own already-established STALL_EXIT window
+# (60 min / +-5%) rather than inventing an unvalidated new number -- checked
+# in check_autonomous_exits itself, before the model is asked, same as the
+# 3pm cutoff above it. A distinct exit reason (ExitReason.AUTONOMOUS_STALL_
+# EXIT) keeps this separately measurable from AI Origination's own mechanism,
+# matching how every other subsystem in this project scopes its own exit
+# constants (Quick Scalp's _MAX_HOLD_MINUTES, etc.) rather than sharing one.
+_STALL_WINDOW_MINUTES = 60
+_STALL_BAND_PERCENT = 5.0
 
 SYSTEM_PROMPT_ENTRY = (
     "You are an autonomous options trading assistant running an independent, "
@@ -558,6 +608,20 @@ def check_autonomous_exits(db: Session, trade_manager, settings: AISettings, end
                 logger.info(
                     "[AUTONOMOUS_AI] %s squared off at %02d:%02d IST cutoff (%.2f%%)",
                     trade.trade_id, end_hm[0], end_hm[1], trade.pnl_percent or 0.0,
+                )
+                continue
+            entry_time_ist = to_ist(trade.entry_time) if trade.entry_time is not None else None
+            elapsed_minutes = (now_ist - entry_time_ist).total_seconds() / 60 if entry_time_ist else 0
+            if elapsed_minutes >= _STALL_WINDOW_MINUTES and abs(trade.pnl_percent or 0.0) <= _STALL_BAND_PERCENT:
+                trade_manager.close_trade(db, trade, trade.current_premium, ExitReason.AUTONOMOUS_STALL_EXIT)
+                log_event(
+                    db, "AUTONOMOUS_AI",
+                    f"[{trade.strategy_name}] stalled -- {elapsed_minutes:.0f} min, {trade.pnl_percent:.2f}%",
+                    payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "elapsed_minutes": elapsed_minutes},
+                )
+                logger.info(
+                    "[AUTONOMOUS_AI] %s closed AUTONOMOUS_STALL_EXIT after %.0f min at %.2f%%",
+                    trade.trade_id, elapsed_minutes, trade.pnl_percent or 0.0,
                 )
                 continue
             user_prompt = _build_exit_prompt(trade, now_ist)
