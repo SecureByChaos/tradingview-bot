@@ -65,6 +65,39 @@ class ExitReason(str, Enum):
     # model is asked, same window/band AI Origination's own STALL_EXIT
     # already uses (60 min / +-5%) rather than an invented new number.
     AUTONOMOUS_STALL_EXIT = "AUTONOMOUS_STALL_EXIT"
+    # Autonomous AI only, 3 Sep 2026 -- the four new deterministic exit rules
+    # from an external redesign document, implemented as specified rather
+    # than adapted (see app.ai.autonomous's module docstring for why this
+    # supersedes the earlier adapted-version decision). Each is a distinct
+    # value, matching this project's own established convention (see
+    # AUTONOMOUS_STALL_EXIT above) of never folding mechanically different
+    # exit paths into one shared reason -- doing so would make each mechanism
+    # unmeasurable on its own.
+    #
+    # Fixed-width peak-giveback: peak_pnl_pct >= 20% and a drop of >= 8% from
+    # that peak. Deliberately NOT reusing GIVEBACK_STOP -- that mechanism
+    # (app/multi_strategy.py) is a different, PROPORTIONAL shape (floor=12%,
+    # width=30% of the peak-to-entry distance, validated against 227 real AI
+    # Origination trades). This one is the document's own fixed-width rule,
+    # a shape this project had previously tested and moved away from (the 31
+    # Jul holdout) -- kept distinct so the two can never be confused in
+    # reporting even though both can fire on the same trade population.
+    AUTONOMOUS_TRAIL_EXIT = "AUTONOMOUS_TRAIL_EXIT"
+    # Break-even violation: once peak_pnl_pct has reached >= 15%, a pullback
+    # to <= 1% exits immediately rather than letting a real move round-trip
+    # all the way back to breakeven or a loss.
+    AUTONOMOUS_BREAKEVEN_EXIT = "AUTONOMOUS_BREAKEVEN_EXIT"
+    # Structural invalidation: the underlying's spot-vs-VWAP relationship
+    # contradicts the held position's side (e.g. holding CE but spot is now
+    # below VWAP). Requires the new futures-based VWAP feature -- see
+    # OptionFinder.find_current_futures_contract.
+    AUTONOMOUS_STRUCTURAL_EXIT = "AUTONOMOUS_STRUCTURAL_EXIT"
+    # Session-close warning: minutes_to_square_off <= 15 (i.e. from 14:45 IST
+    # onward against this module's 15:00 cutoff). Distinct from the existing
+    # unconditional TIME_EXIT this module already fires at 15:00 sharp --
+    # this is an earlier, doc-specified warning-turned-exit, not a
+    # replacement for that later hard backstop.
+    AUTONOMOUS_SESSION_CLOSE = "AUTONOMOUS_SESSION_CLOSE"
 
 
 class WebhookPayload(BaseModel):

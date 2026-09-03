@@ -4,32 +4,34 @@
 {{ page_header("Autonomous AI", "Experimental · Paper Only", "text-bg-warning") }}
 
 <div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
-  <p class="mb-2"><strong>What this is:</strong> the model decides both when to enter AND when to exit,
-  entirely on its own judgment -- no ADX, no EMA/Supertrend/RSI, no CPR, no TradingView signal of any
-  kind. It sees only the current price and today's trading range, the same numbers a human glancing at
-  the dashboard's price ticker would see. Every open position is re-asked, every ~5 minutes, whether to
-  hold or exit -- an EXIT answer really does close the trade immediately, it isn't just logged.</p>
-  <p class="mb-2"><strong>What this is not:</strong> proven to work, or even a new kind of question this
-  project hasn't already asked. A two-year backtest already found that a 45-minute price-drift rule --
-  the same class of input this strategy is given -- has <em>zero</em> positive directional edge on
-  either index, at any horizon; six of sixteen drift bands were reliably negative. Genuine LLM judgment
-  isn't the same as a mechanical rule, so that finding doesn't automatically apply here -- but it means
-  this page's own real results are a fair, still-open test, not a foregone conclusion either way. Every
-  open position also carries a wide backstop stop/target (a safety net, not the intended exit -- the
-  model's own per-cycle decision is meant to act first). No new entries after 3:00 PM IST, and every
-  open position is squared off unconditionally at 3:00 PM regardless of what the model says -- an
-  earlier, dedicated cutoff for this strategy specifically, not the later time every other strategy in
-  this app uses. Paper trading only -- no live-order code path exists for this strategy.</p>
-  <p class="mb-0"><strong>Two more mechanical safety nets, added 3 Sep 2026, both checked before the
-  model is ever asked:</strong> a stagnation exit closes a position that has sat 60+ minutes within
-  &plusmn;5% of entry, so a flat trade doesn't just keep running until 3 PM -- built after a real trade
-  sat open 4h44m at only +2.27% peak gain before the model's own exit call finally fired at -11.24%.
-  Separately, an admin-toggleable giveback-ratio stop (currently on a 2-week live trial, off unless
-  enabled from Settings &gt; General) protects part of a real gain once a trade's peak clears 12% above
-  entry, so it can't fully round-trip back to a loss. Neither replaces the model's own judgment as the
-  intended exit -- both are backstops, same as the wide stop/target above.</p>
+  <p class="mb-2"><strong>What this is:</strong> rebuilt 3 Sep 2026 around a real deterministic feature
+  engine -- ADX(14), EMA9/21 trend regime, and an intraday VWAP computed from a futures contract's real
+  volume (index instruments themselves report zero volume, so this is the first VWAP anywhere in this
+  app). Two hard Python gates run before the model is ever asked: no entry during CHOP_ZONE
+  (11:15 AM&ndash;1:30 PM), OPENING_VOLATILITY (before 9:30), or SQUARE_OFF_ZONE (3:00 PM on); and no
+  entry when ADX is below 18. Above that floor, the model still makes the actual call -- ADX&nbsp;&ge;&nbsp;20,
+  spot strictly above/below VWAP, and no extension into PDH/PDL are its own stated criteria, not a second
+  Python gate. Every open position is re-asked, every ~5 minutes, whether to hold or exit -- an EXIT
+  answer really does close the trade immediately.</p>
+  <p class="mb-2"><strong>Exit matrix, checked in order before the model is asked, each one closing the
+  trade immediately and skipping the LLM call if it fires:</strong> a session-close warning at 15 minutes
+  to square-off; a fixed-width peak-giveback (exits once a &ge;20% peak gain gives back 8 points); a
+  break-even violation (exits if a &ge;15% peak gain has fallen back to &le;1%); a 25-minute stagnation
+  exit for a trade stuck within &plusmn;5% of entry; and a structural-invalidation exit if the underlying's
+  spot-vs-VWAP relation flips against the held side. Only if none of those fire does the model get a real
+  HOLD/EXIT decision. The hard stop-loss and profit target (now 15%/30% nominal, tightened from 35%/50%)
+  are enforced separately and faster still, every 30 seconds, by the same shared mechanism every other
+  strategy's backstop uses. The unconditional 3:00 PM IST square-off is unchanged and always wins.</p>
+  <p class="mb-2"><strong>What this is not:</strong> proven to work. This rebuild implements an external
+  design document as specified, including an ADX gate and a fixed-width trailing stop this project had
+  previously tested and moved away from for OTHER populations (AI Origination's own decisions, and a
+  2024-era rule-based holdout) -- done deliberately, on explicit instruction, after the tradeoffs were
+  laid out. Those earlier findings don't transfer directly to this module's own real trades, which is
+  exactly why this page's own numbers, not a prior finding, are the honest answer to whether this
+  construction works. Paper trading only -- no live-order code path exists for this strategy.</p>
   <p class="mb-0"><strong>Cost note:</strong> re-asking the model every cycle for every open position is
-  real, ongoing API spend beyond a normal one-shot entry decision -- accepted deliberately for this
+  real, ongoing API spend beyond a normal one-shot entry decision, and the feature engine now also spends
+  a futures-contract candle fetch per index per cycle for VWAP -- accepted deliberately for this
   strategy, not something every strategy in this app does.</p>
 </div>
 
@@ -108,6 +110,10 @@
         <td data-label="Exit Reason">
           {% if trade.exit_reason == 'AI_DISCRETION_EXIT' %}<span class="badge text-bg-info">AI discretion</span>
           {% elif trade.exit_reason == 'AUTONOMOUS_STALL_EXIT' %}<span class="badge text-bg-warning text-dark">Stagnation exit (backstop)</span>
+          {% elif trade.exit_reason == 'AUTONOMOUS_TRAIL_EXIT' %}<span class="badge text-bg-warning text-dark">Peak giveback (backstop)</span>
+          {% elif trade.exit_reason == 'AUTONOMOUS_BREAKEVEN_EXIT' %}<span class="badge text-bg-warning text-dark">Break-even violation (backstop)</span>
+          {% elif trade.exit_reason == 'AUTONOMOUS_STRUCTURAL_EXIT' %}<span class="badge text-bg-warning text-dark">Structural invalidation (backstop)</span>
+          {% elif trade.exit_reason == 'AUTONOMOUS_SESSION_CLOSE' %}<span class="badge text-bg-warning text-dark">Session-close warning (backstop)</span>
           {% elif trade.exit_reason == 'GIVEBACK_STOP' %}<span class="badge text-bg-warning text-dark">Giveback stop (backstop)</span>
           {% elif trade.exit_reason %}<span class="badge text-bg-secondary">{{ trade.exit_reason }} (backstop)</span>
           {% endif %}
