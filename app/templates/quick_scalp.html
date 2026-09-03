@@ -4,17 +4,28 @@
 {{ page_header("Quick Scalp", "Experimental · Paper Only", "text-bg-warning") }}
 
 <div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
-  <p class="mb-2"><strong>What this is:</strong> a deterministic strategy -- no AI model, no judgment call --
-  built for quick, small trades. Entries fire on EMA9/EMA21 crossovers confirmed by RSI(14), checked every
-  1 minute (no LLM in this loop, so no reason to run it any slower). A fixed 5% target and a fixed 3% stop,
-  no trailing, and any trade that hits neither within 15 minutes is squared off regardless of P&amp;L --
-  "quick" enforced on both price and time.</p>
-  <p class="mb-0"><strong>What this is not:</strong> validated. The entry signal (EMA_RSI_CROSS) and the
-  cost-floor check this strategy would need to clear (scripts/scalp_breakeven.py) were both built on 10 Aug
-  2026 and never run against real data. Trailing was deliberately left out -- this project's own history has
-  two separate findings against it at this scale: an earlier holdout test where a similar trail capped
-  winners early while losses ran to the full stop, and a documented noise-hit risk at tight stop distances
-  like this one's 3%. Paper trading only -- no live-order code path exists for this strategy.</p>
+  <p class="mb-2"><strong>What this is:</strong> rebuilt 4 Sep 2026 -- a VWAP 2&sigma; mean-reversion scalp,
+  replacing the earlier EMA/RSI-crossover build entirely. Each completed 1-minute bar is checked against a
+  session VWAP and its 2&sigma; bands: a bar that pierces a band, closes back inside it, leaves a rejection
+  wick covering &ge;30% of its range, and has RSI(7) confirming exhaustion (&lt;30 on a lower-band piercing,
+  &gt;70 on an upper one) arms a setup. If the very next completed bar trades back through that setup bar's
+  opposite extreme, that's the entry trigger -- a Deep ITM contract (~100 points from spot, opposite
+  direction from a plain ATM pick) is bought and split 50/50 into a Target-1 leg (a flat option-point
+  target) and a Runner leg that rides until spot reaches back to VWAP.</p>
+  <p class="mb-2"><strong>Risk, checked every cycle:</strong> a flat option-premium stop (~9 points) enforced
+  by the same 30-second backstop every strategy here uses; a structural index-level stop (the setup bar's
+  own rejection extreme &plusmn;1 point, capped at 14 points from the trigger price) checked independently
+  against the live spot; a hard 3-minute time stop if neither leg has resolved; and a breakeven move on the
+  Runner leg's stop once Target 1 has been banked.</p>
+  <p class="mb-0"><strong>What this is not:</strong> validated, or running on live tick data. Built to
+  implement the pasted spec's logic exactly -- the VWAP/sigma math, the setup-and-trigger state machine, the
+  dual-leg risk construction -- but this codebase's real data plumbing is 1-minute REST candle polling (the
+  same architecture every other strategy here uses), not a raw WebSocket tick stream, so bar-by-bar the
+  logic is identical but "finalize on the first tick of the next second" isn't literal. Volume for the VWAP
+  bands comes from the underlying's futures contract (index instruments themselves report zero volume);
+  falls back to an equal-weighted variance, per the spec's own contingency, when a futures contract can't be
+  resolved. Paper trading only -- no live-order code path exists for this strategy, so "hard broker-level
+  SL-M" is a fast, deterministic paper stop, not a real exchange order.</p>
 </div>
 
 <div class="metric-grid mb-3">
@@ -89,7 +100,16 @@
         <td data-label="Entry">{{ trade.entry_price }}</td><td data-label="Exit">{{ trade.exit_price or "" }}</td>
         <td data-label="P&amp;L %" class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
         <td data-label="P&amp;L (₹)" class="{% if trade.status == 'CLOSED' %}{% if trade.profit_loss >= 0 %}profit{% else %}loss{% endif %}{% endif %}">{% if trade.status == 'CLOSED' %}₹{{ "%.2f"|format(trade.profit_loss) }}{% else %}—{% endif %}</td>
-        <td data-label="Exit Reason">{{ trade.exit_reason or "" }}</td>
+        <td data-label="Exit Reason">
+          {% if trade.exit_reason == 'TARGET' %}<span class="badge text-bg-success">Target 1</span>
+          {% elif trade.exit_reason == 'STOPLOSS' %}<span class="badge text-bg-danger">Option-point stop</span>
+          {% elif trade.exit_reason == 'SCALP_STRUCTURAL_STOP' %}<span class="badge text-bg-danger">Structural stop</span>
+          {% elif trade.exit_reason == 'SCALP_VWAP_TARGET' %}<span class="badge text-bg-success">Runner (VWAP cross)</span>
+          {% elif trade.exit_reason == 'SCALP_TIME_STOP' %}<span class="badge text-bg-warning text-dark">Hard time stop (3 min)</span>
+          {% elif trade.exit_reason == 'TIME_EXIT' %}<span class="badge text-bg-secondary">Square-off (15:15)</span>
+          {% elif trade.exit_reason %}<span class="badge text-bg-secondary">{{ trade.exit_reason }}</span>
+          {% endif %}
+        </td>
         <td data-label="Result">{{ trade.result }}</td><td data-label="Status">{{ trade.status }}</td>
       </tr>
     {% endfor %}

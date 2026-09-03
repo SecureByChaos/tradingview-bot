@@ -480,6 +480,15 @@ class StrategyTrade(Base):
     ai_entry_quality: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     ai_risk_quality: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     ai_market_alignment: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # 4 Sep 2026, app.quick_scalp's VWAP 2-sigma mean-reversion rebuild: the
+    # underlying INDEX price level that invalidates the thesis structurally
+    # (C0.low - 1pt for a CE, C0.high + 1pt for a PE, capped at 14 points
+    # from the trigger price) -- a genuinely different concept from
+    # stoploss/target above, which are OPTION PREMIUM levels. Checked each
+    # cycle against the live index spot, independent of and in addition to
+    # the premium-based stop. Null for every trade before this column
+    # existed and for every non-QUICK_SCALP origin.
+    structural_stop_level: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

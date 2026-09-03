@@ -39,14 +39,32 @@ class ExitReason(str, Enum):
     # reporting can tell "the model chose to leave" from "the backstop had to
     # catch it".
     AI_DISCRETION_EXIT = "AI_DISCRETION_EXIT"
-    # Quick Scalp only (app.quick_scalp) -- neither the 3% stop nor the 5%
-    # target was hit within the strategy's own configured max-hold window.
-    # Deliberately NOT reusing STALL_EXIT: that value is tied specifically to
-    # AI Origination's own 60-minute/5%-band check in monitor_open_trades,
-    # gated to trade.origin.startswith("AI_ORIGIN_") -- a different mechanism
-    # with different parameters. This is enforced entirely inside
-    # app.quick_scalp's own cycle, not the shared monitor.
+    # Quick Scalp only (app.quick_scalp), original EMA/RSI-crossover build
+    # (superseded 4 Sep 2026 by the VWAP 2-sigma mean-reversion rebuild
+    # below) -- neither the 3% stop nor the 5% target was hit within the
+    # strategy's own configured max-hold window. No longer produced by any
+    # live code path; kept for historical rows.
     MAX_HOLD_EXIT = "MAX_HOLD_EXIT"
+    # Quick Scalp only, 4 Sep 2026 VWAP 2-sigma mean-reversion rebuild --
+    # the spec's own "Hard Time Stop": neither leg's target/stop/runner
+    # condition fired within 3 completed 1-minute candles (180s) of entry.
+    # Deliberately NOT reusing MAX_HOLD_EXIT (a different mechanism, 15-
+    # minute window, from the superseded build) or STALL_EXIT (AI
+    # Origination's own 60-min/+-5% mechanism) -- distinct parameters,
+    # distinct reason, same as every other exit mechanism in this project.
+    SCALP_TIME_STOP = "SCALP_TIME_STOP"
+    # Quick Scalp only -- the underlying INDEX spot breached
+    # StrategyTrade.structural_stop_level (C0's rejection-bar extreme +-1pt,
+    # capped at 14 points from the trigger price). Distinct from STOPLOSS,
+    # which is the OPTION PREMIUM stop (~8-10 points) checked independently
+    # by the shared 30s monitor -- this is a second, index-level invalidation
+    # layer the spec asks for explicitly, not a duplicate of the premium one.
+    SCALP_STRUCTURAL_STOP = "SCALP_STRUCTURAL_STOP"
+    # Quick Scalp only -- the spec's "Target 2 (Runner)": the runner leg
+    # (the half of the position NOT closed at Target 1) exits when the
+    # underlying spot reaches back to the current session VWAP. Distinct
+    # from TARGET (the flat option-point Target 1 on the other leg).
+    SCALP_VWAP_TARGET = "SCALP_VWAP_TARGET"
     # Temporary 2-week live trial (3 Sep 2026), admin-toggleable, off by
     # default -- see PlatformSettings.giveback_ratio_stop_enabled and
     # monitor_open_trades in app/multi_strategy.py. Scoped to VALIDATED_SIGNAL/
