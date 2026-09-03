@@ -507,6 +507,81 @@ def test_check_exits_does_not_square_off_before_cutoff(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# check_autonomous_exits -- AUTONOMOUS_STALL_EXIT (3 Sep 2026)
+# ---------------------------------------------------------------------------
+#
+# "Now" is frozen at 2026-08-31 12:00 IST (06:30 UTC). entry_time is stored
+# with a real UTC tzinfo -- SQLite strips tzinfo on the round-trip through
+# check_autonomous_exits' own query, and to_ist() then correctly treats the
+# naive result as UTC and adds +5:30 -- same documented gotcha (and same
+# fix) as every other duration-sensitive test in this project.
+
+def _add_trade_at(db, *, trade_id, entry_time_utc, pnl_percent, current_premium=100.0, entry_price=100.0) -> None:
+    db.add(StrategyTrade(
+        trade_id=trade_id, strategy_name="Autonomous AI - Bank Nifty", signal="BUY_CE",
+        index_symbol="BANKNIFTY", tradingsymbol="X", symboltoken="1", strike=57000,
+        expiry="28AUG2026", option_type="CE", quantity=35,
+        entry_price=entry_price, current_premium=current_premium, pnl_percent=pnl_percent,
+        stoploss=65.0, target=150.0, entry_time=entry_time_utc, origin=ORIGIN,
+        status=TradeStatus.OPEN, result=TradeResult.OPEN, mode=TradingMode.PAPER,
+    ))
+    db.commit()
+
+
+def test_check_exits_closes_a_stalled_trade_with_no_model_call(monkeypatch):
+    import app.ai.autonomous as module
+    from datetime import UTC
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 12, 0, tzinfo=IST))
+    db = _make_session()
+    # 90 minutes before the frozen "now" -- past the 60-minute stall window.
+    _add_trade_at(db, trade_id="t1", entry_time_utc=datetime(2026, 8, 31, 5, 0, tzinfo=UTC), pnl_percent=1.5)
+    trade_manager = _make_trade_manager()
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no model call for a stalled trade")))
+
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
+
+    trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == "AUTONOMOUS_STALL_EXIT"
+
+
+def test_check_exits_does_not_stall_before_the_window_elapses(monkeypatch):
+    import app.ai.autonomous as module
+    from datetime import UTC
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 12, 0, tzinfo=IST))
+    db = _make_session()
+    # 30 minutes before "now" -- inside the 60-minute stall window, so this
+    # must still reach the model's own HOLD/EXIT judgment as normal.
+    _add_trade_at(db, trade_id="t1", entry_time_utc=datetime(2026, 8, 31, 6, 0, tzinfo=UTC), pnl_percent=1.5)
+    trade_manager = _make_trade_manager()
+    monkeypatch.setattr(module, "_call_provider",
+                         lambda *a, **k: module._RawCall('{"decision": "HOLD", "reasoning": "still developing"}', None, 5.0))
+
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
+
+    trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
+    assert trade.status == TradeStatus.OPEN
+
+
+def test_check_exits_does_not_stall_a_trade_that_has_moved(monkeypatch):
+    import app.ai.autonomous as module
+    from datetime import UTC
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 12, 0, tzinfo=IST))
+    db = _make_session()
+    # 90 minutes elapsed (past the window) but +8% P&L is outside the +-5%
+    # stall band -- a real, moving trade must still reach the model.
+    _add_trade_at(db, trade_id="t1", entry_time_utc=datetime(2026, 8, 31, 5, 0, tzinfo=UTC), pnl_percent=8.0)
+    trade_manager = _make_trade_manager()
+    monkeypatch.setattr(module, "_call_provider",
+                         lambda *a, **k: module._RawCall('{"decision": "HOLD", "reasoning": "still developing"}', None, 5.0))
+
+    check_autonomous_exits(db, trade_manager, _Settings(), (15, 0))
+
+    trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
+    assert trade.status == TradeStatus.OPEN
+
+
+# ---------------------------------------------------------------------------
 # run_autonomous_checks (end-to-end wiring)
 # ---------------------------------------------------------------------------
 

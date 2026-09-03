@@ -56,6 +56,15 @@ class ExitReason(str, Enum):
     # scripts/giveback_ratio_backtest.py against 227 real AI Origination
     # trades (n=57 armed, 90% CI on mean delta [+1.07%, +3.64%]).
     GIVEBACK_STOP = "GIVEBACK_STOP"
+    # Autonomous AI only (app.ai.autonomous), 3 Sep 2026 -- a real trade sat
+    # open 4h44m at only +2.27% MFE before the model's own exit call finally
+    # fired at -11.24%. Deliberately NOT reusing AI Origination's own
+    # STALL_EXIT value (that one is tied to trade.origin.startswith(
+    # "AI_ORIGIN_") in monitor_open_trades' shared branch, a different
+    # mechanism) -- checked inside check_autonomous_exits itself, before the
+    # model is asked, same window/band AI Origination's own STALL_EXIT
+    # already uses (60 min / +-5%) rather than an invented new number.
+    AUTONOMOUS_STALL_EXIT = "AUTONOMOUS_STALL_EXIT"
 
 
 class WebhookPayload(BaseModel):
