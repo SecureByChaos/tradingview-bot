@@ -119,11 +119,24 @@ _ENTRY_BLOCKED_SESSION_PHASES and _ADX_HARD_FLOOR):
   - session_phase in {CHOP_ZONE, OPENING_VOLATILITY, SQUARE_OFF_ZONE}
   - ADX < 18
 
-Trend regime, VWAP relation, ADX >= 20, and PDH/PDL proximity remain the
-model's own judgment call, stated as explicit criteria in SYSTEM_PROMPT_
-ENTRY -- the document's own design keeps these as LLM criteria rather than
-Python hard gates, and this rebuild preserves that split rather than
-tightening it further.
+VWAP relation, ADX >= 20, and PDH/PDL proximity remain the model's own
+judgment call, stated as explicit criteria in SYSTEM_PROMPT_ENTRY -- the
+document's own design keeps these as LLM criteria rather than Python hard
+gates, and this rebuild preserves that split rather than tightening it
+further.
+
+A THIRD deterministic check was added 4 Sep 2026, after the document's own
+design: EMA-regime/action alignment (_regime_matches_action). This one is
+necessarily a POST-decision check, not a pre-call gate like the two above
+-- it depends on which direction the model actually chose. Real production
+data (Autonomous AI's first two live trades under this rebuild, both real
+losses' companion trade included) showed the model deciding BUY_PE while
+its own returned reasoning explicitly named the EMA regime as bullish/
+contradictory, i.e. failing to self-enforce a criterion SYSTEM_PROMPT_ENTRY
+itself states as required ("ALL must be true", "Contradictory signals
+exist... Mandatory Reject NONE"). A decision whose direction disagrees with
+the EMA regime it was shown is now overridden to NONE in Python rather than
+trusted from the model's own self-report -- see check_autonomous_entry.
 
 EXIT MATRIX -- DETERMINISTIC RULES CHECKED BEFORE THE MODEL, IN ORDER
 --------------------------------------------------------------------------
@@ -602,6 +615,28 @@ def _trend_regime(fast_ema: float | None, slow_ema: float | None) -> str:
     return "NEUTRAL"
 
 
+def _regime_matches_action(features: _Features, action: str) -> bool:
+    """Cross-check the model's own chosen direction against the EMA regime
+    it was shown. SYSTEM_PROMPT_ENTRY states "Fast EMA > Slow EMA" (CE) /
+    "< " (PE) as a criterion that must be true, and separately instructs
+    NONE on "Contradictory signals exist" -- but real production data (4
+    Sep 2026, both of Autonomous AI's first two live trades under this
+    rebuild) showed the model deciding BUY_PE while its own returned
+    reasoning explicitly named the EMA regime as bullish/contradictory
+    ("Fast EMA... is below Slow EMA... is NOT true, so momentum alignment
+    is contradictory" -- and traded anyway). The model is not reliably
+    self-enforcing a criterion its own prompt states as required, so it is
+    enforced here in Python instead, the same escalation already applied
+    to ADX and session phase in check_autonomous_entry. NEUTRAL/UNKNOWN
+    fails closed (does not match either direction) -- "ALL must be true"
+    does not read as satisfied by an indeterminate regime."""
+    if action == "BUY_CE":
+        return features.trend_regime == "BULLISH"
+    if action == "BUY_PE":
+        return features.trend_regime == "BEARISH"
+    return True
+
+
 def _compute_futures_vwap(
     db: Session, index: IndexConfig, option_finder: OptionFinder, smartapi: SmartAPIClient, now_ist
 ) -> float | None:
@@ -941,6 +976,25 @@ def check_autonomous_entry(
     logger.info("[AUTONOMOUS_AI] %s -> %s", index.symbol, decision.action)
     if decision.action == "NONE":
         return None
+
+    # Deterministic override, checked after the model's own decision --
+    # direction-dependent, so it can't be a pre-call gate like ADX/session
+    # phase above. See _regime_matches_action's own docstring for the real
+    # trigger trades this was added for.
+    if not _regime_matches_action(features, decision.action):
+        logger.info(
+            "[AUTONOMOUS_AI] %s: Deterministic override -- model chose %s but EMA regime reads %s, "
+            "contradicting its own required criterion",
+            index.symbol, decision.action, features.trend_regime,
+        )
+        log_event(
+            db, "AUTONOMOUS_AI",
+            f"[{index.symbol}] overridden to NONE -- {decision.action} contradicts EMA regime "
+            f"({features.trend_regime}); model reasoning: {decision.reasoning}",
+            level="WARNING",
+        )
+        return None
+
     return open_autonomous_trade(db, index, decision.action, decision.reasoning, smartapi, option_finder)
 
 

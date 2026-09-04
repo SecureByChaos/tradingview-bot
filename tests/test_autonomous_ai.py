@@ -28,6 +28,7 @@ from app.ai.autonomous import (
     _parse_entry_response,
     _parse_exit_response,
     _peak_pnl_percent,
+    _regime_matches_action,
     _session_phase,
     _structural_invalidation,
     _trend_regime,
@@ -606,6 +607,88 @@ def test_check_entry_reaches_llm_at_or_above_adx_hard_floor_in_an_allowed_phase(
     assert result is None  # NONE decision, but the model WAS reached (no assertion exploded)
 
 
+# ---------------------------------------------------------------------------
+# _regime_matches_action / the EMA-regime override (4 Sep 2026)
+#
+# Real production trigger: Autonomous AI's first two live trades under this
+# rebuild (both Nifty BUY_PE) opened with EMA9 > EMA21 (a BULLISH regime),
+# directly contradicting SYSTEM_PROMPT_ENTRY's own required "Fast EMA <
+# Slow EMA" criterion for a PE -- the model's own returned reasoning named
+# the contradiction explicitly and traded anyway. See
+# _regime_matches_action's own docstring for the full account.
+# ---------------------------------------------------------------------------
+
+def test_regime_matches_action_buy_ce_requires_bullish():
+    bullish = _make_features(fast_ema=57000.0, slow_ema=56800.0)
+    bearish = _make_features(fast_ema=56800.0, slow_ema=57000.0)
+    assert _regime_matches_action(bullish, "BUY_CE") is True
+    assert _regime_matches_action(bearish, "BUY_CE") is False
+
+
+def test_regime_matches_action_buy_pe_requires_bearish():
+    bullish = _make_features(fast_ema=57000.0, slow_ema=56800.0)
+    bearish = _make_features(fast_ema=56800.0, slow_ema=57000.0)
+    assert _regime_matches_action(bearish, "BUY_PE") is True
+    assert _regime_matches_action(bullish, "BUY_PE") is False
+
+
+def test_regime_matches_action_fails_closed_on_neutral_or_unknown():
+    neutral = _make_features(fast_ema=57000.0, slow_ema=57000.0)
+    unknown = _make_features(fast_ema=None, slow_ema=None)
+    assert _regime_matches_action(neutral, "BUY_CE") is False
+    assert _regime_matches_action(neutral, "BUY_PE") is False
+    assert _regime_matches_action(unknown, "BUY_CE") is False
+    assert _regime_matches_action(unknown, "BUY_PE") is False
+
+
+def test_regime_matches_action_none_always_passes():
+    features = _make_features(fast_ema=57000.0, slow_ema=56800.0)
+    assert _regime_matches_action(features, "NONE") is True
+
+
+def test_check_entry_overridden_when_regime_contradicts_decision(monkeypatch):
+    # Reproduces the real 4 Sep 2026 trigger exactly: EMA9=23910.87,
+    # EMA21=23908.96 (BULLISH, EMA9 > EMA21), model decides BUY_PE anyway.
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall(
+            '{"decision": "BUY_PE", "confidence": 0.61, '
+            '"reasoning": "Fast EMA is below Slow EMA is NOT true, so momentum alignment is contradictory; '
+            'however price is strictly below VWAP and ADX confirms trend strength."}',
+            None, 12.0,
+        ),
+    )
+
+    result = check_autonomous_entry(
+        db, index, _make_features(fast_ema=23910.87, slow_ema=23908.96), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+
+    assert result is None
+    assert option_finder.calls == 0
+
+
+def test_check_entry_not_overridden_when_regime_agrees_with_decision(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall('{"decision": "BUY_PE", "confidence": 0.65, "reasoning": "clean bearish setup"}', None, 12.0),
+    )
+
+    result = check_autonomous_entry(
+        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+
+    assert result is not None
+    assert result.signal == "BUY_PE"
+
+
 def test_check_entry_opens_a_trade_on_buy_decision(monkeypatch):
     import app.ai.autonomous as module
     db = _make_session()
@@ -615,8 +698,11 @@ def test_check_entry_opens_a_trade_on_buy_decision(monkeypatch):
     monkeypatch.setattr(module, "_call_provider",
                          lambda *a, **k: module._RawCall('{"decision": "BUY_PE", "confidence": 0.6, "reasoning": "drifting down"}', None, 12.0))
 
+    # EMA regime must actually support the model's own chosen direction --
+    # see test_check_entry_overridden_when_regime_contradicts_decision for
+    # the case where it doesn't.
     result = check_autonomous_entry(
-        db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder,
+        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder,
     )
     assert result is not None
     assert result.signal == "BUY_PE"
