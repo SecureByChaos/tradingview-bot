@@ -9,10 +9,13 @@
   volume (index instruments themselves report zero volume, so this is the first VWAP anywhere in this
   app). Two hard Python gates run before the model is ever asked: no entry during CHOP_ZONE
   (11:15 AM&ndash;1:30 PM), OPENING_VOLATILITY (before 9:30), or SQUARE_OFF_ZONE (3:00 PM on); and no
-  entry when ADX is below 18. Above that floor, the model still makes the actual call -- ADX&nbsp;&ge;&nbsp;20,
-  spot strictly above/below VWAP, and no extension into PDH/PDL are its own stated criteria, not a second
-  Python gate. Every open position is re-asked, every ~5 minutes, whether to hold or exit -- an EXIT
-  answer really does close the trade immediately.</p>
+  entry when ADX is below 18. Above that floor, ADX&nbsp;&ge;&nbsp;20, spot strictly above/below VWAP,
+  and no extension into PDH/PDL remain the model's own stated criteria, not a Python gate. A third
+  check, added 4 Sep 2026, runs AFTER the model answers: if it decides BUY_CE/BUY_PE while the EMA9/21
+  regime it was shown actually points the other way, the decision is overridden to NONE in Python rather
+  than trusted -- added after real trades showed the model naming that exact contradiction in its own
+  reasoning and trading anyway. Every open position is re-asked, every ~5 minutes, whether to hold or
+  exit -- an EXIT answer really does close the trade immediately.</p>
   <p class="mb-2"><strong>Exit matrix, checked in order before the model is asked, each one closing the
   trade immediately and skipping the LLM call if it fires:</strong> a session-close warning at 15 minutes
   to square-off; a fixed-width peak-giveback (exits once a &ge;20% peak gain gives back 8 points); a

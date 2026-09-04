@@ -295,6 +295,60 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI gets a third deterministic gate -- EMA-regime/decision cross-check, from real day-one data (4 Sep 2026)
+
+**Trigger**: the first daily trade-history export after the "without judgement" rebuild (PR #83) went live
+-- the first real trading day the new rule-based `SYSTEM_PROMPT_ENTRY` actually ran. Two Autonomous AI
+trades, both `BUY_PE` on Nifty. Both stored `ai_reasoning` explicitly names the EMA regime as bullish/
+contradictory and trades anyway:
+
+> "Fast EMA (9 EMA 23910.87) is below Slow EMA (21 EMA 23908.96) is not true, so regime confirmation is not
+> bearish; however price is strictly BELOW intraday VWAP..." (09:50, closed -7.12%)
+
+> "Fast EMA (9 EMA 23923.97) is below Slow EMA (21 EMA 23915.54) is NOT true, so momentum alignment is
+> contradictory... Since the EMA regime is inconsistent with BUY_PE and also indicates bullish regime, the
+> required conditions are not all satisfied; therefore this should be NON[E]" (09:55, closed +0.65%)
+
+Verified directly, not just read off the PDF export: `23910.87 < 23908.96` is `False` and `23923.97 <
+23915.54` is `False` in both cases -- EMA9 > EMA21 (a genuinely BULLISH regime) on both trades.
+`SYSTEM_PROMPT_ENTRY` states "Regime indicates sustained downward momentum (Fast EMA < Slow EMA)" as one of
+five criteria that "ALL must be true" for a `BUY_PE`, and separately instructs NONE on "Contradictory
+signals exist" -- the model's own text confirms it saw the contradiction (one trade's reasoning even
+concludes "this should be NONE" mid-sentence) and returned a real `BUY_PE` decision anyway, 2 for 2 on the
+only real data this rebuild has produced so far.
+
+**Fixed with a third deterministic gate, `_regime_matches_action`, necessarily shaped differently from the
+two existing ones.** The session-phase and `ADX < 18` gates (see the "without judgement" entry below) are
+pre-call gates -- they don't depend on which direction the model picks, so they can block before the LLM
+is ever asked. EMA-regime alignment is direction-dependent (a `BUY_CE` needs BULLISH, a `BUY_PE` needs
+BEARISH) and can only be checked once the model has actually answered -- so this is a POST-decision
+override in `check_autonomous_entry`: if the model's chosen action disagrees with `features.trend_regime`,
+the decision is overridden to NONE in Python (logged at WARNING via `log_event`, including the model's own
+reasoning text for audit) rather than trusted from the model's own self-report. NEUTRAL/UNKNOWN regime
+fails closed against either direction -- "ALL must be true" doesn't read as satisfied by an indeterminate
+regime. This doesn't touch `SYSTEM_PROMPT_ENTRY` itself -- the prompt already states the criterion
+correctly; the fix is enforcing what was already asked of the model, the same escalation this project has
+now applied twice (ADX, session phase) once real data showed the model's own self-enforcement wasn't
+reliable enough to trust alone.
+
+7 new tests (`tests/test_autonomous_ai.py`, 70 -> 76): `_regime_matches_action`'s BULLISH/BEARISH match
+cases for both `BUY_CE`/`BUY_PE`, the NEUTRAL/UNKNOWN fail-closed cases, the `NONE` always-passes case, an
+exact reproduction of the real trigger trade (EMA9=23910.87/EMA21=23908.96, model decides `BUY_PE`,
+overridden to no trade), and a regression case confirming a genuinely regime-consistent decision still
+opens normally. One existing test (`test_check_entry_opens_a_trade_on_buy_decision`) needed its
+`_make_features()` call updated to pass a BEARISH regime explicitly -- it was previously relying on the
+default BULLISH fixture, which the new gate now correctly blocks for a `BUY_PE`. Full suite: 835 passed
+(was 829). `python -c "import app.main"` and `python -c "import app.ai.autonomous"` both import cleanly.
+
+The `/autonomous-ai` page banner updated to describe the third check.
+
+**Not verified live beyond the two real trades that motivated it** -- this sandbox cannot run a real
+origination cycle. After deploying, watch the logs for `Deterministic override -- model chose ... but EMA
+regime reads ...` lines and confirm the override rate isn't so high that it's effectively vetoing most of
+what the model tries to do (which would suggest the model's own regime language and the computed EMA
+values disagree more broadly than these two trades show, a different and larger problem than this fix
+addresses) -- two trades is a real, confirmed pattern, but not yet a large sample.
+
 ### Quick Scalp replaced entirely -- VWAP 2-sigma mean-reversion, built exactly to a pasted spec (4 Sep 2026)
 
 **Requested**: "Replace scalping to following logic. Build exactly as said. Do not skip anything," pasting a
