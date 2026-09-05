@@ -116,6 +116,22 @@ class ExitReason(str, Enum):
     # this is an earlier, doc-specified warning-turned-exit, not a
     # replacement for that later hard backstop.
     AUTONOMOUS_SESSION_CLOSE = "AUTONOMOUS_SESSION_CLOSE"
+    # Validated Signal only (app.validated_signal), 5 Sep 2026 full rebuild to
+    # an external Morning/Afternoon breakout specification -- every stop/
+    # target here is a SPOT INDEX price level (StrategyTrade.structural_
+    # stop_level / structural_target_level), checked by this module's own
+    # 5-second exit poll against live spot LTP, never the option premium the
+    # shared 30s monitor_open_trades checks. Distinct from STOPLOSS/TARGET
+    # (which mean a PREMIUM level was hit) on purpose, same reasoning as
+    # Quick Scalp's SCALP_STRUCTURAL_STOP/SCALP_VWAP_TARGET above.
+    VS_SPOT_STOP = "VS_SPOT_STOP"
+    VS_SPOT_TARGET = "VS_SPOT_TARGET"
+    # The spec's own 20-minute stagnation rule: neither the spot stop nor the
+    # spot target has been touched within 20 minutes of entry. Distinct from
+    # STALL_EXIT (AI Origination's own 60-min/+-5%-of-PREMIUM mechanism) --
+    # different window, different measured quantity (elapsed time only, no
+    # P&L band), different population.
+    VS_STAGNATION_EXIT = "VS_STAGNATION_EXIT"
 
 
 class WebhookPayload(BaseModel):

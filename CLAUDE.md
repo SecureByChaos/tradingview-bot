@@ -295,6 +295,159 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Validated Signal replaced entirely -- Morning & Afternoon spot breakout engine, built exactly to a pasted spec (5 Sep 2026)
+
+**Requested**: "Change validated signal as follow, you must follow everything said as it is," pasting a
+complete Markdown specification titled "Systematic Intraday Options Trading Engine: Morning & Afternoon
+Breakout Specification" -- architectural invariants (spot-as-master, ITM-only, single-active-position),
+two entry windows with full boundary/trigger/risk math, a 4-condition 5-second exit-poll loop against live
+spot LTP, a literal `select_itm_strike()` function, and a literal `evaluate_intraday_signal()` reference
+implementation. Third "build exactly as specified, don't skip anything" instruction this week (after
+Autonomous AI's "without any judgement" and Quick Scalp's "Build exactly as said") -- same posture applied
+again: implement in full, make real architecture-fit decisions confidently, name every deviation rather
+than silently dropping anything.
+
+**This REPLACES the 31 Aug EMA_STACK/ST_ALIGNED/ORB_BREAK/PDH_PDL_BREAK 11:00-14:00 signal entirely** --
+`app/validated_signal.py` rewritten from scratch. Kept `ORIGIN="VALIDATED_SIGNAL"` and the `/validated-signal`
+page/route (`app/dashboard_routes.py`, `app/platform.py`'s `get_validated_signal_trades()`), both completely
+unaffected by the rewrite since they're a plain `origin ==` filter -- this replaces the strategy's logic and
+its scheduling, not its identity.
+
+**What shipped**:
+
+- **Two independent breakout windows, evaluated strictly on 5-minute SPOT INDEX candles, never option
+  premium** (the spec's own "Index Spot as Master" invariant): a **Morning Trend Impulse** (09:25-10:45 IST)
+  breaking out of `max(PDH, 10-min opening-range high)` / the mirrored low, and an **Afternoon Box Expansion**
+  (13:15-14:30 IST) breaking out of an 11:00-13:15 consolidation box, gated on its own compression
+  pre-condition (box width <=45pt Nifty / <=160pt Bank Nifty, else Session 2 is naturally inert for the rest
+  of the day -- recomputed fresh every cycle from stored bars, no persisted "disabled today" flag needed,
+  same stateless-recomputation reasoning Quick Scalp's own arm/trigger check already established). Both
+  windows gate on a volume surge over a 20-bar average (1.5x Session 1, 1.3x Session 2) and a hard per-trade
+  risk cap (16/55pt Session 1, 18/65pt Session 2, Nifty/Bank Nifty), sizing the target at a strict 1:2
+  risk:reward off the real spot stop distance. PDH/PDL reused directly from `app.market_context.compute_
+  levels()` (already has the stale-gap protection this needs) -- no new levels code.
+- **Volume substituted from the near-month FUTIDX futures contract's own 5-minute candles** (new
+  `_futures_volume_by_5min`, aligned by timestamp onto the spot bars) -- the same fix Quick Scalp and
+  Autonomous AI already established for the same root cause (spot index candles report volume=0 in this
+  pipeline), just at this module's own 5-minute resolution. Without this substitution every literal
+  `c_vol >= multiplier * vol_sma20` check would compare 0 against 0 -- not a filter, a no-op.
+- **The volume SMA's own literal reference denominator is a bug, not reproduced.** The spec's own
+  `evaluate_intraday_signal` divides by a fixed `20.0` regardless of how many prior bars actually exist
+  (`spot_candles[-21:-1]`), which under-states the average for roughly the first 100 minutes of every
+  session (21 bars don't exist until ~11:00, well past Session 1's own 10:45 close) -- making the surge gate
+  spuriously easy to pass for most of the morning, the opposite of what it's for. `_volume_sma()` averages
+  over however many prior bars actually exist (capped at 20, minimum 5 before evaluating at all) instead.
+- **Section 3.2's stated "Conflict Resolution" rule (discard both signals if both fire on the same candle)
+  is honoured over the reference code's own literal behaviour, which doesn't actually implement it** -- the
+  reference checks bullish with a bare `if` that returns immediately, never reaching the bearish check to
+  notice a conflict. This build checks both before deciding. Proven, and stated in the module docstring,
+  that `UpperBoundary >= LowerBoundary` always holds by construction here (`max(PDH, ORB_High) >= ORB_High
+  >= ORB_Low >= min(PDL, ORB_Low)`), so the conflict case is actually unreachable with these two boundaries
+  specifically -- the check is kept anyway as a literal, direct implementation of the spec's own stated
+  rule, in case a future change to how the boundaries are computed ever makes it reachable.
+- **`select_itm_strike()` (Section 6) preserved verbatim**, including its own asymmetric CE/PE rounding, per
+  the "follow everything said as it is" instruction -- not simplified or "corrected." New
+  `OptionFinder.find_contract_at_strike(signal, index, target_strike, min_dte=0)` is the "given a strike,
+  find the contract" half (same roll-forward-not-skip DTE floor and nearest-strike-within-expiry sort as
+  every other selector in that class) -- the strike MATH stays in `app.validated_signal`, matching the
+  spec's own separation of "compute the strike" from "resolve a contract."
+- **The entire stop/target/stagnation/hard-exit exit engine is genuinely SPOT-based, not a percent-of-
+  premium rescale like every other strategy in this codebase.** New `StrategyTrade.structural_target_level`
+  column (additive migration, sibling to Quick Scalp's own `structural_stop_level`) holds the real
+  `spot_target` alongside `structural_stop_level`'s `spot_sl`; the premium `stoploss`/`target` fields are set
+  to deliberately unreachable sentinels (`entry*0.01` / `entry*100`) so the shared 30-second
+  `monitor_open_trades` never preempts this module's own 5-second poll with an unrelated premium check --
+  same sentinel technique Quick Scalp's Runner leg already established, needed on BOTH sides here since
+  neither premium field carries a real number in this build. The shared monitor still updates
+  `current_premium`/`highest_price`/`lowest_price`/ticks every 30s for reporting; only its STOPLOSS/TARGET
+  decision is defused.
+- **`VALIDATED_SIGNAL` removed from `app.multi_strategy`'s `_GIVEBACK_STOP_ORIGINS`.** That 2-week live
+  trial (3 Sep 2026) was scoped to origins with "zero trailing/discretionary protection today" -- true of
+  the superseded fixed-12%/20% build, no longer true of this one. Left in scope, the giveback mechanism
+  (computed independently from `trade.highest_price`, not gated on the sentinel `stoploss` field) could
+  still have fired on a real premium reversal and silently overridden this engine's spot-level exits on a
+  subset of trades.
+- **Three new `ExitReason` values** (`app/models.py`): `VS_SPOT_STOP`, `VS_SPOT_TARGET`, `VS_STAGNATION_EXIT`
+  -- distinct from `STOPLOSS`/`TARGET` (which mean a PREMIUM level was hit) and from AI Origination's own
+  `STALL_EXIT` (different window, different measured quantity) on purpose. The hard 11:15/15:10 session
+  stops reuse the existing `TIME_EXIT` value, consistent with that value's established meaning everywhere
+  else in this app. Session type (morning vs afternoon) is derived from `entry_time` at exit-check time
+  (`entry_ist.time() < 11:15` -> morning) rather than a new column or string-parsing the free-text
+  `strategy_name` -- cleaner and not dependent on a display label's exact wording ever staying stable.
+- **Single Active Position Rule (Section 1): at most ONE trade across BOTH indices combined**, not
+  per-index like the superseded build -- `_has_open_trade_anywhere()` checks the whole `ORIGIN` population.
+  This is why Validated Signal is no longer hooked into AI Origination's own per-index cycle (the
+  superseded build's design): resolving a genuine cross-index tie-break (highest trigger-candle volume
+  relative to its own 20-bar SMA, per Section 1) needs to see both indices at once in the same cycle, which
+  a per-index hook inside another module's loop can't do cleanly.
+- **Two independent new scheduler jobs**, not one: `validated-signal-entry-check` (5-minute cron, matching
+  the spec's own candle cadence) and `validated-signal-exit-check` (a genuinely new 5-SECOND
+  `IntervalTrigger` -- the fastest job in this codebase, matching the spec's own explicit polling-loop
+  requirement). The exit job is gated only on `trading_day_reason()` (weekday/holiday, no hour-of-day
+  component) -- same reasoning as the shared monitor's own `trade-monitor` job: it must keep running through
+  the whole trading day to catch a position right up to and past either hard-exit time. Returns immediately
+  with zero SmartAPI calls whenever nothing is open, so the 5-second cadence costs nothing in the
+  (overwhelmingly common) idle case. `app/main.py` wires both; `app/ai/originator.py`'s old hook (the
+  import and the try/except call block right after its `[AI][ORIGIN][CTX]` log line) is removed outright.
+- **Sensex explicitly out of scope** -- the spec's own title and every numeric constant in it are stated
+  only for "Nifty 50 and Bank Nifty," so this build evaluates exactly those two index symbols regardless of
+  what else is enabled in Settings.
+- **A real, deliberate behavior change**: `market_context_json` is now always null for new Validated Signal
+  trades. The new engine computes PDH/PDL directly via `compute_levels()` and never builds a full
+  `MarketContext` (no ADX/regime/setups needed anymore) -- stated here rather than only discovered later by
+  someone querying that column.
+
+54 new tests (`tests/test_validated_signal.py`, full replacement of the old ~25): `select_itm_strike`'s
+exact CE/PE/step-size behavior including the boundary case and the unknown-action error, the volume SMA's
+real-average-not-fixed-20 behavior at every bar count, ORB/Box level extraction from exactly the right time
+windows, both sessions' bullish/bearish triggers with their own buffer/max-risk/target math verified against
+hand computation, the compression pre-condition disabling Session 2, the blowout/risk-cap gates cancelling
+an over-wide trigger, the proven `UpperBoundary >= LowerBoundary` invariant, window gating in
+`evaluate_intraday_signal`, the Single Active Position Rule across both indices, `open_validated_trade`'s
+sentinel premium levels and real structural spot levels, all four exit conditions firing at their exact
+boundaries (including stop-beats-hard-exit when both are simultaneously true, matching the spec's own
+checked-in-order semantics) and NOT firing before them, a fallback to `current_premium` when a fresh exit
+LTP fetch fails, and both scheduler entry points end-to-end including the cross-index volume-ratio tie-break
+and the refresh-failure entry halt. `tests/test_validated_signal_hook.py` deleted outright (tested the now-
+removed originator.py hook); `tests/test_validated_signal_trades_query.py` untouched (tests
+`get_validated_signal_trades()`, unaffected by the rewrite). 3 tests in `tests/test_giveback_ratio_stop.py`
+updated for `VALIDATED_SIGNAL`'s removal from `_GIVEBACK_STOP_ORIGINS`, plus a new test confirming it's now
+inert there. Full suite: 865 passed (was 861, plus 2 pre-existing failures unrelated to this change --
+confirmed present on `origin/main` before this work started, both apparent date/time-sensitive flakiness in
+`test_daily_report_origination.py`/`test_index_live_figures_feed.py`, neither touching anything this pass
+modified). `python -c "import app.main"` imports cleanly -- 12 scheduled jobs now, not 10. Migration
+verified via the standard `_ensure_columns()` additive-ALTER pattern (same mechanism `structural_stop_level`
+itself already uses).
+
+The `/validated-signal` page's banner rewritten to describe the new Morning/Afternoon breakout logic, the
+spot-based exit engine, the cross-index single-position rule, and the ITM-not-ATM moneyness; the open-
+position card now shows the real spot entry/stop/target instead of the (now-sentinel, meaningless) premium
+stop/target fields; new distinct badges for `VS_SPOT_STOP`/`VS_SPOT_TARGET`/`VS_STAGNATION_EXIT` plus a
+relabeled `TIME_EXIT` ("Hard session stop"), matching the badge-per-mechanism pattern already established
+on the Autonomous AI and Quick Scalp pages.
+
+**Verified live**: seeded a scratch SQLite DB with one open trade (Morning Impulse, Nifty) and four closed
+trades (Afternoon Expansion, Bank Nifty -- one per new exit reason plus `TIME_EXIT`), started the app,
+logged in, and confirmed `/validated-signal` renders 200 with the new banner text, the open-position card
+showing real spot entry/stop/target values, and all four exit-reason badges rendering distinctly -- no
+Jinja errors. Also confirmed `/` (dashboard) and `/settings` still render cleanly with the originator.py
+hook removed.
+
+**Not verified against real live conditions** -- this sandbox cannot run a real 5-minute cycle against a
+live index feed or a real futures contract's real volume, nor the 5-second exit-poll job against a real
+open position. After deploying: confirm the feature engine resolves a real FUTIDX contract for each index
+and produces a sane, non-zero volume SMA for most of a normal session; confirm a real Session 1 or Session 2
+trigger actually opens a trade with the correct 1-strike-ITM contract and the correct spot stop/target
+levels; confirm the Single Active Position Rule genuinely blocks a second index's signal when one is already
+open, and that a genuine same-cycle concurrent signal on both indices picks the higher-volume-ratio one;
+watch the first few real closes for `VS_SPOT_STOP`/`VS_SPOT_TARGET`/`VS_STAGNATION_EXIT` firing at plausible
+moments (an immediate post-entry `VS_SPOT_STOP` would suggest a units/direction mismatch between the
+computed spot level and the live spot read); and confirm the two hard session-stop times (11:15/15:10)
+actually force-close anything still open at those boundaries. Given this is a full replacement of the
+previous, already-unvalidated construction, with zero real trade history of its own under the new logic,
+read this page's results with the same "not yet enough evidence" standard as every other experimental
+strategy in this project.
+
 ### Autonomous AI gets a third deterministic gate -- EMA-regime/decision cross-check, from real day-one data (4 Sep 2026)
 
 **Trigger**: the first daily trade-history export after the "without judgement" rebuild (PR #83) went live

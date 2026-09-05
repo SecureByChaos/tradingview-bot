@@ -39,6 +39,8 @@ def create_scheduler(
     closing_auction_job: Callable[[], None] | None = None,
     autonomous_job: Callable[[], None] | None = None,
     quick_scalp_job: Callable[[], None] | None = None,
+    validated_signal_entry_job: Callable[[], None] | None = None,
+    validated_signal_exit_job: Callable[[], None] | None = None,
 ) -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone=IST)
     scheduler.add_job(
@@ -94,6 +96,42 @@ def create_scheduler(
             quick_scalp_job,
             trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*", timezone=IST),
             id="quick-scalp-check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+    if validated_signal_entry_job is not None:
+        # 5-minute cron, matching the spec's own 5-minute spot-candle
+        # cadence for setup/trigger evaluation -- see app.validated_signal's
+        # module docstring for why this is its own job rather than hooked
+        # into ai-origination-check's cycle the way the superseded build
+        # was: the Single Active Position Rule needs to see BOTH indices at
+        # once per cycle to resolve a concurrent-signal tie-break. Same
+        # coarse-cron-plus-in-job-check_market_hours-gate shape as every
+        # other AI-adjacent job in this file.
+        scheduler.add_job(
+            validated_signal_entry_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
+            id="validated-signal-entry-check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+    if validated_signal_exit_job is not None:
+        # 5 seconds -- the spec's own explicit exit-poll cadence (Section 5),
+        # the fastest job in this codebase. No day_of_week here (IntervalTrigger
+        # has no such option, same limitation trade-monitor above has) -- the
+        # job's own trading_day_reason() gate handles weekday/holiday, and
+        # deliberately has NO hour-of-day component either, same reasoning as
+        # trade-monitor: this must keep running through the whole trading day
+        # to catch a position right up to and past either hard-exit time.
+        # Returns immediately with zero SmartAPI calls when nothing is open,
+        # so the 5-second cadence costs nothing in the (overwhelmingly common)
+        # idle case.
+        scheduler.add_job(
+            validated_signal_exit_job,
+            trigger=IntervalTrigger(seconds=5),
+            id="validated-signal-exit-check",
             replace_existing=True,
             max_instances=1,
             coalesce=True,

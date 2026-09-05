@@ -168,6 +168,72 @@ class OptionFinder:
             spot_price=round(spot_price, 2),
         )
 
+    def find_contract_at_strike(
+        self, signal: Signal, index: Any, target_strike: int, min_dte: int = 0
+    ) -> OptionContract:
+        """Resolves the nearest actually-listed contract to a STRIKE the
+        caller has already computed -- unlike find_atm_contract (which
+        derives its own target strike from live spot), this trusts the
+        caller's own strike selection verbatim. Built 5 Sep 2026 for
+        app.validated_signal's Morning/Afternoon breakout rebuild, whose own
+        external spec computes a 1-strike-ITM target via its own
+        select_itm_strike() (asymmetric CE/PE rounding, not the plain
+        round-to-nearest-interval find_atm_contract uses) -- this method is
+        the "given a strike, find the contract" half; the strike math itself
+        lives in app.validated_signal, not here, so a future reader isn't
+        surprised to find two different strike-selection rules in one place.
+
+        Same roll-forward-not-skip min_dte behaviour as find_atm_contract
+        (never declines to trade on a near expiry, rolls to the next listed
+        one instead), and the same nearest-strike-within-expiry sort as
+        every other selector in this class.
+        """
+        index = index or self._default_index()
+        spot_price = self.smartapi.get_index_spot(index)
+        option_type = "CE" if signal.value.endswith("CE") else "PE"
+        instruments = self._load_instruments()
+        matches = self._filter_index_options(instruments, index, option_type)
+        if matches.empty:
+            raise ValueError(f"No {index.symbol} {option_type} contracts found in instrument master")
+
+        today = datetime.now(IST).date()
+        if min_dte > 0:
+            eligible = matches[(matches["expiry_dt"] - today).apply(lambda d: d.days) >= min_dte]
+            if eligible.empty:
+                logger.info(
+                    "No %s %s expiry at least %s DTE out; falling back to nearest available",
+                    index.symbol, option_type, min_dte,
+                )
+                eligible = matches
+            elif eligible["expiry_dt"].min() != matches["expiry_dt"].min():
+                logger.info(
+                    "%s: rolled from %s to %s to satisfy the %s-DTE floor",
+                    index.symbol, matches["expiry_dt"].min(), eligible["expiry_dt"].min(), min_dte,
+                )
+            matches = eligible
+
+        nearest_expiry = matches["expiry_dt"].min()
+        expiry_contracts = matches[matches["expiry_dt"] == nearest_expiry].copy()
+        expiry_contracts = expiry_contracts.assign(
+            strike_diff=(expiry_contracts["strike_normalized"] - target_strike).abs()
+        )
+        selected = expiry_contracts.sort_values(["strike_diff", "strike_normalized"]).iloc[0]
+        logger.info(
+            "Selected %s (%s) at spot %.2f: %s strike=%s (target %s) expiry=%s",
+            signal, index.symbol, spot_price, selected["symbol"],
+            int(selected["strike_normalized"]), target_strike, selected["expiry"],
+        )
+        return OptionContract(
+            exchange=selected.get("exch_seg", index.exchange_segment),
+            tradingsymbol=selected["symbol"],
+            symboltoken=str(selected["token"]),
+            strike=int(selected["strike_normalized"]),
+            expiry=str(selected["expiry"]),
+            option_type=option_type,
+            lot_size=int(float(selected.get("lotsize") or index.lot_size)),
+            spot_price=round(spot_price, 2),
+        )
+
     def find_current_futures_contract(self, index: Any) -> dict[str, Any] | None:
         """The near-month FUTIDX contract for this index, or None if the
         instrument master has nothing suitable.

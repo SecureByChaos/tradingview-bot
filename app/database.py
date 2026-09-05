@@ -184,6 +184,7 @@ def _ensure_columns() -> None:
             "ai_risk_quality": "ALTER TABLE strategy_trades ADD COLUMN ai_risk_quality FLOAT",
             "ai_market_alignment": "ALTER TABLE strategy_trades ADD COLUMN ai_market_alignment FLOAT",
             "structural_stop_level": "ALTER TABLE strategy_trades ADD COLUMN structural_stop_level FLOAT",
+            "structural_target_level": "ALTER TABLE strategy_trades ADD COLUMN structural_target_level FLOAT",
         }
         with engine.begin() as connection:
             for column, statement in trade_statements.items():

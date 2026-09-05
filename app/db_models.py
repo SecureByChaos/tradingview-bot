@@ -489,6 +489,17 @@ class StrategyTrade(Base):
     # the premium-based stop. Null for every trade before this column
     # existed and for every non-QUICK_SCALP origin.
     structural_stop_level: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # 5 Sep 2026, app.validated_signal's full Morning/Afternoon breakout
+    # rebuild: the counterpart SPOT INDEX target level (structural_stop_
+    # level's sibling) -- both are index price levels checked by that
+    # module's own 5-second exit poll, never the shared 30s premium monitor.
+    # Reused rather than a third Quick-Scalp-only concept: same "a stop/
+    # target measured on the underlying, not the premium" idea, just also
+    # used for the target side here since Validated Signal's whole risk
+    # construction (per its external spec) lives on the index, not the
+    # option. Null for every trade before this column existed and for every
+    # non-VALIDATED_SIGNAL origin.
+    structural_target_level: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
