@@ -104,8 +104,12 @@ def test_constants_match_the_validated_backtest_cell():
     assert _GIVEBACK_STOP_RATIO == 0.30
 
 
-def test_included_origins_are_exactly_the_three_no_trailing_strategies():
-    assert _GIVEBACK_STOP_ORIGINS == frozenset({"VALIDATED_SIGNAL", "QUICK_SCALP", "AUTONOMOUS_AI"})
+def test_included_origins_are_exactly_the_two_no_trailing_strategies():
+    # VALIDATED_SIGNAL was REMOVED 5 Sep 2026 when that origin was rebuilt to
+    # its own complete, spot-level stop/target/stagnation exit engine (see
+    # app.validated_signal) -- this trial's "zero existing protection" scope
+    # is no longer true for it.
+    assert _GIVEBACK_STOP_ORIGINS == frozenset({"QUICK_SCALP", "AUTONOMOUS_AI"})
 
 
 def test_toggle_off_by_default_behaves_exactly_as_before(monkeypatch, db_session: Session) -> None:
@@ -125,7 +129,7 @@ def test_toggle_off_by_default_behaves_exactly_as_before(monkeypatch, db_session
 
 def test_toggle_on_arms_and_catches_a_reversal_above_the_original_stop(monkeypatch, db_session: Session) -> None:
     _enable_giveback_stop(db_session)
-    _open_trade(db_session, origin="VALIDATED_SIGNAL", entry_price=100.0, stoploss=50.0, target=300.0)
+    _open_trade(db_session, origin="AUTONOMOUS_AI", entry_price=100.0, stoploss=50.0, target=300.0)
     # Peak reaches 115 (15% MFE, clears the 12% floor). Giveback level =
     # 115 - 0.30*(115-100) = 110.5. A drop to 108 must trigger there, not
     # at the original 50 stop.
@@ -177,6 +181,20 @@ def test_toggle_on_does_not_apply_to_signal_origin_trades(monkeypatch, db_sessio
     assert trade.status == TradeStatus.OPEN
 
 
+def test_toggle_on_does_not_apply_to_validated_signal_trades(monkeypatch, db_session: Session) -> None:
+    # Removed from scope 5 Sep 2026 -- see the module-level comment on
+    # _GIVEBACK_STOP_ORIGINS. This origin now runs its own complete,
+    # spot-level exit engine (app.validated_signal); its premium stoploss
+    # field is a deliberately unreachable sentinel, so confirm the giveback
+    # mechanism can't fire on a real premium reversal that would otherwise
+    # have armed it.
+    _enable_giveback_stop(db_session)
+    _open_trade(db_session, origin="VALIDATED_SIGNAL", entry_price=100.0, stoploss=50.0, target=300.0)
+    _run(monkeypatch, db_session, [115.0])
+    trade = _run(monkeypatch, db_session, [108.0])
+    assert trade.status == TradeStatus.OPEN
+
+
 def test_toggle_on_applies_to_quick_scalp(monkeypatch, db_session: Session) -> None:
     _enable_giveback_stop(db_session)
     _open_trade(db_session, origin="QUICK_SCALP", entry_price=100.0, stoploss=50.0, target=300.0)
@@ -199,7 +217,7 @@ def test_giveback_level_never_goes_below_the_original_stop(monkeypatch, db_sessi
     # confirms the level is real room above the original stop, not
     # accidentally tighter than intended.
     _enable_giveback_stop(db_session)
-    _open_trade(db_session, origin="VALIDATED_SIGNAL", entry_price=100.0, stoploss=50.0, target=300.0)
+    _open_trade(db_session, origin="QUICK_SCALP", entry_price=100.0, stoploss=50.0, target=300.0)
     _run(monkeypatch, db_session, [112.0])
     trade = _run(monkeypatch, db_session, [108.4])
     assert trade.exit_reason == ExitReason.GIVEBACK_STOP.value

@@ -4,17 +4,29 @@
 {{ page_header("Validated Signal", "Experimental · Paper Only", "text-bg-warning") }}
 
 <div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
-  <p class="mb-2"><strong>What this is:</strong> a separate, deterministic strategy -- no AI model, no judgment
-  call -- that trades exactly one thing: the single entry signal this project's two years of backtesting has
-  actually found and replicated (EMA_STACK / ST_ALIGNED / ORB_BREAK / PDH_PDL_BREAK, matched to direction,
-  between 11:00 and 14:00 IST). It runs alongside AI Origination's existing 5-minute cycle at zero extra
-  broker-call cost, and is fully isolated from every other trade in this app under its own origin.</p>
-  <p class="mb-0"><strong>What this is not:</strong> a validated strategy, or a promise of a win. The entry
-  signal itself has replicated in backtests; this exact construction -- a plain fixed 12% stop / 20% target
-  with no trailing, chosen to avoid the specific way an earlier holdout test of this same signal failed
-  (its trail/target exits capped winners early while losses ran to the full stop) -- has not been tested
-  against real history. Every number below is a live, ongoing measurement with no minimum sample size met
-  yet, not a confirmed result. Paper trading only -- no live-order code path exists for this strategy.</p>
+  <p class="mb-2"><strong>What this is (rebuilt 5 Sep 2026):</strong> a fully deterministic Morning &amp;
+  Afternoon breakout engine, built to an external specification exactly as written. Two independent windows:
+  a Morning Trend Impulse (09:25-10:45 IST) breaking out of max(previous-day high, opening range high) / the
+  mirrored low, and an Afternoon Box Expansion (13:15-14:30 IST) breaking out of an 11:00-13:15 consolidation
+  box -- both gated on a volume surge over a 20-bar average and a hard per-trade risk cap, both sized at a
+  strict 1:2 risk:reward. <strong>Every setup, trigger, stop and target is computed on 5-minute SPOT INDEX
+  candles only</strong> -- the option is purely the execution vehicle, never the source of any indicator.
+  At most one position is open across Nifty and Bank Nifty combined; if both trigger in the same 5-minute
+  cycle, the one with the higher trigger-candle volume (relative to its own 20-bar average) wins. Contracts
+  are 1-strike In-The-Money, not ATM. Runs on its own two scheduler jobs -- a 5-minute entry check and a
+  genuinely new 5-second exit poll, the fastest job in this app -- fully isolated from every other trade
+  under its own origin.</p>
+  <p class="mb-2"><strong>The stop/target/stagnation exit engine is SPOT-based, not premium-based, unlike
+  every other strategy on this dashboard.</strong> The "Stop"/"Target" figures below are real INDEX price
+  levels checked every 5 seconds against live spot LTP -- not the option's own premium. A trade also exits
+  automatically if it hasn't moved at least 1x its own entry risk within 20 minutes (a stagnation cutoff),
+  or at a hard session cutoff (11:15 IST for a morning trade, 15:10 IST for an afternoon one) regardless of
+  where price sits.</p>
+  <p class="mb-0"><strong>What this is not:</strong> a validated strategy, or a promise of a win. Every
+  threshold here (buffers, risk caps, box widths, the volume multipliers, the 20-minute stagnation window)
+  is the external spec's own number, not something this project's own backtesting has produced or confirmed.
+  Every number below is a live, ongoing measurement with no minimum sample size met yet. Paper trading only
+  -- no live-order code path exists for this strategy.</p>
 </div>
 
 <div class="metric-grid mb-3">
@@ -38,7 +50,7 @@
           <span class="badge text-bg-secondary">{{ trade.mode }}</span>
         </div>
         <div>Entry: {{ trade.entry_price }} · Current: {{ trade.current_premium or trade.entry_price }}</div>
-        <div>Stop: {{ trade.stoploss }} · Target: {{ trade.target }}</div>
+        <div>Spot entry: {{ trade.spot_at_entry }} · Spot stop: {{ trade.structural_stop_level }} · Spot target: {{ trade.structural_target_level }}</div>
         <div class="{% if (trade.pnl_percent or 0) >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent or 0) }}%</div>
         <div class="text-muted mt-2" style="font-size:0.85em;">{{ trade.ai_reasoning }}</div>
         <div class="text-muted" style="font-size:0.85em;">Opened {{ trade.entry_time|ist }}</div>
@@ -89,14 +101,21 @@
         <td data-label="Entry">{{ trade.entry_price }}</td><td data-label="Exit">{{ trade.exit_price or "" }}</td>
         <td data-label="P&amp;L %" class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
         <td data-label="P&amp;L (₹)" class="{% if trade.status == 'CLOSED' %}{% if trade.profit_loss >= 0 %}profit{% else %}loss{% endif %}{% endif %}">{% if trade.status == 'CLOSED' %}₹{{ "%.2f"|format(trade.profit_loss) }}{% else %}—{% endif %}</td>
-        <td data-label="Exit Reason">{{ trade.exit_reason or "" }}</td>
+        <td data-label="Exit Reason">
+          {% if trade.exit_reason == 'VS_SPOT_STOP' %}<span class="badge text-bg-danger">Spot stop</span>
+          {% elif trade.exit_reason == 'VS_SPOT_TARGET' %}<span class="badge text-bg-success">Spot target</span>
+          {% elif trade.exit_reason == 'VS_STAGNATION_EXIT' %}<span class="badge text-bg-warning text-dark">Stagnation (20 min)</span>
+          {% elif trade.exit_reason == 'TIME_EXIT' %}<span class="badge text-bg-secondary">Hard session stop</span>
+          {% elif trade.exit_reason %}<span class="badge text-bg-secondary">{{ trade.exit_reason }}</span>
+          {% endif %}
+        </td>
         <td data-label="Result">{{ trade.result }}</td><td data-label="Status">{{ trade.status }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
 </div>
-{% else %}{{ empty_state("No Validated Signal trades yet -- this strategy only enters between 11:00-14:00 IST when the matched setup is active.") }}{% endif %}
+{% else %}{{ empty_state("No Validated Signal trades yet -- this strategy only enters 09:25-10:45 or 13:15-14:30 IST on a confirmed spot breakout with a volume surge.") }}{% endif %}
 
 {% if equity_curve %}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>

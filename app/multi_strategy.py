@@ -65,8 +65,8 @@ _AI_ORIGIN_TRAIL_OFFSET_PERCENT = 5.0
 # of entry, ratio=30% of the peak gain protected once armed (n=57 armed,
 # 90% CI on mean delta [+1.07%, +3.64%]).
 #
-# Scoped to VALIDATED_SIGNAL/QUICK_SCALP/AUTONOMOUS_AI only, NOT AI_ORIGIN_*
-# or SIGNAL:
+# Scoped to QUICK_SCALP/AUTONOMOUS_AI only, NOT AI_ORIGIN_*, SIGNAL, or (as
+# of 5 Sep 2026) VALIDATED_SIGNAL:
 #   - AI_ORIGIN_* already has its own trailing mechanism just above (trail_
 #     activate_percent/trail_width_percent, arms ~8%) -- the backtest never
 #     modeled stacking a second, independent trail on top of that, so
@@ -78,8 +78,20 @@ _AI_ORIGIN_TRAIL_OFFSET_PERCENT = 5.0
 #     works and confounding the single-variable measurement this trial
 #     needs. Every prior AI-Origination-only mechanism in this file (STALL_
 #     EXIT, the trail above) drew the same line.
-# The three included origins currently have no trailing/discretionary exit
-# of their own on their FIXED-mode trades, so this is the only protective
+#   - VALIDATED_SIGNAL was REMOVED from this trial's scope when that origin
+#     was rebuilt to an external Morning/Afternoon breakout spec (5 Sep
+#     2026, app.validated_signal). This trial was scoped to origins with
+#     "zero trailing/discretionary protection today" -- true of the
+#     superseded fixed-12%/20% build, no longer true of the rebuild, which
+#     now runs its own complete, spot-level stop/target/stagnation exit
+#     engine on its own 5-second poll. Leaving it in scope would let this
+#     premium-based mechanism silently override that engine's exits on a
+#     subset of trades (the rebuild's own premium stoploss/target fields are
+#     deliberately unreachable sentinels, but giveback_stop_level is
+#     computed independently of them from trade.highest_price, so it would
+#     still have been able to fire).
+# QUICK_SCALP/AUTONOMOUS_AI currently have no trailing/discretionary exit of
+# their own on their FIXED-mode trades, so this is the only protective
 # mechanism active for them -- no interaction to reason about.
 #
 # Review after the 2-week trial: if the real outcome supports it, this
@@ -87,7 +99,7 @@ _AI_ORIGIN_TRAIL_OFFSET_PERCENT = 5.0
 # delete this block and the admin toggle rather than leaving it dormant.
 _GIVEBACK_STOP_FLOOR_PERCENT = 12.0
 _GIVEBACK_STOP_RATIO = 0.30
-_GIVEBACK_STOP_ORIGINS = frozenset({"VALIDATED_SIGNAL", "QUICK_SCALP", "AUTONOMOUS_AI"})
+_GIVEBACK_STOP_ORIGINS = frozenset({"QUICK_SCALP", "AUTONOMOUS_AI"})
 
 # Fallback only -- PlatformSettings.trading_start_time/square_off_time (Settings
 # > General) are the real, admin-editable values. These match what was

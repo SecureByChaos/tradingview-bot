@@ -29,6 +29,7 @@ from app.signal_validation import check_duplicate_signal, check_market_hours, ch
 from app.ai.autonomous import run_autonomous_checks
 from app.ai.originator import run_origination_checks
 from app.quick_scalp import run_quick_scalp_checks
+from app.validated_signal import run_validated_signal_entry_checks, run_validated_signal_exit_checks
 from app.live_feed import IndexFeed, LiveFeedStore
 from app.market_data import capture_closing_auction
 from app.option_chain import build_collector_client, run_chain_collection
@@ -93,6 +94,8 @@ scheduler = create_scheduler(
     closing_auction_job=lambda: capture_closing_auction(smartapi, SessionLocal),
     autonomous_job=lambda: run_autonomous_checks(smartapi, option_finder, multi_strategy_manager, live_feed_store),
     quick_scalp_job=lambda: run_quick_scalp_checks(smartapi, option_finder, multi_strategy_manager),
+    validated_signal_entry_job=lambda: run_validated_signal_entry_checks(smartapi, option_finder),
+    validated_signal_exit_job=lambda: run_validated_signal_exit_checks(smartapi, multi_strategy_manager),
 )
 health_manager.scheduler = scheduler
 
