@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import Select, func, or_, select
+from sqlalchemy.exc import InvalidRequestError, OperationalError
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
@@ -105,15 +106,40 @@ def log_event(
     level: str = "INFO",
     payload: dict[str, Any] | None = None,
 ) -> None:
-    db.add(
-        LogEvent(
-            event_type=event_type,
-            level=level,
-            message=message,
-            payload=json.dumps(payload or {}, default=str),
-        )
+    """7 Sep 2026: a real ~20-minute production incident traced to this
+    function. A scheduler job's own except-block routinely calls this to
+    record the error that just happened -- but if that error was a DBAPI-
+    level failure (a SQLite "database is locked" contention, in the
+    incident), SQLAlchemy marks the session's current transaction unusable
+    until an explicit rollback. The old unconditional db.add()/db.commit()
+    then raised its OWN InvalidRequestError/PendingRollbackError, so the
+    job's attempt to log its failure failed too -- "Also failed to log the
+    above failure" in the real logs, hiding the original error behind a
+    confusing second one instead of recording it.
+
+    Retried once after a rollback specifically for that case. Safe even
+    when nothing is wrong: a rollback on a session with no pending failed
+    transaction is a normal no-op. Not a data-loss risk either -- by the
+    time a session reaches this poisoned state, any other pending work on
+    it (e.g. earlier loop iterations in a per-trade monitor batch) was
+    already lost the moment the underlying statement failed; the caller's
+    own subsequent commit would raise the identical error regardless."""
+    entry = LogEvent(
+        event_type=event_type,
+        level=level,
+        message=message,
+        payload=json.dumps(payload or {}, default=str),
     )
-    db.commit()
+    try:
+        db.add(entry)
+        db.commit()
+    except (InvalidRequestError, OperationalError):
+        db.rollback()
+        try:
+            db.add(entry)
+            db.commit()
+        except (InvalidRequestError, OperationalError):
+            logger.exception("[LOG_EVENT] Failed to persist log event after retry: %s", message)
 
 
 def set_bot_state(db: Session, status: str, trading_allowed: bool, risk_locked: bool | None = None) -> BotState:
