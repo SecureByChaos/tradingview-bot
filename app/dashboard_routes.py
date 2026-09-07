@@ -806,6 +806,7 @@ def update_ai_settings_page(
     ai_origination_trail_activate_percent: Annotated[float, Form()] = 8.0,
     ai_origination_chop_gate_min_efficiency_ratio: Annotated[float, Form()] = 0.3,
     enabled: Annotated[str | None, Form()] = None,
+    ai_origination_enabled: Annotated[str | None, Form()] = None,
     ai_origination_chop_gate_enabled: Annotated[str | None, Form()] = None,
     secondary_enabled: Annotated[str | None, Form()] = None,
     secondary_provider: Annotated[str, Form()] = "claude",
@@ -834,6 +835,7 @@ def update_ai_settings_page(
     settings = get_ai_settings(db) or create_ai_settings(db, id=1)
     values = {
         "enabled": enabled == "on",
+        "ai_origination_enabled": ai_origination_enabled == "on",
         "mode": mode,
         "provider": provider,
         "model": model.strip(),

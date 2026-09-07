@@ -261,6 +261,7 @@ def _ensure_columns() -> None:
             "ai_origination_trail_activate_percent": "ALTER TABLE ai_settings ADD COLUMN ai_origination_trail_activate_percent FLOAT NOT NULL DEFAULT 8.0",
             "ai_origination_chop_gate_enabled": "ALTER TABLE ai_settings ADD COLUMN ai_origination_chop_gate_enabled BOOLEAN NOT NULL DEFAULT 0",
             "ai_origination_chop_gate_min_efficiency_ratio": "ALTER TABLE ai_settings ADD COLUMN ai_origination_chop_gate_min_efficiency_ratio FLOAT NOT NULL DEFAULT 0.3",
+            "ai_origination_enabled": "ALTER TABLE ai_settings ADD COLUMN ai_origination_enabled BOOLEAN NOT NULL DEFAULT 1",
         }
         with engine.begin() as connection:
             for column, statement in ai_statements.items():

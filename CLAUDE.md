@@ -295,6 +295,74 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination gets its own independent pause toggle -- separate from the shared "Enable AI" checkbox (7 Sep 2026)
+
+**Requested**: "I want to pause ai origination trades for few days." Investigated before building: `AISettings.
+enabled`/`mode` (the existing "Enable AI" checkbox on Settings > AI) is read identically by
+`run_origination_checks` (AI Origination, `app/ai/originator.py`) **and** `run_autonomous_checks` (Autonomous AI,
+`app/ai/autonomous.py` line ~1176 -- the exact same `if settings is None or not settings.enabled or settings.
+mode == "DISABLED":` condition). Unchecking the existing toggle would have paused both strategies at once, not
+just the one asked about -- flagged this via `AskUserQuestion` rather than either silently pausing Autonomous AI
+too or silently building a new toggle without confirming that tradeoff. User chose: **pause AI Origination only**,
+via a small code change adding a second, independent toggle.
+
+**Implementation**: new `AISettings.ai_origination_enabled` column (`app/db_models.py`, `Boolean, default=True,
+nullable=False` -- same deploy-safe convention as every other `AISettings` field added this project: defaulting
+to the value that preserves current live behavior means deploying this changes nothing until an admin actually
+unchecks the new box), additive `_ensure_columns()` migration in `app/database.py`. `run_origination_checks`
+checks it as a second, separate gate immediately after the existing shared enabled/mode check:
+
+```python
+if not settings.ai_origination_enabled:
+    logger.info("[AI][ORIGIN] Skipped: AI Origination paused (Settings > AI)")
+    return
+```
+
+`app/ai/repository.py`'s `get_settings`/`create_settings`/`update_settings` are fully generic (`setattr` over
+whatever `values` are passed, validated only via `hasattr(AISettings, field)`), so no repository code changes
+were needed -- only the DB model, migration, route, template, and the one new gate line in `originator.py`.
+`app/dashboard_routes.py`'s `update_ai_settings_page` gained the matching `ai_origination_enabled: Annotated[str
+| None, Form()] = None` parameter and `"ai_origination_enabled": ai_origination_enabled == "on"` in its `values`
+dict, right alongside the existing `enabled` field. Settings > AI (`settings.html`) gained a new checkbox
+directly under "Enable AI", with a tooltip stating explicitly that it does **not** affect Autonomous AI, Quick
+Scalp, or Validated Signal -- so a future reader of the UI doesn't have to already know the shared-gate history
+above to use it correctly. `app/ai/autonomous.py` itself is completely untouched by this change -- confirmed by
+`git diff`, and by a dedicated test (below) that sets `ai_origination_enabled=False` and asserts
+`run_autonomous_checks` still reaches its own entry check normally.
+
+Once deployed, the user can pause and resume AI Origination for however long they want entirely from Settings >
+AI -- no further deploy needed either way, which was the point of building a real toggle rather than a one-off
+code change.
+
+4 new tests (`tests/test_ai_origination_pause_toggle.py`): `run_origination_checks` skips entirely (never builds
+market context, never calls the model) when `ai_origination_enabled=False` even with `enabled=True` and a real
+provider configured -- proving this is a genuinely separate gate, not a restatement of the existing one; the
+default-`True` control case still reaches `_load_market_context` normally; `run_autonomous_checks` reaches its
+own `check_autonomous_entry` normally with the new flag set to `False`, the core guarantee this whole change
+exists to provide; and a direct call into `update_ai_settings_page` round-trips the new checkbox both ways
+(`None` -> unchecked/`False`, `"on"` -> checked/`True`). Full suite: 877 passed, 1 failed (was 874 passed) -- the failure is pre-existing, unrelated, time-of-day-dependent
+flakiness in `tests/test_validated_signal.py::test_exits_no_stagnation_when_move_is_genuinely_favorable`, which
+calls real `utc_now()` with no clock mock and so fails whenever run after either of Validated Signal's own hard
+session-exit times, 11:15/15:10 IST -- confirmed present identically on a clean `git stash` of this change,
+unrelated to anything touched here. `python -c "import app.main"` imports cleanly.
+Migration verified against a simulated pre-migration DB (built the full current schema, dropped the new column
+via `ALTER TABLE ... DROP COLUMN`, ran `_ensure_columns()` for real, confirmed the column reappears, confirmed a
+second run is a clean no-op).
+
+**Verified live**: started the app against a scratch SQLite DB, logged in, confirmed `/settings?tab=ai` renders
+the new checkbox checked by default (matching the column's `True` default), submitted the AI settings form
+without the checkbox (simulating an admin unchecking it) and confirmed it renders unchecked afterward, then
+re-submitted with it checked and confirmed it renders checked again -- both round trips via real HTTP POSTs
+against the real route, not just the unit tests. Confirmed `/settings` (General tab) and `/` (dashboard) both
+still render 200 with this change in place.
+
+**Not verified live against a real origination cycle** -- this sandbox cannot run the scheduler against real
+SmartAPI credentials. After deploying, the admin can uncheck "AI Origination Enabled" on Settings > AI and
+confirm `[AI][ORIGIN] Skipped: AI Origination paused (Settings > AI)` starts appearing in the logs every cycle,
+while `[AUTONOMOUS_AI]` log lines continue completely unaffected, and Quick Scalp/Validated Signal keep trading
+as normal. Re-check after a few days and confirm re-checking the box resumes AI Origination on the very next
+5-minute cycle with no restart needed.
+
 ### "Too much memory" turned out to be a ~20-minute SQLite lock cascade that killed the process -- fixed at the engine level (7 Sep 2026)
 
 **Reported**: "the bot is using too much memory from last two days." Investigated the code first (no unbounded
