@@ -196,6 +196,10 @@
         <input class="form-check-input" type="checkbox" name="enabled" id="ai-enabled" {% if ai_settings.enabled %}checked{% endif %}>
         <label class="form-check-label" for="ai-enabled">Enable AI</label>
       </div>
+      <div class="form-check mb-3">
+        <input class="form-check-input" type="checkbox" name="ai_origination_enabled" id="ai_origination_enabled" {% if ai_settings.ai_origination_enabled %}checked{% endif %}>
+        <label class="form-check-label" for="ai_origination_enabled" title="Pauses AI Origination specifically, e.g. to stop it for a few days without touching anything else. Independent of 'Enable AI' above and unrelated to Autonomous AI -- unchecking this does NOT pause Autonomous AI, Quick Scalp, or Validated Signal, all of which keep running normally.">AI Origination Enabled</label>
+      </div>
       <div class="form-grid">
         <div><label class="form-label">Mode</label><select class="form-select" name="mode">
           {% for value, label in [("DISABLED", "Disabled"), ("SHADOW", "Shadow"), ("ADVISORY", "Advisory"), ("BLOCKING", "Blocking")] %}

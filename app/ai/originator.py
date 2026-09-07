@@ -1458,6 +1458,12 @@ def run_origination_checks(
         if settings is None or not settings.enabled or settings.mode == "DISABLED":
             logger.info("[AI][ORIGIN] Skipped: AI disabled")
             return
+        if not settings.ai_origination_enabled:
+            # Distinct from the shared enabled/mode check above -- that pair
+            # also gates app.ai.autonomous's run_autonomous_checks, so it
+            # can't be used to pause AI Origination alone. This flag can.
+            logger.info("[AI][ORIGIN] Skipped: AI Origination paused (Settings > AI)")
+            return
         if (settings.provider or "").strip().lower() not in {"openai", "claude"}:
             logger.info("[AI][ORIGIN] Skipped: no real provider configured (provider=%s)", settings.provider)
             return

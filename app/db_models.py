@@ -142,6 +142,18 @@ class AISettings(Base):
     # prompt (_efficiency_ratio_text), not a separately-chosen number.
     ai_origination_chop_gate_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     ai_origination_chop_gate_min_efficiency_ratio: Mapped[float] = mapped_column(Float, default=0.3, nullable=False)
+    # 7 Sep 2026: requested as a way to pause AI Origination specifically for
+    # a few days -- `enabled`/`mode` above are NOT specific to AI Origination,
+    # app.ai.autonomous.run_autonomous_checks reads that exact same pair of
+    # fields to decide whether Autonomous AI runs, so turning those off would
+    # have paused both strategies at once, not just the one asked about. This
+    # is a second, independent gate checked ONLY by run_origination_checks --
+    # Autonomous AI, Quick Scalp, and Validated Signal are all unaffected by
+    # it either way. Defaults to True so deploying this column changes
+    # nothing on its own; an admin unchecks "AI Origination Enabled" on
+    # Settings > AI to actually pause it, and re-checks it to resume -- no
+    # further deploy needed either way.
+    ai_origination_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
