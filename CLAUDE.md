@@ -295,6 +295,92 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### "Too much memory" turned out to be a ~20-minute SQLite lock cascade that killed the process -- fixed at the engine level (7 Sep 2026)
+
+**Reported**: "the bot is using too much memory from last two days." Investigated the code first (no unbounded
+accumulator, no leaking module-level cache, `LiveFeedStore`/`_recent_signals` both bounded) and asked for real
+numbers rather than guessing. `free -h` on the live box: 412Mi total RAM, only 147Mi available, 485Mi of a 1Gi
+swap already in use, and the bot's own RSS (130Mi, 30.9% of total) was the single largest consumer on the box.
+Genuinely a capacity symptom, not a leak in the classic sense -- and it lined up with the last two days' three
+rebuilds (Quick Scalp, Autonomous AI's third gate, Validated Signal) adding a sixth scheduler job, including the
+first-ever 5-second interval job in this codebase.
+
+**Then the site actually went down (502) mid-investigation, and that's what turned out to be the real bug.**
+`sudo journalctl -u tradingview-bot -n 50` showed the service already auto-restarted by systemd's own restart
+policy; a wider window (`--since "30 minutes ago"`) found the actual cause: `systemd[1]: tradingview-bot.service:
+Main process exited, code=killed, status=9/KILL` / `Failed with result 'timeout'`, preceded by ~20 minutes
+(13:16-13:36 IST) of near-continuous `sqlite3.OperationalError: database is locked` across every single scheduler
+job -- `app.quick_scalp`, `app.validated_signal`, `app.ai.autonomous`, `app.ai.originator`, `MultiStrategyMonitor.tick`,
+the new 5-second exit-poll job, all of it. systemd eventually SIGKILLed a process that had stopped responding.
+
+**Root cause: six-plus scheduler jobs, one shared SQLite file, no busy-wait configured.** `app/database.py`'s engine
+never set a `timeout` on the sqlite3 connection (Python's own driver default is a bare 5 seconds) and never
+touched SQLite's default rollback-journal mode, which blocks every reader while a writer holds the lock. Adding
+Quick Scalp (1-min), Autonomous AI (5-min), and Validated Signal (5-min entry **and** a genuinely new 5-second
+exit poll) on top of the existing AI Origination (5-min) and shared monitor (30s) jobs raised the odds of two
+threads hitting the same file at once far enough that the 5-second default budget wasn't remotely enough --
+confirmed by reproducing the exact failure locally: 10 threads writing concurrently with a bare rollback-journal
+engine and no timeout threw 9 real `database is locked` errors matching the production message byte for byte;
+the same load against a WAL-mode engine with `busy_timeout=10000` threw zero.
+
+**A second, independent bug made this far worse than a few skipped cycles: `log_event()` couldn't log its own
+failures.** Once one statement on a session fails at the DBAPI level, SQLAlchemy marks that session's transaction
+invalid until an explicit `rollback()` -- so the old `log_event()` (`app/platform.py`), called from inside every
+job's own `except Exception:` block specifically to record what just went wrong, tried to `db.add()`/`db.commit()`
+on that same poisoned session and raised its OWN `PendingRollbackError`. The real logs show this exactly:
+`[AI][ORIGIN] Check failed for index BANKNIFTY` immediately followed by `[AI][ORIGIN] Also failed to log the
+above failure for BANKNIFTY` -- the error-reporting path was itself failing, hiding the real cause behind a
+second, more confusing one, on every single job, every cycle, for the full 20 minutes.
+
+**Fixed at the engine level, two changes, both applied to `app/database.py`'s main engine and
+`app/option_chain_store.py`'s separate archive engine:**
+
+- `connect_args={"timeout": 10}` -- sqlite3's own busy-wait budget, up from the driver's 5s default. This is what
+  actually converts a `database is locked` collision into "wait a bit and proceed" instead of an immediate
+  exception, confirmed to be the dominant fix for writer-vs-writer contention in the reproduction above (WAL
+  alone, with no timeout, still threw the same 9 errors; the timeout alone, with the default journal mode, threw
+  zero).
+- `PRAGMA journal_mode=WAL` (+ `synchronous=NORMAL`, the documented safe pairing) via a `sqlalchemy.event.
+  listens_for(engine, "connect")` hook, so every pooled connection gets it. WAL's own contribution is orthogonal
+  to the timeout: it lets a reader (a candle refresh's `SELECT`) proceed concurrently with an in-progress writer
+  instead of blocking on it at all, which is exactly the OTHER half of what the real incident's traceback showed
+  (reads and writes both timing out, from different modules, in the same window).
+
+**`log_event()` itself now recovers from a poisoned session instead of raising a second exception on top of the
+first.** Wrapped in a try/except for `(InvalidRequestError, OperationalError)` -- on failure, rolls back once and
+retries the exact same write; if the retry also fails, logs via the plain Python `logger` instead of raising, since
+this is specifically the safety-net path an exception handler calls and it must never itself throw. Verified this
+doesn't risk losing any legitimately-pending work: once a session hits this state, the caller's own subsequent
+`db.commit()` (e.g. `monitor_open_trades`' one final commit after its whole per-trade loop) would raise the
+identical error regardless of what `log_event` does, so anything still pending on a poisoned session was already
+lost the moment the first statement failed -- this fix only changes whether the *error itself* gets recorded, not
+what data survives.
+
+**Not the same file as the option-chain archive by accident** -- `app/option_chain_store.py` maintains its own,
+completely separate SQLite file (`data/option_chain.db`) and its own engine, so it got the identical PRAGMA/timeout
+treatment for consistency even though it wasn't implicated in this incident (single writer, 5-minute cadence,
+nothing live reads it).
+
+7 new tests: `tests/test_sqlite_pragmas.py` (WAL/busy_timeout actually take effect on a real connection, persist
+across a second pooled connection, and -- critically -- that the REAL `app.database.engine` object has them, not
+just a reconstruction of it) and `tests/test_log_event_resilience.py` (a normal write is untouched; recovery from
+both failure shapes seen in production -- a session already poisoned by a prior statement, and `log_event`'s own
+commit hitting a fresh lock -- via controlled fakes reproducing SQLAlchemy's exact `PendingRollbackError`/code
+`8s2b`, not a real file-locking race; and confirmation the safety net itself never raises even when the retry also
+fails). Full suite: 874 passed (was 867). `python -c "import app.main"` imports cleanly.
+
+**Verified directly against the real failure mode**, not just unit tests: a standalone concurrency reproduction
+(10 threads, each writing 15 batches of 20 rows with a small hold-open delay, mirroring `store_bars`' own
+multi-row-then-commit shape) reliably produced the exact `(sqlite3.OperationalError) database is locked` message
+against an unfixed engine, and zero errors against the fixed one, under identical load.
+
+**Not verified live** -- this sandbox cannot reproduce six real scheduler jobs contending against a live SmartAPI
+feed. After deploying, confirm no `database is locked` lines appear in `journalctl` under real trading-hours load,
+and if the same class of incident ever recurs despite this, the next thing to check is the systemd unit's own
+`TimeoutStopSec`/watchdog configuration (outside this repo, on the server itself) -- the SIGKILL in this incident
+was systemd's own timeout policy reacting to a hung process, not something this codebase configures, and raising
+it would only buy more time for a future hang to resolve on its own, not prevent one.
+
 ### Validated Signal replaced entirely -- Morning & Afternoon spot breakout engine, built exactly to a pasted spec (5 Sep 2026)
 
 **Requested**: "Change validated signal as follow, you must follow everything said as it is," pasting a

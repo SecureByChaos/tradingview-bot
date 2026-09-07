@@ -5,7 +5,7 @@ import os
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
@@ -50,11 +50,39 @@ if resolved_database_url.startswith("sqlite:///"):
     if sqlite_path and sqlite_path != ":memory:":
         Path(sqlite_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
 
+# timeout=10: sqlite3's own busy-wait budget (seconds) before raising
+# "database is locked" -- the driver default is only 5s. Six-plus scheduler
+# jobs (as of the 5 Sep Validated Signal rebuild, including a 5-second
+# interval job) can now genuinely land concurrent writes against this one
+# file; 7 Sep 2026 saw a real ~20-minute cascade of "database is locked"
+# errors that ended with systemd SIGKILLing the process on a timeout. 10s
+# gives real headroom without letting one stuck job tie up a scheduler
+# thread for too long.
 engine = create_engine(
     resolved_database_url,
-    connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {},
+    connect_args={"check_same_thread": False, "timeout": 10} if settings.database_url.startswith("sqlite") else {},
     future=True,
 )
+
+if resolved_database_url.startswith("sqlite"):
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, connection_record) -> None:
+        # WAL mode is the other half of the 7 Sep fix: the default rollback-
+        # journal mode blocks every reader while a writer holds the lock,
+        # which is exactly the contention pattern that produced that
+        # incident's error cascade. WAL lets readers proceed concurrently
+        # with a single writer -- only writer-vs-writer still serializes,
+        # which the busy_timeout above now absorbs instead of raising
+        # immediately. synchronous=NORMAL is the documented safe pairing
+        # with WAL (still durable across an application crash, only trades
+        # away safety against an OS-level power loss, an acceptable trade
+        # for this app's own risk profile).
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=10000")
+        cursor.close()
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 

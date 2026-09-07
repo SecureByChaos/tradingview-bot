@@ -53,6 +53,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+    event,
     func,
     select,
 )
@@ -161,9 +162,22 @@ def get_session_factory():
         path.parent.mkdir(parents=True, exist_ok=True)
         _engine = create_engine(
             _database_url(path),
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 10},
             future=True,
         )
+
+        @event.listens_for(_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, connection_record) -> None:
+            # Same hardening as app.database's main engine (7 Sep 2026
+            # "database is locked" incident) -- this is a separate file, but
+            # cheap and correct regardless of how many writers it actually
+            # sees today.
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=10000")
+            cursor.close()
+
         ChainBase.metadata.create_all(bind=_engine)
         _SessionLocal = sessionmaker(
             bind=_engine, autoflush=False, autocommit=False, expire_on_commit=False
