@@ -87,15 +87,22 @@ def create_scheduler(
             coalesce=True,
         )
     if quick_scalp_job is not None:
-        # 1-minute resolution, not 5 -- see app.quick_scalp's own module
-        # docstring for why: there is no LLM cost to amortize against a
-        # slower cadence here, so "quick" scalping gets a genuinely quick
-        # decision loop. Same coarse-cron-plus-in-job-check_market_hours-gate
-        # shape as every other AI-adjacent job in this file.
+        # 8 Sep 2026 rebuild: entries moved OFF the scheduler entirely onto
+        # app.quick_scalp_feed.QuickScalpFeed's own bar-close callback (real
+        # WS tick aggregation, started in app/main.py's lifespan) -- this job
+        # is now exit-management + square-off only, so it's sped up to a
+        # 5-second IntervalTrigger to match app.validated_signal's own
+        # already-established exit-poll precedent (same reasoning: no
+        # day/time-of-day option on IntervalTrigger, so the job's own
+        # trading_day_reason() gate handles weekday/holiday and deliberately
+        # has no hour-of-day component -- must keep running through the
+        # whole trading day to catch a position right up to and past the
+        # square-off cutoff). Returns immediately with zero SmartAPI calls
+        # when nothing is open, so the fast cadence costs nothing idle.
         scheduler.add_job(
             quick_scalp_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*", timezone=IST),
-            id="quick-scalp-check",
+            trigger=IntervalTrigger(seconds=5),
+            id="quick-scalp-exit-check",
             replace_existing=True,
             max_instances=1,
             coalesce=True,

@@ -101,20 +101,22 @@ def test_autonomous_ai_check_not_registered_without_a_job():
     assert scheduler.get_job("autonomous-ai-check") is None
 
 
-def test_quick_scalp_check_uses_a_weekday_session_hours_every_minute_cron():
+def test_quick_scalp_exit_check_uses_a_5_second_interval_trigger():
+    # 8 Sep 2026 rebuild: entries moved off the scheduler entirely onto
+    # app.quick_scalp_feed.QuickScalpFeed's own bar-close callback -- this
+    # job is exit-management + square-off only now, sped up to match
+    # app.validated_signal's own 5-second exit-poll precedent.
+    from apscheduler.triggers.interval import IntervalTrigger
+
     scheduler = create_scheduler(_FakeMonitor(), quick_scalp_job=lambda: None)
-    job = scheduler.get_job("quick-scalp-check")
+    job = scheduler.get_job("quick-scalp-exit-check")
 
-    assert isinstance(job.trigger, CronTrigger)
-    fields = _trigger_fields(job.trigger)
-    assert fields["day_of_week"] == "mon-fri"
-    assert fields["hour"] == "9-15"
-    assert fields["minute"] == "*"
+    assert isinstance(job.trigger, IntervalTrigger)
 
 
-def test_quick_scalp_check_not_registered_without_a_job():
+def test_quick_scalp_exit_check_not_registered_without_a_job():
     scheduler = create_scheduler(_FakeMonitor(), quick_scalp_job=None)
-    assert scheduler.get_job("quick-scalp-check") is None
+    assert scheduler.get_job("quick-scalp-exit-check") is None
 
 
 def test_pre_market_health_job_wired_through_the_scheduler():

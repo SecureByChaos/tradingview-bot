@@ -45,25 +45,33 @@ class ExitReason(str, Enum):
     # strategy's own configured max-hold window. No longer produced by any
     # live code path; kept for historical rows.
     MAX_HOLD_EXIT = "MAX_HOLD_EXIT"
-    # Quick Scalp only, 4 Sep 2026 VWAP 2-sigma mean-reversion rebuild --
-    # the spec's own "Hard Time Stop": neither leg's target/stop/runner
-    # condition fired within 3 completed 1-minute candles (180s) of entry.
-    # Deliberately NOT reusing MAX_HOLD_EXIT (a different mechanism, 15-
-    # minute window, from the superseded build) or STALL_EXIT (AI
-    # Origination's own 60-min/+-5% mechanism) -- distinct parameters,
-    # distinct reason, same as every other exit mechanism in this project.
+    # Quick Scalp only. Originally the 4 Sep 2026 VWAP 2-sigma rebuild's
+    # unconditional "Hard Time Stop" -- closed the WHOLE position (both
+    # Target1/Runner legs) at 3 completed 1-minute candles (180s) regardless
+    # of P&L. Narrowed by the 8 Sep 2026 rebuild (single-clip exit, no more
+    # legs): this now fires ONLY when the position is still flat/negative at
+    # the 3-minute mark -- a "scratch". A position that's already profitable
+    # enough to cover round-trip costs at that mark is instead left open
+    # with its stop trailed to breakeven (no new ExitReason for that --
+    # trailing the stop isn't an exit). Deliberately NOT reusing MAX_HOLD_
+    # EXIT (a different mechanism, 15-minute window, from the superseded
+    # EMA/RSI build) or STALL_EXIT (AI Origination's own 60-min/+-5%
+    # mechanism) -- distinct parameters, distinct reason, same as every
+    # other exit mechanism in this project.
     SCALP_TIME_STOP = "SCALP_TIME_STOP"
     # Quick Scalp only -- the underlying INDEX spot breached
     # StrategyTrade.structural_stop_level (C0's rejection-bar extreme +-1pt,
     # capped at 14 points from the trigger price). Distinct from STOPLOSS,
-    # which is the OPTION PREMIUM stop (~8-10 points) checked independently
-    # by the shared 30s monitor -- this is a second, index-level invalidation
-    # layer the spec asks for explicitly, not a duplicate of the premium one.
+    # which is the OPTION PREMIUM stop checked independently by the shared
+    # 30s monitor -- this is a second, index-level invalidation layer the
+    # spec asks for explicitly, not a duplicate of the premium one.
     SCALP_STRUCTURAL_STOP = "SCALP_STRUCTURAL_STOP"
-    # Quick Scalp only -- the spec's "Target 2 (Runner)": the runner leg
-    # (the half of the position NOT closed at Target 1) exits when the
-    # underlying spot reaches back to the current session VWAP. Distinct
-    # from TARGET (the flat option-point Target 1 on the other leg).
+    # Quick Scalp only, 4 Sep 2026 build -- the spec's "Target 2 (Runner)":
+    # the runner leg (the half of the position NOT closed at Target 1) exited
+    # when the underlying spot reached back to the current session VWAP.
+    # SUPERSEDED by the 8 Sep 2026 rebuild's single-clip exit (no more
+    # Target1/Runner legs at all) -- no longer produced by any live code
+    # path; kept for historical rows, same convention as MAX_HOLD_EXIT above.
     SCALP_VWAP_TARGET = "SCALP_VWAP_TARGET"
     # Temporary 2-week live trial (3 Sep 2026), admin-toggleable, off by
     # default -- see PlatformSettings.giveback_ratio_stop_enabled and
