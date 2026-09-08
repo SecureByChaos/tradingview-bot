@@ -295,6 +295,139 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp rebuilt again -- real WebSocket tick engine, single-clip exit, P&L-aware time stop (8 Sep 2026)
+
+**Requested**: pasting a full spec titled "NIFTY 50 VWAP 2sigma Scalp Engine -- Comprehensive SmartAPI
+Production Spec" with no accompanying instruction. Flagged before building anything: the core VWAP+2sigma
+setup/trigger logic already matches the 4 Sep build almost exactly, but the risk construction and data
+ingestion are materially different (single-clip exit vs. the 4 Sep build's dual-leg split, percentage-based
+stop/target vs. flat option points, a P&L-aware time-stop vs. an unconditional one, and a real WebSocket
+tick engine vs. the 4 Sep build's own explicitly-declined REST-polling substitute). Asked via
+`AskUserQuestion` whether to replace Quick Scalp entirely (including the WS engine), adopt only the
+risk-mechanism changes on the existing REST architecture, or just save the spec as a reference doc. User
+chose: **full rebuild, including the WebSocket-based engine**.
+
+**Real, named risk surfaced before building, not after**: this project's own notes from the same week
+document the production box (a 412Mi Lightsail instance) as memory-constrained after Quick Scalp's own 4
+Sep rebuild and Validated Signal's 5 Sep rebuild already pushed it from 3 to 6 concurrent scheduler jobs,
+followed by a real SQLite lock-cascade crash and, days later, an admin choosing to leave the box under real
+strain rather than pause a second strategy or upgrade the plan. Building a SECOND persistent WebSocket
+connection (this one) on top of that is a genuine, material additional resource cost -- said so explicitly
+in this file, in the module's own docstring, and on the page's own banner, rather than building it quietly.
+If capacity pressure gets worse after this deploys, this feed -- not started via the scheduler, so pausing
+it means not constructing it at all in `app/main.py`'s lifespan -- is a specific, known thing to reconsider.
+
+**What's new, `app/quick_scalp_feed.py` (new module)**: `QuickScalpFeed`, a persistent background
+WebSocket connection mirroring `app/live_feed.py`'s `IndexFeed` shape (deferred SDK import, reconnect
+loop, market-hours gate, single instance for the process) but subscribing to TWO token sets per index --
+the spot token in LTP mode (price) and the near-month FUTIDX futures contract's own token in QUOTE mode
+(real volume, since index instruments themselves report zero -- same substitution this project has used
+since 3 Sep for Autonomous AI's VWAP feature). Ticks are aggregated into 1-minute `Bar` objects and
+persisted via the existing `store_bars` the instant a tick's minute rolls over -- not up to 60+ seconds
+later on the next scheduler firing, which is the actual "false-breakout chop" fix the spec's own Section 1
+names as its first bottleneck. Deliberately does NOT hand-roll a second, parallel incremental VWAP/RSI
+implementation: once a bar closes, the existing, already-tested `_compute_vwap_bands`/`rsi` pure functions
+are simply re-run over that day's stored bars (a few hundred rows, negligible cost) -- the spec's own
+"O(1) per bar" framing is a real concern for a per-TICK engine, not for something that only needs to run
+once per completed BAR. Full list of untested assumptions (LTP paise-scaling, `volume_trade_for_the_day`
+being cumulative not per-tick, wall-clock vs. exchange-timestamp bucketing, NSE_FO exchange-type) is in the
+module's own docstring, same discipline `app/live_feed.py` already established for its own untested
+assumptions.
+
+**Position-level monitoring is deliberately NOT a second, per-position WebSocket channel.** The spec's own
+`on_option_tick` design subscribes/unsubscribes per open position; this build keeps that decision on the
+existing scheduler-poll job instead, sped up from Quick Scalp's own 1-minute cron to a 5-second
+`IntervalTrigger` (`quick-scalp-exit-check`, replacing `quick-scalp-check`) -- the exact same tradeoff
+`app.validated_signal`'s own 5-second exit poll already made and this project already trusts. Building a
+second dynamic subscription-management system for a decision (has 180 seconds elapsed, is the trade now
+profitable enough to cover costs) that doesn't need tick-level precision was judged not worth the added
+complexity on top of an already resource-constrained box. The option-premium stop/target themselves are
+still independently, and faster, enforced by the existing shared 30-second `monitor_open_trades` tick, same
+as the 4 Sep build.
+
+**Entries moved off the scheduler entirely.** `app.quick_scalp`'s `_on_scalp_bar_closed` is registered as
+`QuickScalpFeed`'s `on_bar_closed` callback (via `make_bar_closed_callback`, wired in `app/main.py`'s
+lifespan alongside `IndexFeed`) -- invoked synchronously on the feed's own background thread once a bar has
+already been persisted, opening its own DB session the same way every other entry point in this codebase
+already does. A WS feed outage pauses NEW entries only (no new bars, no callback firings) until it
+reconnects -- any already-open Quick Scalp position is completely unaffected, since its own exits run on
+the independent scheduler-poll path with no dependency on this feed at all. Same fail-soft philosophy
+`app/live_feed.py` already established: "a feed problem degrades... never blocks trading."
+
+**Single-clip exit, no more Target-1/Runner legs.** `open_scalp_trade` now opens exactly one
+`StrategyTrade` row per signal -- `_sibling_trade_id`, the 50/50 lot-fraction math, and the Runner leg's
+VWAP-cross exit are all gone. `ExitReason.SCALP_VWAP_TARGET` is no longer produced by any live code path
+(marked historical in `app/models.py`, same convention as `MAX_HOLD_EXIT`).
+
+**Percentage-based stop/target, not flat option points.** Stop is a flat -2.5% of entry premium; target is
+the midpoint of the spec's own stated "+3.5% to +4.0%" range (3.75%), floored at the spec's own stated
+minimum +Rs12 premium points -- `max(entry * 3.75%, entry + 12)`. The structural (index-level) stop is
+kept unchanged from the 4 Sep build (C0's rejection-bar extreme +-1pt, capped at 14 points from the trigger
+price) despite the new spec's own sample code not implementing it -- the spec's risk TABLE still states
+"Stop Loss: -2.5% or structural bar invalidation," and the table is treated as the authoritative
+requirement over an incomplete reference implementation, same resolution `app.validated_signal`'s own
+rebuild already used for an analogous gap.
+
+**The hard time-stop now branches on P&L instead of force-closing unconditionally -- a real, material
+behavior change directly motivated by real data.** At the 3-completed-bar (180s) mark: if the position is
+already profitable enough to cover round-trip costs (current premium >= entry + Rs2, the spec's own
+cost-buffer number), the stop is moved up to that breakeven-plus-buffer level and the trade is left OPEN to
+run toward its real target -- not force-closed. Only a still-flat/negative position is closed at this mark
+(a "scratch"). `ExitReason.SCALP_TIME_STOP` is kept (same value), its meaning narrowed accordingly (see
+`app/models.py`'s updated comment). This is exactly the mechanism that closed two of 8 Sep's four real
+Quick Scalp legs at a net loss despite each having moved slightly favorably (+0.48%) -- discussed with the
+user the same day this rebuild was requested, and named directly in the module's own docstring as part of
+what prompted it.
+
+**Idempotency for the breakeven trail uses `trade.stoploss` itself, not a new flag.** Deliberately does NOT
+reuse `StrategyTrade.trailing_active` for this -- that field is read by AI Origination's own trailing logic
+inside `monitor_open_trades`' shared FIXED branch, and while confirmed harmless for QUICK_SCALP trades (that
+logic is gated behind `trade.origin.startswith("AI_ORIGIN_")`), avoiding it entirely removes any risk of a
+future reader conflating this module's own one-shot breakeven move with that shared field's established
+meaning. The check `trade.stoploss >= round(trade.entry_price + _COST_BUFFER_POINTS, 2)` is sufficient and
+self-contained.
+
+24 new tests (`tests/test_quick_scalp_feed.py`): tick-to-bar aggregation and minute-rollover finalization
+(including that the finalized bar's close is the LAST tick before rollover, not the first), real per-minute
+futures-volume-delta computation from consecutive cumulative readings (clamped at zero on a decrease --
+a session reset or stale first reading after reconnect), a bar with no futures ticks at all still persists
+correctly with volume=0 (falls through to `_compute_vwap_bands`' own equal-weight fallback), `_handle_data`
+routing spot vs. futures ticks by token, `_resolve_tokens` degrading gracefully when a futures contract
+can't be resolved, `_finalize_bar` swallowing both a persistence failure and a callback failure without
+raising, and the full `_run` reconnect loop (market-hours gate, waits for auth, subscribes BOTH spot LTP
+and futures QUOTE mode with the correct exchange types) -- mirroring `tests/test_live_feed.py`'s own test
+shape for `IndexFeed`. `tests/test_quick_scalp.py` rewritten (dropped every dual-leg/sibling-pairing test,
+added single-clip open/stop/target tests, the new `_on_scalp_bar_closed` callback's own warmup/cutoff
+gating and exception-swallowing, and both branches of the new time-stop -- breakeven-trail-when-profitable
+and scratch-when-not, plus idempotency on a repeat cycle). `tests/test_scheduler.py` updated for the
+renamed `quick-scalp-exit-check` job and its new `IntervalTrigger(seconds=5)`. Full suite: 897 passed (was
+877), plus the same pre-existing, unrelated, wall-clock-dependent flake in
+`tests/test_validated_signal.py::test_exits_no_stagnation_when_move_is_genuinely_favorable` documented in
+the entry above this one. `python -c "import app.main"` imports cleanly, 12 scheduled jobs registering
+(same count as before -- one renamed, none added at the scheduler level; the new WS thread is started
+outside the scheduler, alongside `IndexFeed`).
+
+**Verified live**: started the app against a scratch SQLite DB, confirmed the startup log shows
+`[QUICK_SCALP_FEED] Started background feed thread` alongside the existing `[LIVEFEED]` line with no
+errors, seeded one open and five closed trades (one per exit reason: `TARGET`, `STOPLOSS`,
+`SCALP_STRUCTURAL_STOP`, `SCALP_TIME_STOP`, `TIME_EXIT`), logged in, and confirmed `/quick-scalp` renders
+200 with the rewritten banner text and all five distinct badges rendering correctly (including the new
+"Time-stop scratch (3 min, not yet profitable)" wording) -- no Jinja errors. Confirmed `/` and `/settings`
+still render 200 unaffected.
+
+**Not verified against a real live tick stream** -- this sandbox has no network path to Angel One. Same
+standing constraint `app/live_feed.py`'s own docstring already states for its sibling feed, now doubled:
+neither `QuickScalpFeed`'s price/volume field assumptions nor its reconnect behavior have been exercised
+against a real WebSocket connection. After deploying: confirm `[QUICK_SCALP_FEED] Connected; subscribing
+spot=... futures=...` appears with real token lists, confirm bars actually populate the `candles` table for
+`NIFTY`/`BANKNIFTY` at real market-open with sane OHLC and non-zero volume during active futures trading,
+and specifically watch the first few real trades' `SCALP_TIME_STOP` closes for plausible entry-vs-current
+premium relationships (an immediate-post-entry scratch every single time would suggest a units/timing
+mismatch somewhere in the tick aggregation). Also watch overall box memory/CPU for a few days against this
+project's own already-documented capacity concerns -- this is a second persistent WS thread on the same
+constrained instance, and if it measurably worsens the picture, pausing it (skip constructing `QuickScalpFeed`
+in `app/main.py`'s lifespan) is the fastest lever, with no scheduler change needed.
+
 ### AI Origination gets its own independent pause toggle -- separate from the shared "Enable AI" checkbox (7 Sep 2026)
 
 **Requested**: "I want to pause ai origination trades for few days." Investigated before building: `AISettings.

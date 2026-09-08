@@ -4,28 +4,32 @@
 {{ page_header("Quick Scalp", "Experimental · Paper Only", "text-bg-warning") }}
 
 <div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
-  <p class="mb-2"><strong>What this is:</strong> rebuilt 4 Sep 2026 -- a VWAP 2&sigma; mean-reversion scalp,
-  replacing the earlier EMA/RSI-crossover build entirely. Each completed 1-minute bar is checked against a
-  session VWAP and its 2&sigma; bands: a bar that pierces a band, closes back inside it, leaves a rejection
-  wick covering &ge;30% of its range, and has RSI(7) confirming exhaustion (&lt;30 on a lower-band piercing,
-  &gt;70 on an upper one) arms a setup. If the very next completed bar trades back through that setup bar's
-  opposite extreme, that's the entry trigger -- a Deep ITM contract (~100 points from spot, opposite
-  direction from a plain ATM pick) is bought and split 50/50 into a Target-1 leg (a flat option-point
-  target) and a Runner leg that rides until spot reaches back to VWAP.</p>
-  <p class="mb-2"><strong>Risk, checked every cycle:</strong> a flat option-premium stop (~9 points) enforced
-  by the same 30-second backstop every strategy here uses; a structural index-level stop (the setup bar's
-  own rejection extreme &plusmn;1 point, capped at 14 points from the trigger price) checked independently
-  against the live spot; a hard 3-minute time stop if neither leg has resolved; and a breakeven move on the
-  Runner leg's stop once Target 1 has been banked.</p>
-  <p class="mb-0"><strong>What this is not:</strong> validated, or running on live tick data. Built to
-  implement the pasted spec's logic exactly -- the VWAP/sigma math, the setup-and-trigger state machine, the
-  dual-leg risk construction -- but this codebase's real data plumbing is 1-minute REST candle polling (the
-  same architecture every other strategy here uses), not a raw WebSocket tick stream, so bar-by-bar the
-  logic is identical but "finalize on the first tick of the next second" isn't literal. Volume for the VWAP
-  bands comes from the underlying's futures contract (index instruments themselves report zero volume);
-  falls back to an equal-weighted variance, per the spec's own contingency, when a futures contract can't be
-  resolved. Paper trading only -- no live-order code path exists for this strategy, so "hard broker-level
-  SL-M" is a fast, deterministic paper stop, not a real exchange order.</p>
+  <p class="mb-2"><strong>What this is:</strong> rebuilt 8 Sep 2026 -- same VWAP 2&sigma; mean-reversion
+  signal as the 4 Sep build, on a genuinely real-time engine and a tightened risk construction. Each
+  1-minute bar is now finalized the instant a live tick's minute rolls over (a persistent WebSocket feed,
+  not a periodic REST poll), then checked against a session VWAP and its 2&sigma; bands: a bar that pierces
+  a band, closes back inside it, leaves a rejection wick covering &ge;30% of its range, and has RSI(7)
+  confirming exhaustion (&lt;30 on a lower-band piercing, &gt;70 on an upper one) arms a setup. If the very
+  next completed bar trades back through that setup bar's opposite extreme, that's the entry trigger -- a
+  Deep ITM contract (~100 points from spot, opposite direction from a plain ATM pick) is bought as ONE
+  single-clip position, no more Target-1/Runner leg split.</p>
+  <p class="mb-2"><strong>Risk, checked every cycle:</strong> a flat -2.5% option-premium stop enforced by
+  the same 30-second backstop every strategy here uses; a structural index-level stop (the setup bar's own
+  rejection extreme &plusmn;1 point, capped at 14 points from the trigger price) checked independently
+  against the live spot; and at the 3-minute mark, a branch on P&amp;L -- already profitable enough to cover
+  round-trip costs (premium &ge; entry + &#8377;2) gets its stop trailed to that breakeven-plus-buffer level
+  and is left open to run toward the real +3.5-4% target (floored at +&#8377;12), while a still-flat/negative
+  position is scratched immediately. The old build force-closed everything at 3 minutes regardless of P&amp;L
+  -- that's what clipped two same-day trades at a net loss despite a small favorable move, part of what
+  prompted this rebuild.</p>
+  <p class="mb-0"><strong>What this is not:</strong> validated. The entry SIGNAL now runs on real ticks, but
+  position MONITORING (stop/target/structural/time-stop) still runs on a fast 5-second poll rather than a
+  second, per-position WebSocket channel -- deliberately, matching this project's own Validated Signal
+  precedent for the same tradeoff. Adding a second persistent WebSocket connection is also a real, material
+  resource cost on a box this project's own notes already describe as memory-constrained -- if capacity
+  pressure worsens, this feed (like AI Origination before it) is a specific, known thing to consider pausing.
+  Paper trading only -- no live-order code path exists for this strategy, so "hard broker-level SL-M" is a
+  fast, deterministic paper stop, not a real exchange order.</p>
 </div>
 
 <div class="metric-grid mb-3">
@@ -101,11 +105,11 @@
         <td data-label="P&amp;L %" class="{% if trade.pnl_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(trade.pnl_percent) }}%</td>
         <td data-label="P&amp;L (₹)" class="{% if trade.status == 'CLOSED' %}{% if trade.profit_loss >= 0 %}profit{% else %}loss{% endif %}{% endif %}">{% if trade.status == 'CLOSED' %}₹{{ "%.2f"|format(trade.profit_loss) }}{% else %}—{% endif %}</td>
         <td data-label="Exit Reason">
-          {% if trade.exit_reason == 'TARGET' %}<span class="badge text-bg-success">Target 1</span>
-          {% elif trade.exit_reason == 'STOPLOSS' %}<span class="badge text-bg-danger">Option-point stop</span>
+          {% if trade.exit_reason == 'TARGET' %}<span class="badge text-bg-success">Target</span>
+          {% elif trade.exit_reason == 'STOPLOSS' %}<span class="badge text-bg-danger">-2.5% stop</span>
           {% elif trade.exit_reason == 'SCALP_STRUCTURAL_STOP' %}<span class="badge text-bg-danger">Structural stop</span>
-          {% elif trade.exit_reason == 'SCALP_VWAP_TARGET' %}<span class="badge text-bg-success">Runner (VWAP cross)</span>
-          {% elif trade.exit_reason == 'SCALP_TIME_STOP' %}<span class="badge text-bg-warning text-dark">Hard time stop (3 min)</span>
+          {% elif trade.exit_reason == 'SCALP_VWAP_TARGET' %}<span class="badge text-bg-secondary" title="Superseded 8 Sep 2026 -- the Runner leg this exit belonged to no longer exists in the single-clip rebuild">Runner (VWAP cross) -- historical</span>
+          {% elif trade.exit_reason == 'SCALP_TIME_STOP' %}<span class="badge text-bg-warning text-dark">Time-stop scratch (3 min, not yet profitable)</span>
           {% elif trade.exit_reason == 'TIME_EXIT' %}<span class="badge text-bg-secondary">Square-off (15:15)</span>
           {% elif trade.exit_reason %}<span class="badge text-bg-secondary">{{ trade.exit_reason }}</span>
           {% endif %}
