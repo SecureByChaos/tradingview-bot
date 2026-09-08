@@ -182,6 +182,16 @@ _CANDLE_LOOKBACK_MINUTES = 420
 
 _STRIKE_OFFSET_POINTS = 100.0
 
+# 8 Sep 2026: requested as "trade with 2 lots by default," scoped to Quick
+# Scalp only -- every other strategy in this codebase sizes its own position
+# independently (AI Origination is hardcoded to exactly 1 lot for its own
+# stated reasons, rule-based strategies read StrategyConfig.lots_per_trade),
+# so this is a Quick-Scalp-specific constant, not a shared default. A plain
+# multiplier on the resolved contract's own lot_size, not a hardcoded
+# quantity -- keeps this correct across a strike/expiry with a different
+# lot_size without needing a second number to stay in sync.
+_LOT_MULTIPLIER = 2
+
 # ---------------------------------------------------------------------------
 # Section 5 -- Friction-Proof Risk & Position Management
 # ---------------------------------------------------------------------------
@@ -412,8 +422,8 @@ def open_scalp_trade(
         strike=contract.strike,
         expiry=contract.expiry,
         option_type=contract.option_type,
-        quantity=contract.lot_size,
-        investment_amount=round(entry_price * contract.lot_size, 2),
+        quantity=contract.lot_size * _LOT_MULTIPLIER,
+        investment_amount=round(entry_price * contract.lot_size * _LOT_MULTIPLIER, 2),
         entry_price=round(entry_price, 2),
         current_premium=round(entry_price, 2),
         stoploss=stoploss,

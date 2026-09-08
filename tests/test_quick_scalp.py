@@ -335,11 +335,25 @@ def test_open_scalp_trade_opens_exactly_one_position_at_percentage_levels():
     assert trade is not None
     assert trade.origin == ORIGIN
     assert trade.mode == TradingMode.PAPER
-    assert trade.quantity == 75
+    # 8 Sep 2026: Quick Scalp trades 2 lots by default, scoped to this
+    # strategy only -- a real contract lot_size of 75 becomes quantity 150.
+    assert trade.quantity == 150
+    assert trade.investment_amount == round(100.0 * 150, 2)
     assert trade.stoploss == round(100.0 * (1 - _STOP_PERCENT), 2)
     # target%(3.75) of 100 = 103.75, floor entry+12=112 -- floor wins.
     assert trade.target == round(max(100.0 * (1 + _TARGET_PERCENT), 112.0), 2)
     assert trade.structural_stop_level == round(24000.0 - _STRUCTURAL_BUFFER_POINTS, 2)
+
+
+def test_open_scalp_trade_uses_the_lot_multiplier_regardless_of_lot_size():
+    db = _make_session()
+    index = _make_index()
+    signal = _make_signal()
+    option_finder = FakeOptionFinder(_make_contract(lot_size=35))  # a different real lot size (Bank Nifty-shaped)
+
+    trade = open_scalp_trade(db, index, signal, FakeSmartAPI(price=100.0), option_finder, to_ist(utc_now()))
+
+    assert trade.quantity == 70
 
 
 def test_open_scalp_trade_target_uses_percentage_when_above_the_points_floor():
