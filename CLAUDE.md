@@ -295,6 +295,38 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp now trades 2 lots by default, scoped to this strategy only (8 Sep 2026)
+
+**Requested**: "Quick scalp should trade with 2 lots by default. Make this change to quick scalp trades
+only." New `_LOT_MULTIPLIER = 2` in `app/quick_scalp.py`, applied at the one place this module ever opens
+a trade (`open_scalp_trade`): `quantity=contract.lot_size * _LOT_MULTIPLIER`,
+`investment_amount=round(entry_price * contract.lot_size * _LOT_MULTIPLIER, 2)`. A multiplier on the
+resolved contract's own `lot_size`, not a hardcoded quantity -- stays correct across Nifty/Bank Nifty or a
+future lot-size change with no second number to keep in sync.
+
+**Scoped exactly as asked -- every other strategy's own sizing is untouched.** AI Origination remains
+hardcoded to exactly 1 lot (its own documented reasoning: capital deployed is purely premium-dependent);
+rule-based strategies (BNV5.1/BNV6/BNV7/NV1) still read their own `StrategyConfig.lots_per_trade`;
+Autonomous AI and Validated Signal are unaffected -- none of them share this constant or this code path.
+Confirmed via `git diff --stat`: only `app/quick_scalp.py` and its own test file changed.
+
+2 tests updated/added (`tests/test_quick_scalp.py`): the existing single-clip open test now asserts
+`quantity == 150` for a 75-lot contract (was 75) and the matching `investment_amount`; a new test opens a
+trade against a different real lot size (35, Bank Nifty-shaped) and confirms `quantity == 70`, proving the
+multiplier applies to whatever `lot_size` the resolved contract actually carries rather than a hardcoded
+number. Full suite: 897 passed, 1 pre-existing unrelated wall-clock-dependent flake in
+`tests/test_validated_signal.py` (documented in earlier entries). `python -c "import app.main"` imports
+cleanly.
+
+**Verified live**: opened a real trade through `open_scalp_trade` against a scratch DB with a 75-lot fake
+contract and confirmed `quantity=150`, `investment_amount=15000.0` -- 2x the prior single-lot values.
+
+**Not verified against a real live entry** -- this sandbox cannot run a real bar-close signal end to end.
+After deploying, confirm the next real Quick Scalp entry opens at twice its previous quantity for the same
+strike/contract, and that capital-at-risk scales accordingly (this doubles both potential P&L and the
+capital a single Quick Scalp position ties up, on a strategy still carrying the same "not yet enough
+evidence" status as when it launched).
+
 ### Quick Scalp's WebSocket feed merged into the existing IndexFeed connection -- one socket, not two (8 Sep 2026)
 
 **Requested**, same day as the entry directly below this one, immediately after it shipped: "Cant we combined
