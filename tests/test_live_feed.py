@@ -235,6 +235,141 @@ def test_run_skips_connection_attempt_when_market_closed():
     assert store.get("BANKNIFTY") is None
 
 
+class FakeScalpAggregator:
+    """8 Sep 2026: IndexFeed and app.quick_scalp_feed's own WebSocket
+    connection were merged (see IndexFeed's module docstring) -- these
+    tests exercise the dispatch/subscription side of that merge without
+    depending on app.quick_scalp_feed's own real ScalpBarAggregator
+    internals, which are tested separately in test_quick_scalp_feed.py."""
+
+    def __init__(self, futures_tokens: list[str] | None = None) -> None:
+        self.futures_tokens = futures_tokens or []
+        self.futures_token_to_symbol = {tok: "NIFTY" for tok in self.futures_tokens}
+        self.spot_ticks: list[tuple[str, float, int]] = []
+        self.futures_ticks: list[tuple[str, float | None, int]] = []
+
+    def resolve_futures_tokens(self) -> list[str]:
+        return self.futures_tokens
+
+    def on_spot_tick(self, symbol: str, price: float, minute_bucket: int) -> None:
+        self.spot_ticks.append((symbol, price, minute_bucket))
+
+    def on_futures_tick(self, symbol: str, cumulative_volume, minute_bucket: int) -> None:
+        self.futures_ticks.append((symbol, cumulative_volume, minute_bucket))
+
+
+def test_handle_data_dispatches_spot_ticks_to_both_store_and_aggregator():
+    store = LiveFeedStore()
+    aggregator = FakeScalpAggregator()
+    feed = IndexFeed(FakeSmartAPIClient(), store, [BANKNIFTY], scalp_aggregator=aggregator)
+
+    feed._handle_data(None, {"token": "99926009", "last_traded_price": 5000000})
+
+    assert store.get("BANKNIFTY")["price"] == 50000.0
+    assert aggregator.spot_ticks == [("BANKNIFTY", 50000.0, aggregator.spot_ticks[0][2])]
+
+
+def test_handle_data_routes_futures_ticks_only_to_the_aggregator():
+    store = LiveFeedStore()
+    aggregator = FakeScalpAggregator(futures_tokens=["555"])
+    feed = IndexFeed(FakeSmartAPIClient(), store, [BANKNIFTY], scalp_aggregator=aggregator)
+
+    feed._handle_data(None, {"token": "555", "last_traded_price": 5000000, "volume_trade_for_the_day": 42})
+
+    assert aggregator.futures_ticks == [("NIFTY", 42, aggregator.futures_ticks[0][2])]
+    assert store.get("BANKNIFTY") is None  # never touched by a futures tick
+
+
+def test_handle_data_with_no_aggregator_behaves_exactly_as_before():
+    # Every existing dashboard-only deployment path (scalp_aggregator=None)
+    # must be completely unaffected by the merge.
+    store = LiveFeedStore()
+    feed = IndexFeed(FakeSmartAPIClient(), store, [BANKNIFTY])
+    feed._handle_data(None, {"token": "99926009", "last_traded_price": 5000000})
+    assert store.get("BANKNIFTY")["price"] == 50000.0
+
+
+def test_handle_open_subscribes_both_spot_and_futures_when_aggregator_present():
+    store = LiveFeedStore()
+    aggregator = FakeScalpAggregator(futures_tokens=["555"])
+    feed = IndexFeed(FakeSmartAPIClient(), store, [BANKNIFTY], scalp_aggregator=aggregator)
+    feed._futures_tokens = ["555"]
+
+    subscriptions = []
+
+    class FakeWS:
+        def subscribe(self, correlation_id, mode, token_list):
+            subscriptions.append((correlation_id, mode, token_list))
+
+    feed._ws = FakeWS()
+    feed._handle_open(None)
+
+    assert len(subscriptions) == 2
+    modes = {mode for _, mode, _ in subscriptions}
+    assert modes == {1, 2}
+    futures_sub = next(s for s in subscriptions if s[1] == 2)
+    assert futures_sub[2] == [{"exchangeType": 2, "tokens": ["555"]}]
+
+
+def test_handle_open_subscribes_only_spot_without_an_aggregator():
+    store = LiveFeedStore()
+    feed = IndexFeed(FakeSmartAPIClient(), store, [BANKNIFTY])
+
+    subscriptions = []
+
+    class FakeWS:
+        def subscribe(self, correlation_id, mode, token_list):
+            subscriptions.append((correlation_id, mode, token_list))
+
+    feed._ws = FakeWS()
+    feed._handle_open(None)
+
+    assert len(subscriptions) == 1
+
+
+def test_run_resolves_futures_tokens_fresh_each_connection_attempt():
+    store = LiveFeedStore()
+    aggregator = FakeScalpAggregator(futures_tokens=["555"])
+    client = FakeSmartAPIClient()
+    feed = IndexFeed(client, store, [BANKNIFTY], scalp_aggregator=aggregator)
+
+    resolve_calls = {"n": 0}
+    real_resolve = aggregator.resolve_futures_tokens
+
+    def _counting_resolve():
+        resolve_calls["n"] += 1
+        return real_resolve()
+
+    aggregator.resolve_futures_tokens = _counting_resolve
+
+    class FakeWS:
+        def __init__(self, **kwargs):
+            self.on_open = None
+            self.on_data = None
+            self.on_error = None
+            self.on_close = None
+
+        def subscribe(self, *_args, **_kwargs):
+            pass
+
+        def connect(self):
+            self.on_close(self)
+            feed._stop_requested = True
+
+        def close_connection(self):
+            pass
+
+    fake_module = types.SimpleNamespace(SmartWebSocketV2=FakeWS)
+
+    with patch.dict(sys.modules, {"SmartApi.smartWebSocketV2": fake_module}), \
+         patch("app.live_feed.time.sleep"), \
+         patch("app.live_feed.check_market_hours", return_value=None):
+        feed._run()
+
+    assert resolve_calls["n"] == 1
+    assert feed._futures_tokens == ["555"]
+
+
 def test_run_resumes_connecting_once_market_reopens():
     store = LiveFeedStore()
     client = FakeSmartAPIClient()

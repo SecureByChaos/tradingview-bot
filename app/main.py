@@ -29,7 +29,7 @@ from app.signal_validation import check_duplicate_signal, check_market_hours, ch
 from app.ai.autonomous import run_autonomous_checks
 from app.ai.originator import run_origination_checks
 from app.quick_scalp import make_bar_closed_callback, run_quick_scalp_exit_checks
-from app.quick_scalp_feed import QuickScalpFeed
+from app.quick_scalp_feed import ScalpBarAggregator
 from app.validated_signal import run_validated_signal_entry_checks, run_validated_signal_exit_checks
 from app.live_feed import IndexFeed, LiveFeedStore
 from app.market_data import capture_closing_auction
@@ -128,29 +128,22 @@ async def lifespan(_: FastAPI):
     try:
         with SessionLocal() as db:
             enabled_indexes = list(db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True))))
-        index_feed = IndexFeed(smartapi, live_feed_store, enabled_indexes)
+        # 8 Sep 2026: Quick Scalp's own WebSocket engine was merged into this
+        # single connection rather than opening a second one -- see
+        # app/live_feed.py's own module docstring for why. scalp_aggregator
+        # is None-safe: a failure constructing it (or this whole feed) still
+        # degrades to "no dashboard prices, no new Quick Scalp entries until
+        # restart", never blocks trading from starting.
+        scalp_aggregator = ScalpBarAggregator(
+            option_finder, SessionLocal, make_bar_closed_callback(smartapi, option_finder), enabled_indexes,
+        )
+        index_feed = IndexFeed(smartapi, live_feed_store, enabled_indexes, scalp_aggregator=scalp_aggregator)
         index_feed.start()
     except Exception:
         # Same reasoning as the option-chain collector above: a feed problem
-        # degrades the dashboard, it must never stop trading from starting.
-        logger.exception("[LIVEFEED] Failed to start index live feed; dashboard prices will read unavailable")
-    quick_scalp_feed = None
-    try:
-        with SessionLocal() as db:
-            enabled_indexes = list(db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True))))
-        quick_scalp_feed = QuickScalpFeed(
-            smartapi, option_finder, SessionLocal,
-            make_bar_closed_callback(smartapi, option_finder),
-            enabled_indexes,
-        )
-        quick_scalp_feed.start()
-    except Exception:
-        # Same fail-soft reasoning as the index feed above -- a problem here
-        # degrades Quick Scalp to "no new entries until it recovers", it must
-        # never stop trading (or the rest of the app) from starting. Any
-        # already-open Quick Scalp position is unaffected either way -- see
-        # app.quick_scalp_feed's own module docstring.
-        logger.exception("[QUICK_SCALP_FEED] Failed to start Quick Scalp feed; entries paused until next restart")
+        # degrades the dashboard (and now Quick Scalp's entries), it must
+        # never stop trading from starting.
+        logger.exception("[LIVEFEED] Failed to start index live feed; dashboard prices and Quick Scalp entries will be unavailable")
     scheduler.start()
     logger.info("Scheduler started")
     try:
@@ -158,8 +151,6 @@ async def lifespan(_: FastAPI):
     finally:
         if index_feed is not None:
             index_feed.stop()
-        if quick_scalp_feed is not None:
-            quick_scalp_feed.stop()
         scheduler.shutdown(wait=False)
         logger.info("Scheduler stopped")
 

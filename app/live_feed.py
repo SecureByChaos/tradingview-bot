@@ -16,6 +16,33 @@ dashboard traffic. Dashboard requests read the latest price from an
 in-memory store this feed keeps updated -- zero additional SmartAPI calls
 per view, whether there is 1 viewer or 1000.
 
+MERGED WITH QUICK SCALP'S OWN FEED, 8 SEP 2026
+--------------------------------------------------
+Quick Scalp's WebSocket rebuild the same day originally opened a SECOND,
+independent connection subscribing to the same index spot tokens (in the
+same LTP mode) this feed already pulls, plus each index's futures contract
+in QUOTE mode for real volume. Asked directly afterwards whether the two
+could share one connection -- yes: a single SmartWebSocketV2 connection
+already supports subscribing multiple token sets at different modes at
+once, and the spot-tick duplication was pure waste. `IndexFeed` now owns
+the ONE connection and dispatches every tick to whichever consumers are
+registered: `LiveFeedStore` for the dashboard (unchanged, always present),
+and an optional `scalp_aggregator` (`app.quick_scalp_feed.
+ScalpBarAggregator`) for Quick Scalp's bar construction, when passed in.
+When `scalp_aggregator` is None this class behaves exactly as it always
+has -- every existing dashboard-only deployment path is unaffected.
+
+The one real tradeoff, named rather than hidden: the dashboard price feed
+and Quick Scalp's entry-signal feed now share a single connection and
+thread, where they were previously isolated -- a problem in one's tick
+handling could in principle affect the other's. In practice this is a
+small risk, since every tick handler on both sides is already exception-
+safe (a bad tick logs and returns, never raises) and `_handle_data` itself
+wraps the whole dispatch in one more try/except regardless. What this buys
+back is real: one persistent WebSocket connection instead of two on a
+production box this project's own notes already document as memory-
+constrained.
+
 NOT VERIFIED AGAINST THE REAL FEED
 ------------------------------------
 This sandbox has no network path to Angel One (outbound HTTPS/WSS is
@@ -65,7 +92,9 @@ _PAISE_PER_RUPEE = 100.0
 # installed SmartApi==1.5.5 source directly.
 _EXCHANGE_TYPE_BY_NAME = {"NSE": 1}  # NSE_CM
 _DEFAULT_EXCHANGE_TYPE = 1
+_FUTURES_EXCHANGE_TYPE = 2  # NSE_FO -- Quick Scalp's futures-volume leg
 _LTP_MODE = 1
+_QUOTE_MODE = 2  # Quick Scalp's futures-volume leg -- carries volume_trade_for_the_day
 
 # How long a feed entry can go without a fresh tick before dashboard reads
 # stop trusting it as "live" -- doesn't affect what's returned, only the
@@ -149,12 +178,17 @@ class IndexFeed:
     doesn't depend on this at all (AI Origination and the trade monitor keep
     using their own existing REST calls, untouched by this module)."""
 
-    def __init__(self, smartapi_client: Any, store: LiveFeedStore, indexes: list[Any]) -> None:
+    def __init__(
+        self, smartapi_client: Any, store: LiveFeedStore, indexes: list[Any],
+        scalp_aggregator: Any | None = None,
+    ) -> None:
         self._client = smartapi_client
         self.store = store
+        self._scalp_aggregator = scalp_aggregator
         self._indexes = [idx for idx in indexes if idx.spot_token and idx.spot_exchange]
         self._token_list = self._build_token_list()
         self._token_to_symbol = self._build_token_to_symbol()
+        self._futures_tokens: list[str] = []
         self._thread: threading.Thread | None = None
         self._ws: Any = None
         self._stop_requested = False
@@ -187,21 +221,41 @@ class IndexFeed:
                 logger.exception("[LIVEFEED] Error closing websocket during shutdown")
 
     def _handle_open(self, wsapp: Any) -> None:
-        logger.info("[LIVEFEED] Connected; subscribing to %s", self._token_list)
+        logger.info(
+            "[LIVEFEED] Connected; subscribing spot=%s futures=%s", self._token_list, self._futures_tokens,
+        )
         self.store.mark_connected(True)
         try:
             self._ws.subscribe("livefeed01", _LTP_MODE, self._token_list)
+            if self._futures_tokens:
+                self._ws.subscribe(
+                    "livefeed01-fut", _QUOTE_MODE,
+                    [{"exchangeType": _FUTURES_EXCHANGE_TYPE, "tokens": self._futures_tokens}],
+                )
         except Exception:
             logger.exception("[LIVEFEED] Subscribe failed")
 
     def _handle_data(self, wsapp: Any, message: dict[str, Any]) -> None:
         try:
             token = message.get("token")
-            symbol = self._token_to_symbol.get(token)
             raw_price = message.get("last_traded_price")
-            if symbol is None or raw_price is None:
+            if token is None or raw_price is None:
                 return
-            self.store.update(symbol, float(raw_price) / _PAISE_PER_RUPEE)
+            price = float(raw_price) / _PAISE_PER_RUPEE
+
+            symbol = self._token_to_symbol.get(token)
+            if symbol is not None:
+                self.store.update(symbol, price)
+                if self._scalp_aggregator is not None:
+                    self._scalp_aggregator.on_spot_tick(symbol, price, int(time.time() // 60))
+                return
+
+            if self._scalp_aggregator is not None:
+                futures_symbol = self._scalp_aggregator.futures_token_to_symbol.get(token)
+                if futures_symbol is not None:
+                    self._scalp_aggregator.on_futures_tick(
+                        futures_symbol, message.get("volume_trade_for_the_day"), int(time.time() // 60),
+                    )
         except Exception:
             logger.exception("[LIVEFEED] Error processing tick: %r", message)
 
@@ -262,6 +316,14 @@ class IndexFeed:
                 self.store.mark_connected(False)
                 time.sleep(_RECONNECT_DELAY_SECONDS)
                 continue
+
+            # Re-resolved fresh every connection attempt, not just at
+            # IndexFeed construction -- the near-month FUTIDX contract rolls
+            # at expiry, and a stale token would silently stop producing
+            # volume ticks with no error. Spot tokens don't roll this way,
+            # so self._token_list stays built once at construction time.
+            if self._scalp_aggregator is not None:
+                self._futures_tokens = self._scalp_aggregator.resolve_futures_tokens()
 
             try:
                 ws = SmartWebSocketV2(

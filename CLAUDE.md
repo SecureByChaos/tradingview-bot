@@ -295,6 +295,70 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp's WebSocket feed merged into the existing IndexFeed connection -- one socket, not two (8 Sep 2026)
+
+**Requested**, same day as the entry directly below this one, immediately after it shipped: "Cant we combined
+this with the websocket we already opened?" Checked before answering: `app.live_feed.IndexFeed` was already
+subscribing to every enabled index's SPOT token in LTP mode for the dashboard; the just-shipped
+`QuickScalpFeed` was opening a SECOND, fully independent connection subscribing to those SAME spot tokens in
+the SAME LTP mode (for its own bar construction), plus each index's FUTIDX futures contract in QUOTE mode
+(for volume). The spot-tick subscription was pure duplication -- two connections independently re-pulling
+the identical tick stream -- and a single `SmartWebSocketV2` connection already supports subscribing
+multiple token sets at different modes at once (`QuickScalpFeed` itself already proved this internally, one
+connection with two `subscribe()` calls). Confirmed: yes, this should be one connection, and building it as
+two in the first place was the design that needed a second look, not something to defend.
+
+**Implementation**: `app/quick_scalp_feed.py`'s `QuickScalpFeed` class (connection-owning: reconnect loop,
+market-hours gate, subscribe/handle_open/handle_data/handle_error/handle_close) is deleted outright. What's
+left is `ScalpBarAggregator` -- pure tick-to-bar business logic with no WebSocket connection of its own:
+`on_spot_tick`/`on_futures_tick`/`resolve_futures_tokens`/`_finalize_bar`, unchanged from before, just
+stripped of everything connection-related. `app.live_feed.IndexFeed` gained an optional `scalp_aggregator`
+constructor parameter (`None` by default -- every existing dashboard-only deployment path is byte-identical
+to before this change): when present, `_handle_open` subscribes the futures token list in QUOTE mode
+alongside the existing spot LTP subscription (two `subscribe()` calls, one connection), `_handle_data`
+dispatches a spot tick to BOTH `LiveFeedStore.update()` (unchanged) AND `scalp_aggregator.on_spot_tick()`,
+and a futures tick goes to `scalp_aggregator.on_futures_tick()` only. `_run`'s reconnect loop now also calls
+`scalp_aggregator.resolve_futures_tokens()` once per connection attempt (unchanged reasoning from the
+original build: futures contracts roll at expiry, spot tokens don't, so only the futures side needs
+re-resolving per attempt). `app/main.py`'s lifespan now constructs one `ScalpBarAggregator` and passes it
+into the single `IndexFeed`, rather than constructing and starting/stopping two separate feed objects.
+
+**The one real tradeoff, named rather than hidden (in `app/live_feed.py`'s own updated module docstring, and
+here)**: the dashboard's price feed and Quick Scalp's entry-signal feed now share one connection and one
+background thread, where they were previously isolated -- a problem in one's tick handling could in
+principle affect the other's. Judged a small risk in practice: both `LiveFeedStore.update()` and
+`ScalpBarAggregator`'s own tick handlers were already exception-safe (a bad tick logs and returns, never
+raises) before this change, and `IndexFeed._handle_data` wraps the whole dispatch in one more try/except
+regardless. What this buys back is real and was the whole point of asking: one persistent WebSocket
+connection instead of two, on a production box this file's own notes (see the "Rebuild Quick Scalp" and
+"Too much memory" entries) already document as memory-constrained -- directly and immediately addressing
+the resource-cost concern the previous entry raised, rather than leaving it as a "watch and see."
+
+Tests reorganized to match: `tests/test_quick_scalp_feed.py` rewritten down to `ScalpBarAggregator`'s own
+pure tick-to-bar logic (aggregation, minute-rollover finalization, futures-volume-delta computation,
+`resolve_futures_tokens` degrading gracefully) with all connection-lifecycle tests removed -- there is no
+connection here anymore to test. `tests/test_live_feed.py` gained 7 new tests covering the merge itself: a
+spot tick dispatches to both `LiveFeedStore` and the aggregator, a futures tick reaches the aggregator only
+and never touches the store, the `scalp_aggregator=None` path behaves byte-identically to every pre-merge
+test already in this file, `_handle_open` subscribes both token sets (two calls, modes `{1, 2}`) when an
+aggregator is present versus one call without it, and `_run` calls `resolve_futures_tokens()` exactly once
+per connection attempt. Full suite: 896 passed (was 897 -- net around even: fewer connection-lifecycle
+tests in `test_quick_scalp_feed.py`, matched by the new ones in `test_live_feed.py`), plus the same
+pre-existing, unrelated, wall-clock-dependent flake documented in the entry below. `python -c "import
+app.main"` imports cleanly.
+
+**Verified live**: started the app against a scratch SQLite DB and confirmed the startup log now shows
+exactly ONE feed thread (`[LIVEFEED] Started background feed thread for [...]`) with no separate
+`[QUICK_SCALP_FEED]` line at all, confirmed `/` (dashboard) and `/quick-scalp` both still render 200.
+
+**Not verified against a real live tick stream** -- same standing constraint as every entry touching these
+two modules. After deploying, the check is the same as the previous entry's, now against one connection
+instead of two: confirm `[LIVEFEED] Connected; subscribing spot=... futures=...` shows both token lists
+populated correctly, and watch whether merging genuinely reduced the box's resource pressure relative to
+running the two feeds separately (even briefly, if there's a way to compare before/after) -- that
+comparison is the actual point of this change and can only be confirmed against the real box, not this
+sandbox.
+
 ### Quick Scalp rebuilt again -- real WebSocket tick engine, single-clip exit, P&L-aware time stop (8 Sep 2026)
 
 **Requested**: pasting a full spec titled "NIFTY 50 VWAP 2sigma Scalp Engine -- Comprehensive SmartAPI
