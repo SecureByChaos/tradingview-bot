@@ -138,6 +138,30 @@ exist... Mandatory Reject NONE"). A decision whose direction disagrees with
 the EMA regime it was shown is now overridden to NONE in Python rather than
 trusted from the model's own self-report -- see check_autonomous_entry.
 
+A NON-GATING addition, 9 Sep 2026: SAME-DAY TRADE HISTORY IN THE ENTRY PROMPT
+------------------------------------------------------------------------------
+Triggered by a real trading day (9 Sep 2026) where this module opened
+BUY_PE seven times across both indices with nearly identical reasoning each
+time, six of them losing -- the model had no way to know it was repeating
+the same thesis, because the entry prompt built by _build_entry_prompt never
+included anything about this module's own prior trades. Explicitly asked
+NOT to fix this with a hard same-direction gate (the shape
+app.ai.originator's own _same_direction_consecutive_losses uses): a real
+trade the same day (Nifty PE, third same-direction attempt after two
+losses) won cleanly, which a fixed-threshold block would also have
+refused. Instead, _recent_history_text now renders each index's own
+closed-AUTONOMOUS_AI-trade record for today, broken down by direction (win/
+loss count, mean P&L, and a losing-streak counter once it reaches 2), into
+the entry prompt as a new section -- and SYSTEM_PROMPT_ENTRY now explicitly
+asks the model to weigh that history itself and explain what's different
+about a repeat attempt, rather than restate the checklist as if nothing had
+happened. This is instrumentation/persuasion, not enforcement: nothing is
+blocked here, and it is a genuinely open question whether an LLM given its
+own recent same-day outcomes actually changes behavior in response, or just
+produces better-justified repeats of the same decision -- read the next
+few days of `ai_reasoning` on any repeated same-direction entry to see
+which one this turns out to be.
+
 EXIT MATRIX -- DETERMINISTIC RULES CHECKED BEFORE THE MODEL, IN ORDER
 --------------------------------------------------------------------------
 check_autonomous_exits checks these in sequence, each one closing the trade
@@ -352,6 +376,17 @@ Evaluation Protocol:
    - Any required indicator or confirmation is ambiguous or missing.
 
 Do not guess, predict reversals, or anticipate breakouts. If there is any doubt or lack of edge, output NONE.
+
+If a "Today's Autonomous AI history on this index" section is shown below, treat it as real
+evidence about how today's session is actually behaving, not just background color: a direction
+that has already lost multiple times today under readings that looked similarly valid on paper
+is telling you that the setup is not converting into premium gains the way the checklist above
+assumes, on this index, today. Weigh it honestly, the way a trader reviewing their own day would
+-- it should raise your bar for confidence, not silently override it. Do not treat a losing streak
+as an automatic reason to avoid that direction forever either: streaks end, and a genuinely new
+attempt can still be correct. If you decide to trade a direction that has already failed
+repeatedly today, your reasoning must explain what is different about this attempt, not simply
+restate the checklist as if the history did not exist.
 
 Respond with a single valid JSON object only, with no markdown fences or extra text:
 {"decision": "BUY_CE" | "BUY_PE" | "NONE", "confidence": 0.0-1.0, "reasoning": "Direct citation of matching or failing rules"}"""
@@ -755,7 +790,78 @@ def _compute_features(
     )
 
 
-def _build_entry_prompt(features: _Features, index_display_name: str) -> str:
+def _todays_closed_trades(db: Session, index_symbol: str, now_ist) -> list[StrategyTrade]:
+    """Every AUTONOMOUS_AI trade for this index that closed today (IST
+    calendar day) -- raw material for _recent_history_text below. Same
+    30-hour-lookback-then-filter-in-Python shape app.platform's own "today"
+    queries already use (get_ai_origination_today_highlights) -- SQLite
+    doesn't round-trip tzinfo (see CLAUDE.md's own gotcha), so a plain
+    date() comparison on the stored UTC column can't be trusted directly."""
+    today = now_ist.date()
+    rows = db.scalars(
+        select(StrategyTrade).where(
+            StrategyTrade.index_symbol == index_symbol,
+            StrategyTrade.origin == ORIGIN,
+            StrategyTrade.status == TradeStatus.CLOSED,
+            StrategyTrade.exit_time >= utc_now() - timedelta(hours=30),
+        )
+    )
+    todays = [
+        t for t in rows
+        if t.exit_time is not None and to_ist(t.exit_time) is not None and to_ist(t.exit_time).date() == today
+    ]
+    return sorted(todays, key=lambda t: t.exit_time)
+
+
+def _recent_history_text(db: Session, index_symbol: str, now_ist) -> str:
+    """Renders today's closed-trade history for this index into the entry
+    prompt, broken down by direction -- the model is otherwise never told
+    its own trade history anywhere in this module (see the FEATURE ENGINE
+    section of the module docstring: it only ever sees a fresh snapshot).
+
+    Deliberately NOT a gate. A hard same-direction block (the shape
+    app.ai.originator's own _same_direction_consecutive_losses uses) would
+    also have refused the real 9 Sep 2026 Nifty PE trade that won cleanly
+    on its third attempt after two same-direction losses earlier that
+    session -- see CLAUDE.md. This is shown as information and
+    SYSTEM_PROMPT_ENTRY asks the model to weigh it itself, not have Python
+    decide on its behalf. Returns "" once nothing has closed yet today, so
+    _build_entry_prompt can omit the section entirely rather than render an
+    empty one."""
+    trades = _todays_closed_trades(db, index_symbol, now_ist)
+    if not trades:
+        return ""
+
+    lines = []
+    for direction in ("BUY_CE", "BUY_PE"):
+        same_direction = [t for t in trades if t.signal == direction]
+        if not same_direction:
+            continue
+        wins = sum(1 for t in same_direction if (t.pnl_percent or 0.0) > 0)
+        losses = len(same_direction) - wins
+        mean_pnl = sum(t.pnl_percent or 0.0 for t in same_direction) / len(same_direction)
+        # Consecutive-loss streak, walked from most recent backward -- same
+        # convention app.ai.originator's own gate uses to COUNT a streak;
+        # display only here, nothing is blocked on it.
+        streak = 0
+        for t in reversed(same_direction):
+            if (t.pnl_percent or 0.0) <= 0:
+                streak += 1
+            else:
+                break
+        streak_text = f", currently on a {streak}-trade losing streak" if streak >= 2 else ""
+        last = same_direction[-1]
+        lines.append(
+            f"  {direction}: {len(same_direction)} closed today ({wins}W/{losses}L), "
+            f"mean P&L {mean_pnl:+.1f}%{streak_text}. Most recent: "
+            f"{(last.pnl_percent or 0.0):+.1f}% via {last.exit_reason or 'unknown'}."
+        )
+    if not lines:
+        return ""
+    return "Today's Autonomous AI history on this index so far:\n" + "\n".join(lines)
+
+
+def _build_entry_prompt(features: _Features, index_display_name: str, history_text: str = "") -> str:
     adx_label = "Trending" if (features.adx or 0.0) >= _ADX_LLM_FLOOR else "Range-bound/Chop"
     adx_text = f"{features.adx:.1f}" if features.adx is not None else "unavailable"
     vwap_text = f"{features.vwap:.2f}" if features.vwap is not None else "unavailable"
@@ -763,6 +869,7 @@ def _build_entry_prompt(features: _Features, index_display_name: str) -> str:
     slow_ema_text = f"{features.slow_ema:.2f}" if features.slow_ema is not None else "unavailable"
     dist_to_pdh = f"{features.dist_to_pdh} pts" if features.dist_to_pdh is not None else "unknown"
     dist_to_pdl = f"{features.dist_to_pdl} pts" if features.dist_to_pdl is not None else "unknown"
+    history_section = f"\n{history_text}\n" if history_text else ""
     return (
         "Current Market State:\n"
         f"- Index: {index_display_name}\n"
@@ -771,7 +878,8 @@ def _build_entry_prompt(features: _Features, index_display_name: str) -> str:
         f"- Trend Regime: {features.trend_regime} (9 EMA: {fast_ema_text}, 21 EMA: {slow_ema_text})\n"
         f"- ADX (14): {adx_text} ({adx_label})\n"
         f"- Proximity to Key Levels: PDH: {dist_to_pdh} | PDL: {dist_to_pdl}\n"
-        f"- Session Phase: {features.session_phase} (Time to square-off: {features.minutes_to_close} mins)\n\n"
+        f"- Session Phase: {features.session_phase} (Time to square-off: {features.minutes_to_close} mins)\n"
+        f"{history_section}\n"
         "Apply the evaluation rules. Output decision JSON:"
     )
 
@@ -963,7 +1071,8 @@ def check_autonomous_entry(
         )
         return None
 
-    user_prompt = _build_entry_prompt(features, index.display_name or index.symbol)
+    history_text = _recent_history_text(db, index.symbol, now_ist)
+    user_prompt = _build_entry_prompt(features, index.display_name or index.symbol, history_text)
     raw = _call_provider(settings.provider, _provider_view(settings), SYSTEM_PROMPT_ENTRY, user_prompt)
     if raw.error:
         logger.error("[AUTONOMOUS_AI] %s entry call FAILED: %s", index.symbol, raw.error)

@@ -295,6 +295,71 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI now sees its own same-day trade history in the entry prompt -- not a gate (9 Sep 2026)
+
+**Trigger**: 9 Sep 2026's real trade history showed Autonomous AI opening `BUY_PE` seven times across both
+indices in one morning, with near-identical reasoning each time ("bearish regime, ADX confirms trend, spot
+below VWAP, MORNING_MOMENTUM not CHOP_ZONE") -- 6 losses, 1 win. Asked why OpenAI "couldn't identify" the
+repeated failure: traced directly in `_build_entry_prompt` -- the entry prompt contains only a fresh market
+snapshot (spot, VWAP, EMA9/21, ADX, PDH/PDL distance, session phase) and **nothing about this module's own
+prior trades or their outcomes**. Each cycle is a stateless API call; the model has no way to know it tried
+the same thesis 20 minutes earlier and lost, because it was never shown that. Not a reasoning failure --
+an information gap.
+
+**Explicitly asked NOT to fix this with a hard gate** (the shape `app.ai.originator`'s own
+`_same_direction_consecutive_losses` uses, capped at 2) -- instead, make the model aware of its own recent
+failures and let it factor that in. This was the right call on the same day's own data: Nifty's own PE
+history that morning was 2 losses followed by a clean +12.78% win on the third attempt (`GIVEBACK_STOP`) --
+a fixed same-direction block would have refused that winning trade too. Bank Nifty's PE history, by
+contrast, was 4 straight losses with no recovery -- exactly the case a hard gate is built for, and exactly
+the case this softer approach cannot guarantee it prevents. Both real outcomes from the same morning
+directly motivate showing the history rather than mechanically vetoing on it.
+
+**Implementation** (`app/ai/autonomous.py`): new `_todays_closed_trades(db, index_symbol, now_ist)` -- every
+`AUTONOMOUS_AI` trade for this index closed today (IST calendar day), via the same 30-hour-lookback-then-
+filter-in-Python shape `app.platform.get_ai_origination_today_highlights` already uses (SQLite doesn't
+round-trip tzinfo, so a plain `date()` comparison on the stored UTC column can't be trusted -- see this
+file's own gotcha). New `_recent_history_text(db, index_symbol, now_ist)` renders that history per direction
+(`BUY_CE`/`BUY_PE` separately, since today showed they can diverge sharply on the same index) -- closed
+count, win/loss split, mean P&L, and a losing-streak counter that only appears once it reaches 2 (a single
+loss isn't a "streak"), plus the most recent trade's own P&L and exit reason. Returns `""` when nothing has
+closed yet today, so `_build_entry_prompt` omits the section entirely rather than render an empty one --
+confirmed by a dedicated test, since a blank "Today's history:" header would itself read as a signal.
+
+`_build_entry_prompt` gained an optional `history_text` parameter, inserted as a new section between the
+existing market-state block and the closing "Apply the evaluation rules" instruction. `check_autonomous_entry`
+computes it once per cycle per index (`_recent_history_text(db, index.symbol, now_ist)`) and threads it
+through -- no new DB round trips beyond the one query, no new SmartAPI calls.
+
+**`SYSTEM_PROMPT_ENTRY` gained a new paragraph telling the model how to use this section**, deliberately
+worded as guidance rather than a rule: weigh a repeated same-direction failure as real evidence the setup
+isn't converting into premium gains today, raise the confidence bar accordingly, but do not treat a losing
+streak as an automatic reason to avoid a direction forever (streaks end, per the same day's own Nifty
+counter-example) -- and if it does trade a direction that already failed repeatedly today, its `reasoning`
+must say what's different this time, not restate the checklist as if the history didn't exist. This mirrors
+the existing "resolution requirement" pattern AI Origination's own prompt already uses for self-stated risks
+(19 Aug entry above) -- force an explicit justification rather than a bare restatement, applied here to the
+model's own trade history instead of a single decision's internal contradiction.
+
+10 new tests (`tests/test_autonomous_ai.py`, 76 -> 86): `_todays_closed_trades`' index/origin/today filters
+(excludes other indexes, other origins including `AI_ALT_*`, trades older than today, still-open trades);
+`_recent_history_text`'s empty-population case, per-direction win/loss/mean-P&L rendering matching a hand-
+computed example, the losing-streak counter appearing at 2 and not at 1, and the streak resetting after an
+intervening win (mirrors the Nifty counter-example directly); and two `check_autonomous_entry` integration
+tests confirming the history text actually reaches the real prompt string handed to `_call_provider` --
+present with the right content when a trade closed earlier today, absent entirely when nothing has. Full
+suite: 953 passed (was 943). `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox cannot call OpenAI's real API to see how it actually responds to being
+shown its own losing streak. After deploying, the open question stated directly in the module's own
+docstring: read the next several days of `ai_reasoning` on any repeated same-direction entry and check
+whether it's actually engaging with the shown history (naming something concretely different about this
+attempt) or just producing a better-justified-sounding repeat of the same decision. If the latter, that's a
+real, useful finding on its own -- it would mean this population needs the harder gate after all, the same
+escalation this project has already made twice for other soft-caution-first mechanisms (AI Origination's
+own same-direction gate, 17 Aug; the EMA-regime override, 4 Sep) once anecdote alone wasn't enough to change
+behavior.
+
 ### Portal fix hardened -- feed-aware spot pricing, batched trade-monitor quotes, and real never-hold-a-session-during-network-I/O discipline (9 Sep 2026, same day)
 
 **Follow-up to the entry directly below this one**, same day. That first pass fixed the two highest-frequency

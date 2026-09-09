@@ -28,8 +28,10 @@ from app.ai.autonomous import (
     _parse_entry_response,
     _parse_exit_response,
     _peak_pnl_percent,
+    _recent_history_text,
     _regime_matches_action,
     _session_phase,
+    _todays_closed_trades,
     _structural_invalidation,
     _trend_regime,
     _vwap_relation,
@@ -70,17 +72,19 @@ def _make_features(
 
 def _add_trade(db, *, trade_id, index_symbol="BANKNIFTY", origin=ORIGIN, status=TradeStatus.OPEN,
                 current_premium=100.0, entry_price=100.0, stoploss=65.0, target=150.0,
-                option_type="CE", highest_price=None, pnl_percent=None) -> None:
+                option_type="CE", highest_price=None, pnl_percent=None,
+                signal=None, exit_time=None, exit_reason=None) -> None:
     if pnl_percent is None and entry_price:
         pnl_percent = round((current_premium - entry_price) / entry_price * 100, 2)
     db.add(StrategyTrade(
-        trade_id=trade_id, strategy_name="Autonomous AI - Bank Nifty", signal=f"BUY_{option_type}",
+        trade_id=trade_id, strategy_name="Autonomous AI - Bank Nifty", signal=signal or f"BUY_{option_type}",
         index_symbol=index_symbol, tradingsymbol="X", symboltoken="1", strike=57000,
         expiry="28AUG2026", option_type=option_type, quantity=35,
         entry_price=entry_price, current_premium=current_premium, stoploss=stoploss, target=target,
         entry_time=utc_now(), origin=origin, status=status, pnl_percent=pnl_percent,
         result=TradeResult.OPEN if status == TradeStatus.OPEN else TradeResult.WIN,
         mode=TradingMode.PAPER, highest_price=highest_price,
+        exit_time=exit_time, exit_reason=exit_reason,
     ))
     db.commit()
 
@@ -734,6 +738,153 @@ def test_check_entry_provider_error_opens_nothing(monkeypatch):
     result = check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder)
     assert result is None
     assert option_finder.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# _todays_closed_trades / _recent_history_text -- 9 Sep 2026 same-day
+# trade-history-in-the-prompt addition. Deliberately NOT a gate -- see the
+# module docstring's "SAME-DAY TRADE HISTORY IN THE ENTRY PROMPT" section.
+# ---------------------------------------------------------------------------
+
+def test_todays_closed_trades_filters_to_this_index_and_today():
+    db = _make_session()
+    now = utc_now()
+    _add_trade(db, trade_id="bn1", index_symbol="BANKNIFTY", status=TradeStatus.CLOSED,
+               pnl_percent=-2.0, exit_time=now - timedelta(hours=1), exit_reason="STOPLOSS")
+    _add_trade(db, trade_id="nifty1", index_symbol="NIFTY", status=TradeStatus.CLOSED,
+               pnl_percent=5.0, exit_time=now - timedelta(hours=1), exit_reason="TARGET")
+    _add_trade(db, trade_id="bn_old", index_symbol="BANKNIFTY", status=TradeStatus.CLOSED,
+               pnl_percent=-3.0, exit_time=now - timedelta(days=2), exit_reason="STOPLOSS")
+
+    result = _todays_closed_trades(db, "BANKNIFTY", to_ist(now))
+
+    assert [t.trade_id for t in result] == ["bn1"]
+
+
+def test_todays_closed_trades_excludes_other_origins():
+    db = _make_session()
+    now = utc_now()
+    _add_trade(db, trade_id="alt1", origin="AI_ALT_OPENAI", status=TradeStatus.CLOSED,
+               pnl_percent=-2.0, exit_time=now - timedelta(hours=1), exit_reason="STOPLOSS")
+
+    result = _todays_closed_trades(db, "BANKNIFTY", to_ist(now))
+
+    assert result == []
+
+
+def test_todays_closed_trades_excludes_still_open_trades():
+    db = _make_session()
+    _add_trade(db, trade_id="open1", status=TradeStatus.OPEN)
+
+    result = _todays_closed_trades(db, "BANKNIFTY", to_ist(utc_now()))
+
+    assert result == []
+
+
+def test_recent_history_text_empty_when_nothing_closed_today():
+    db = _make_session()
+
+    assert _recent_history_text(db, "BANKNIFTY", to_ist(utc_now())) == ""
+
+
+def test_recent_history_text_reports_wins_losses_and_mean_pnl_per_direction():
+    db = _make_session()
+    now = utc_now()
+    _add_trade(db, trade_id="pe1", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=-4.0, exit_time=now - timedelta(hours=2), exit_reason="STOPLOSS")
+    _add_trade(db, trade_id="pe2", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=6.0, exit_time=now - timedelta(hours=1), exit_reason="TARGET")
+
+    text = _recent_history_text(db, "BANKNIFTY", to_ist(now))
+
+    assert "Today's Autonomous AI history on this index so far:" in text
+    assert "BUY_PE: 2 closed today (1W/1L)" in text
+    assert "mean P&L +1.0%" in text
+    assert "Most recent: +6.0% via TARGET" in text
+    assert "BUY_CE" not in text  # no calls closed today -- section omitted
+
+
+def test_recent_history_text_reports_losing_streak_at_2_or_more():
+    db = _make_session()
+    now = utc_now()
+    _add_trade(db, trade_id="pe1", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=-4.0, exit_time=now - timedelta(minutes=30), exit_reason="AUTONOMOUS_STALL_EXIT")
+    _add_trade(db, trade_id="pe2", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=-5.0, exit_time=now - timedelta(minutes=15), exit_reason="AI_DISCRETION_EXIT")
+
+    text = _recent_history_text(db, "BANKNIFTY", to_ist(now))
+
+    assert "currently on a 2-trade losing streak" in text
+
+
+def test_recent_history_text_no_streak_text_for_a_single_loss():
+    db = _make_session()
+    _add_trade(db, trade_id="pe1", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=-4.0, exit_time=utc_now() - timedelta(minutes=10), exit_reason="STOPLOSS")
+
+    text = _recent_history_text(db, "BANKNIFTY", to_ist(utc_now()))
+
+    assert "losing streak" not in text
+
+
+def test_recent_history_text_streak_resets_on_an_intervening_win():
+    db = _make_session()
+    now = utc_now()
+    _add_trade(db, trade_id="pe1", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=-4.0, exit_time=now - timedelta(hours=3), exit_reason="STOPLOSS")
+    _add_trade(db, trade_id="pe2", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=8.0, exit_time=now - timedelta(hours=2), exit_reason="TARGET")
+    _add_trade(db, trade_id="pe3", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=-1.0, exit_time=now - timedelta(hours=1), exit_reason="STOPLOSS")
+
+    text = _recent_history_text(db, "BANKNIFTY", to_ist(now))
+
+    assert "losing streak" not in text  # only 1 loss since the intervening win
+
+
+# ---------------------------------------------------------------------------
+# check_autonomous_entry -- history threaded into the actual prompt sent
+# ---------------------------------------------------------------------------
+
+def test_check_entry_includes_history_in_the_prompt_sent_to_the_provider(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    _add_trade(db, trade_id="pe1", index_symbol="BANKNIFTY", signal="BUY_PE", status=TradeStatus.CLOSED,
+               pnl_percent=-4.0, exit_time=utc_now() - timedelta(hours=1), exit_reason="AUTONOMOUS_STALL_EXIT")
+
+    captured = {}
+
+    def fake_call_provider(provider, view, system_prompt, user_prompt):
+        captured["user_prompt"] = user_prompt
+        return module._RawCall('{"decision": "NONE", "reasoning": "declining"}', None, 5.0)
+
+    monkeypatch.setattr(module, "_call_provider", fake_call_provider)
+
+    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder)
+
+    assert "Today's Autonomous AI history on this index so far:" in captured["user_prompt"]
+    assert "BUY_PE: 1 closed today" in captured["user_prompt"]
+
+
+def test_check_entry_prompt_omits_history_section_with_nothing_closed_today(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+
+    captured = {}
+
+    def fake_call_provider(provider, view, system_prompt, user_prompt):
+        captured["user_prompt"] = user_prompt
+        return module._RawCall('{"decision": "NONE", "reasoning": "declining"}', None, 5.0)
+
+    monkeypatch.setattr(module, "_call_provider", fake_call_provider)
+
+    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder)
+
+    assert "Today's Autonomous AI history" not in captured["user_prompt"]
 
 
 # ---------------------------------------------------------------------------
