@@ -41,8 +41,27 @@ def create_scheduler(
     quick_scalp_job: Callable[[], None] | None = None,
     validated_signal_entry_job: Callable[[], None] | None = None,
     validated_signal_exit_job: Callable[[], None] | None = None,
+    index_tick_recorder_job: Callable[[], None] | None = None,
 ) -> BackgroundScheduler:
-    scheduler = BackgroundScheduler(timezone=IST)
+    # job_defaults: the library default misfire_grace_time is 1 second --
+    # far tighter than this app can guarantee under real load (a scheduler
+    # thread queued behind the shared SmartAPI quote throttle, or waiting on
+    # a DB connection-pool slot, can easily slip a job's fire time by more
+    # than 1 second). A too-tight grace time doesn't delay the job, it
+    # SILENTLY SKIPS it -- exactly the wrong failure mode for an exit-poll
+    # job during the busy periods this default was most likely to bite.
+    # 30s here is the default for the fast IntervalTrigger jobs (5s/25s/30s
+    # cadence -- trade-monitor, quick-scalp-exit-check, validated-signal-
+    # exit-check, index-tick-recorder), real headroom without letting a
+    # backlog span multiple firing periods. Every CronTrigger-based job
+    # below (5-minute-or-slower cadence) sets its own explicit
+    # misfire_grace_time=60 instead -- a coarser cadence can tolerate a
+    # longer delay before a missed firing actually matters, and 60s still
+    # comfortably covers the kind of contention this investigation found
+    # without risking two firings' worth of work colliding. coalesce=True
+    # (already set on every job) collapses any backlog to a single catch-up
+    # run rather than a burst, on both tiers.
+    scheduler = BackgroundScheduler(timezone=IST, job_defaults={"misfire_grace_time": 30})
     scheduler.add_job(
         monitor.tick,
         trigger=IntervalTrigger(seconds=30),
@@ -71,6 +90,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     if autonomous_job is not None:
         # Same coarse-cron-plus-in-job-market-hours-gate shape as
@@ -85,6 +105,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     if quick_scalp_job is not None:
         # 8 Sep 2026 rebuild: entries moved OFF the scheduler entirely onto
@@ -123,6 +144,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     if validated_signal_exit_job is not None:
         # 5 seconds -- the spec's own explicit exit-poll cadence (Section 5),
@@ -139,6 +161,26 @@ def create_scheduler(
             validated_signal_exit_job,
             trigger=IntervalTrigger(seconds=5),
             id="validated-signal-exit-check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+    if index_tick_recorder_job is not None:
+        # 9 Sep 2026: replaces the IndexPriceTick write that used to happen
+        # inline inside app.platform.get_index_live_figures on every
+        # dashboard poll -- see CLAUDE.md, the "portal unresponsive during
+        # market hours" investigation, Phase 2c. Runs on a fixed cadence
+        # matching app.platform's own _INDEX_TICK_THROTTLE_SECONDS (25s)
+        # regardless of whether any browser tab is open, so tick density no
+        # longer depends on dashboard traffic. No coarse cron gate needed --
+        # the job itself calls check_market_hours() before touching the DB
+        # or SmartAPI at all, so an off-hours firing is a single cheap
+        # early-return, the same shape trade-monitor's own empty-open-trades
+        # early return already established for its own 24/7 IntervalTrigger.
+        scheduler.add_job(
+            index_tick_recorder_job,
+            trigger=IntervalTrigger(seconds=25),
+            id="index-tick-recorder",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -183,6 +225,7 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+            misfire_grace_time=60,
     )
     if closing_auction_job is not None:
         # 15:45, after the auction concludes (~15:35) and after derivatives
@@ -197,6 +240,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     if health_manager is not None:
         scheduler.add_job(
@@ -206,6 +250,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     scheduler.add_job(
         reports.run_daily_summary_job,
@@ -214,6 +259,7 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+            misfire_grace_time=60,
     )
     scheduler.add_job(
         reports.run_weekly_report_job,
@@ -222,6 +268,7 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+            misfire_grace_time=60,
     )
     scheduler.add_job(
         reports.run_monthly_report_job,
@@ -230,5 +277,6 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+            misfire_grace_time=60,
     )
     return scheduler

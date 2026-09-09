@@ -122,9 +122,14 @@ def _ist(y, m, d, hh=10, mm=0):
     return datetime(y, m, d, hh, mm, tzinfo=IST)
 
 
-def test_records_a_tick_during_trading_hours_on_a_weekday(monkeypatch):
-    # 14 Aug 2026: this is the path dashboard polling drives, independent of
-    # originator.py's own (already market-hours-gated) tick recording.
+def test_never_records_a_tick_even_during_trading_hours_on_a_weekday(monkeypatch):
+    # 9 Sep 2026: get_index_live_figures is now purely a read -- the write it
+    # used to do inline (throttled, market-hours-gated) moved entirely to
+    # app.platform.record_index_ticks, its own fixed-cadence scheduler job
+    # (see the "portal unresponsive during market hours" investigation,
+    # Phase 2c). This is the same trading-hours moment the old
+    # "test_records_a_tick_during_trading_hours_on_a_weekday" test used to
+    # assert DID write a tick -- now it must not, from this function, ever.
     monkeypatch.setattr(platform_module, "utc_now", lambda: _ist(2026, 8, 13, 11, 0))  # Thursday, trading hours
     db = _make_session()
     _seed_index(db)
@@ -133,7 +138,7 @@ def test_records_a_tick_during_trading_hours_on_a_weekday(monkeypatch):
     get_index_live_figures(db, FakeSmartAPI(), feed_store)
 
     ticks = list(db.scalars(select(IndexPriceTick).where(IndexPriceTick.index_symbol == "BANKNIFTY")))
-    assert len(ticks) == 1
+    assert len(ticks) == 0
 
 
 def test_does_not_record_a_tick_on_a_weekend(monkeypatch):
@@ -141,7 +146,8 @@ def test_does_not_record_a_tick_on_a_weekend(monkeypatch):
     # IndexPriceTick with the same frozen price every ~25s, purely because a
     # browser tab was open, even on a day the market never opened. The
     # figure itself must still render (last known price, via the feed) --
-    # only the redundant write should stop.
+    # 9 Sep 2026: now trivially true regardless of day/hour, since this
+    # function never writes a tick at all any more (see the test above).
     monkeypatch.setattr(platform_module, "utc_now", lambda: _ist(2026, 8, 15, 12, 0))  # Saturday
     db = _make_session()
     _seed_index(db)
@@ -151,7 +157,7 @@ def test_does_not_record_a_tick_on_a_weekend(monkeypatch):
 
     ticks = list(db.scalars(select(IndexPriceTick).where(IndexPriceTick.index_symbol == "BANKNIFTY")))
     assert len(ticks) == 0
-    assert figures[0]["price"] == 50000.0  # still shown, just not re-recorded
+    assert figures[0]["price"] == 50000.0  # still shown, just never recorded from here
 
 
 def test_does_not_record_a_tick_outside_trading_hours_on_a_weekday(monkeypatch):
@@ -205,11 +211,9 @@ def test_last_known_tick_fallback_picks_the_most_recent_one():
 
 
 def test_last_known_tick_fallback_is_not_re_recorded_as_a_fresh_tick(monkeypatch):
-    # Even in the rare case this fallback fires DURING trading hours (feed
-    # hasn't produced its first tick of the session yet), the fallback price
-    # must not be written as a new tick -- that would inject a possibly-days-
-    # old value into today's tick history and corrupt the change/day-range
-    # math computed from it for the rest of the day.
+    # 9 Sep 2026: get_index_live_figures never writes a tick at all any more
+    # (see the tests above) -- kept as a regression guard that the fallback
+    # price is still just READ, never inserted, even during trading hours.
     monkeypatch.setattr(platform_module, "utc_now", lambda: _ist(2026, 8, 13, 11, 0))  # Thursday, trading hours
     db = _make_session()
     _seed_index(db)

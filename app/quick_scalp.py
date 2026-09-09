@@ -374,7 +374,32 @@ def open_scalp_trade(
 ) -> Optional[StrategyTrade]:
     """Resolves a Deep ITM contract and opens exactly ONE StrategyTrade row
     -- single-clip full exit, no Target1/Runner split (see module docstring,
-    "WHAT'S GENUINELY NEW IN THIS REBUILD" #2)."""
+    "WHAT'S GENUINELY NEW IN THIS REBUILD" #2).
+
+    9 Sep 2026: the actual resolve (contract lookup + entry-price fetch,
+    both possible network calls) is factored out into _resolve_scalp_entry
+    below, kept here as one resolve-then-write call for every existing
+    direct test of this function. The real bar-close entry path
+    (_on_scalp_bar_closed) instead calls _resolve_scalp_entry and
+    _write_scalp_trade separately, with no DB session held across the
+    resolve step -- see the 9 Sep 2026 "portal unresponsive during market
+    hours" investigation, Phase 3."""
+    resolved = _resolve_scalp_entry(index, signal, smartapi, option_finder, now_ist)
+    if resolved is None:
+        return None
+    return _write_scalp_trade(db, index, signal, resolved)
+
+
+def _resolve_scalp_entry(
+    index: IndexConfig,
+    signal: _ScalpSignal,
+    smartapi: SmartAPIClient,
+    option_finder: OptionFinder,
+    now_ist,
+) -> Optional[dict]:
+    """Pure resolve step for open_scalp_trade -- contract resolution and the
+    entry-price fetch, NO DB access at all. Returns None (never a partial
+    trade) on any resolution failure."""
     option_type = "CE" if signal.action == "BUY_CE" else "PE"
     trade_signal = Signal.BUY_CE if option_type == "CE" else Signal.BUY_PE
 
@@ -411,6 +436,24 @@ def open_scalp_trade(
         f"stop {_STOP_PERCENT:.1%}, target {_TARGET_PERCENT:.2%} (floor +{_MIN_TARGET_POINTS:.0f}pts)."
     )
 
+    return {
+        "contract": contract,
+        "trade_signal": trade_signal,
+        "entry_price": entry_price,
+        "stoploss": stoploss,
+        "target": target,
+        "structural_level": structural_level,
+        "reasoning": reasoning,
+    }
+
+
+def _write_scalp_trade(db: Session, index: IndexConfig, signal: _ScalpSignal, resolved: dict) -> StrategyTrade:
+    """DB-only write step -- builds and persists the StrategyTrade row from
+    an already-resolved entry (see _resolve_scalp_entry). No network calls
+    here."""
+    contract = resolved["contract"]
+    trade_signal = resolved["trade_signal"]
+    entry_price = resolved["entry_price"]
     trade = StrategyTrade(
         trade_id=uuid4().hex,
         strategy_name=f"Quick Scalp - {index.display_name or index.symbol}",
@@ -426,8 +469,8 @@ def open_scalp_trade(
         investment_amount=round(entry_price * contract.lot_size * _LOT_MULTIPLIER, 2),
         entry_price=round(entry_price, 2),
         current_premium=round(entry_price, 2),
-        stoploss=stoploss,
-        target=target,
+        stoploss=resolved["stoploss"],
+        target=resolved["target"],
         entry_time=utc_now(),
         # Structurally paper-only -- see module docstring. No live order path
         # exists anywhere in this module.
@@ -443,9 +486,9 @@ def open_scalp_trade(
         sl_mode=SLMode.FIXED,
         origin=ORIGIN,
         ai_action=signal.action,
-        ai_reasoning=reasoning,
+        ai_reasoning=resolved["reasoning"],
         spot_at_entry=round(signal.trigger_level, 2),
-        structural_stop_level=structural_level,
+        structural_stop_level=resolved["structural_level"],
     )
     db.add(trade)
     db.commit()
@@ -453,7 +496,7 @@ def open_scalp_trade(
     log_event(
         db, "QUICK_SCALP",
         f"[{trade.strategy_name}] opened {trade_signal.value} @ strike {trade.strike}",
-        payload={"trade_id": trade.trade_id, "structural_stop_level": structural_level},
+        payload={"trade_id": trade.trade_id, "structural_stop_level": resolved["structural_level"]},
     )
     logger.info("[QUICK_SCALP] %s opened %s for %s", ORIGIN, trade_signal.value, index.symbol)
     return trade
@@ -467,6 +510,13 @@ def check_quick_scalp_entry(
     option_finder: OptionFinder,
     now_ist,
 ) -> Optional[StrategyTrade]:
+    """Single-call decide-then-open helper, held across one DB session end
+    to end. 9 Sep 2026: the real bar-close entry path (_on_scalp_bar_closed)
+    no longer calls this -- it runs the same decision logic across its own
+    three phases so the network call in open_scalp_trade never happens with
+    a session held (see the "portal unresponsive during market hours"
+    investigation). Kept for direct testing of the decide-then-open
+    sequence in one call."""
     if _has_open_quick_scalp_trade(db, index.symbol):
         return None
     if features is None:
@@ -482,25 +532,70 @@ def _on_scalp_bar_closed(index_symbol: str, smartapi: SmartAPIClient, option_fin
     """Registered as app.quick_scalp_feed.QuickScalpFeed's on_bar_closed
     callback (see app/main.py's lifespan wiring) -- invoked synchronously on
     the feed's own background thread once a new bar has already been
-    persisted. Opens and closes its own DB session, the same convention
-    every other entry point in this codebase follows."""
+    persisted.
+
+    9 Sep 2026, Phase 3 of the "portal unresponsive during market hours"
+    investigation: previously opened ONE session and held it across
+    check_quick_scalp_entry's own call into open_scalp_trade, which made a
+    real smartapi.get_ltp() call while that session's connection-pool slot
+    sat checked out. Split into three phases: Phase A (a short session --
+    load the index config and today's features, and bail out early if a
+    trade is already open, all closed before any network call), Phase B
+    (no session held -- resolve the contract and entry price via
+    _resolve_scalp_entry), Phase C (a new short session -- re-check no
+    trade opened in the gap since Phase A, a real race this callback can
+    hit since it's invoked once per bar close per index, then write via
+    _write_scalp_trade)."""
+    if smartapi is None or option_finder is None:
+        return
+    now_ist = to_ist(utc_now())
+    if (now_ist.hour, now_ist.minute) < _WARMUP_END or (now_ist.hour, now_ist.minute) >= _ENTRY_CUTOFF:
+        return
+
     db = None
     try:
-        if smartapi is None or option_finder is None:
-            return
-        now_ist = to_ist(utc_now())
-        if (now_ist.hour, now_ist.minute) < _WARMUP_END or (now_ist.hour, now_ist.minute) >= _ENTRY_CUTOFF:
-            return
         db = SessionLocal()
         index = db.scalar(
             select(IndexConfig).where(IndexConfig.symbol == index_symbol, IndexConfig.enabled.is_(True))
         )
         if index is None:
             return
+        if _has_open_quick_scalp_trade(db, index_symbol):
+            return
         features = _load_scalp_features(db, index_symbol, now_ist)
-        check_quick_scalp_entry(db, index, features, smartapi, option_finder, now_ist)
     except Exception:
         logger.exception("[QUICK_SCALP] bar-close entry check failed for %s", index_symbol)
+        return
+    finally:
+        if db is not None:
+            db.close()
+
+    if features is None:
+        return
+    signal = vwap_scalp_action(features)
+    if signal is None:
+        return
+
+    try:
+        resolved = _resolve_scalp_entry(index, signal, smartapi, option_finder, now_ist)
+    except Exception:
+        logger.exception("[QUICK_SCALP] bar-close entry resolution failed for %s", index_symbol)
+        return
+    if resolved is None:
+        return
+
+    db = None
+    try:
+        db = SessionLocal()
+        if _has_open_quick_scalp_trade(db, index_symbol):
+            logger.info(
+                "[QUICK_SCALP] %s: signal resolved but a trade opened in the gap since Phase A, discarding",
+                index_symbol,
+            )
+            return
+        _write_scalp_trade(db, index, signal, resolved)
+    except Exception:
+        logger.exception("[QUICK_SCALP] bar-close entry write failed for %s", index_symbol)
     finally:
         if db is not None:
             db.close()
@@ -632,12 +727,32 @@ def run_quick_scalp_exit_checks(
     positions and end-of-day square-off. Returns immediately with zero
     SmartAPI calls whenever nothing is open, same precedent as app.
     validated_signal's own 5-second exit job -- the fast cadence costs
-    nothing in the overwhelmingly common idle case."""
+    nothing in the overwhelmingly common idle case.
+
+    9 Sep 2026, Phase A/B/C of the "portal unresponsive during market hours"
+    investigation: this used to hold one DB session open for the ENTIRE
+    function, including the per-index smartapi.get_index_spot() calls below
+    -- a real REST call, serialized through the shared 1.3s quote throttle,
+    made while a connection-pool slot sat checked out. At a 5-second cadence
+    that's the single biggest contributor to pool contention this
+    investigation found. Restructured into three phases: Phase A reads
+    what's open and whether it's past square-off in a short session, closed
+    before any network call; Phase B resolves spot prices with NO session
+    held at all -- smartapi.get_index_spot() now prefers LiveFeedStore
+    internally (see app.smartapi_client, Phase 2 item 1), REST via the
+    throttle only as a fallback, so this call is usually free; Phase C opens
+    a new short session only once prices are already in hand. Phase C's own
+    check_quick_scalp_exits/_square_off_all re-query for OPEN trades fresh
+    from THIS session rather than reusing Phase A's now-stale ORM objects,
+    so a trade another job closed in the gap (a kill switch, the shared
+    square-off) is naturally excluded -- no separate re-check needed beyond
+    the query itself already being fresh."""
     if smartapi is None or trade_manager is None:
         logger.info("[QUICK_SCALP] Skipped: no smartapi/trade_manager available in this context")
         return
     if trading_day_reason(to_ist(utc_now())) is not None:
         return
+
     owns_session = db is None
     session = db or SessionLocal()
     try:
@@ -652,20 +767,40 @@ def run_quick_scalp_exit_checks(
         if not open_trades:
             return
         now_ist = to_ist(utc_now())
-        if (now_ist.hour, now_ist.minute) >= _SQUARE_OFF:
-            _square_off_all(session, trade_manager)
-            return
-
+        past_square_off = (now_ist.hour, now_ist.minute) >= _SQUARE_OFF
         open_index_symbols = {trade.index_symbol for trade in open_trades}
-        current_spot_by_index: dict[str, float | None] = {}
-        for index in list_index_configs(session):
-            if index.symbol not in open_index_symbols:
-                continue
-            try:
-                current_spot_by_index[index.symbol] = smartapi.get_index_spot(index)
-            except Exception:
-                current_spot_by_index[index.symbol] = None
+        indexes_with_open_trades = (
+            [] if past_square_off
+            else [index for index in list_index_configs(session) if index.symbol in open_index_symbols]
+        )
+    finally:
+        if owns_session:
+            session.close()
 
+    if past_square_off:
+        owns_session = db is None
+        session = db or SessionLocal()
+        try:
+            _square_off_all(session, trade_manager)
+        finally:
+            if owns_session:
+                session.close()
+        return
+
+    # Phase B: no DB session held across any of these. get_index_spot()
+    # itself prefers a fresh LiveFeedStore reading (zero cost) and only
+    # falls back to a REST call through the shared quote throttle when the
+    # feed has nothing fresh enough for this index.
+    current_spot_by_index: dict[str, float | None] = {}
+    for index in indexes_with_open_trades:
+        try:
+            current_spot_by_index[index.symbol] = smartapi.get_index_spot(index)
+        except Exception:
+            current_spot_by_index[index.symbol] = None
+
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
         check_quick_scalp_exits(session, trade_manager, now_ist, current_spot_by_index)
     finally:
         if owns_session:

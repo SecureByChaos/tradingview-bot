@@ -10,6 +10,7 @@ from sqlalchemy.exc import InvalidRequestError, OperationalError
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
+from app.database import SessionLocal
 from app.db_models import AIOriginationLog, BotState, BotStatus, Candle, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.market_context import ADX_NO_TREND, ADX_TRENDING
 from app.market_data import ONE_MINUTE
@@ -517,10 +518,11 @@ def compute_performance_kpis(closed_trades: list[StrategyTrade]) -> dict[str, An
 
 
 def record_index_tick_if_stale(db: Session, index_symbol: str, price: float) -> None:
-    """Throttled IndexPriceTick recorder, shared by the live-dashboard figure
-    fetch and app/ai/originator.py's momentum check -- both need real spot-price
-    history, and originator.py runs on a schedule independent of whether anyone
-    has the dashboard open, so tick recording can't stay dashboard-only."""
+    """Throttled IndexPriceTick recorder, shared by record_index_ticks below
+    and app/ai/originator.py's momentum check -- both need real spot-price
+    history, and originator.py runs on a schedule independent of whether
+    anyone has the dashboard open, so tick recording can't stay dashboard-
+    only."""
     latest_tick = db.scalar(
         select(IndexPriceTick)
         .where(IndexPriceTick.index_symbol == index_symbol)
@@ -532,6 +534,69 @@ def record_index_tick_if_stale(db: Session, index_symbol: str, price: float) -> 
     if latest_ist is None or (now_ist - latest_ist).total_seconds() >= _INDEX_TICK_THROTTLE_SECONDS:
         db.add(IndexPriceTick(index_symbol=index_symbol, price=price))
         db.commit()
+
+
+def record_index_ticks(smartapi: Any, feed_store: Any, db: Session | None = None) -> None:
+    """Scheduler entry point (see app.scheduler's "index-tick-recorder" job)
+    -- the write get_index_live_figures used to do inline on every dashboard
+    poll, moved here 9 Sep 2026 so it runs at a fixed cadence regardless of
+    whether any browser tab is open. Two real problems with the old
+    dashboard-poll-driven write, both fixed by this move: (1) it was the one
+    write in the request path -- see the 9 Sep 2026 "portal unresponsive
+    during market hours" investigation, Phase 2c -- and (2) tick density
+    silently depended on tab-open/tab-closed (see this file's own "Gotchas"
+    section in CLAUDE.md), so the AI's price-history resolution varied with
+    how many people happened to be looking at the dashboard. A fixed
+    scheduler cadence removes both.
+
+    Fetches every enabled index's price FIRST -- feed_store (zero SmartAPI
+    cost) preferred, a direct smartapi.get_index_spot() call only when
+    feed_store is None or hasn't produced a value yet for that index -- and
+    only opens a DB session afterward, to read the enabled-index list and
+    write the throttled ticks. Never holds a session open across the price
+    fetch itself (see Phase 2a of the same investigation: a session held
+    across a SmartAPI/throttle wait is what was exhausting the connection
+    pool). Skipped entirely outside market hours, same reasoning
+    get_index_live_figures's own now-removed inline write used to state:
+    recording a frozen off-hours price on a fixed cadence would be exactly
+    as pointless as the tab-open write it replaces, just on a timer instead
+    of a poll."""
+    if check_market_hours(utc_now()) is not None:
+        return
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
+        indexes = list(session.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True))))
+    finally:
+        if owns_session:
+            session.close()
+    if not indexes:
+        return
+
+    prices: dict[str, float] = {}
+    for index in indexes:
+        feed_entry = feed_store.get(index.symbol) if feed_store is not None else None
+        if feed_entry is not None:
+            prices[index.symbol] = round(feed_entry["price"], 2)
+        elif feed_store is None:
+            try:
+                prices[index.symbol] = round(smartapi.get_index_spot(index), 2)
+            except Exception as exc:
+                logger.warning("record_index_ticks: spot fetch failed for %s: %s", index.symbol, exc)
+        # else: feed_store is wired but has no value yet for this index this
+        # process -- nothing fresh to record this cycle, same fail-soft skip
+        # get_index_live_figures's fallback path already used.
+    if not prices:
+        return
+
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
+        for symbol, price in prices.items():
+            record_index_tick_if_stale(session, symbol, price)
+    finally:
+        if owns_session:
+            session.close()
 
 
 def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -> list[dict[str, Any]]:
@@ -576,23 +641,23 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
     exists to eliminate; a stale feed entry is still used, just flagged via
     is_live=False.
 
-    14 Aug 2026: tick recording below is skipped entirely outside market
-    hours. This function is driven by dashboard polling (every 10s per open
-    browser tab, see live_dashboard.html), which has no market-hours
-    awareness of its own -- unlike originator.py's own call to
-    record_index_tick_if_stale, which is now upstream of the market-hours
-    gate added in run_origination_checks (see CLAUDE.md, "SmartAPI calls
-    stopped outside market hours"), this call site had none. A frozen
-    weekend/holiday price was being re-recorded as a new IndexPriceTick
-    roughly every _INDEX_TICK_THROTTLE_SECONDS for as long as anyone had the
-    dashboard open -- real DB writes for a value that never changed, adding
-    nothing today's-first-tick/day-range math below can use. The figures
-    themselves (and the feed's own is_live/stale badge) are unaffected --
-    this only stops the redundant write, not the display."""
+    14 Aug 2026: this function used to write a throttled IndexPriceTick row
+    inline, gated to market hours, on every dashboard poll (every 10s per
+    open browser tab -- see live_dashboard.html). 9 Sep 2026: that write was
+    removed entirely (see CLAUDE.md, the "portal unresponsive during market
+    hours" investigation, Phase 2c) -- this function is now purely a read
+    against whatever ticks already exist, called from a request handler that
+    must never itself touch the DB with a write. Tick recording is now
+    app.platform.record_index_ticks, its own fixed-cadence scheduler job
+    (app.scheduler's "index-tick-recorder"), independent of whether anyone
+    has the dashboard open at all -- which also removes the tab-open/
+    tab-closed sample-density confound this file's own "Gotchas" section
+    documents. The figures themselves (and the feed's own is_live/stale
+    badge) are unaffected by this change -- only which code path writes the
+    ticks they're read from."""
     figures: list[dict[str, Any]] = []
     indexes = list(db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)))
     today = today_ist().isoformat()
-    is_trading_now = check_market_hours(utc_now()) is None
     for index in indexes:
         entry: dict[str, Any] = {
             "symbol": index.symbol,
@@ -605,7 +670,6 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
             "is_live": None,
         }
         feed_entry = feed_store.get(index.symbol) if feed_store is not None else None
-        price_is_fresh = True
         if feed_entry is not None:
             price = round(feed_entry["price"], 2)
             entry["is_live"] = feed_entry["is_live"]
@@ -649,16 +713,6 @@ def get_index_live_figures(db: Session, smartapi: Any, feed_store: Any = None) -
                 continue
             price = round(last_tick.price, 2)
             entry["is_live"] = False
-            price_is_fresh = False
-
-        # Never record a fallback (not-fresh) price as a new tick -- that
-        # would insert a possibly-days-old value into today's tick history
-        # and corrupt the change/day-range math below for the rest of the
-        # day. Only ever relevant in the rare case this fallback fires while
-        # is_trading_now is still True (feed hasn't produced its first tick
-        # of the session yet).
-        if is_trading_now and price_is_fresh:
-            record_index_tick_if_stale(db, index.symbol, price)
 
         todays_ticks = list(
             db.scalars(

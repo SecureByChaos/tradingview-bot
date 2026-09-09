@@ -138,6 +138,15 @@ _DEFAULT_TRADING_END = (15, 15)
 # measured.
 _NV1_MIN_DTE = 1
 
+# 9 Sep 2026, Phase 2 item 2 of the "portal unresponsive during market
+# hours" investigation: Angel One's getMarketData per-request token cap --
+# same value app.option_chain.py's own _TOKENS_PER_REQUEST already
+# established for the exact same reason (its own chain sweep). Duplicated
+# rather than imported to avoid a cross-module coupling for one constant,
+# the same convention this codebase already applies elsewhere (ADX bands,
+# chop-signal classification, the DTE-bucket function).
+_QUOTE_BATCH_SIZE = 50
+
 
 class MultiStrategyTradeManager:
     def __init__(
@@ -418,13 +427,108 @@ class MultiStrategyTradeManager:
         log_event(db, "TRADE", f"[V7] Closed active trade: {trade.trade_id}")
         return WebhookResponse(accepted=True, message=f"Closed active {option_type} trade")
 
+    def _fetch_premiums_batched(self, rows: list) -> dict[str, float]:
+        """Phase B of monitor_open_trades (9 Sep 2026, Phase 2 item 2 of the
+        "portal unresponsive during market hours" investigation): one
+        getMarketData call per _QUOTE_BATCH_SIZE-token chunk instead of one
+        get_ltp() call per open trade -- the same batching app.option_
+        chain.py's own chain sweep already established, replacing what used
+        to be N throttled REST calls (one per open trade, across every
+        rule-based strategy and every AI trade sharing this monitor) with
+        ceil(N/50). Falls back to an individual get_ltp() call only for a
+        token the batch response didn't return a row for -- Angel returns
+        partial results rather than failing the whole batch on one bad
+        token, and this same fallback path is what a get_market_data-less
+        SmartAPI stand-in (several of this module's own tests) degrades to
+        automatically, since every token then simply has no batch entry to
+        skip. No DB session is touched anywhere in this method."""
+        premium_by_token: dict[str, float] = {}
+        for start in range(0, len(rows), _QUOTE_BATCH_SIZE):
+            chunk = rows[start : start + _QUOTE_BATCH_SIZE]
+            payload: dict[str, list[str]] = {}
+            for row in chunk:
+                payload.setdefault(row.exchange, []).append(row.symboltoken)
+            try:
+                for quote_row in self.smartapi.get_market_data("LTP", payload):
+                    token = str(quote_row.get("symbolToken") or "")
+                    ltp = quote_row.get("ltp")
+                    if not token or ltp is None:
+                        continue
+                    try:
+                        premium_by_token[token] = round(float(ltp), 2)
+                    except (TypeError, ValueError):
+                        continue
+            except Exception as exc:
+                logger.warning(
+                    "Multi-strategy monitor: batched quote chunk failed (%s tokens): %s", len(chunk), exc
+                )
+
+        for row in rows:
+            if row.symboltoken in premium_by_token:
+                continue
+            try:
+                premium_by_token[row.symboltoken] = round(
+                    self.smartapi.get_ltp(row.exchange, row.tradingsymbol, row.symboltoken), 2
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Multi-strategy monitor: get_ltp fallback failed for %s (%s): %s",
+                    row.trade_id, row.symboltoken, exc,
+                )
+        return premium_by_token
+
     def monitor_open_trades(self, db: Session) -> list[StrategyTrade]:
+        """9 Sep 2026, Phase 2 items 2/3 of the "portal unresponsive during
+        market hours" investigation: this used to call self.smartapi.
+        get_ltp() once per open trade, inline, with the caller's DB session
+        (from MultiStrategyMonitor.tick's own `with SessionLocal() as db:`)
+        checked out the whole time -- real REST calls serialized through the
+        shared 1.3s quote throttle, one per trade, every 30 seconds. Now
+        split into three phases. Phase A reads only the lightweight fields
+        needed for a batched quote request, then commits -- a safe no-op
+        here since nothing is pending, but the actual mechanism that returns
+        db's connection to the pool before Phase B's network calls, since
+        this function doesn't own db's lifecycle (its caller does, and needs
+        it usable afterward for enforce_daily_loss_limits) and so can't
+        close it outright the way a scheduler-owned entry point does. Phase
+        B fetches every premium via _fetch_premiums_batched with no session
+        held at all. Phase C reloads the full trade objects fresh and
+        re-checks they're still OPEN (a square-off or kill switch may have
+        closed one in the gap since Phase A), then applies the exact same
+        per-trade decision logic as before -- unchanged for every strategy,
+        only the premium's SOURCE changed. A trade whose token has no
+        premium this tick (both the batch and the individual fallback
+        missed it) is skipped with a WARNING log, not a Telegram alert --
+        deliberately: it's a routine, self-healing gap resolved by the next
+        30s tick, and alerting from here would mean a Telegram HTTP call
+        (itself network I/O) inside this same short write session."""
         closed: list[StrategyTrade] = []
+
+        # Phase A.
+        trade_rows = list(
+            db.execute(
+                select(
+                    StrategyTrade.trade_id, StrategyTrade.exchange, StrategyTrade.tradingsymbol,
+                    StrategyTrade.symboltoken,
+                ).where(
+                    StrategyTrade.status == TradeStatus.OPEN,
+                    func.upper(StrategyTrade.strategy_name) != "V7",
+                )
+            ).all()
+        )
+        if not trade_rows:
+            return closed
+        db.commit()
+
+        # Phase B.
+        premium_by_token = self._fetch_premiums_batched(trade_rows)
+
+        # Phase C.
+        trade_ids = [row.trade_id for row in trade_rows]
         trades = list(
             db.scalars(
                 select(StrategyTrade).where(
-                    StrategyTrade.status == TradeStatus.OPEN,
-                    func.upper(StrategyTrade.strategy_name) != "V7",
+                    StrategyTrade.trade_id.in_(trade_ids), StrategyTrade.status == TradeStatus.OPEN
                 )
             )
         )
@@ -443,6 +547,13 @@ class MultiStrategyTradeManager:
         square_off_hm = parse_hhmm(platform_settings.square_off_time, _DEFAULT_TRADING_END)
         for trade in trades:
             try:
+                premium = premium_by_token.get(trade.symboltoken)
+                if premium is None:
+                    logger.warning(
+                        "Multi-strategy monitor: no premium available for %s (%s) this tick",
+                        trade.trade_id, trade.symboltoken,
+                    )
+                    continue
                 strategy = strategies_by_name.get(trade.strategy_name)
                 # Per-trade sl_mode wins when set (AI Origin trades use this --
                 # see StrategyTrade.sl_mode's docstring); otherwise fall back to
@@ -451,7 +562,6 @@ class MultiStrategyTradeManager:
                 activation_percent = strategy.trailing_activation_percent if strategy is not None else 10.0
                 offset_percent = strategy.trailing_offset_percent if strategy is not None else 5.0
 
-                premium = self.smartapi.get_ltp(trade.exchange, trade.tradingsymbol, trade.symboltoken)
                 trade.current_premium = round(premium, 2)
                 trade.pnl_percent = round(((premium - trade.entry_price) / trade.entry_price) * 100, 2)
                 db.add(StrategyTradeTick(trade_id=trade.trade_id, premium=trade.current_premium))
