@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 
 from collections.abc import Generator
 from pathlib import Path
@@ -9,6 +11,8 @@ from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -58,11 +62,66 @@ if resolved_database_url.startswith("sqlite:///"):
 # errors that ended with systemd SIGKILLing the process on a timeout. 10s
 # gives real headroom without letting one stuck job tie up a scheduler
 # thread for too long.
+#
+# pool_timeout=5 (9 Sep 2026): this sits IN FRONT OF the busy_timeout above,
+# and until now had no explicit value -- SQLAlchemy's QueuePool default is
+# 30s. That default was masking, not preventing, a real problem: when the
+# pool's 15 slots (pool_size=5 + max_overflow=10, also SQLAlchemy defaults,
+# still unset on purpose -- see the module docstring note below on why a
+# bigger pool is not the fix) are all checked out -- which the 9 Sep "portal
+# unresponsive during market hours" investigation traced to several
+# scheduler jobs holding a session open across a SmartAPI call serialized by
+# the shared 1.3s quote throttle -- a 16th request used to hang silently for
+# up to 30 seconds before finally raising. 5s makes exhaustion fail LOUDLY
+# and quickly (a clear "QueuePool limit... reached, connection timed out"
+# in the log) instead of reading as a generic, unexplained slow request.
+# This is deliberately NOT a pool_size increase: a bigger pool would let the
+# same underlying contention (sessions held across throttled network calls)
+# hide for longer before the ceiling is hit, not remove it. Phase 2a of that
+# investigation (never hold a session across a SmartAPI/LLM/throttle wait)
+# is the actual fix; this is the fast-failure/observability half of it.
 engine = create_engine(
     resolved_database_url,
     connect_args={"check_same_thread": False, "timeout": 10} if settings.database_url.startswith("sqlite") else {},
+    pool_timeout=5,
     future=True,
 )
+
+
+_POOL_CHECKOUT_WARN_SECONDS = 1.0
+
+
+def _wrap_pool_connect_with_timing(pool: object, threshold_seconds: float = _POOL_CHECKOUT_WARN_SECONDS) -> None:
+    """Logs a WARNING whenever checking a connection out of `pool` takes
+    longer than `threshold_seconds` -- the actual signal that request-side
+    DB sessions are starting to queue for a pool slot, not just that one
+    query happened to be slow. SQLAlchemy's own Pool events (checkout/
+    checkin/connect) all fire only AFTER a connection has already been
+    obtained -- there is no built-in "waited Ns for a slot" event -- so this
+    wraps Pool.connect() itself, the actual method that blocks on
+    QueuePool's internal queue when every slot is checked out, rather than
+    only observing that a connection eventually arrived."""
+    original_connect = pool.connect
+
+    def _timed_connect(*args: object, **kwargs: object) -> object:
+        started = time.monotonic()
+        try:
+            return original_connect(*args, **kwargs)
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed > threshold_seconds:
+                checked_out = getattr(pool, "checkedout", lambda: "?")()
+                overflow = getattr(pool, "overflow", lambda: "?")()
+                logger.warning(
+                    "[DB_POOL] Connection checkout took %.2fs (> %.1fs threshold) -- "
+                    "the pool may be under contention (checked_out=%s, overflow=%s)",
+                    elapsed, threshold_seconds, checked_out, overflow,
+                )
+
+    pool.connect = _timed_connect
+
+
+_wrap_pool_connect_with_timing(engine.pool)
 
 if resolved_database_url.startswith("sqlite"):
     @event.listens_for(engine, "connect")

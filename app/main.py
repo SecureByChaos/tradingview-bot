@@ -7,6 +7,7 @@ from datetime import timedelta
 import json
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -22,7 +23,7 @@ from app.models import WebhookPayload, WebhookResponse
 from app.multi_strategy import MultiStrategyTradeManager
 from app.multi_strategy_monitor import MultiStrategyMonitor
 from app.option_finder import OptionFinder
-from app.platform import get_or_create_settings, get_or_create_strategy_stats, log_event, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, strategy_trading_allowed, trading_allowed
+from app.platform import get_or_create_settings, get_or_create_strategy_stats, log_event, record_index_ticks, reset_daily_risk_if_needed, serialize_strategy_trade, strategy_trades_query_for_filter, strategy_trading_allowed, trading_allowed
 from sqlalchemy import select
 from app.risk import RiskProtectionService
 from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
@@ -94,9 +95,12 @@ scheduler = create_scheduler(
     option_chain_interval_minutes=settings.option_chain_interval_minutes,
     closing_auction_job=lambda: capture_closing_auction(smartapi, SessionLocal),
     autonomous_job=lambda: run_autonomous_checks(smartapi, option_finder, multi_strategy_manager, live_feed_store),
-    quick_scalp_job=lambda: run_quick_scalp_exit_checks(smartapi, multi_strategy_manager),
+    quick_scalp_job=lambda: run_quick_scalp_exit_checks(smartapi, multi_strategy_manager, feed_store=live_feed_store),
     validated_signal_entry_job=lambda: run_validated_signal_entry_checks(smartapi, option_finder),
-    validated_signal_exit_job=lambda: run_validated_signal_exit_checks(smartapi, multi_strategy_manager),
+    validated_signal_exit_job=lambda: run_validated_signal_exit_checks(
+        smartapi, multi_strategy_manager, feed_store=live_feed_store
+    ),
+    index_tick_recorder_job=lambda: record_index_ticks(smartapi, live_feed_store),
 )
 health_manager.scheduler = scheduler
 
@@ -320,6 +324,26 @@ def _is_present(value: object) -> bool:
     return True
 
 
+def _log_webhook_validation_failure(errors: object, body_text: str) -> None:
+    """The blocking half of webhook_validation_exception_handler below --
+    opening a DB session and writing a log row. Split out and run via
+    run_in_threadpool rather than inline in the async handler: this handler
+    is one of only two async def functions anywhere in the request path
+    (see the 9 Sep 2026 portal-hang investigation's route audit), and it's
+    the one that genuinely did blocking SessionLocal()/db.commit() work
+    directly on the event loop. A burst of malformed webhooks landing at
+    once could previously stall every other request in the process; running
+    the DB work on FastAPI's own thread pool (the same pool every plain
+    `def` route already uses) removes that risk without needing to drop the
+    `await request.body()` call this handler still needs."""
+    try:
+        payload_obj = json.loads(body_text) if body_text and body_text.startswith("{") else {"raw_body": body_text}
+    except Exception:
+        payload_obj = {"raw_body": body_text}
+    with SessionLocal() as db:
+        log_event(db, "WEBHOOK", "Webhook validation failed", "ERROR", {"errors": errors, "request": payload_obj})
+
+
 @app.exception_handler(RequestValidationError)
 async def webhook_validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     body_text = ""
@@ -331,10 +355,5 @@ async def webhook_validation_exception_handler(request: Request, exc: RequestVal
     logger.error("========== WEBHOOK VALIDATION ERROR ==========")
     logger.error("Validation Errors: %s", exc.errors())
     logger.error("Complete JSON Request: %s", body_text)
-    with SessionLocal() as db:
-        try:
-            payload_obj = json.loads(body_text) if body_text and body_text.startswith("{") else {"raw_body": body_text}
-        except Exception:
-            payload_obj = {"raw_body": body_text}
-        log_event(db, "WEBHOOK", "Webhook validation failed", "ERROR", {"errors": exc.errors(), "request": payload_obj})
+    await run_in_threadpool(_log_webhook_validation_failure, exc.errors(), body_text)
     return JSONResponse(status_code=422, content={"detail": exc.errors()})

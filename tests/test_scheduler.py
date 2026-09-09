@@ -142,3 +142,62 @@ def test_trade_monitor_stays_a_24_7_interval_trigger():
     job = scheduler.get_job("trade-monitor")
 
     assert isinstance(job.trigger, IntervalTrigger)
+
+def test_index_tick_recorder_uses_a_25_second_interval_trigger():
+    # 9 Sep 2026: replaces the IndexPriceTick write that used to happen
+    # inline inside app.platform.get_index_live_figures on every dashboard
+    # poll -- see CLAUDE.md, "portal unresponsive during market hours",
+    # Phase 2c. 25s matches app.platform._INDEX_TICK_THROTTLE_SECONDS.
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    scheduler = create_scheduler(_FakeMonitor(), index_tick_recorder_job=lambda: None)
+    job = scheduler.get_job("index-tick-recorder")
+
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.trigger.interval.total_seconds() == 25
+
+
+def test_index_tick_recorder_not_registered_without_a_job():
+    scheduler = create_scheduler(_FakeMonitor(), index_tick_recorder_job=None)
+    assert scheduler.get_job("index-tick-recorder") is None
+
+
+def test_scheduler_job_defaults_set_misfire_grace_time_to_30_seconds():
+    # 9 Sep 2026: the library default (1 second) is far tighter than this app
+    # can guarantee under load -- a job delayed by a queued DB-pool checkout
+    # or a throttled SmartAPI call would previously be silently SKIPPED
+    # rather than run late. Checked at the constructor level (a job added
+    # before scheduler.start() is only a pending placeholder -- job_defaults
+    # aren't merged into it until the scheduler actually starts, see
+    # test_scheduler_default_misfire_grace_time_applies_once_started below
+    # for the fully-resolved, end-to-end version of this same check).
+    scheduler = create_scheduler(_FakeMonitor())
+
+    assert scheduler._job_defaults["misfire_grace_time"] == 30
+
+
+def test_scheduler_default_misfire_grace_time_applies_once_started():
+    # End-to-end version of the check above: a job with no misfire_grace_time
+    # of its own (trade-monitor) inherits 30s once the scheduler resolves
+    # pending jobs against job_defaults.
+    scheduler = create_scheduler(_FakeMonitor())
+    scheduler.start()
+    try:
+        job = scheduler.get_job("trade-monitor")
+        assert job.misfire_grace_time == 30
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+def test_option_chain_collect_keeps_its_own_explicit_misfire_grace_time_once_started():
+    # job_defaults only fills in jobs that don't specify their own -- this
+    # job's existing misfire_grace_time=60 must not be overridden to 30.
+    scheduler = create_scheduler(_FakeMonitor(), option_chain_job=lambda: None)
+    scheduler.start()
+    try:
+        job = scheduler.get_job("option-chain-collect")
+        assert job.misfire_grace_time == 60
+    finally:
+        scheduler.shutdown(wait=False)
+
+

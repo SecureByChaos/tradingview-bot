@@ -41,8 +41,23 @@ def create_scheduler(
     quick_scalp_job: Callable[[], None] | None = None,
     validated_signal_entry_job: Callable[[], None] | None = None,
     validated_signal_exit_job: Callable[[], None] | None = None,
+    index_tick_recorder_job: Callable[[], None] | None = None,
 ) -> BackgroundScheduler:
-    scheduler = BackgroundScheduler(timezone=IST)
+    # job_defaults: the library default misfire_grace_time is 1 second --
+    # far tighter than this app can guarantee under real load (a scheduler
+    # thread queued behind the shared SmartAPI quote throttle, or waiting on
+    # a DB connection-pool slot, can easily slip a 5-second job's fire time
+    # by more than 1 second). A too-tight grace time doesn't delay the job,
+    # it SILENTLY SKIPS it -- exactly the wrong failure mode for an exit-poll
+    # job during the busy periods this default was most likely to bite.
+    # 30s gives real headroom for every interval/cron job in this file
+    # (a 5s job delayed by up to 30s still fires; a 5-minute cron delayed by
+    # up to 30s still fires) while coalesce=True (already set on every job
+    # below) collapses any backlog to a single catch-up run rather than a
+    # burst. option-chain-collect keeps its own explicit misfire_grace_time=60
+    # (set per-job, below) since job_defaults only fills in jobs that don't
+    # specify their own.
+    scheduler = BackgroundScheduler(timezone=IST, job_defaults={"misfire_grace_time": 30})
     scheduler.add_job(
         monitor.tick,
         trigger=IntervalTrigger(seconds=30),
@@ -139,6 +154,26 @@ def create_scheduler(
             validated_signal_exit_job,
             trigger=IntervalTrigger(seconds=5),
             id="validated-signal-exit-check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+    if index_tick_recorder_job is not None:
+        # 9 Sep 2026: replaces the IndexPriceTick write that used to happen
+        # inline inside app.platform.get_index_live_figures on every
+        # dashboard poll -- see CLAUDE.md, the "portal unresponsive during
+        # market hours" investigation, Phase 2c. Runs on a fixed cadence
+        # matching app.platform's own _INDEX_TICK_THROTTLE_SECONDS (25s)
+        # regardless of whether any browser tab is open, so tick density no
+        # longer depends on dashboard traffic. No coarse cron gate needed --
+        # the job itself calls check_market_hours() before touching the DB
+        # or SmartAPI at all, so an off-hours firing is a single cheap
+        # early-return, the same shape trade-monitor's own empty-open-trades
+        # early return already established for its own 24/7 IntervalTrigger.
+        scheduler.add_job(
+            index_tick_recorder_job,
+            trigger=IntervalTrigger(seconds=25),
+            id="index-tick-recorder",
             replace_existing=True,
             max_instances=1,
             coalesce=True,

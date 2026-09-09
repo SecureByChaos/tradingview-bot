@@ -295,6 +295,188 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Portal unresponsive during market hours -- diagnosed, then fixed at the DB-session/pool level (9 Sep 2026)
+
+**Requested**: "Portal (Jinja2 dashboard + `/api/*`) becomes unresponsive during market hours only. Off-hours
+it's fine. Diagnose first, fix second." A five-part Phase 1 audit (route audit, SmartAPI-from-request audit,
+DB-write-from-request audit, scheduler config dump, a `scripts/portal_probe.sh` diagnostic to run on the live
+box during a real hang) reported before any code changed, per the user's own explicit instruction not to guess
+at a root cause the audit didn't show -- then three follow-up checks (session-held-across-network-I/O audit,
+REST-vs-LiveFeedStore + throttle-capacity math, a leaked-session sweep), then Phase 2 fixes in the user's own
+given priority order.
+
+**Phase 1, condensed** (full audit reported in chat): zero `async def` page/API routes exist anywhere in
+`app/main.py`/`app/dashboard_routes.py`/`app/api_routes.py` (only `lifespan` and the rare-path
+`webhook_validation_exception_handler`), so the classic single-event-loop-blocked failure mode is structurally
+impossible here -- the real risk is thread-pool/connection-pool exhaustion. `get_index_live_figures` (backing
+`/` and `/api/live-dashboard`) does not call SmartAPI directly in production (prefers `LiveFeedStore`); the one
+write in the dashboard-poll hot path was `record_index_tick_if_stale`, gated to `is_trading_now` -- directly
+explaining "market hours only." The scheduler's 12 jobs all had `max_instances=1`/`coalesce=True` but only
+`option-chain-collect` had an explicit `misfire_grace_time` (library default: 1 second). SQLAlchemy's own
+engine had no explicit `poolclass`/`pool_size`, empirically confirmed to default to
+`QueuePool(pool_size=5, max_overflow=10, pool_timeout=30.0)` -- a second contention layer sitting in front of
+the already-shipped (7 Sep) SQLite WAL/busy_timeout fix.
+
+**Three follow-up checks, the ones that actually pinned down the mechanism:**
+
+1. **Session held across a SmartAPI/LLM/throttle wait -- real, in every high-frequency path checked.**
+   `trade-monitor`'s `with SessionLocal() as db:` (30s) holds `db` across `monitor_open_trades`' own
+   `smartapi.get_ltp()` call per open trade. `run_quick_scalp_exit_checks` and
+   `run_validated_signal_exit_checks` (both 5-second `IntervalTrigger` jobs) each opened one session for their
+   *entire* function body and called `smartapi.get_index_spot()`/`get_ltp()` from inside it. Quick Scalp's own
+   bar-close entry callback (`_on_scalp_bar_closed` -> `open_scalp_trade`) does the same for its one-shot
+   `get_ltp()` at entry. AI Origination's and Autonomous AI's 5-minute cron jobs hold a session across their
+   entire per-index loop, including the real LLM API call. Zero leaked sessions found anywhere (every
+   `SessionLocal()` call site correctly uses `with`/`try-finally`) -- `app/ai/exit_shadow.py`'s
+   `run_exit_shadow_checks` closes correctly too but is confirmed dead code, not wired into `scheduler.py` or
+   `main.py`.
+2. **REST, not `LiveFeedStore`, and the throttle math is the actual bottleneck.** `get_index_spot()` calls
+   `_throttle_quote_call()` directly with no `LiveFeedStore` awareness at all. `_MIN_QUOTE_INTERVAL_SECONDS =
+   1.3` is one shared lock across the whole process (~0.77 calls/sec total capacity). `quick-scalp-exit-check`
+   and `validated-signal-exit-check` alone, one open trade each, already consume ~0.40 of that -- **over half
+   the throttle's total steady-state capacity** -- before `trade-monitor`'s own bursty per-trade calls (every
+   30s, one call per open trade across BNV5.1/BNV6/NV1/AI-Origination-up-to-4-slots/Autonomous
+   AI/Quick Scalp/Validated Signal) or the three 5-minute cron bursts are even added. Because every one of
+   those calls happens with a DB session checked out, a stack of ~10-12 calls landing close together (which
+   will periodically happen, since 5s/30s/300s share common multiples) means the last thread in that queue
+   holds its pool slot for `(N-1)*1.3s` -- 12-15+ seconds against a 15-slot pool, easily enough to exhaust it
+   and push anything queued behind it (a dashboard request, a webhook) into a 30s wait.
+3. **No leaked sessions anywhere** -- confirmed by inspecting every `SessionLocal()` call site.
+
+**Phase 2 fixes shipped, in the user's own given priority order:**
+
+- **(a) Never hold a session across a SmartAPI/throttle wait -- fixed for the two dominant, highest-frequency
+  contributors.** `run_quick_scalp_exit_checks` and `run_validated_signal_exit_checks` are both restructured
+  into three phases: a short session to read what's open (closed before any network call) -> spot resolution
+  with **no session held at all** -> a second short session, opened only once prices are already in hand, to
+  write the exit decisions. `check_validated_signal_exits` gained a `current_spot_by_index` parameter (same
+  `{index_symbol: spot_or_None}` shape `app.quick_scalp`'s own exit check already used) -- when omitted
+  (every existing unit test's calling convention), it falls back to its original inline
+  `smartapi.get_index_spot()` call, so the low-level decision-logic tests needed zero changes; only the real
+  scheduler entry point (`run_validated_signal_exit_checks`) now pre-resolves and passes the dict.
+  **Deliberately NOT restructured this pass, named rather than silently skipped**: `MultiStrategyTradeManager.
+  monitor_open_trades` (the 30s `trade-monitor` job) still holds its session across each open trade's
+  `get_ltp()` call -- this function is explicitly flagged elsewhere in this file as a change-freeze zone for
+  the currently-profitable rule-based strategies ("The shared-FIXED-branch hazard"), and a correct restructure
+  needs re-fetching each trade fresh in a second session after a detach, real added risk for a function this
+  file already says must be touched with extreme care. Lower priority anyway: 30s cadence vs. the two 5s jobs
+  that were the proven dominant contributor. Also not restructured: Quick Scalp's bar-close entry callback
+  (`open_scalp_trade`'s one-shot `get_ltp()` -- fires at most a few times a day, far below the two 5s jobs'
+  steady-state cost) and AI Origination's/Autonomous AI's/Validated-Signal-entry's 5-minute-cron sessions held
+  across LLM/candle-refresh calls -- same reasoning, much lower frequency, much larger and riskier functions
+  to restructure safely in this pass.
+- **(b) Exit polls read spot from `LiveFeedStore`; REST only as a stale-feed fallback.** New
+  `app.live_feed.resolve_spot_for_exit_check(index, smartapi, feed_store)`: prefers a *fresh* (`is_live=True`)
+  feed entry, falls back to a direct `get_index_spot()` REST call only when the feed has no reading or its
+  reading is stale, and falls back to the stale feed price (rather than `None`) if the REST call itself then
+  fails. Both `run_quick_scalp_exit_checks` and `run_validated_signal_exit_checks` gained a `feed_store`
+  parameter (default `None`, preserving exact prior behavior for every existing test) and now call this
+  helper instead of `smartapi.get_index_spot()` directly. `app/main.py`'s `quick_scalp_job`/
+  `validated_signal_exit_job` scheduler lambdas both pass `feed_store=live_feed_store` through -- the same
+  singleton `IndexFeed` already keeps updated for the dashboard, so both 5-second jobs now read spot at zero
+  SmartAPI cost in the overwhelmingly common case (feed connected and fresh), only falling back to a REST
+  call on a genuine feed gap.
+- **(c) `record_index_tick_if_stale` moved out of the request path entirely.** New
+  `app.platform.record_index_ticks(smartapi, feed_store, db=None)`, wired as a new scheduler job
+  (`index-tick-recorder`, `IntervalTrigger(seconds=25)` matching the existing `_INDEX_TICK_THROTTLE_SECONDS`)
+  in `app/scheduler.py`/`app/main.py`. Fetches every enabled index's price first (feed_store preferred, REST
+  fallback only when `feed_store is None` entirely) with no session held, then opens one short session to
+  write. `get_index_live_figures` had its entire tick-write block removed -- it is now purely a read, the
+  `is_trading_now`/`price_is_fresh` locals it no longer needs were removed with it. This also removes the
+  tab-open/tab-closed `IndexPriceTick` sample-density confound this file's own "Gotchas" section already
+  documented: tick density is now a fixed cadence, not a function of how many browser tabs happen to be open.
+- **(d) `webhook_validation_exception_handler` no longer does blocking work directly on the event loop.** New
+  `_log_webhook_validation_failure(errors, body_text)` (a plain `def`) holds the `with SessionLocal() as db:
+  log_event(...)` work that used to run inline inside the `async def` handler; the handler now does
+  `await run_in_threadpool(_log_webhook_validation_failure, exc.errors(), body_text)` after its own
+  `await request.body()` (which still needs the function to stay `async def`). This was one of only two
+  `async def` functions in the entire request path, and the one that genuinely did blocking DB work on it.
+- **(e) Explicit engine config: fail loudly and fast, not silently and slowly.** `create_engine(...)` now
+  passes `pool_timeout=5` explicitly (was the QueuePool default of 30s) -- pool exhaustion now raises a clear
+  `QueuePool limit... reached, connection timed out` within 5 seconds instead of hanging for up to 30.
+  Deliberately **not** a `pool_size` increase, per the user's own explicit instruction -- a bigger pool would
+  let the same underlying contention (sessions held across throttled calls) hide for longer before the
+  ceiling is hit, not remove it. New `_wrap_pool_connect_with_timing(pool, threshold_seconds=1.0)` monkeypatches
+  `engine.pool.connect` (the actual method that blocks on `QueuePool`'s internal queue -- SQLAlchemy's own Pool
+  events all fire only *after* a connection is already obtained, so there's no built-in "waited Ns for a slot"
+  signal) to log a `[DB_POOL] Connection checkout took Xs...` WARNING, with `checked_out`/`overflow` counts,
+  whenever a checkout takes longer than 1 second.
+- **(f) Scheduler `job_defaults`.** `BackgroundScheduler(timezone=IST, job_defaults={"misfire_grace_time": 30})`
+  -- the library default (1 second) was far tighter than this app can guarantee under real load; a job delayed
+  by more than 1 second used to be silently *skipped* rather than run late, exactly the wrong failure mode for
+  an exit-poll job during the busy periods this investigation was about. 30s gives real headroom while
+  `coalesce=True` (already set on every job) still collapses any backlog to a single catch-up run.
+  `option-chain-collect` keeps its own explicit `misfire_grace_time=60`, confirmed unaffected (`job_defaults`
+  only fills in jobs that don't specify their own). `max_instances=1` was already set everywhere and is
+  unchanged.
+
+**Web/worker systemd split -- written proposal, NOT implemented this pass, per the user's own request to keep
+it a proposal for after this lands:**
+
+Split `tradingview-bot.service` into two units sharing the same WAL SQLite file:
+
+- **`tradingview-web.service`**: `uvicorn app.main:app` only. `app/main.py`'s lifespan would need a flag (e.g.
+  `RUN_SCHEDULER=0` env var, read in `lifespan()`) to skip `scheduler.start()`/`index_feed.start()` entirely on
+  this unit, keeping the FastAPI app, its routes, and `get_db()` as the only things running here. Only
+  reachable via nginx/direct port, serves the dashboard and `/webhook`.
+- **`tradingview-worker.service`**: the scheduler (all 13 jobs) plus the `IndexFeed`/`ScalpBarAggregator`
+  WebSocket thread and the square-off jobs. No uvicorn, no HTTP server -- just `init_db()` then
+  `scheduler.start()` and `index_feed.start()`, blocking forever (or run under the same `app.main` module with
+  a `RUN_WEB=0` flag skipping `app.add_middleware`/route registration, whichever is the smaller diff once this
+  is actually built).
+- Both processes construct their own `SmartAPIClient`/`MultiStrategyTradeManager`/etc. singletons (module-level
+  in `app/main.py` today) -- these would need to move into a shared, explicitly-constructed object graph
+  rather than implicit module-level singletons, since two processes each importing `app.main` today would each
+  get their own independent copy of every singleton, which is *already* true and *already* fine for stateless
+  ones (SmartAPIClient) but would need checking for anything assuming single-process state (in-memory
+  `LiveFeedStore`, the pool-checkout-timing wrapper's log output).
+- **RAM cost, honestly stated, not glossed over**: this project's own notes elsewhere in this file document a
+  412Mi Lightsail instance already running close to its limit after this week's own feature additions (6+
+  scheduler jobs, a persistent WebSocket thread). A second Python interpreter is realistically another
+  60-100Mi RSS (roughly what the existing single process's own measured 130Mi/30.9%-of-412Mi footprint
+  suggests a second, smaller, no-uvicorn-overhead process would cost) -- **this box likely needs a memory
+  upgrade before this split is worth doing**, not after. Recommend re-measuring actual free memory on the live
+  box (`free -h`, the same check `scripts/portal_probe.sh` already runs) before committing to this migration;
+  if headroom is thin, the split trades one large risk (contention) for a new one (OOM) without first fixing
+  the capacity problem underneath both.
+- The real benefit this split buys, worth restating plainly: a hung/overloaded worker process (scheduler jobs
+  piling up, a slow SmartAPI call) would no longer make the *dashboard* unresponsive, since the web process's
+  own request threadpool and DB pool would be entirely separate from the worker's. It does NOT by itself fix
+  DB-file-level writer-vs-writer contention (both processes still share one SQLite file, still bounded by the
+  same `busy_timeout`) -- Phase 2's fixes above are what actually reduce that, independent of whether this
+  split ever happens.
+
+**Tests**: 10 new (`tests/test_record_index_ticks.py` -- 8, covering `record_index_ticks`' market-hours gate,
+feed_store preference, REST fallback, per-index failure isolation, the existing throttle, and that the
+lookup session is fully closed before any price fetch; 6 new in `tests/test_live_feed.py` for
+`resolve_spot_for_exit_check`'s fresh/stale/missing/failed branches; 4 new in `tests/test_index_live_figures_
+feed.py`, repurposing the old tick-write assertions into "never writes, ever" assertions now that the write
+moved out of this function entirely; 5 new in `tests/test_database_pool.py` for the `pool_timeout=5` config
+and the checkout-timing wrapper's logging/no-logging/missing-methods-survival cases; 5 new in
+`tests/test_scheduler.py` for the `index-tick-recorder` job registration and the `misfire_grace_time=30`
+default, both at the constructor-kwarg level and end-to-end once the scheduler is actually started, since a
+job added before `scheduler.start()` is only a pending placeholder that hasn't yet merged `job_defaults`).
+Full suite: 922 passed (was 912 at the point this session's own last change landed). `python -c "import
+app.main"` imports cleanly, 13 scheduled jobs now (was 12 -- the new `index-tick-recorder`).
+
+**Not verified live** -- this sandbox cannot reproduce a real market-hours request burst, a real connection-
+pool exhaustion, or a real hang. After deploying:
+
+1. Run `scripts/portal_probe.sh` on the live box during real market hours (a normal day is fine, a hang isn't
+   required) and confirm `[DB_POOL]` WARNING lines do NOT appear under ordinary load -- if they do, that's real
+   evidence the two fixed jobs weren't the whole story and `trade-monitor` (or another named residual above)
+   needs the same restructuring next.
+2. Watch for `QueuePool limit... reached, connection timed out` in the log -- this is the NEW, intended failure
+   mode if the pool is ever genuinely exhausted (fails in 5s instead of hanging in 30s); its appearance at all
+   is itself useful signal, not necessarily a regression.
+3. Confirm the dashboard and `/api/live-dashboard` stay responsive through a full ordinary trading session with
+   several browser tabs open, and confirm `IndexPriceTick` rows keep accumulating on the new 25-second
+   scheduler cadence even with zero tabs open (querying `index_price_ticks` around a time no dashboard was
+   being viewed is the direct check).
+4. If contention is still reported after this deploys, `trade-monitor`'s own `monitor_open_trades` is the
+   next, higher-risk candidate named above -- revisit only with the same care CLAUDE.md's "shared-FIXED-branch
+   hazard" section already demands for that function.
+
 ### Quick Scalp now trades 2 lots by default, scoped to this strategy only (8 Sep 2026)
 
 **Requested**: "Quick scalp should trade with 2 lots by default. Make this change to quick scalp trades

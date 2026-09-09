@@ -154,6 +154,7 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.db_models import IndexConfig, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.live_feed import resolve_spot_for_exit_check
 from app.market_context import compute_levels
 from app.market_data import Bar, FIVE_MINUTE, load_bars, parse_smartapi_row, store_bars
 from app.models import ExitReason, Signal
@@ -596,11 +597,33 @@ def check_validated_signal_exits(
     trade_manager,
     smartapi: SmartAPIClient,
     now_ist,
+    current_spot_by_index: Optional[dict] = None,
 ) -> None:
     """Section 5's 4-condition exit engine, checked in the spec's own order
     (spot stop, spot target, 20-minute stagnation, hard session stop) for
-    every open VALIDATED_SIGNAL trade, against live spot LTP. Returns
-    immediately with zero SmartAPI calls when there is nothing open."""
+    every open VALIDATED_SIGNAL trade, against live spot. Returns
+    immediately when there is nothing open.
+
+    9 Sep 2026, Phase 2a/2b of the "portal unresponsive during market hours"
+    investigation: current_spot_by_index lets the caller pre-resolve spot
+    (feed_store first, REST only as a stale-feed fallback -- see
+    app.live_feed.resolve_spot_for_exit_check) BEFORE opening the session
+    that reaches this function, the same {index_symbol: spot_or_None} shape
+    app.quick_scalp's own exit check already uses for the identical reason
+    -- this is what run_validated_signal_exit_checks (the real scheduler
+    entry point) now does, so the recurring per-cycle spot lookup never
+    happens with a connection-pool slot checked out. When
+    current_spot_by_index is None (the default -- every existing unit test
+    of this function calls it this way), it falls back to the original
+    smartapi.get_index_spot() call made directly inside this function, for
+    direct unit testing of the decision logic without needing to also stand
+    up the caller's pre-resolution step. A missing or None entry either way
+    means this cycle has no spot for that index and the check is skipped,
+    never guessed. The exit-fill smartapi.get_ltp() call below is a
+    deliberate, named exception left inside the session either way: unlike
+    the per-cycle spot lookup above, it fires only once, at most, right when
+    a trade is actually closing (never on the steady-state 5s tick), and
+    closing the trade needs the same session/ORM instance regardless."""
     trades = list(
         db.scalars(
             select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN, StrategyTrade.origin == ORIGIN)
@@ -624,11 +647,14 @@ def check_validated_signal_exits(
             if entry_ist is None:
                 continue
 
-            try:
-                current_spot = smartapi.get_index_spot(index)
-            except Exception as exc:
-                logger.info("[VALIDATED_SIGNAL] %s: spot LTP fetch failed this poll (%s)", trade.trade_id, exc)
-                continue
+            if current_spot_by_index is not None:
+                current_spot = current_spot_by_index.get(trade.index_symbol)
+            else:
+                try:
+                    current_spot = smartapi.get_index_spot(index)
+                except Exception as exc:
+                    logger.info("[VALIDATED_SIGNAL] %s: spot LTP fetch failed this poll (%s)", trade.trade_id, exc)
+                    continue
             if current_spot is None:
                 continue
 
@@ -754,12 +780,24 @@ def run_validated_signal_exit_checks(
     smartapi: Optional[SmartAPIClient] = None,
     trade_manager=None,
     db=None,
+    feed_store=None,
 ) -> None:
     """Scheduler entry point (see app.scheduler's "validated-signal-exit-
     check" job, 5-second interval). Day-only gate (weekday/holiday, no
     hour-of-day component) -- same reasoning as the shared 30s monitor's own
     trade-monitor job: this must keep running through the whole trading day
-    to catch a position right up to and past either hard-exit time."""
+    to catch a position right up to and past either hard-exit time.
+
+    9 Sep 2026, Phase 2a/2b of the "portal unresponsive during market hours"
+    investigation: used to hold one DB session open for this whole function,
+    including check_validated_signal_exits' own internal
+    smartapi.get_index_spot() call -- a real REST call, serialized through
+    the shared 1.3s quote throttle, made every 5 seconds with a
+    connection-pool slot checked out. Restructured to read what's open
+    (short session #1, closed before any network call), resolve spot with
+    no session held at all (feed_store first, REST only as a stale-feed
+    fallback -- see app.live_feed.resolve_spot_for_exit_check), then open a
+    second short session only once prices are already in hand."""
     if smartapi is None or trade_manager is None:
         return
     if trading_day_reason(to_ist(utc_now())) is not None:
@@ -768,8 +806,33 @@ def run_validated_signal_exit_checks(
     owns_session = db is None
     session = db or SessionLocal()
     try:
+        open_index_symbols = {
+            trade.index_symbol
+            for trade in session.scalars(
+                select(StrategyTrade).where(StrategyTrade.status == TradeStatus.OPEN, StrategyTrade.origin == ORIGIN)
+            )
+        }
+        if not open_index_symbols:
+            return
+        indexes_with_open_trades = [
+            index for index in list_index_configs(session) if index.symbol in open_index_symbols
+        ]
+    finally:
+        if owns_session:
+            session.close()
+
+    current_spot_by_index: dict[str, float | None] = {}
+    for index in indexes_with_open_trades:
+        try:
+            current_spot_by_index[index.symbol] = resolve_spot_for_exit_check(index, smartapi, feed_store)
+        except Exception:
+            current_spot_by_index[index.symbol] = None
+
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
         now_ist = to_ist(utc_now())
-        check_validated_signal_exits(session, trade_manager, smartapi, now_ist)
+        check_validated_signal_exits(session, trade_manager, smartapi, now_ist, current_spot_by_index)
     finally:
         if owns_session:
             session.close()

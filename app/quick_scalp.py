@@ -151,6 +151,7 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.db_models import IndexConfig, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.indicators import rsi
+from app.live_feed import resolve_spot_for_exit_check
 from app.market_data import ONE_MINUTE, Bar, load_bars
 from app.models import ExitReason, Signal
 from app.option_finder import OptionFinder
@@ -623,6 +624,7 @@ def run_quick_scalp_exit_checks(
     smartapi: Optional[SmartAPIClient] = None,
     trade_manager=None,
     db=None,
+    feed_store=None,
 ) -> None:
     """Scheduler entry point (see app.scheduler's "quick-scalp-exit-check"
     job, a 5-second IntervalTrigger). Owns its own DB session when called
@@ -632,12 +634,27 @@ def run_quick_scalp_exit_checks(
     positions and end-of-day square-off. Returns immediately with zero
     SmartAPI calls whenever nothing is open, same precedent as app.
     validated_signal's own 5-second exit job -- the fast cadence costs
-    nothing in the overwhelmingly common idle case."""
+    nothing in the overwhelmingly common idle case.
+
+    9 Sep 2026, Phase 2a/2b of the "portal unresponsive during market hours"
+    investigation: this used to hold one DB session open for the ENTIRE
+    function, including the per-index smartapi.get_index_spot() calls below
+    -- a real REST call, serialized through the shared 1.3s quote throttle,
+    made while a connection-pool slot sat checked out. At a 5-second cadence
+    that's the single biggest contributor to pool contention this
+    investigation found. Restructured so the DB is only ever touched by a
+    short-lived session with no network call inside it: read what's open
+    and whether it's past square-off (session #1, closed before any network
+    call) -> resolve spot prices with no session held at all (feed_store
+    first, REST only as a stale-feed fallback -- see
+    app.live_feed.resolve_spot_for_exit_check) -> write the exit decisions
+    (session #2, opened only once prices are already in hand)."""
     if smartapi is None or trade_manager is None:
         logger.info("[QUICK_SCALP] Skipped: no smartapi/trade_manager available in this context")
         return
     if trading_day_reason(to_ist(utc_now())) is not None:
         return
+
     owns_session = db is None
     session = db or SessionLocal()
     try:
@@ -652,20 +669,39 @@ def run_quick_scalp_exit_checks(
         if not open_trades:
             return
         now_ist = to_ist(utc_now())
-        if (now_ist.hour, now_ist.minute) >= _SQUARE_OFF:
-            _square_off_all(session, trade_manager)
-            return
-
+        past_square_off = (now_ist.hour, now_ist.minute) >= _SQUARE_OFF
         open_index_symbols = {trade.index_symbol for trade in open_trades}
-        current_spot_by_index: dict[str, float | None] = {}
-        for index in list_index_configs(session):
-            if index.symbol not in open_index_symbols:
-                continue
-            try:
-                current_spot_by_index[index.symbol] = smartapi.get_index_spot(index)
-            except Exception:
-                current_spot_by_index[index.symbol] = None
+        indexes_with_open_trades = (
+            [] if past_square_off
+            else [index for index in list_index_configs(session) if index.symbol in open_index_symbols]
+        )
+    finally:
+        if owns_session:
+            session.close()
 
+    if past_square_off:
+        owns_session = db is None
+        session = db or SessionLocal()
+        try:
+            _square_off_all(session, trade_manager)
+        finally:
+            if owns_session:
+                session.close()
+        return
+
+    # No DB session held across any of these -- each is a feed_store read
+    # (in-memory, no I/O) or, only on a missing/stale feed entry, a single
+    # REST call through the shared quote throttle.
+    current_spot_by_index: dict[str, float | None] = {}
+    for index in indexes_with_open_trades:
+        try:
+            current_spot_by_index[index.symbol] = resolve_spot_for_exit_check(index, smartapi, feed_store)
+        except Exception:
+            current_spot_by_index[index.symbol] = None
+
+    owns_session = db is None
+    session = db or SessionLocal()
+    try:
         check_quick_scalp_exits(session, trade_manager, now_ist, current_spot_by_index)
     finally:
         if owns_session:
