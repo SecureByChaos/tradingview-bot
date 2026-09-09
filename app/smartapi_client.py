@@ -53,6 +53,23 @@ BROKER_FAILED = "FAILED"
 # nudged to the exact number that would have avoided one specific incident.
 _MIN_QUOTE_INTERVAL_SECONDS = 1.3
 
+# 9 Sep 2026, Phase 2 item 6 of the "portal unresponsive during market
+# hours" investigation: a wait THIS long inside _throttle_quote_call means
+# real contention has built up in the queue behind this shared lock, not
+# just the ordinary 0-1.3s spacing every call pays. Distinct from the
+# per-call INFO log below (which fires on every wait, however small) --
+# this is a WARNING specifically for "something is piling up here."
+_THROTTLE_WAIT_WARN_SECONDS = 3.0
+
+# Default freshness window for get_index_spot()'s LiveFeedStore preference
+# (Phase 2 item 1) -- a feed reading older than this many seconds is
+# treated the same as no reading at all, falling back to a fresh REST call
+# through the throttle. Deliberately much tighter than LiveFeedStore's own
+# _STALE_AFTER_SECONDS (30s, which only governs the dashboard's "stale"
+# badge) -- a trading decision needs a genuinely current price, not merely
+# "the feed hasn't been disconnected for half a minute."
+_DEFAULT_SPOT_FEED_FRESHNESS_SECONDS = 3.0
+
 # Rate-limit recovery backoff. Deliberately much more patient than the
 # generic 3-attempt/~3.5s retry used elsewhere in this file for auth/token
 # issues: those are software-side and either fix immediately (refresh) or
@@ -66,8 +83,14 @@ _RATE_LIMIT_BACKOFF_CAP_SECONDS = 15.0
 
 
 class SmartAPIClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, spot_feed_freshness_seconds: float = _DEFAULT_SPOT_FEED_FRESHNESS_SECONDS) -> None:
         self.settings = settings
+        # Set post-construction by app/main.py's lifespan once LiveFeedStore
+        # exists (app.live_feed.IndexFeed's own single persistent WebSocket
+        # connection) -- None until then, and in most test contexts, which
+        # is exactly "no feed available" and falls straight through to REST.
+        self.feed_store: Any = None
+        self._spot_feed_freshness_seconds = spot_feed_freshness_seconds
         self._client: Any = None
         self._jwt_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
@@ -510,7 +533,18 @@ class SmartAPIClient:
         line is what would have made that visible directly instead of by
         static analysis -- keep it deployed for a few sessions after the fix
         ships to confirm gaps never fall meaningfully under the 1.3s
-        minimum, then remove it once that's established."""
+        minimum, then remove it once that's established.
+
+        9 Sep 2026: the >3s WARNING measures total elapsed time from BEFORE
+        this call attempts to acquire self._quote_rate_lock, not just the
+        in-lock sleep computed below -- that sleep alone can never exceed
+        _MIN_QUOTE_INTERVAL_SECONDS (1.3s), so it could never itself cross a
+        3s threshold. Real contention shows up as callers queued waiting to
+        ACQUIRE the lock in the first place (several threads wanting a quote
+        at once, each serialized 1.3s apart) -- that queueing time happens
+        entirely before the `with` block below, so it has to be measured
+        from outside it."""
+        waiting_since = time.monotonic()
         with self._quote_rate_lock:
             gap = time.monotonic() - self._last_quote_call_monotonic
             wait = _MIN_QUOTE_INTERVAL_SECONDS - gap
@@ -526,6 +560,13 @@ class SmartAPIClient:
                     gap, _MIN_QUOTE_INTERVAL_SECONDS,
                 )
             self._last_quote_call_monotonic = time.monotonic()
+        total_waited = time.monotonic() - waiting_since
+        if total_waited > _THROTTLE_WAIT_WARN_SECONDS:
+            logger.warning(
+                "[THROTTLE] Call waited %.2fs total (lock queue + spacing) before proceeding -- "
+                "exceeds the %.1fs warn threshold, real contention is queued behind the shared throttle",
+                total_waited, _THROTTLE_WAIT_WARN_SECONDS,
+            )
 
     def get_ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
         self._throttle_quote_call()
@@ -561,11 +602,40 @@ class SmartAPIClient:
         )
 
     def get_index_spot(self, index: Any) -> float:
-        """Generalized spot-price fetch for any configured index (BankNifty/Nifty/Sensex/...)."""
+        """Generalized spot-price fetch for any configured index (BankNifty/Nifty/Sensex/...).
+
+        9 Sep 2026, Phase 2 item 1 of the "portal unresponsive during market
+        hours" investigation: consults self.feed_store (app.live_feed.
+        LiveFeedStore, set once by app/main.py's lifespan once the WebSocket
+        feed exists) first. A reading fresher than self._spot_feed_
+        freshness_seconds (default 3s -- deliberately far tighter than the
+        feed's own is_live flag, which only flips false after 30s of no
+        ticks and exists for the dashboard's staleness badge, a different
+        concern) is returned directly, at zero SmartAPI/throttle cost.
+        Every high-frequency spot-price caller (Quick Scalp's and Validated
+        Signal's exit polls included) benefits automatically just by calling
+        this method -- none of them need their own feed-store plumbing.
+        Falls straight through to the original REST-via-throttle path when
+        feed_store is unset (most test contexts) or has no reading fresh
+        enough for this index."""
         if not index.spot_token:
             raise SmartAPIError(
                 f"{index.symbol} spot token is not configured. Set it in Settings > Instruments before trading this index."
             )
+        if self.feed_store is not None:
+            entry = self.feed_store.get(index.symbol)
+            if entry is not None:
+                age = entry.get("age_seconds")
+                if age is not None and age < self._spot_feed_freshness_seconds:
+                    logger.debug(
+                        "[SPOT] %s: using LiveFeedStore price %.2f (age %.2fs < %.1fs freshness window)",
+                        index.symbol, entry["price"], age, self._spot_feed_freshness_seconds,
+                    )
+                    return entry["price"]
+        logger.debug(
+            "[SPOT] %s: LiveFeedStore reading absent or stale, falling back to REST via the quote throttle",
+            index.symbol,
+        )
         return self.get_ltp(index.spot_exchange, index.spot_symbol, index.spot_token)
 
     def get_index_ohlc(self, index: Any) -> dict[str, float] | None:

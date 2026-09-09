@@ -67,6 +67,13 @@ health_manager = HealthManager(smartapi, engine, telegram)
 # the dashboard to "unavailable", never block trading, which doesn't depend
 # on this feed at all.
 live_feed_store = LiveFeedStore()
+# 9 Sep 2026, Phase 2 item 1 of the "portal unresponsive during market
+# hours" investigation: SmartAPIClient.get_index_spot() now prefers this
+# feed store directly (a fresh reading, zero throttle cost) over its own
+# REST fallback -- every high-frequency spot-price caller (Quick Scalp's
+# and Validated Signal's exit polls included) benefits automatically just
+# by calling get_index_spot(), with no per-caller feed_store plumbing.
+smartapi.feed_store = live_feed_store
 
 # Option-chain archival. Collection only: nothing in the trading path reads it,
 # and it is months away from being evaluable. It is wired in now because the
@@ -95,11 +102,9 @@ scheduler = create_scheduler(
     option_chain_interval_minutes=settings.option_chain_interval_minutes,
     closing_auction_job=lambda: capture_closing_auction(smartapi, SessionLocal),
     autonomous_job=lambda: run_autonomous_checks(smartapi, option_finder, multi_strategy_manager, live_feed_store),
-    quick_scalp_job=lambda: run_quick_scalp_exit_checks(smartapi, multi_strategy_manager, feed_store=live_feed_store),
+    quick_scalp_job=lambda: run_quick_scalp_exit_checks(smartapi, multi_strategy_manager),
     validated_signal_entry_job=lambda: run_validated_signal_entry_checks(smartapi, option_finder),
-    validated_signal_exit_job=lambda: run_validated_signal_exit_checks(
-        smartapi, multi_strategy_manager, feed_store=live_feed_store
-    ),
+    validated_signal_exit_job=lambda: run_validated_signal_exit_checks(smartapi, multi_strategy_manager),
     index_tick_recorder_job=lambda: record_index_ticks(smartapi, live_feed_store),
 )
 health_manager.scheduler = scheduler

@@ -4,7 +4,7 @@ import sys
 import types
 from unittest.mock import patch
 
-from app.live_feed import IndexFeed, LiveFeedStore, resolve_spot_for_exit_check, _PAISE_PER_RUPEE, _STALE_AFTER_SECONDS
+from app.live_feed import IndexFeed, LiveFeedStore, _PAISE_PER_RUPEE, _STALE_AFTER_SECONDS
 
 
 class FakeIndex:
@@ -403,84 +403,3 @@ def test_run_resumes_connecting_once_market_reopens():
         feed._run()
 
     assert attempts["n"] == 1
-
-
-# ---------------------------------------------------------------------------
-# resolve_spot_for_exit_check (9 Sep 2026, Phase 2b of the "portal
-# unresponsive during market hours" investigation)
-# ---------------------------------------------------------------------------
-
-class _FakeFeedStoreForResolve:
-    def __init__(self, entry: dict | None) -> None:
-        self.entry = entry
-
-    def get(self, symbol: str):
-        return self.entry
-
-
-class _FakeSmartAPIForResolve:
-    def __init__(self, spot: float = 24000.0, raises: bool = False) -> None:
-        self.spot = spot
-        self.raises = raises
-        self.calls = 0
-
-    def get_index_spot(self, index):
-        self.calls += 1
-        if self.raises:
-            raise RuntimeError("broker error")
-        return self.spot
-
-
-def test_resolve_spot_uses_fresh_feed_entry_without_calling_smartapi():
-    feed_store = _FakeFeedStoreForResolve({"price": 24500.0, "is_live": True})
-    smartapi = _FakeSmartAPIForResolve()
-
-    result = resolve_spot_for_exit_check(NIFTY, smartapi, feed_store)
-
-    assert result == 24500.0
-    assert smartapi.calls == 0
-
-
-def test_resolve_spot_falls_back_to_rest_when_feed_entry_is_stale():
-    feed_store = _FakeFeedStoreForResolve({"price": 24500.0, "is_live": False})
-    smartapi = _FakeSmartAPIForResolve(spot=24600.0)
-
-    result = resolve_spot_for_exit_check(NIFTY, smartapi, feed_store)
-
-    assert result == 24600.0
-    assert smartapi.calls == 1
-
-
-def test_resolve_spot_falls_back_to_rest_when_feed_has_no_entry_yet():
-    smartapi = _FakeSmartAPIForResolve(spot=24700.0)
-
-    result = resolve_spot_for_exit_check(NIFTY, smartapi, _FakeFeedStoreForResolve(None))
-
-    assert result == 24700.0
-    assert smartapi.calls == 1
-
-
-def test_resolve_spot_falls_back_to_rest_when_feed_store_is_none():
-    smartapi = _FakeSmartAPIForResolve(spot=24800.0)
-
-    result = resolve_spot_for_exit_check(NIFTY, smartapi, None)
-
-    assert result == 24800.0
-    assert smartapi.calls == 1
-
-
-def test_resolve_spot_falls_back_to_the_stale_feed_price_when_rest_also_fails():
-    feed_store = _FakeFeedStoreForResolve({"price": 24500.0, "is_live": False})
-    smartapi = _FakeSmartAPIForResolve(raises=True)
-
-    result = resolve_spot_for_exit_check(NIFTY, smartapi, feed_store)
-
-    assert result == 24500.0
-
-
-def test_resolve_spot_returns_none_when_nothing_is_available():
-    smartapi = _FakeSmartAPIForResolve(raises=True)
-
-    result = resolve_spot_for_exit_check(NIFTY, smartapi, _FakeFeedStoreForResolve(None))
-
-    assert result is None

@@ -169,30 +169,6 @@ class LiveFeedStore:
         }
 
 
-def resolve_spot_for_exit_check(index: Any, smartapi: Any, feed_store: "LiveFeedStore | None") -> float | None:
-    """Spot-price resolution for the fast exit-poll jobs (Quick Scalp's and
-    Validated Signal's own 5-second checks -- see the 9 Sep 2026 "portal
-    unresponsive during market hours" investigation, Phase 2b). Prefers a
-    FRESH LiveFeedStore reading -- zero SmartAPI cost, which matters far
-    more here than for the dashboard, since these jobs fire every 5
-    seconds, the exact frequency this feed exists to spare from a direct
-    REST call through the shared 1.3s quote throttle. Falls back to a
-    direct smartapi.get_index_spot() call only when the feed has no
-    reading yet for this index or its own reading is stale (is_live=False)
-    -- an exit decision needs an accurate spot price to compare against a
-    real stop/target level, unlike the dashboard's own display-only
-    fallback (app.platform.get_index_live_figures), which is fine showing
-    a stale price with a badge rather than spending a REST call on it.
-    Returns None (never fabricates a value) if neither source has one."""
-    feed_entry = feed_store.get(index.symbol) if feed_store is not None else None
-    if feed_entry is not None and feed_entry.get("is_live"):
-        return feed_entry["price"]
-    try:
-        return smartapi.get_index_spot(index)
-    except Exception:
-        return feed_entry["price"] if feed_entry is not None else None
-
-
 class IndexFeed:
     """Wraps SmartWebSocketV2 in a single background thread, subscribed to
     every enabled index's spot token. Start once at app startup

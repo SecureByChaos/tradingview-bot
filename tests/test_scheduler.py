@@ -201,3 +201,46 @@ def test_option_chain_collect_keeps_its_own_explicit_misfire_grace_time_once_sta
         scheduler.shutdown(wait=False)
 
 
+
+def test_cron_jobs_get_explicit_60_second_misfire_grace_time_once_started():
+    # 9 Sep 2026: differentiated tiers -- 30s (via job_defaults) for the
+    # fast IntervalTrigger jobs, an explicit 60s for every CronTrigger job
+    # (5-minute-or-slower cadence, which can tolerate a longer delay before
+    # a missed firing actually matters).
+    scheduler = create_scheduler(
+        _FakeMonitor(),
+        health_manager=_FakeHealthManager(),
+        originator_job=lambda: None,
+        autonomous_job=lambda: None,
+        validated_signal_entry_job=lambda: None,
+        option_chain_job=lambda: None,
+    )
+    scheduler.start()
+    try:
+        cron_job_ids = [
+            "ai-origination-check", "autonomous-ai-check", "validated-signal-entry-check",
+            "option-chain-collect", "daily-square-off", "pre-market-health",
+            "ai-daily-summary", "ai-weekly-report", "ai-monthly-report",
+        ]
+        for job_id in cron_job_ids:
+            job = scheduler.get_job(job_id)
+            assert job is not None, f"{job_id} did not register"
+            assert job.misfire_grace_time == 60, f"{job_id} expected 60, got {job.misfire_grace_time}"
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+def test_fast_interval_jobs_keep_the_30_second_default_once_started():
+    scheduler = create_scheduler(
+        _FakeMonitor(), quick_scalp_job=lambda: None, validated_signal_exit_job=lambda: None,
+        index_tick_recorder_job=lambda: None,
+    )
+    scheduler.start()
+    try:
+        interval_job_ids = ["trade-monitor", "quick-scalp-exit-check", "validated-signal-exit-check", "index-tick-recorder"]
+        for job_id in interval_job_ids:
+            job = scheduler.get_job(job_id)
+            assert job is not None, f"{job_id} did not register"
+            assert job.misfire_grace_time == 30, f"{job_id} expected 30, got {job.misfire_grace_time}"
+    finally:
+        scheduler.shutdown(wait=False)

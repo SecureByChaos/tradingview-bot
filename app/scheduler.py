@@ -46,17 +46,21 @@ def create_scheduler(
     # job_defaults: the library default misfire_grace_time is 1 second --
     # far tighter than this app can guarantee under real load (a scheduler
     # thread queued behind the shared SmartAPI quote throttle, or waiting on
-    # a DB connection-pool slot, can easily slip a 5-second job's fire time
-    # by more than 1 second). A too-tight grace time doesn't delay the job,
-    # it SILENTLY SKIPS it -- exactly the wrong failure mode for an exit-poll
+    # a DB connection-pool slot, can easily slip a job's fire time by more
+    # than 1 second). A too-tight grace time doesn't delay the job, it
+    # SILENTLY SKIPS it -- exactly the wrong failure mode for an exit-poll
     # job during the busy periods this default was most likely to bite.
-    # 30s gives real headroom for every interval/cron job in this file
-    # (a 5s job delayed by up to 30s still fires; a 5-minute cron delayed by
-    # up to 30s still fires) while coalesce=True (already set on every job
-    # below) collapses any backlog to a single catch-up run rather than a
-    # burst. option-chain-collect keeps its own explicit misfire_grace_time=60
-    # (set per-job, below) since job_defaults only fills in jobs that don't
-    # specify their own.
+    # 30s here is the default for the fast IntervalTrigger jobs (5s/25s/30s
+    # cadence -- trade-monitor, quick-scalp-exit-check, validated-signal-
+    # exit-check, index-tick-recorder), real headroom without letting a
+    # backlog span multiple firing periods. Every CronTrigger-based job
+    # below (5-minute-or-slower cadence) sets its own explicit
+    # misfire_grace_time=60 instead -- a coarser cadence can tolerate a
+    # longer delay before a missed firing actually matters, and 60s still
+    # comfortably covers the kind of contention this investigation found
+    # without risking two firings' worth of work colliding. coalesce=True
+    # (already set on every job) collapses any backlog to a single catch-up
+    # run rather than a burst, on both tiers.
     scheduler = BackgroundScheduler(timezone=IST, job_defaults={"misfire_grace_time": 30})
     scheduler.add_job(
         monitor.tick,
@@ -86,6 +90,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     if autonomous_job is not None:
         # Same coarse-cron-plus-in-job-market-hours-gate shape as
@@ -100,6 +105,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     if quick_scalp_job is not None:
         # 8 Sep 2026 rebuild: entries moved OFF the scheduler entirely onto
@@ -138,6 +144,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     if validated_signal_exit_job is not None:
         # 5 seconds -- the spec's own explicit exit-poll cadence (Section 5),
@@ -218,6 +225,7 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+            misfire_grace_time=60,
     )
     if closing_auction_job is not None:
         # 15:45, after the auction concludes (~15:35) and after derivatives
@@ -232,6 +240,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     if health_manager is not None:
         scheduler.add_job(
@@ -241,6 +250,7 @@ def create_scheduler(
             replace_existing=True,
             max_instances=1,
             coalesce=True,
+            misfire_grace_time=60,
         )
     scheduler.add_job(
         reports.run_daily_summary_job,
@@ -249,6 +259,7 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+            misfire_grace_time=60,
     )
     scheduler.add_job(
         reports.run_weekly_report_job,
@@ -257,6 +268,7 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+            misfire_grace_time=60,
     )
     scheduler.add_job(
         reports.run_monthly_report_job,
@@ -265,5 +277,6 @@ def create_scheduler(
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+            misfire_grace_time=60,
     )
     return scheduler

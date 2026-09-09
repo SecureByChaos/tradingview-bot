@@ -240,3 +240,34 @@ def test_retry_rate_limited_reraises_a_genuine_non_rate_limit_exception(monkeypa
         assert False, "expected the unrelated exception to propagate"
     except RuntimeError as exc:
         assert "connection reset" in str(exc)
+
+
+def test_throttle_warns_when_total_wait_exceeds_the_threshold(monkeypatch, caplog):
+    # 9 Sep 2026, Phase 2 item 6: the WARNING measures TOTAL elapsed time
+    # from before lock acquisition, not just the in-lock spacing sleep
+    # (which can never itself exceed _MIN_QUOTE_INTERVAL_SECONDS=1.3s) --
+    # real contention shows up as callers queued waiting to acquire the
+    # lock in the first place. Simulated here with a fully controlled
+    # monotonic() sequence rather than a real multi-thread queue.
+    client = _make_client()
+    import app.smartapi_client as module
+
+    # waiting_since=100 -> gap calc=200 (gap=200, past due, no sleep) ->
+    # last_quote_call update=200 -> total_waited calc=5000 (4900s elapsed).
+    times = iter([100.0, 200.0, 200.0, 5000.0])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(times))
+
+    with caplog.at_level("WARNING"):
+        client._throttle_quote_call()
+
+    warnings = [r.message for r in caplog.records if "[THROTTLE]" in r.message and r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "4900.00s" in warnings[0]
+
+
+def test_throttle_does_not_warn_when_total_wait_is_ordinary(caplog):
+    client = _make_client()
+    with caplog.at_level("WARNING"):
+        client._throttle_quote_call()
+    warnings = [r.message for r in caplog.records if "[THROTTLE]" in r.message and r.levelname == "WARNING"]
+    assert warnings == []
