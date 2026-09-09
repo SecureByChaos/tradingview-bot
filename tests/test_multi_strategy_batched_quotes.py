@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from types import SimpleNamespace
 
@@ -35,8 +36,15 @@ def _pool_backed_session_factory():
     ':memory:' engines most of this test suite uses for convenience, whose
     pool behaviour under repeated open/close isn't the thing being tested
     here. Needed so pool.checkedout() reflects a REAL connection checkout/
-    release cycle for the item-3 pool-discipline assertion below."""
-    path = tempfile.mktemp(suffix=".sqlite3")
+    release cycle for the item-3 pool-discipline assertion below.
+
+    Uses mkdtemp (atomic, race-free directory creation) rather than the
+    deprecated tempfile.mktemp for the db file's path -- mktemp only
+    generates a name, leaving a window where another process could create
+    something at that path first (CodeQL: insecure temporary file, flagged
+    on this exact line before this fix)."""
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "test.sqlite3")
     engine = create_engine(f"sqlite:///{path}")
     Base.metadata.create_all(engine)
     return engine, sessionmaker(bind=engine)
