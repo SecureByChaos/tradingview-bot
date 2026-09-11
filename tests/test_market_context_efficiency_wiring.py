@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from app.market_context import build_market_context, compute_efficiency_ratio
+from app.market_context import build_market_context, compute_efficiency_ratio, compute_recent_price_change_percent
 from app.market_data import Bar
 
 
@@ -52,3 +52,32 @@ def test_chop_efficiency_ratio_appears_in_as_dict():
     assert context is not None
     assert "chop_efficiency_ratio" in context.as_dict()
     assert context.as_dict()["chop_efficiency_ratio"] == context.chop_efficiency_ratio
+
+
+def test_recent_price_change_percent_reaches_the_returned_context():
+    start = datetime(2026, 9, 11, 9, 15)
+    bars_1m = _bars(80, start, 1)
+    bars_5m = _bars(40, start, 5)
+    bars_15m = _bars(15, start, 15)
+    as_of = start + timedelta(minutes=195)
+
+    context = build_market_context("BANKNIFTY", bars_1m, bars_5m, bars_15m, spot=bars_5m[-1].close, as_of=as_of)
+
+    assert context is not None
+    expected = compute_recent_price_change_percent(bars_5m)
+    assert expected is not None
+    assert context.recent_price_change_percent == expected
+
+
+def test_recent_price_change_percent_appears_in_as_dict():
+    start = datetime(2026, 9, 11, 9, 15)
+    bars_1m = _bars(80, start, 1)
+    bars_5m = _bars(40, start, 5)
+    bars_15m = _bars(15, start, 15)
+    as_of = start + timedelta(minutes=195)
+
+    context = build_market_context("BANKNIFTY", bars_1m, bars_5m, bars_15m, spot=bars_5m[-1].close, as_of=as_of)
+
+    assert context is not None
+    assert "recent_price_change_percent" in context.as_dict()
+    assert context.as_dict()["recent_price_change_percent"] == context.recent_price_change_percent

@@ -197,6 +197,56 @@ trigger trade, or just adds another caveat the model states and trades past
 anyway (the same open question the same-day-history feature above already
 raised), is unverified until real decisions accumulate against it.
 
+A third NON-GATING addition, next real trading day: RECENT (~15 MIN) PRICE
+ACTION, ALONGSIDE THE HOURLY CHOP READING
+------------------------------------------------------------------------------
+The Market Efficiency addition above shipped, then on the very next real
+trading day (11 Sep 2026) missed the exact failure it was built for. Two
+Autonomous AI entries the same session -- a BankNifty BUY_PE with Market
+Efficiency reading MIXED, a Nifty BUY_PE with Market Efficiency reading
+CLEAN -- both opened directly into a 2-3-candle bounce that was plainly
+visible on the live 5-minute chart at entry time. Reading
+compute_efficiency_ratio's own math explains why: it is a ~1 HOUR window: net
+displacement over total path length across that whole hour. A move that ran
+cleanly in one direction for most of the hour and only reversed in the last
+couple of bars can still read CLEAN or MIXED, because the reversal has not
+yet consumed enough of the hour's total path to move the ratio. This is not a
+bug in the ratio -- it is answering a genuinely different question ("has the
+last hour been clean overall") from "which way has price actually moved in
+just the last few candles", and nothing in this module previously answered
+the second question at all.
+
+Fixed by adding app.market_context.compute_recent_price_change_percent -- a
+signed % change in close over the most recent ~15 minutes (3 five-minute
+bars), read off the same MarketContext object already built this cycle
+(context.recent_price_change_percent, zero new SmartAPI cost). Labelled
+RISING / FALLING / FLAT / UNKNOWN by _recent_momentum_label, shown in both
+prompts alongside (not instead of) the hourly Market Efficiency reading.
+
+Deliberately prompt-only again, same posture as the chop addition and for
+the same reason -- this is a second, narrower signal added on top of an
+already-soft mechanism, and escalating straight to a Python gate before
+either has been watched against real decisions would make it impossible to
+tell which one is actually doing the work if a future trade still gets
+through. SYSTEM_PROMPT_ENTRY's Mandatory Reject list gained a new condition:
+Recent Price Action moving opposite to the direction being evaluated is its
+own independent reject, regardless of how clean the hourly reading is.
+SYSTEM_PROMPT_EXIT's Structural Invalidation section gained a matching
+"Recent Reversal" rule treating an adverse ~15-minute move against an open
+position as an early signal of the same failure Adverse Momentum (the
+existing VWAP-contradiction rule) already protects against -- worth weighing
+before a full VWAP contradiction has had time to form. The HOLD criteria
+list was extended to match, so the reject and hold conditions cannot quietly
+disagree with each other, the same discipline already applied when Market
+Efficiency was added.
+
+Whether a second soft caution actually closes this gap, or the model cites
+both readings and trades through anyway (the same open question raised
+twice already, for the same-day-history feature and for Market Efficiency
+itself), remains to be seen -- read the next several days of `ai_reasoning`
+on any entry or HOLD decision made while Recent Price Action disagrees with
+the position/direction in question.
+
 EXIT MATRIX -- DETERMINISTIC RULES CHECKED BEFORE THE MODEL, IN ORDER
 --------------------------------------------------------------------------
 check_autonomous_exits checks these in sequence, each one closing the trade
@@ -412,6 +462,12 @@ Evaluation Protocol:
      back-and-forth with little net progress -- a CHOPPY efficiency reading is its own independent reject
      condition, not something ADX confirming "trend strength" overrides. Do not open a new position while
      Market Efficiency reads CHOPPY, even if every other criterion above is satisfied.
+   - Recent Price Action (last ~15 minutes) is moving opposite to the direction you are about to trade --
+     RISING while evaluating BUY_PE, or FALLING while evaluating BUY_CE. Market Efficiency and the EMA/
+     ADX/VWAP readings above describe the last ~45-60 minutes as a whole and can still look clean even
+     when the most recent few candles have already turned; a fresh reversal that is too small to move the
+     longer window yet is still a real reversal. Do not open a new position against what the last ~15
+     minutes are actually doing, even if every longer-window criterion above is satisfied.
    - Contradictory signals exist (e.g., price above VWAP but momentum trending down).
    - Any required indicator or confirmation is ambiguous or missing.
 
@@ -447,6 +503,7 @@ Evaluation Rules:
 
 3. Structural Invalidation (EXIT):
    - Adverse Momentum: If spot_vs_vwap contradicts position side (e.g., holding CE but spot broke below VWAP, or holding PE but spot broke above VWAP), EXIT immediately.
+   - Recent Reversal: If Recent Price Action (last ~15 minutes) is moving directly against your position side (RISING while holding a PE, or FALLING while holding a CE), treat this as an early signal of the same failure Adverse Momentum protects against, even before the longer VWAP/momentum reading has caught up to it -- weigh it seriously alongside the other exit criteria rather than waiting for a full VWAP contradiction to form.
    - Stop-Loss Hit: If current_pnl_pct <= -stop_loss_pct, EXIT.
 
 4. Chop Protection (EXIT):
@@ -460,8 +517,9 @@ Evaluation Rules:
 
 5. Criteria to HOLD:
    - Trade is active, underlying momentum remains strictly aligned with position side, Market Efficiency
-     does not read CHOPPY while the position is at or below zero, holding time is under 20 minutes, and no
-     profit-protection triggers have fired.
+     does not read CHOPPY while the position is at or below zero, Recent Price Action is not moving
+     directly against the position side, holding time is under 20 minutes, and no profit-protection
+     triggers have fired.
 
 Do not gamble on reversals or hold through sideways drift. Respond strictly with a single valid JSON object only:
 {"decision": "EXIT" | "HOLD", "confidence": 0.0-1.0, "exit_reason": "RULE_NAME_OR_NONE", "reasoning": "Direct explanation based on rules"}"""
@@ -664,6 +722,7 @@ class _Features:
     session_phase: str
     minutes_to_close: int
     chop_efficiency_ratio: float | None = None
+    recent_price_change_percent: float | None = None
 
 
 def _session_phase(now_ist) -> str:
@@ -840,6 +899,7 @@ def _compute_features(
         session_phase=session_phase,
         minutes_to_close=minutes_to_close,
         chop_efficiency_ratio=context.chop_efficiency_ratio,
+        recent_price_change_percent=context.recent_price_change_percent,
     )
 
 
@@ -940,6 +1000,36 @@ def _chop_label(ratio: float | None) -> str:
     return "CLEAN"
 
 
+# Small band around zero treated as no real directional move over the short
+# window -- distinguishes genuine noise/rounding from an actual short-term
+# move without inventing a second unvalidated threshold family. Not
+# backtested, same reasoning as chop_efficiency_ratio's own 0.3/0.5 bands
+# before any real history looked at them.
+_RECENT_MOVE_FLAT_BAND_PERCENT = 0.03
+
+
+def _recent_momentum_label(pct: float | None) -> str:
+    """Short qualitative label for compute_recent_price_change_percent's
+    ~15-minute reading (app.market_context, read off
+    context.recent_price_change_percent in _compute_features -- zero new
+    cost, same MarketContext object already built this cycle).
+
+    11 Sep 2026: added after chop_efficiency_ratio's own ~1 hour window was
+    shown, on the same real trading day, to still miss a fresh 2-3-candle
+    reversal that hadn't yet consumed enough of that hour's path length to
+    move the ratio -- two real Autonomous AI entries (BankNifty BUY_PE at
+    Market Efficiency=MIXED, Nifty BUY_PE at Market Efficiency=CLEAN) both
+    opened directly into a visible short bounce neither reading caught. This
+    is deliberately a much shorter, narrower signal answering only "which
+    way has price actually moved in the last ~15 minutes", not a replacement
+    for the hourly chop read."""
+    if pct is None:
+        return "UNKNOWN"
+    if abs(pct) < _RECENT_MOVE_FLAT_BAND_PERCENT:
+        return "FLAT"
+    return "RISING" if pct > 0 else "FALLING"
+
+
 def _build_entry_prompt(features: _Features, index_display_name: str, history_text: str = "") -> str:
     adx_label = "Trending" if (features.adx or 0.0) >= _ADX_LLM_FLOOR else "Range-bound/Chop"
     adx_text = f"{features.adx:.1f}" if features.adx is not None else "unavailable"
@@ -952,6 +1042,12 @@ def _build_entry_prompt(features: _Features, index_display_name: str, history_te
         f"{features.chop_efficiency_ratio:.2f}" if features.chop_efficiency_ratio is not None else "unavailable"
     )
     chop_label = _chop_label(features.chop_efficiency_ratio)
+    recent_text = (
+        f"{features.recent_price_change_percent:+.2f}%"
+        if features.recent_price_change_percent is not None
+        else "unavailable"
+    )
+    recent_label = _recent_momentum_label(features.recent_price_change_percent)
     history_section = f"\n{history_text}\n" if history_text else ""
     return (
         "Current Market State:\n"
@@ -961,6 +1057,7 @@ def _build_entry_prompt(features: _Features, index_display_name: str, history_te
         f"- Trend Regime: {features.trend_regime} (9 EMA: {fast_ema_text}, 21 EMA: {slow_ema_text})\n"
         f"- ADX (14): {adx_text} ({adx_label})\n"
         f"- Market Efficiency (last ~1hr): {chop_text} ({chop_label})\n"
+        f"- Recent Price Action (last ~15 min): {recent_text} ({recent_label})\n"
         f"- Proximity to Key Levels: PDH: {dist_to_pdh} | PDL: {dist_to_pdl}\n"
         f"- Session Phase: {features.session_phase} (Time to square-off: {features.minutes_to_close} mins)\n"
         f"{history_section}\n"
@@ -994,6 +1091,7 @@ def _build_exit_prompt(trade: StrategyTrade, features: Optional[_Features], now_
         vwap_status = features.vwap_relation
         momentum = features.trend_regime
         chop_label = _chop_label(features.chop_efficiency_ratio)
+        recent_label = _recent_momentum_label(features.recent_price_change_percent)
     else:
         end_minutes = _TRADING_END[0] * 60 + _TRADING_END[1]
         now_minutes = now_ist.hour * 60 + now_ist.minute
@@ -1001,6 +1099,7 @@ def _build_exit_prompt(trade: StrategyTrade, features: Optional[_Features], now_
         vwap_status = "UNKNOWN"
         momentum = "UNKNOWN"
         chop_label = "UNKNOWN"
+        recent_label = "UNKNOWN"
     return (
         "Position Status:\n"
         f"- Index: {trade.index_symbol} ({trade.option_type})\n"
@@ -1012,6 +1111,7 @@ def _build_exit_prompt(trade: StrategyTrade, features: Optional[_Features], now_
         f"- Underlying Spot vs VWAP: {vwap_status}\n"
         f"- Underlying Momentum: {momentum}\n"
         f"- Market Efficiency (last ~1hr): {chop_label}\n"
+        f"- Recent Price Action (last ~15 min): {recent_label}\n"
         f"- Defined Risk Boundaries: Hard SL at -{stop_loss_pct}%, Target at +{target_pnl_pct}%\n\n"
         "Apply the evaluation rules. Output decision JSON:"
     )

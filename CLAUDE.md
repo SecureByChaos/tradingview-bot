@@ -295,6 +295,70 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI gets a Recent Price Action (~15 min) signal alongside Market Efficiency -- the hourly chop reading missed the exact case it was built for, on the very next real trading day (11 Sep 2026)
+
+**Trigger**: PR #94 (Market Efficiency/chop awareness) merged, then on the next real trading day two
+Autonomous AI entries showed the exact failure it was meant to catch. BankNifty `BUY_PE` at strike 56000
+opened with Market Efficiency reading **MIXED** (not CHOPPY, so the new Mandatory Reject didn't apply);
+Nifty `BUY_PE` at strike 23300 opened with Market Efficiency reading **CLEAN** outright. Both fired while
+ADX/EMA/VWAP all still read the broader session as bearish -- but the live 5-minute chart for both indices
+showed a plain 2-3-candle bounce directly under the entry (Nifty: 23260 -> 23305 over the preceding ~30
+minutes). Neither reading caught it because neither was built to: `compute_efficiency_ratio` measures net
+displacement over total path length across the trailing **~1 hour**, so a move that ran cleanly downward
+for most of that hour and only reversed in the last couple of bars can still read CLEAN/MIXED, since the
+reversal hasn't yet consumed enough of the hour's total path to move the ratio. Not a defect in the ratio
+-- it answers "has the last hour been clean overall," a genuinely different question from "which way has
+price actually moved in just the last few candles," and nothing in this module answered the second
+question at all.
+
+**Fixed by adding a second, much shorter signal, not by tuning the first one.** New
+`app.market_context.compute_recent_price_change_percent()` -- signed % change in close over the most
+recent `RECENT_MOVE_LOOKBACK_BARS = 3` five-minute bars (~15 minutes), read off the same `MarketContext`
+object `_compute_features` already builds every cycle (`context.recent_price_change_percent`, zero new
+SmartAPI cost, same reuse pattern the chop signal itself established). New `MarketContext.recent_price_
+change_percent` field, threaded through `as_dict()` and `build_market_context()`.
+
+`app/ai/autonomous.py` gained `_Features.recent_price_change_percent` and a new
+`_recent_momentum_label()` helper -- RISING (`>= +0.03%`) / FALLING (`<= -0.03%`) / FLAT (within that
+band) / UNKNOWN (`None`), a small band around zero to absorb rounding noise rather than a second
+unvalidated threshold family, same reasoning the chop bands themselves carried before any real history
+looked at them. Shown in both prompts **alongside**, not instead of, Market Efficiency: a new
+`Recent Price Action (last ~15 min)` line in the entry prompt (after the Market Efficiency line) and the
+exit prompt (after Market Efficiency, before the risk-boundary line).
+
+**Deliberately prompt-only again, same posture as the chop addition, for the same reason.** Escalating
+straight to a Python gate on a second, narrower signal before either has been watched against real
+decisions would make it impossible to tell which one is actually doing the work if a future trade still
+slips through. `SYSTEM_PROMPT_ENTRY`'s Mandatory Reject list gained a new condition: Recent Price Action
+moving opposite to the direction being evaluated (RISING while considering `BUY_PE`, FALLING while
+considering `BUY_CE`) is its own independent reject, regardless of how clean the hourly reading is.
+`SYSTEM_PROMPT_EXIT`'s Structural Invalidation section gained a matching "Recent Reversal" rule, framed as
+an early signal of the same failure the existing Adverse Momentum (VWAP-contradiction) rule already
+protects against -- worth weighing before a full VWAP contradiction has had time to form. The existing
+"Criteria to HOLD" list was extended to also require Recent Price Action not moving directly against the
+position, so the reject/hold conditions can't quietly disagree, the same discipline already applied when
+Market Efficiency was added.
+
+**Not shipped as a hard gate, same as the chop addition it sits alongside** -- this is a second soft
+caution layered onto an already-soft mechanism, not an escalation of it. Whether the model actually treats
+a fresh short-term reversal as disqualifying, or cites both readings in its `reasoning` and trades through
+anyway (the same open question raised twice already for the same-day-history feature and for Market
+Efficiency itself), is unverified until real decisions accumulate against it.
+
+8 new tests in `tests/test_recent_price_change.py` (the pure formula: rising/falling moves, the short
+window correctly ignoring a longer prior trend outside it, insufficient bars, a zero reference close,
+custom lookback, rounding), 4 new in `tests/test_market_context_efficiency_wiring.py` (the field actually
+reaching the returned `MarketContext` and its `as_dict()`), and 7 new in `tests/test_autonomous_ai.py`
+(`_recent_momentum_label`'s exact `+/-0.03%` boundaries, both prompts rendering the value/label correctly
+including the "unavailable"/`UNKNOWN` fallback, and both system prompts containing the required new
+language). Full suite: 977 passed (was 959). `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox cannot call either provider's real API. After deploying: read the
+next several days of `ai_reasoning` on any entry or HOLD decision made while Recent Price Action disagrees
+with the direction/position in question -- if the model names the caution but doesn't act on it, that is
+the same escalation trigger already established for the same-day-history feature and for Market Efficiency
+itself: move this specific mechanism to a hard gate once soft guidance alone is shown not to be enough.
+
 ### Autonomous AI gets Market Efficiency (chop) awareness on both entry and exit -- prompt-only (10 Sep 2026)
 
 **Trigger**: the very next real trading day after the same-day-history feature (entry directly below this

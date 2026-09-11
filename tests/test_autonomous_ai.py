@@ -32,6 +32,7 @@ from app.ai.autonomous import (
     _parse_exit_response,
     _peak_pnl_percent,
     _recent_history_text,
+    _recent_momentum_label,
     _regime_matches_action,
     _session_phase,
     _todays_closed_trades,
@@ -65,6 +66,7 @@ def _make_features(
     spot: float = 57000.0, vwap: float | None = 56900.0, fast_ema: float | None = 57000.0,
     slow_ema: float | None = 56800.0, minutes_to_close: int = 120,
     chop_efficiency_ratio: float | None = None,
+    recent_price_change_percent: float | None = None,
 ) -> _Features:
     return _Features(
         spot=spot, vwap=vwap, vwap_relation=_vwap_relation(spot, vwap),
@@ -72,6 +74,7 @@ def _make_features(
         adx=adx, pdh=None, pdl=None, dist_to_pdh=None, dist_to_pdl=None,
         session_phase=session_phase, minutes_to_close=minutes_to_close,
         chop_efficiency_ratio=chop_efficiency_ratio,
+        recent_price_change_percent=recent_price_change_percent,
     )
 
 
@@ -471,6 +474,77 @@ def test_system_prompt_exit_has_chop_protection_section():
     assert "Chop Protection" in SYSTEM_PROMPT_EXIT
     assert "CHOPPY" in SYSTEM_PROMPT_EXIT
     assert "EXIT rather than HOLD" in SYSTEM_PROMPT_EXIT
+
+
+# ---------------------------------------------------------------------------
+# _recent_momentum_label / Recent Price Action (~15 min) awareness --
+# 11 Sep 2026, prompted by two real same-day entries (BankNifty BUY_PE at
+# Market Efficiency=MIXED, Nifty BUY_PE at Market Efficiency=CLEAN) that both
+# opened directly into a 2-3-candle bounce the hourly chop reading hadn't yet
+# caught. Deliberately prompt-only, not a gate -- see module docstring's
+# "RECENT (~15 MIN) PRICE ACTION" section.
+# ---------------------------------------------------------------------------
+
+def test_recent_momentum_label_boundaries():
+    assert _recent_momentum_label(None) == "UNKNOWN"
+    assert _recent_momentum_label(0.0) == "FLAT"
+    assert _recent_momentum_label(0.02) == "FLAT"
+    assert _recent_momentum_label(-0.02) == "FLAT"
+    assert _recent_momentum_label(0.03) == "RISING"
+    assert _recent_momentum_label(0.5) == "RISING"
+    assert _recent_momentum_label(-0.03) == "FALLING"
+    assert _recent_momentum_label(-0.5) == "FALLING"
+
+
+def test_build_entry_prompt_includes_recent_price_action():
+    features = _make_features(recent_price_change_percent=0.14)
+    prompt = _build_entry_prompt(features, "Bank Nifty")
+    assert "Recent Price Action" in prompt
+    assert "+0.14%" in prompt
+    assert "RISING" in prompt
+
+
+def test_build_entry_prompt_recent_price_action_unavailable_when_missing():
+    features = _make_features(recent_price_change_percent=None)
+    prompt = _build_entry_prompt(features, "Bank Nifty")
+    assert "Recent Price Action (last ~15 min): unavailable (UNKNOWN)" in prompt
+
+
+def test_build_exit_prompt_includes_recent_price_action_from_features():
+    db = _make_session()
+    trade = StrategyTrade(
+        trade_id="t1", strategy_name="x", signal="BUY_CE", index_symbol="BANKNIFTY",
+        tradingsymbol="X", symboltoken="1", strike=57000, expiry="28AUG2026", option_type="CE",
+        quantity=35, entry_price=100.0, current_premium=110.0, stoploss=65.0, target=150.0,
+        entry_time=utc_now(), origin=ORIGIN, status=TradeStatus.OPEN, pnl_percent=10.0,
+        highest_price=110.0, mode=TradingMode.PAPER,
+    )
+    features = _make_features(vwap=100.0, spot=110.0, recent_price_change_percent=-0.4)
+    prompt = _build_exit_prompt(trade, features, to_ist(utc_now()))
+    assert "Recent Price Action (last ~15 min): FALLING" in prompt
+
+
+def test_build_exit_prompt_recent_price_action_unknown_when_features_missing():
+    trade = StrategyTrade(
+        trade_id="t1", strategy_name="x", signal="BUY_CE", index_symbol="BANKNIFTY",
+        tradingsymbol="X", symboltoken="1", strike=57000, expiry="28AUG2026", option_type="CE",
+        quantity=35, entry_price=100.0, current_premium=110.0, stoploss=65.0, target=150.0,
+        entry_time=utc_now(), origin=ORIGIN, status=TradeStatus.OPEN, pnl_percent=10.0,
+        mode=TradingMode.PAPER,
+    )
+    prompt = _build_exit_prompt(trade, None, to_ist(utc_now()))
+    assert "Recent Price Action (last ~15 min): UNKNOWN" in prompt
+
+
+def test_system_prompt_entry_rejects_recent_reversal_independent_of_hourly_reading():
+    assert "Recent Price Action" in SYSTEM_PROMPT_ENTRY
+    assert "RISING while evaluating BUY_PE" in SYSTEM_PROMPT_ENTRY
+    assert "FALLING while evaluating BUY_CE" in SYSTEM_PROMPT_ENTRY
+
+
+def test_system_prompt_exit_has_recent_reversal_rule():
+    assert "Recent Reversal" in SYSTEM_PROMPT_EXIT
+    assert "Recent Price Action" in SYSTEM_PROMPT_EXIT
 
 
 # ---------------------------------------------------------------------------
