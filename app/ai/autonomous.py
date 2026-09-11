@@ -162,6 +162,41 @@ produces better-justified repeats of the same decision -- read the next
 few days of `ai_reasoning` on any repeated same-direction entry to see
 which one this turns out to be.
 
+A second NON-GATING addition, same day: MARKET EFFICIENCY (CHOP) AWARENESS
+------------------------------------------------------------------------------
+Triggered by the very next real trading day (10 Sep 2026): both indices
+trended net-bearish all session (every trade that day was BUY_PE), but the
+day's worst loss (-13.88%, Nifty) opened right as a bounce began inside that
+larger downtrend. At entry, ADX read 23.1 -- above this module's floor,
+logged as "confirming trend strength" -- because ADX is deliberately a
+lagging, session-cumulative signal (see app/indicators.py's own docstring);
+it had no way to reflect that the immediately preceding stretch had already
+started reversing. Chart review confirmed a clear counter-trend leg sat
+right under that entry.
+
+Fixed by reusing app.market_context.compute_efficiency_ratio -- Kaufman's
+Efficiency Ratio over the trailing ~1 hour of 5-min closes, already computed
+inside build_market_context for AI Origination's own chop gate (27 Aug
+2026) and now read off the same MarketContext object here at zero extra
+cost (context.chop_efficiency_ratio, no new SmartAPI call). Below 0.3 =
+CHOPPY, 0.3-0.5 = MIXED, >=0.5 = CLEAN -- identical bands to
+app.ai.originator's own _efficiency_ratio_text.
+
+Deliberately prompt-only on both sides, not a Python gate, per explicit
+instruction: SYSTEM_PROMPT_ENTRY now lists a CHOPPY reading as its own
+Mandatory Reject condition (independent of ADX, so a "trending" ADX cannot
+override it), and SYSTEM_PROMPT_EXIT gained a new Chop Protection section
+telling the model not to hold a losing or breakeven position through a
+CHOPPY session hoping it resolves -- prefer EXIT unless it can name something
+concrete that makes this position different from ordinary chop noise. This
+is a softer choice than AI Origination's own chop gate, which is a hard
+Python block (and even that required tightening to chop-AND-weak-ADX after
+chop alone was found to falsely block a genuinely trending market) --
+whether a prompt-only instruction actually stops entries like the 10 Sep
+trigger trade, or just adds another caveat the model states and trades past
+anyway (the same open question the same-day-history feature above already
+raised), is unverified until real decisions accumulate against it.
+
 EXIT MATRIX -- DETERMINISTIC RULES CHECKED BEFORE THE MODEL, IN ORDER
 --------------------------------------------------------------------------
 check_autonomous_exits checks these in sequence, each one closing the trade
@@ -372,6 +407,11 @@ Evaluation Protocol:
 3. Mandatory Reject ("NONE") Conditions:
    - Price is oscillating near VWAP or ADX indicates low trend strength / consolidation (< 20).
    - Current session is "CHOP_ZONE" (11:15 AM - 1:30 PM).
+   - Market Efficiency (last ~1 hour) reads CHOPPY. ADX and the EMA stack are both lagging and can still
+     read "trending" from the session's cumulative history even while the last hour has actually been
+     back-and-forth with little net progress -- a CHOPPY efficiency reading is its own independent reject
+     condition, not something ADX confirming "trend strength" overrides. Do not open a new position while
+     Market Efficiency reads CHOPPY, even if every other criterion above is satisfied.
    - Contradictory signals exist (e.g., price above VWAP but momentum trending down).
    - Any required indicator or confirmation is ambiguous or missing.
 
@@ -409,8 +449,19 @@ Evaluation Rules:
    - Adverse Momentum: If spot_vs_vwap contradicts position side (e.g., holding CE but spot broke below VWAP, or holding PE but spot broke above VWAP), EXIT immediately.
    - Stop-Loss Hit: If current_pnl_pct <= -stop_loss_pct, EXIT.
 
-4. Criteria to HOLD:
-   - Trade is active, underlying momentum remains strictly aligned with position side, holding time is under 20 minutes, and no profit-protection triggers have fired.
+4. Chop Protection (EXIT):
+   - If Market Efficiency (last ~1 hour) reads CHOPPY, treat the session as unreliable for a directional
+     recovery -- back-and-forth movement with little net progress does not resolve in your favor just by
+     waiting it out.
+   - If current_pnl_pct is at or below zero while Market Efficiency reads CHOPPY, EXIT rather than HOLD,
+     unless you can name a specific, concrete reason this position differs from ordinary chop noise (not
+     "still developing" or "within normal range").
+   - Do not let a choppy session turn a small loss into a larger one by holding through it.
+
+5. Criteria to HOLD:
+   - Trade is active, underlying momentum remains strictly aligned with position side, Market Efficiency
+     does not read CHOPPY while the position is at or below zero, holding time is under 20 minutes, and no
+     profit-protection triggers have fired.
 
 Do not gamble on reversals or hold through sideways drift. Respond strictly with a single valid JSON object only:
 {"decision": "EXIT" | "HOLD", "confidence": 0.0-1.0, "exit_reason": "RULE_NAME_OR_NONE", "reasoning": "Direct explanation based on rules"}"""
@@ -612,6 +663,7 @@ class _Features:
     dist_to_pdl: float | None
     session_phase: str
     minutes_to_close: int
+    chop_efficiency_ratio: float | None = None
 
 
 def _session_phase(now_ist) -> str:
@@ -787,6 +839,7 @@ def _compute_features(
         dist_to_pdl=round(spot - pdl, 2) if pdl is not None else None,
         session_phase=session_phase,
         minutes_to_close=minutes_to_close,
+        chop_efficiency_ratio=context.chop_efficiency_ratio,
     )
 
 
@@ -861,6 +914,32 @@ def _recent_history_text(db: Session, index_symbol: str, now_ist) -> str:
     return "Today's Autonomous AI history on this index so far:\n" + "\n".join(lines)
 
 
+def _chop_label(ratio: float | None) -> str:
+    """Short qualitative label for the last ~1 hour's Kaufman Efficiency
+    Ratio (app.market_context.compute_efficiency_ratio, already computed
+    inside build_market_context and read off context.chop_efficiency_ratio
+    in _compute_features -- zero new cost). Same 0.3/0.5 band boundaries
+    app.ai.originator's own _efficiency_ratio_text already uses; kept as a
+    short CHOPPY/MIXED/CLEAN label here to match this module's own
+    ADX/session-phase label style, duplicated rather than imported per this
+    module's established "deliberately independent" convention.
+
+    9 Sep 2026: added after a real trading day (10 Sep) showed Autonomous
+    AI entering BUY_PE right as a bounce began inside an otherwise-correct
+    bearish day -- ADX read "trending" (23.1, above the entry floor) from
+    the cumulative session history while the immediately preceding hour had
+    actually reversed. ADX is deliberately lagging (see app/indicators.py's
+    own docstring); this is the one signal in this module that reads the
+    last hour specifically rather than the session as a whole."""
+    if ratio is None:
+        return "UNKNOWN"
+    if ratio < 0.3:
+        return "CHOPPY"
+    if ratio < 0.5:
+        return "MIXED"
+    return "CLEAN"
+
+
 def _build_entry_prompt(features: _Features, index_display_name: str, history_text: str = "") -> str:
     adx_label = "Trending" if (features.adx or 0.0) >= _ADX_LLM_FLOOR else "Range-bound/Chop"
     adx_text = f"{features.adx:.1f}" if features.adx is not None else "unavailable"
@@ -869,6 +948,10 @@ def _build_entry_prompt(features: _Features, index_display_name: str, history_te
     slow_ema_text = f"{features.slow_ema:.2f}" if features.slow_ema is not None else "unavailable"
     dist_to_pdh = f"{features.dist_to_pdh} pts" if features.dist_to_pdh is not None else "unknown"
     dist_to_pdl = f"{features.dist_to_pdl} pts" if features.dist_to_pdl is not None else "unknown"
+    chop_text = (
+        f"{features.chop_efficiency_ratio:.2f}" if features.chop_efficiency_ratio is not None else "unavailable"
+    )
+    chop_label = _chop_label(features.chop_efficiency_ratio)
     history_section = f"\n{history_text}\n" if history_text else ""
     return (
         "Current Market State:\n"
@@ -877,6 +960,7 @@ def _build_entry_prompt(features: _Features, index_display_name: str, history_te
         f"- Intraday VWAP: {vwap_text} (Relation: {features.vwap_relation})\n"
         f"- Trend Regime: {features.trend_regime} (9 EMA: {fast_ema_text}, 21 EMA: {slow_ema_text})\n"
         f"- ADX (14): {adx_text} ({adx_label})\n"
+        f"- Market Efficiency (last ~1hr): {chop_text} ({chop_label})\n"
         f"- Proximity to Key Levels: PDH: {dist_to_pdh} | PDL: {dist_to_pdl}\n"
         f"- Session Phase: {features.session_phase} (Time to square-off: {features.minutes_to_close} mins)\n"
         f"{history_section}\n"
@@ -909,12 +993,14 @@ def _build_exit_prompt(trade: StrategyTrade, features: Optional[_Features], now_
         minutes_to_close = features.minutes_to_close
         vwap_status = features.vwap_relation
         momentum = features.trend_regime
+        chop_label = _chop_label(features.chop_efficiency_ratio)
     else:
         end_minutes = _TRADING_END[0] * 60 + _TRADING_END[1]
         now_minutes = now_ist.hour * 60 + now_ist.minute
         minutes_to_close = max(end_minutes - now_minutes, 0)
         vwap_status = "UNKNOWN"
         momentum = "UNKNOWN"
+        chop_label = "UNKNOWN"
     return (
         "Position Status:\n"
         f"- Index: {trade.index_symbol} ({trade.option_type})\n"
@@ -925,6 +1011,7 @@ def _build_exit_prompt(trade: StrategyTrade, features: Optional[_Features], now_
         f"- Minutes to Square-Off: {minutes_to_close}\n"
         f"- Underlying Spot vs VWAP: {vwap_status}\n"
         f"- Underlying Momentum: {momentum}\n"
+        f"- Market Efficiency (last ~1hr): {chop_label}\n"
         f"- Defined Risk Boundaries: Hard SL at -{stop_loss_pct}%, Target at +{target_pnl_pct}%\n\n"
         "Apply the evaluation rules. Output decision JSON:"
     )
