@@ -81,6 +81,34 @@ def compute_efficiency_ratio(bars_5m: list[Bar], lookback: int = CHOP_EFFICIENCY
         return None
     return round(net_change / path_length, 3)
 
+
+# 11 Sep 2026: compute_efficiency_ratio measures the trailing ~1 HOUR as a
+# whole -- if price moved cleanly in one direction for most of that hour and
+# only reversed in the last 2-3 bars, the reversal hasn't yet consumed enough
+# of the hour's total path length to move the ratio, so it can still read
+# CLEAN or MIXED. Two real Autonomous AI entries in the same session (a
+# BankNifty BUY_PE at Market Efficiency=MIXED, a Nifty BUY_PE at Market
+# Efficiency=CLEAN) both opened directly into a 2-3-candle bounce visible on
+# the live chart -- this is that blind spot, not a defect in the ratio
+# itself; the two questions are genuinely different. RECENT_MOVE_LOOKBACK_
+# BARS is deliberately much shorter (~15 minutes) so it can answer "which way
+# has price actually moved in just the last few candles", independent of
+# what the longer window says.
+RECENT_MOVE_LOOKBACK_BARS = 3  # ~15 minutes of 5-min bars
+
+
+def compute_recent_price_change_percent(
+    bars_5m: list[Bar], lookback: int = RECENT_MOVE_LOOKBACK_BARS
+) -> float | None:
+    """Signed % change in close over the most recent `lookback` 5-min bars.
+    Positive = price has risen over this short window, negative = fallen.
+    None when there isn't a full window yet, or the reference close is zero
+    (can't express a % change against it)."""
+    closes = [b.close for b in bars_5m[-(lookback + 1):]]
+    if len(closes) < lookback + 1 or not closes[0]:
+        return None
+    return round((closes[-1] - closes[0]) / closes[0] * 100, 3)
+
 # A breakout requires a completed bar to CLOSE beyond the level. A wick
 # touching it does not qualify -- that distinction is most of the difference
 # between a breakout and a failed breakout.
@@ -178,6 +206,13 @@ class MarketContext:
     # ONLY, same as the trend-age fields above -- not backtested, does not
     # gate anything.
     chop_efficiency_ratio: float | None = None
+    # 11 Sep 2026: see compute_recent_price_change_percent's own docstring --
+    # a much SHORTER (~15 min) directional read than chop_efficiency_ratio's
+    # ~1 hour window, meant to surface a reversal the longer window hasn't
+    # yet consumed enough path length to reflect. DESCRIPTIVE ONLY, same as
+    # every other trend-age/chop field above -- not backtested, does not
+    # gate anything on its own.
+    recent_price_change_percent: float | None = None
     # Filled by the caller, not by build_market_context -- it needs the trade
     # table, and this module is deliberately pure over bars.
     same_direction_entries_today: dict[str, int] = field(default_factory=dict)
@@ -231,6 +266,7 @@ class MarketContext:
             "trend_duration_pct_of_session": self.trend_duration_pct_of_session,
             "move_extent_atr": self.move_extent_atr,
             "chop_efficiency_ratio": self.chop_efficiency_ratio,
+            "recent_price_change_percent": self.recent_price_change_percent,
             "same_direction_entries_today": self.same_direction_entries_today,
             "setups": {k: v for k, v in self.setups.items() if v},
             "setup_strength": self.setup_strength,
@@ -589,6 +625,7 @@ def build_market_context(
     # "trend duration" always describes the trend the model is being shown.
     trend_bars, trend_pct, move_atr = compute_trend_age(bars_5m, st_5m, atr_value, as_of)
     efficiency_ratio = compute_efficiency_ratio(bars_5m)
+    recent_price_change_percent = compute_recent_price_change_percent(bars_5m)
 
     return MarketContext(
         index_symbol=index_symbol,
@@ -624,4 +661,5 @@ def build_market_context(
         trend_duration_pct_of_session=trend_pct,
         move_extent_atr=move_atr,
         chop_efficiency_ratio=efficiency_ratio,
+        recent_price_change_percent=recent_price_change_percent,
     )
