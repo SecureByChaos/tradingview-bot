@@ -295,6 +295,81 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI gets Market Efficiency (chop) awareness on both entry and exit -- prompt-only (10 Sep 2026)
+
+**Trigger**: the very next real trading day after the same-day-history feature (entry directly below this
+one) -- 10 Sep 2026, both indices trended net-bearish all session (every trade that day was `BUY_PE`, none
+`BUY_CE`), but the day's worst loss (Nifty, -13.88%) opened right as a bounce began inside that larger
+downtrend. Chart review confirmed a clear counter-trend leg sat directly under that entry. At decision
+time, ADX read 23.1 -- above Autonomous AI's entry floor, logged in the model's own reasoning as
+"confirming trend strength" -- because ADX is a deliberately lagging, session-cumulative signal (see
+`app/indicators.py`'s own docstring): it had no way to reflect that the immediately preceding hour had
+already started reversing.
+
+**Not a new mechanism -- this project already built the fix, for a different module.** Kaufman's Efficiency
+Ratio (`compute_efficiency_ratio()`, `app/market_context.py`, 27 Aug 2026) measures net displacement over
+total path length across the trailing ~1 hour of 5-min closes: near 1.0 for a clean, direct move, near 0 for
+a lot of back-and-forth with little net progress -- a genuinely different question from ADX's "has there
+been a sustained directional bias over the whole session." It was already built for AI Origination's own
+chop gate and already computed inside `build_market_context()` on every cycle; Autonomous AI's feature
+engine already calls `build_market_context()` and simply never read this one extra field off the result.
+
+**Implementation, `app/ai/autonomous.py`, zero new SmartAPI cost:**
+
+- `_Features` gained `chop_efficiency_ratio: float | None = None`; `_compute_features` now reads it straight
+  off `context.chop_efficiency_ratio` -- the same `MarketContext` object it already builds every cycle for
+  ADX/EMA/PDH-PDL, no new computation, no new candle fetch.
+- New `_chop_label(ratio)` -- CHOPPY (`<0.3`) / MIXED (`0.3-0.5`) / CLEAN (`>=0.5`) / UNKNOWN (`None`), the
+  same band boundaries `app.ai.originator`'s own `_efficiency_ratio_text` already uses, kept as a short label
+  in this module's own ADX/session-phase label style rather than imported (this module's established
+  "deliberately independent" duplication convention).
+- `_build_entry_prompt` gained a `Market Efficiency (last ~1hr): {ratio} ({label})` line, and
+  `_build_exit_prompt` gained a `Market Efficiency (last ~1hr): {label}` line (falls back to `UNKNOWN` when
+  `features` is unavailable, matching the existing `vwap_status`/`momentum` fallback pattern already there).
+
+**Explicitly prompt-only on both sides, per direct instruction -- not a Python gate.** `SYSTEM_PROMPT_ENTRY`
+gained a new Mandatory Reject condition: a CHOPPY efficiency reading blocks a new entry on its own, stated
+as independent of ADX specifically so a "trending" ADX reading cannot be read as overriding it -- directly
+targeting the 10 Sep failure shape, where ADX alone was exactly what let the trade through.
+`SYSTEM_PROMPT_EXIT` gained a new numbered section, **Chop Protection**: if the session reads CHOPPY, don't
+hold a position that's at or below zero hoping the market resolves it in your favor -- prefer EXIT unless
+the model can name something concrete that makes this position different from ordinary chop noise, not
+"still developing." This is the direct answer to "don't let an already-open trade turn into a loss during a
+choppy session" -- the model is re-asked HOLD/EXIT every cycle for every open position (see
+`check_autonomous_exits`), so this reaches every open trade, not just fresh entries. The existing "Criteria
+to HOLD" section (renumbered 4 -> 5) now also requires Market Efficiency not reading CHOPPY while the
+position is at or below zero, so the two sections can't quietly disagree with each other.
+
+**Deliberately softer than AI Origination's own chop gate**, which is a hard Python block -- and even that
+one needed tightening (27 Aug) to require chop AND weak ADX together, after chop alone was found to falsely
+block a genuinely trending Bank Nifty market. Per direct instruction here, this ships as persuasion, not
+enforcement, mirroring the same-day-history feature's own rollout: ask the model, watch what it actually
+does with the information, escalate to a hard gate only if real decisions show it isn't enough -- the same
+escalation path this project has already used twice before (AI Origination's own same-direction gate, 17
+Aug; the EMA-regime override, 4 Sep).
+
+7 new tests (`tests/test_autonomous_ai.py`, 86 -> 93): `_chop_label`'s four boundaries including the exact
+0.3/0.5 edges; `_build_entry_prompt` renders the ratio and label when present and "unavailable (UNKNOWN)"
+when absent; `_build_exit_prompt` renders the label from `features` when available and `UNKNOWN` when
+`features` is `None`; both system prompts contain the new sections' required language (`CHOPPY`, `Market
+Efficiency`, `Chop Protection`, `EXIT rather than HOLD`). Full suite: 959 passed (was 953) plus 1 failure in
+`tests/test_index_live_figures_feed.py::test_day_low_high_still_computed_from_todays_ticks_only` --
+confirmed pre-existing and unrelated via `git status` (only `app/ai/autonomous.py` and its own test file
+changed this pass): a real-wall-clock-dependent test that seeds ticks at `now - 1h`/`now - 2h` and can cross
+a UTC calendar-day boundary in the ~2 hours after UTC midnight, the same class of time-of-day flake this
+file already documents elsewhere (e.g. `test_validated_signal.py`'s stagnation-window flake).
+`python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox cannot call either provider's real API. After deploying, the open
+question is the same one the same-day-history feature already raised, now asked of a second signal: does
+the model actually decline/exit more when Market Efficiency reads CHOPPY, or does it name the caution in its
+reasoning and trade/hold through it anyway (the exact pattern already observed with the history feature on
+its first real day). Read the next several days of `ai_reasoning` on any entry decided while `Market
+Efficiency` reads CHOPPY, and on any EXIT/HOLD decision made on a losing position during a choppy session --
+if the model is naming the caution but not acting on it, that is the trigger to escalate this specific
+mechanism to a hard gate, the same escalation this project has made before once a soft caution alone wasn't
+changing behavior.
+
 ### Autonomous AI now sees its own same-day trade history in the entry prompt -- not a gate (9 Sep 2026)
 
 **Trigger**: 9 Sep 2026's real trade history showed Autonomous AI opening `BUY_PE` seven times across both

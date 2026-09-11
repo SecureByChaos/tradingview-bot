@@ -20,9 +20,12 @@ from app.ai.autonomous import (
     _SESSION_CLOSE_WARNING_MINUTES,
     _STALL_WINDOW_MINUTES,
     ORIGIN,
+    SYSTEM_PROMPT_ENTRY,
+    SYSTEM_PROMPT_EXIT,
     _Features,
     _build_entry_prompt,
     _build_exit_prompt,
+    _chop_label,
     _compute_futures_vwap,
     _has_open_autonomous_trade,
     _parse_entry_response,
@@ -61,12 +64,14 @@ def _make_features(
     *, adx: float | None = 25.0, session_phase: str = "MORNING_MOMENTUM",
     spot: float = 57000.0, vwap: float | None = 56900.0, fast_ema: float | None = 57000.0,
     slow_ema: float | None = 56800.0, minutes_to_close: int = 120,
+    chop_efficiency_ratio: float | None = None,
 ) -> _Features:
     return _Features(
         spot=spot, vwap=vwap, vwap_relation=_vwap_relation(spot, vwap),
         fast_ema=fast_ema, slow_ema=slow_ema, trend_regime=_trend_regime(fast_ema, slow_ema),
         adx=adx, pdh=None, pdl=None, dist_to_pdh=None, dist_to_pdl=None,
         session_phase=session_phase, minutes_to_close=minutes_to_close,
+        chop_efficiency_ratio=chop_efficiency_ratio,
     )
 
 
@@ -397,6 +402,75 @@ def test_build_exit_prompt_handles_missing_features():
     )
     prompt = _build_exit_prompt(trade, None, to_ist(utc_now()))
     assert "UNKNOWN" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _chop_label / Market Efficiency (chop) awareness -- 9 Sep 2026, prompted by
+# the 10 Sep trigger trade (ADX read "trending" while the last hour had
+# actually reversed). Deliberately prompt-only, not a gate -- see module
+# docstring's "MARKET EFFICIENCY (CHOP) AWARENESS" section.
+# ---------------------------------------------------------------------------
+
+def test_chop_label_boundaries():
+    assert _chop_label(None) == "UNKNOWN"
+    assert _chop_label(0.0) == "CHOPPY"
+    assert _chop_label(0.29) == "CHOPPY"
+    assert _chop_label(0.3) == "MIXED"
+    assert _chop_label(0.49) == "MIXED"
+    assert _chop_label(0.5) == "CLEAN"
+    assert _chop_label(1.0) == "CLEAN"
+
+
+def test_build_entry_prompt_includes_market_efficiency():
+    features = _make_features(chop_efficiency_ratio=0.22)
+    prompt = _build_entry_prompt(features, "Bank Nifty")
+    assert "Market Efficiency" in prompt
+    assert "0.22" in prompt
+    assert "CHOPPY" in prompt
+
+
+def test_build_entry_prompt_market_efficiency_unavailable_when_missing():
+    features = _make_features(chop_efficiency_ratio=None)
+    prompt = _build_entry_prompt(features, "Bank Nifty")
+    assert "Market Efficiency (last ~1hr): unavailable (UNKNOWN)" in prompt
+
+
+def test_build_exit_prompt_includes_market_efficiency_from_features():
+    db = _make_session()
+    trade = StrategyTrade(
+        trade_id="t1", strategy_name="x", signal="BUY_CE", index_symbol="BANKNIFTY",
+        tradingsymbol="X", symboltoken="1", strike=57000, expiry="28AUG2026", option_type="CE",
+        quantity=35, entry_price=100.0, current_premium=110.0, stoploss=65.0, target=150.0,
+        entry_time=utc_now(), origin=ORIGIN, status=TradeStatus.OPEN, pnl_percent=10.0,
+        highest_price=110.0, mode=TradingMode.PAPER,
+    )
+    features = _make_features(vwap=100.0, spot=110.0, chop_efficiency_ratio=0.65)
+    prompt = _build_exit_prompt(trade, features, to_ist(utc_now()))
+    assert "Market Efficiency (last ~1hr): CLEAN" in prompt
+
+
+def test_build_exit_prompt_market_efficiency_unknown_when_features_missing():
+    trade = StrategyTrade(
+        trade_id="t1", strategy_name="x", signal="BUY_CE", index_symbol="BANKNIFTY",
+        tradingsymbol="X", symboltoken="1", strike=57000, expiry="28AUG2026", option_type="CE",
+        quantity=35, entry_price=100.0, current_premium=110.0, stoploss=65.0, target=150.0,
+        entry_time=utc_now(), origin=ORIGIN, status=TradeStatus.OPEN, pnl_percent=10.0,
+        mode=TradingMode.PAPER,
+    )
+    prompt = _build_exit_prompt(trade, None, to_ist(utc_now()))
+    assert "Market Efficiency (last ~1hr): UNKNOWN" in prompt
+
+
+def test_system_prompt_entry_rejects_choppy_market_independent_of_adx():
+    assert "CHOPPY" in SYSTEM_PROMPT_ENTRY
+    assert "Market Efficiency" in SYSTEM_PROMPT_ENTRY
+    assert "Mandatory Reject" in SYSTEM_PROMPT_ENTRY
+
+
+def test_system_prompt_exit_has_chop_protection_section():
+    assert "Chop Protection" in SYSTEM_PROMPT_EXIT
+    assert "CHOPPY" in SYSTEM_PROMPT_EXIT
+    assert "EXIT rather than HOLD" in SYSTEM_PROMPT_EXIT
 
 
 # ---------------------------------------------------------------------------
