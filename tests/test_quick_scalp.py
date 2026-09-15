@@ -238,6 +238,32 @@ def test_buy_pe_declines_without_rsi_confirmation():
     assert vwap_scalp_action(features) is None
 
 
+# 15 Sep 2026: a wick touch through the trigger level is not confirmation --
+# C1 must also CLOSE beyond it. Two real trades (11 Sep, 15 Sep) opened and
+# closed within seconds via SCALP_STRUCTURAL_STOP at 0% P&L because C1
+# poked through on a wick then reversed hard within its own minute.
+
+def test_buy_ce_disarms_when_c1_wicks_through_but_closes_back_inside():
+    ts = datetime(2026, 9, 4, 10, 0)
+    c0 = _bar(ts, o=23995, h=24010, l=23980, c=23995)
+    # c1.high (24015) clears c0.high (24010), but c1 reverses hard and
+    # closes back below it -- the exact wick-then-reversal shape that
+    # produced the two real 0-duration structural-stop trades.
+    c1 = _bar(ts + timedelta(minutes=1), o=24012, h=24015, l=23996, c=23998)
+    features = _features_for(c0, c1, vwap0=24000.0, sigma0=5.0, rsi0=25.0)
+    assert vwap_scalp_action(features) is None
+
+
+def test_buy_pe_disarms_when_c1_wicks_through_but_closes_back_inside():
+    ts = datetime(2026, 9, 4, 10, 0)
+    c0 = _bar(ts, o=24005, h=24020, l=23990, c=24005)
+    # c1.low (23985) clears c0.low (23990), but c1 reverses hard and closes
+    # back above it -- the PE mirror of the CE case above.
+    c1 = _bar(ts + timedelta(minutes=1), o=23988, h=24004, l=23985, c=24002)
+    features = _features_for(c0, c1, vwap0=24000.0, sigma0=5.0, rsi0=75.0)
+    assert vwap_scalp_action(features) is None
+
+
 def test_returns_none_with_fewer_than_two_bars():
     ts = datetime(2026, 9, 4, 10, 0)
     single = _ScalpFeatures(session_bars=[_bar(ts, 1, 1, 1, 1)], vwap_series=[1.0], sigma_series=[1.0], rsi_series=[50.0])

@@ -295,6 +295,48 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp's entry trigger now requires C1 to CLOSE beyond C0's extreme, not just touch it on a wick -- two real trades opened and closed within seconds of each other (15 Sep 2026)
+
+**Reported**: "Scalping having some issue. It opens and closes the trades same time." Traced to a real, repeating
+pattern in the trade exports, not a one-off: 11 Sep (`Quick Scalp - Nifty 50`, 3s duration, entry price ==
+exit price 166.95) and again 15 Sep (`Quick Scalp - Bank Nifty`, literally 0s duration, entry == exit
+764.5). Both closed via `SCALP_STRUCTURAL_STOP` at 0% gross P&L (a real net loss once costs are deducted,
+since entry and exit premium were identical).
+
+**Root cause**: `vwap_scalp_action()`'s entry trigger only ever checked whether C1's intrabar high/low
+*touched* C0's opposite extreme (`c1.high > c0.high` for `BUY_CE`, `c1.low < c0.low` for `BUY_PE`) -- not
+whether C1 actually *closed* beyond it. The structural stop, meanwhile, sits only `_MAX_INDEX_STOP_POINTS`
+(14 points) inside that same trigger level. So when C1 spiked through the trigger on a wick and then
+reversed hard within its own minute -- closing back near or past the structural stop before the position had
+even finished resolving (a real network round trip: contract lookup + LTP fetch) -- the very next 5-second
+`quick-scalp-exit-check` cycle found live spot already past the structural level and closed it almost
+instantly. Entry price equals exit price in both real cases because `trade.current_premium` is only
+refreshed by the shared 30-second `monitor_open_trades` tick, which hadn't run yet on a trade this young.
+
+**Fixed**: `vwap_scalp_action()` now also requires `c1.close > c0.high` (CE) / `c1.close < c0.low` (PE) --
+C1 must close beyond the level, a wick touching it no longer qualifies. Same "a completed bar must CLOSE
+beyond a level, a wick touching it does not qualify" discipline `app/market_context.py`'s own breakout logic
+(`_failed_breakout`) already applies elsewhere in this project -- Quick Scalp's entry never had it. The C0
+setup criteria (band pierce, wick rejection, RSI exhaustion) are completely untouched; only C1's own
+confirmation got stricter. `_structural_stop_level()`, the exit-check cadence, and everything else in the
+module are unchanged.
+
+2 new tests in `tests/test_quick_scalp.py` (54 -> 56): both directions reproduce the exact real failure
+shape (C1 wicks through the trigger level, then closes back inside) and confirm no signal fires. Every
+existing "fires on full setup and trigger" test already had C1 closing beyond the level in its own fixture
+(unintentionally, since the code didn't require it before), so none needed changes. Full suite: 978 passed
+(was 977), plus 1 pre-existing, unrelated wall-clock-dependent failure in
+`tests/test_validated_signal.py::test_exits_no_stagnation_when_move_is_genuinely_favorable` (fails after
+Validated Signal's own 15:10 IST hard session-exit cutoff, confirmed by real IST clock time at the moment
+this ran -- the same class of flake CLAUDE.md already documents elsewhere). `python -c "import app.main"`
+imports cleanly.
+
+**Not verified live** -- this sandbox has no real WebSocket tick stream to reproduce a genuine wick-and-
+reverse bar. After deploying, confirm no new Quick Scalp trade closes with `exit_reason='SCALP_STRUCTURAL_
+STOP'` and a holding time under a few seconds -- the specific shape this fix targets. A structural stop
+firing after a real elapsed hold (minutes, not seconds) is unaffected by this change and still expected
+behavior.
+
 ### Autonomous AI gets a Recent Price Action (~15 min) signal alongside Market Efficiency -- the hourly chop reading missed the exact case it was built for, on the very next real trading day (11 Sep 2026)
 
 **Trigger**: PR #94 (Market Efficiency/chop awareness) merged, then on the next real trading day two
