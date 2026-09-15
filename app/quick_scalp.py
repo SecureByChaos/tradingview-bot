@@ -272,7 +272,20 @@ def _compute_vwap_bands(
 def vwap_scalp_action(features: _ScalpFeatures) -> Optional[_ScalpSignal]:
     """Section 4's full setup-and-trigger check, evaluated against the two
     most recent completed session bars. Pure function, no DB, no network --
-    directly testable. Unchanged from the 4 Sep build."""
+    directly testable.
+
+    15 Sep 2026: the trigger condition now ALSO requires C1's own CLOSE to
+    clear C0's opposite extreme, not just C1's high/low touching it
+    intrabar. Two real trades (11 Sep, 15 Sep) opened and closed within
+    seconds of each other at the exact same premium (0% gross P&L, a real
+    net loss after costs) via SCALP_STRUCTURAL_STOP -- both cases where C1
+    poked through the trigger level on a wick, then reversed hard within its
+    own minute, closing back near or past the structural stop (which sits
+    only _MAX_INDEX_STOP_POINTS inside that same trigger level) before the
+    position had even finished opening. Requiring C1 to CLOSE beyond the
+    level, not just touch it, is the same "a wick does not qualify as
+    confirmation" discipline app.market_context.py's own breakout logic
+    already applies -- see that module's own comment on _failed_breakout."""
     n = len(features.session_bars)
     if n < 2:
         return None
@@ -297,6 +310,7 @@ def vwap_scalp_action(features: _ScalpFeatures) -> Optional[_ScalpSignal]:
         and (lower_wick / candle_range) >= _WICK_REJECTION_RATIO
         and rsi0 < _RSI_OVERSOLD
         and c1.high > c0.high
+        and c1.close > c0.high
     ):
         return _ScalpSignal("BUY_CE", c0.high, c0.low, c0.high)
 
@@ -306,6 +320,7 @@ def vwap_scalp_action(features: _ScalpFeatures) -> Optional[_ScalpSignal]:
         and (upper_wick / candle_range) >= _WICK_REJECTION_RATIO
         and rsi0 > _RSI_OVERBOUGHT
         and c1.low < c0.low
+        and c1.close < c0.low
     ):
         return _ScalpSignal("BUY_PE", c0.low, c0.low, c0.high)
 
