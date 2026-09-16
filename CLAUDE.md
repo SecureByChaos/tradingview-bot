@@ -295,6 +295,137 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### AI Origination, Autonomous AI and Validated Signal now read candles from the same live WebSocket-fed source Quick Scalp already used -- fixes a real multi-day Validated Signal outage (16 Sep 2026)
+
+**Reported**: "I havent seen validated signal trades from last few days." Investigated with real production
+logs, not guessed at. `sudo journalctl -u tradingview-bot ... | grep VALIDATED_SIGNAL` on 15 Sep showed
+`data refresh failed this cycle -- halting new signals` repeatedly through both entry windows, on both
+indices -- a mix of `apiconnect.angelone.in` read timeouts and `SmartAPI rate limit recovery failed for
+this call` (every retry in `_retry_rate_limited` exhausted). Not a "no qualifying setup" dry spell; the
+module was failing to get fresh data to evaluate a signal against, almost every cycle it ran.
+
+**A second question in the same conversation narrowed the real cause further**: "Quick scalp is working" --
+while Validated Signal starved on the same box, at the same time. Traced to a genuine architectural gap,
+not a coincidence: `app/quick_scalp.py` has **no `get_candles()` REST call anywhere** -- its 1-minute bars
+come entirely from the shared WebSocket connection (`app.live_feed.IndexFeed` -> `app.quick_scalp_feed.
+ScalpBarAggregator`, merged into one connection 8 Sep). AI Origination's `_load_market_context` and
+Autonomous AI's own spot-candle refresh both already read/fall back through `load_bars(..., ONE_MINUTE)`
+on the exact key that feed writes to -- so a REST failure there was *already* quietly falling back to
+fresh WebSocket-derived bars, not stale ones, before this pass. **Validated Signal never got any of this
+benefit**: `_load_index_features`/`_futures_volume_by_5min` fetched and stored `FIVE_MINUTE` candles
+directly over REST -- a completely different `Candle.interval` bucket from the `ONE_MINUTE` key the
+WebSocket feed populates. A REST failure there had no live fallback at all, only whatever a previous REST
+call happened to leave behind -- which is why it, alone among the three, halted outright instead of
+degrading gracefully.
+
+**A third, related gap, found while tracing the futures side**: Autonomous AI's VWAP and Validated
+Signal's volume-surge gate both maintain their *own* independent REST-fetched futures candle series
+(`f"{index}_FUT"` at `ONE_MINUTE`), even though the same WebSocket connection already receives those exact
+futures ticks for Quick Scalp's own volume substitution -- it just discarded them into the spot bar's
+volume field instead of also persisting a real futures OHLC bar under that shared key. Futures data was
+being independently REST-fetched three separate times (Autonomous AI, Validated Signal, and Quick Scalp's
+own volume-only read) with zero cross-benefit between any of them.
+
+**User asked, before any code changed, to have this checked against the actual code rather than assumed.**
+Confirmed the above by reading every candle-refresh call site directly (`_load_market_context`,
+`_compute_features`/`_compute_futures_vwap`, `_load_index_features`/`_futures_volume_by_5min`,
+`ScalpBarAggregator`), then proposed and built a three-part fix, all reusing existing pieces rather than
+opening any new connection:
+
+1. **`app.market_data` gained two shared primitives** used by every consumer below rather than each
+   re-deriving its own: `FUTURES_CANDLE_SUFFIX = "_FUT"` (consolidated from three independently-typed
+   per-module copies -- Autonomous AI's and Validated Signal's own local constants are now gone, both
+   import this one; the DTE-bucket-divergence gotcha elsewhere in this file is exactly the failure mode a
+   silently-drifted third copy would have risked) and `latest_bar_age_seconds(db, index_symbol, interval,
+   now_ist)` -- seconds since the most recently stored bar, or `None` if nothing is stored. New
+   `BAR_FRESHNESS_SECONDS = 150.0`, a reasoned starting point, not backtested: a completed 1-minute bar
+   off the live feed is typically 60-150s old by the time the next tick closes it out, and every consumer
+   here already tolerated up to a full 5-minute gap between REST refreshes before this -- so anything under
+   this floor is strictly more current than the REST-only status quo, never a loosening of it.
+
+2. **`app.quick_scalp_feed.ScalpBarAggregator` now persists a real futures OHLC bar**, not just a volume
+   delta merged into the spot bar. `on_futures_tick` gained an optional `price` parameter (defaulted to
+   `None` so every pre-existing caller, including this module's own tests, is unaffected) -- when present,
+   tracks its own forming bar via a small shared `_advance_forming` helper (extracted from `on_spot_tick`'s
+   identical open/high/low/close logic to avoid two copies of the same rollover math) and persists the
+   closed bar under the shared `f"{symbol}{FUTURES_CANDLE_SUFFIX}"` key at `ONE_MINUTE` via a new
+   `_finalize_futures_bar` -- deliberately never calling `_on_bar_closed`, since that callback is Quick
+   Scalp's own spot-bar entry check and must stay scoped to the real index bar, not this one.
+   `IndexFeed._handle_data` now passes the already-computed `price` (previously extracted for every
+   message but only ever used on the spot branch) through to `on_futures_tick` too. The pre-existing
+   volume-delta-into-spot-bar behaviour is completely unchanged, just now duplicated into its own
+   independent accumulator (`_futures_bar_volume`) so the futures bar's own close can pop its volume
+   without racing the spot bar's pop of the same minute.
+
+3. **Every REST-polling consumer now checks `latest_bar_age_seconds` before attempting its own REST call**,
+   skipping it entirely when the WebSocket-fed history is already fresh -- this is the piece that actually
+   removes each module's own contribution to the shared quote-throttle contention, since a good fallback
+   alone doesn't reduce how often the REST call is *attempted*. Applied identically to AI Origination's
+   `_load_market_context` (spot), Autonomous AI's `_compute_features` (spot) and `_compute_futures_vwap`
+   (futures), and Validated Signal's `_load_index_features` (spot) and `_futures_volume_by_5min` (futures).
+   **Validated Signal's spot/futures fetch and storage both switched from `FIVE_MINUTE` to `ONE_MINUTE` +
+   `resample()`** -- the same pattern AI Origination/Autonomous AI already used for their own spot data --
+   so it can share the WebSocket-fed key at all; `_CANDLE_LOOKBACK_DAYS = 7` (already well under SmartAPI's
+   ~28-day 1-minute-history ceiling) and a new `_CANDLE_LOAD_LIMIT = 3000` mirror the sibling modules'
+   own constants exactly.
+
+**One correctness wrinkle handled explicitly, not assumed away**: `resample()`'s own docstring states it
+deliberately returns its trailing bucket even when still forming, since AI Origination's live path
+genuinely wants the in-progress bar. A real REST `get_candles(interval=FIVE_MINUTE)` call -- Validated
+Signal's behaviour before this pass -- never returns a partial bar. Left unhandled, switching to
+resampling from 1-minute bars would have let an incomplete, still-forming 5-minute candle reach the
+box/ORB/trigger logic, which needs a bar that has actually CLOSED (the same "a completed bar must close
+beyond a level, a wick touching it does not qualify" discipline this file already documents for Quick
+Scalp's own entry trigger, directly above this entry). Fixed in `_load_index_features`: the last resampled
+bar is dropped whenever its own bucket hasn't fully elapsed yet (`bar.ts_ist + 5min > now`).
+
+**A second, unrelated latent bug surfaced and fixed in the same pass**: `_load_market_context` could
+already crash with `AttributeError` on `context.same_direction_entries_today = ...` whenever
+`build_market_context` returned `None` from a non-empty-but-insufficient `bars_1m` (enough bars to pass
+the earlier `if not bars_1m` check, not enough for ADX/EMA/Supertrend to warm up) -- the existing None-guard
+only covered the "zero bars at all" case. Pre-existing, not introduced by this pass; surfaced by a new test
+combining a single stale stored bar with an empty REST response. Fixed with a second `if context is None:
+return None, data_stale` check, matching the fail-closed convention this function already uses everywhere
+else.
+
+27 new tests: `tests/test_market_data.py` (6, new file -- `FUTURES_CANDLE_SUFFIX`'s literal value,
+`latest_bar_age_seconds`'s None-when-nothing-stored/real-elapsed-time/naive-now/most-recent-bar/index-and-
+interval-scoping cases), `tests/test_quick_scalp_feed.py` (+7 -- futures OHLC bar persistence including the
+no-price-no-op case for every pre-existing caller, the exact volume-accumulation-then-close case,
+confirmation a futures close never fires `on_bar_closed`, confirmation it never pollutes the real index's
+own `Candle` rows, spot and futures forming bars tracked independently, and persistence-failure
+swallowing), `tests/test_originator_bar_freshness.py` (4, new file -- skip-when-fresh, refresh-when-stale,
+refresh-when-nothing-stored, and the `build_market_context is None` regression),
+`tests/test_validated_signal_bar_freshness.py` (7, new file -- spot skip/refresh, the incomplete-trailing-
+bucket drop, futures skip/refresh/resample-correctness/no-contract), and 3 new in
+`tests/test_autonomous_ai.py` (futures VWAP skip/refresh and spot skip, using an exploding `get_candles`
+stand-in that fails the test if REST is ever reached). `tests/test_live_feed.py`'s existing
+`FakeScalpAggregator`/its one futures-routing test updated for `on_futures_tick`'s new `price` parameter.
+Full suite: 1006 passed (was 979, confirmed via `git stash -u` against the pre-this-pass tree).
+`python -c "import app.main"` imports cleanly, 13 scheduled jobs (unchanged -- no new jobs, only how
+existing ones source their candle data).
+
+**Not verified live** -- this sandbox has no network path to a real Angel One WebSocket feed or REST
+endpoint (see `app/live_feed.py`'s own standing docstring caveat). After deploying, the checks:
+
+```bash
+# Should stop appearing almost entirely during the two Validated Signal entry windows -- a handful right
+# after a fresh deploy/feed reconnect is expected, a sustained run is not.
+sudo journalctl -u tradingview-bot --since today | grep "VALIDATED_SIGNAL.*halting new signals"
+
+# Confirms item 3 is actually engaging in production for all three modules -- spot-check a few, expect the
+# large majority to say "skipping REST refresh", REST fallback only on a genuine feed gap.
+sudo journalctl -u tradingview-bot --since today | grep -i "WebSocket-fed), skipping REST refresh"
+
+# Confirms item 2 -- futures OHLC bars accumulating under the shared key for both indexes, not just the
+# volume-only merge Quick Scalp already had.
+sqlite3 data/trading.db "SELECT index_symbol, COUNT(*) FROM candles WHERE interval='ONE_MINUTE' AND index_symbol LIKE '%_FUT' GROUP BY index_symbol;"
+```
+
+Also confirm a real Validated Signal entry opens correctly off the new ONE_MINUTE-resampled-to-5-minute
+path (matched setup, correct box/ORB levels, correct volume-surge read) the next time its own signal
+conditions actually line up -- this pass changes the DATA SOURCE only, never the signal/risk logic itself.
+
 ### Quick Scalp's entry trigger now requires C1 to CLOSE beyond C0's extreme, not just touch it on a wick -- two real trades opened and closed within seconds of each other (15 Sep 2026)
 
 **Reported**: "Scalping having some issue. It opens and closes the trades same time." Traced to a real, repeating

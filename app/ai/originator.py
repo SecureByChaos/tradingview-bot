@@ -18,9 +18,11 @@ from app.database import SessionLocal
 from app.db_models import AISettings, IndexConfig, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.market_context import ADX_NO_TREND, ADX_TRENDING, CPR, MarketContext, build_market_context
 from app.market_data import (
+    BAR_FRESHNESS_SECONDS,
     FIFTEEN_MINUTE,
     FIVE_MINUTE,
     ONE_MINUTE,
+    latest_bar_age_seconds,
     load_bars,
     parse_smartapi_row,
     resample,
@@ -1067,27 +1069,43 @@ def _load_market_context(
     if not index.spot_token:
         return None, False
     data_stale = False
-    try:
-        # Pull a rolling window rather than only the newest bar: cheap (one
-        # call), self-healing after any gap, and the upsert makes re-fetching
-        # overlapping minutes free.
-        from_dt = (now_ist - timedelta(days=_CANDLE_WARMUP_DAYS)).strftime("%Y-%m-%d %H:%M")
-        to_dt = now_ist.strftime("%Y-%m-%d %H:%M")
-        rows = smartapi.get_candles(
-            exchange=index.spot_exchange,
-            symboltoken=index.spot_token,
-            interval=ONE_MINUTE,
-            from_dt=from_dt,
-            to_dt=to_dt,
+    # 16 Sep 2026: skip the REST call entirely when the live WebSocket feed
+    # (app.quick_scalp_feed.ScalpBarAggregator, fed by app.live_feed.
+    # IndexFeed's single connection) has already written a 1-minute bar
+    # fresher than BAR_FRESHNESS_SECONDS -- see CLAUDE.md's "pull everything
+    # from a single source" entry. This is what actually removes AI
+    # Origination's own contribution to the shared quote-throttle/rate-limit
+    # contention every 5-min cycle was adding; the load_bars() fallback
+    # below already benefited from this data when the REST call failed, but
+    # nothing previously stopped the REST call from being attempted anyway.
+    age = latest_bar_age_seconds(db, index.symbol, ONE_MINUTE, now_ist)
+    if age is not None and age <= BAR_FRESHNESS_SECONDS:
+        logger.debug(
+            "[AI][ORIGIN] %s: 1-min history is %.0fs old (WebSocket-fed), skipping REST refresh",
+            index.symbol, age,
         )
-        if rows:
-            store_bars(db, index.symbol, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
-    except Exception as exc:
-        # Non-fatal here: stored history may still be sufficient. The
-        # sufficiency check below is what actually decides whether to proceed
-        # at all; data_stale is what tells the caller it proceeded on old data.
-        data_stale = True
-        logger.info("[AI][ORIGIN] %s: candle refresh failed (%s), using stored history", index.symbol, exc)
+    else:
+        try:
+            # Pull a rolling window rather than only the newest bar: cheap (one
+            # call), self-healing after any gap, and the upsert makes re-fetching
+            # overlapping minutes free.
+            from_dt = (now_ist - timedelta(days=_CANDLE_WARMUP_DAYS)).strftime("%Y-%m-%d %H:%M")
+            to_dt = now_ist.strftime("%Y-%m-%d %H:%M")
+            rows = smartapi.get_candles(
+                exchange=index.spot_exchange,
+                symboltoken=index.spot_token,
+                interval=ONE_MINUTE,
+                from_dt=from_dt,
+                to_dt=to_dt,
+            )
+            if rows:
+                store_bars(db, index.symbol, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
+        except Exception as exc:
+            # Non-fatal here: stored history may still be sufficient. The
+            # sufficiency check below is what actually decides whether to proceed
+            # at all; data_stale is what tells the caller it proceeded on old data.
+            data_stale = True
+            logger.info("[AI][ORIGIN] %s: candle refresh failed (%s), using stored history", index.symbol, exc)
 
     bars_1m = load_bars(db, index.symbol, ONE_MINUTE, limit=_CANDLE_LOAD_LIMIT)
     if not bars_1m:
@@ -1102,6 +1120,14 @@ def _load_market_context(
         spot=spot,
         as_of=now_ist.replace(tzinfo=None),
     )
+    if context is None:
+        # bars_1m being non-empty doesn't guarantee enough history for
+        # ADX/EMA/Supertrend to warm up -- build_market_context fails
+        # closed in that case, same as the "not bars_1m" check above just
+        # with a subtler trigger. Surfaced 16 Sep 2026 by a stale-but-
+        # non-empty stored history combined with an empty REST response;
+        # pre-existing, not introduced by this pass's freshness-skip logic.
+        return None, data_stale
     # Attached here rather than inside build_market_context, which is a pure
     # function over bars and has no business reading the trade table.
     context.same_direction_entries_today = _same_direction_entries_today(db, index.symbol)

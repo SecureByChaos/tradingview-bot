@@ -246,7 +246,7 @@ class FakeScalpAggregator:
         self.futures_tokens = futures_tokens or []
         self.futures_token_to_symbol = {tok: "NIFTY" for tok in self.futures_tokens}
         self.spot_ticks: list[tuple[str, float, int]] = []
-        self.futures_ticks: list[tuple[str, float | None, int]] = []
+        self.futures_ticks: list[tuple[str, float | None, int, float | None]] = []
 
     def resolve_futures_tokens(self) -> list[str]:
         return self.futures_tokens
@@ -254,8 +254,8 @@ class FakeScalpAggregator:
     def on_spot_tick(self, symbol: str, price: float, minute_bucket: int) -> None:
         self.spot_ticks.append((symbol, price, minute_bucket))
 
-    def on_futures_tick(self, symbol: str, cumulative_volume, minute_bucket: int) -> None:
-        self.futures_ticks.append((symbol, cumulative_volume, minute_bucket))
+    def on_futures_tick(self, symbol: str, cumulative_volume, minute_bucket: int, price=None) -> None:
+        self.futures_ticks.append((symbol, cumulative_volume, minute_bucket, price))
 
 
 def test_handle_data_dispatches_spot_ticks_to_both_store_and_aggregator():
@@ -276,7 +276,9 @@ def test_handle_data_routes_futures_ticks_only_to_the_aggregator():
 
     feed._handle_data(None, {"token": "555", "last_traded_price": 5000000, "volume_trade_for_the_day": 42})
 
-    assert aggregator.futures_ticks == [("NIFTY", 42, aggregator.futures_ticks[0][2])]
+    # price is now passed through too (16 Sep 2026, real futures OHLC bar
+    # persistence -- see app.quick_scalp_feed.ScalpBarAggregator).
+    assert aggregator.futures_ticks == [("NIFTY", 42, aggregator.futures_ticks[0][2], 50000.0)]
     assert store.get("BANKNIFTY") is None  # never touched by a futures tick
 
 

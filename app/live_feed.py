@@ -255,6 +255,7 @@ class IndexFeed:
                 if futures_symbol is not None:
                     self._scalp_aggregator.on_futures_tick(
                         futures_symbol, message.get("volume_trade_for_the_day"), int(time.time() // 60),
+                        price=price,
                     )
         except Exception:
             logger.exception("[LIVEFEED] Error processing tick: %r", message)
