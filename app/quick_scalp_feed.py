@@ -115,7 +115,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from app.market_data import ONE_MINUTE, Bar, store_bars
+from app.market_data import FUTURES_CANDLE_SUFFIX, ONE_MINUTE, Bar, store_bars
 from app.time_utils import IST
 
 logger = logging.getLogger(__name__)
@@ -166,7 +166,9 @@ class ScalpBarAggregator:
         self._indexes = list(indexes)
         self._lock = threading.Lock()
         self._forming: dict[str, _FormingBar] = {}
+        self._forming_futures: dict[str, _FormingBar] = {}
         self._minute_volume: dict[str, dict[int, float]] = {}
+        self._futures_bar_volume: dict[str, dict[int, float]] = {}
         self._last_futures_cum_volume: dict[str, float] = {}
         self.futures_token_to_symbol: dict[str, str] = {}
 
@@ -192,44 +194,76 @@ class ScalpBarAggregator:
 
     # -- tick handling ---------------------------------------------------
 
+    @staticmethod
+    def _advance_forming(
+        forming_dict: dict[str, "_FormingBar"], symbol: str, price: float, minute_bucket: int,
+    ) -> "_FormingBar | None":
+        """Shared open/high/low/close tracking for both the spot and
+        futures forming-bar dicts -- callers must already hold self._lock.
+        Returns the just-completed _FormingBar the instant the minute rolls
+        over (the caller reads its own volume bucket and builds the real
+        Bar from it), None while still forming."""
+        forming = forming_dict.get(symbol)
+        if forming is None:
+            forming_dict[symbol] = _FormingBar(minute_bucket, price, price, price, price)
+            return None
+        if minute_bucket == forming.minute_bucket:
+            forming.high = max(forming.high, price)
+            forming.low = min(forming.low, price)
+            forming.close = price
+            return None
+        forming_dict[symbol] = _FormingBar(minute_bucket, price, price, price, price)
+        return forming
+
     def on_spot_tick(self, symbol: str, price: float, minute_bucket: int) -> None:
         closed_bar: Bar | None = None
         with self._lock:
-            forming = self._forming.get(symbol)
             volumes = self._minute_volume.setdefault(symbol, {})
-            if forming is None:
-                self._forming[symbol] = _FormingBar(minute_bucket, price, price, price, price)
-                return
-            if minute_bucket == forming.minute_bucket:
-                forming.high = max(forming.high, price)
-                forming.low = min(forming.low, price)
-                forming.close = price
-                return
-            # Minute rolled over -- finalize the just-completed bar before
-            # starting a new one at this tick's price.
-            volume = volumes.pop(forming.minute_bucket, 0.0)
-            closed_bar = Bar(
-                ts_ist=_minute_bucket_to_ts_ist(forming.minute_bucket),
-                open=forming.open, high=forming.high, low=forming.low, close=forming.close,
-                volume=volume,
-            )
-            self._forming[symbol] = _FormingBar(minute_bucket, price, price, price, price)
+            closed = self._advance_forming(self._forming, symbol, price, minute_bucket)
+            if closed is not None:
+                volume = volumes.pop(closed.minute_bucket, 0.0)
+                closed_bar = Bar(
+                    ts_ist=_minute_bucket_to_ts_ist(closed.minute_bucket),
+                    open=closed.open, high=closed.high, low=closed.low, close=closed.close,
+                    volume=volume,
+                )
         if closed_bar is not None:
             self._finalize_bar(symbol, closed_bar)
 
-    def on_futures_tick(self, symbol: str, cumulative_volume: float | None, minute_bucket: int) -> None:
-        if cumulative_volume is None:
-            return
+    def on_futures_tick(
+        self, symbol: str, cumulative_volume: float | None, minute_bucket: int, price: float | None = None,
+    ) -> None:
+        """`price` is new, 16 Sep 2026 -- optional and defaulted to None so
+        every pre-existing caller (this module's own tests included) that
+        only cares about the volume-delta side keeps working unchanged.
+        When present, this also tracks and persists a real futures OHLC bar
+        under the shared FUTURES_CANDLE_SUFFIX key, alongside the existing
+        volume-delta bookkeeping that on_spot_tick still reads to substitute
+        real volume into the SPOT bar -- see module docstring."""
+        closed_futures_bar: Bar | None = None
         with self._lock:
-            last = self._last_futures_cum_volume.get(symbol)
-            self._last_futures_cum_volume[symbol] = cumulative_volume
-            if last is None:
-                return  # No baseline yet this connection -- delta unknown, skip.
-            delta = max(0.0, cumulative_volume - last)
-            if delta <= 0:
-                return
-            bucket = self._minute_volume.setdefault(symbol, {})
-            bucket[minute_bucket] = bucket.get(minute_bucket, 0.0) + delta
+            if cumulative_volume is not None:
+                last = self._last_futures_cum_volume.get(symbol)
+                self._last_futures_cum_volume[symbol] = cumulative_volume
+                if last is not None:
+                    delta = max(0.0, cumulative_volume - last)
+                    if delta > 0:
+                        bucket = self._minute_volume.setdefault(symbol, {})
+                        bucket[minute_bucket] = bucket.get(minute_bucket, 0.0) + delta
+                        fut_bucket = self._futures_bar_volume.setdefault(symbol, {})
+                        fut_bucket[minute_bucket] = fut_bucket.get(minute_bucket, 0.0) + delta
+
+            if price is not None:
+                closed = self._advance_forming(self._forming_futures, symbol, price, minute_bucket)
+                if closed is not None:
+                    volume = self._futures_bar_volume.get(symbol, {}).pop(closed.minute_bucket, 0.0)
+                    closed_futures_bar = Bar(
+                        ts_ist=_minute_bucket_to_ts_ist(closed.minute_bucket),
+                        open=closed.open, high=closed.high, low=closed.low, close=closed.close,
+                        volume=volume,
+                    )
+        if closed_futures_bar is not None:
+            self._finalize_futures_bar(symbol, closed_futures_bar)
 
     def _finalize_bar(self, symbol: str, bar: Bar) -> None:
         try:
@@ -243,3 +277,19 @@ class ScalpBarAggregator:
             self._on_bar_closed(symbol)
         except Exception:
             logger.exception("[QUICK_SCALP_FEED] on_bar_closed callback failed for %s", symbol)
+
+    def _finalize_futures_bar(self, symbol: str, bar: Bar) -> None:
+        """Persists under the shared FUTURES_CANDLE_SUFFIX key so Autonomous
+        AI's VWAP and Validated Signal's volume-surge gate -- both already
+        reading this exact key from their own REST-fetch-then-fallback path
+        -- get live WebSocket-fed history instead of only ever seeing
+        whatever their last successful independent REST pull left behind.
+        Deliberately does NOT call _on_bar_closed: that callback is Quick
+        Scalp's own SPOT-bar entry check and must stay scoped to the real
+        index bar closing, never this one."""
+        try:
+            with self._session_factory() as db:
+                store_bars(db, f"{symbol}{FUTURES_CANDLE_SUFFIX}", ONE_MINUTE, [bar])
+                db.commit()
+        except Exception:
+            logger.exception("[QUICK_SCALP_FEED] Failed to persist futures bar for %s", symbol)

@@ -281,6 +281,54 @@ def latest_bar_time(db: Session, index_symbol: str, interval: str) -> datetime |
     )
 
 
+# Synthetic index_symbol suffix shared by every consumer that stores a
+# futures contract's own candle series apart from the real index's own (AI
+# Origination has no futures need; Autonomous AI's VWAP and Validated
+# Signal's volume-surge gate both read one, and app.quick_scalp_feed.
+# ScalpBarAggregator -- the live WebSocket feed's tick-to-bar aggregator --
+# now WRITES one too, see its own module docstring). One shared constant
+# here rather than three independently-typed copies: all three must agree
+# on the exact literal string for the shared-key mechanism between them to
+# do anything, and CLAUDE.md's own "DTE bucket function... must not
+# diverge" gotcha is exactly the failure mode a silently-drifted duplicate
+# would produce here. Previously duplicated per-module before 16 Sep 2026;
+# consolidated when the WebSocket feed started writing to this same key.
+FUTURES_CANDLE_SUFFIX = "_FUT"
+
+# How stale the most recently stored bar for an index/interval can be
+# before a REST candle refresh is worth attempting at all. A reasoned
+# starting point, not backtested: a completed 1-minute bar finalized off
+# the live WebSocket feed (app.live_feed.IndexFeed via app.quick_scalp_
+# feed.ScalpBarAggregator) is typically 60-150s old by the time the NEXT
+# tick closes it out and the write lands, and every REST-polling consumer
+# in this codebase already tolerates up to a full 5-minute gap between
+# refreshes today -- so treating anything under this threshold as "fresh
+# enough" to skip a REST call is strictly more current than the REST-only
+# status quo, never a loosening of it. 16 Sep 2026, see CLAUDE.md's
+# "pull everything from a single source" entry for the throttle-contention
+# problem this exists to relieve.
+BAR_FRESHNESS_SECONDS = 150.0
+
+
+def latest_bar_age_seconds(
+    db: Session, index_symbol: str, interval: str, now_ist: datetime
+) -> float | None:
+    """Seconds between `now_ist` and the close of the most recently stored
+    bar for this index/interval, or None when nothing is stored for it yet
+    (a REST refresh is always worth attempting in that case). `now_ist` may
+    be naive or tz-aware IST -- tzinfo is stripped before comparing against
+    Candle.ts_ist, which this module always stores naive (see
+    parse_smartapi_row's own reasoning). Callers use this to skip a REST
+    candle refresh entirely when the live WebSocket-fed history is already
+    fresher than BAR_FRESHNESS_SECONDS, rather than spending shared
+    quote-throttle budget re-fetching data already in hand."""
+    latest = latest_bar_time(db, index_symbol, interval)
+    if latest is None:
+        return None
+    now_naive = now_ist.replace(tzinfo=None) if now_ist.tzinfo is not None else now_ist
+    return (now_naive - latest).total_seconds()
+
+
 def prune_before(db: Session, cutoff: datetime, interval: str = ONE_MINUTE) -> int:
     """Drop 1-minute bars older than cutoff. Retention is a deliberate decision,
     not a default: keep at least 30 days so offline replay stays possible."""

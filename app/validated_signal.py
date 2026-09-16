@@ -155,7 +155,18 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.db_models import IndexConfig, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.market_context import compute_levels
-from app.market_data import Bar, FIVE_MINUTE, load_bars, parse_smartapi_row, store_bars
+from app.market_data import (
+    BAR_FRESHNESS_SECONDS,
+    Bar,
+    FIVE_MINUTE,
+    FUTURES_CANDLE_SUFFIX,
+    ONE_MINUTE,
+    latest_bar_age_seconds,
+    load_bars,
+    parse_smartapi_row,
+    resample,
+    store_bars,
+)
 from app.models import ExitReason, Signal
 from app.option_finder import OptionFinder
 from app.platform import list_index_configs, log_event
@@ -216,7 +227,9 @@ _SENTINEL_TARGET_FACTOR = 100.0
 
 _SUPPORTED_INDEXES = frozenset({"NIFTY", "BANKNIFTY"})
 _CANDLE_LOOKBACK_DAYS = 7
-_FUTURES_CANDLE_SUFFIX = "_FUT"
+# Matches app.ai.originator's/app.ai.autonomous's own load cap for the same
+# 7-day 1-minute warmup window (3000 1-min bars ~= 8 trading sessions).
+_CANDLE_LOAD_LIMIT = 3000
 
 
 @dataclass(frozen=True)
@@ -420,7 +433,15 @@ def _futures_volume_by_5min(
     by naive-IST bar-open timestamp -- see module docstring's NAMED
     DEVIATIONS #1. Returns {} (every bar then falls back to a volume of 0.0,
     which fails every surge gate closed) when no futures contract can be
-    resolved."""
+    resolved.
+
+    16 Sep 2026: reads/writes ONE_MINUTE under the shared FUTURES_CANDLE_
+    SUFFIX key and resamples to 5-min locally, instead of fetching/storing
+    FIVE_MINUTE directly. That key is now also written in real time by the
+    live WebSocket feed (app.quick_scalp_feed.ScalpBarAggregator), which
+    only ever produces 1-minute bars -- reading FIVE_MINUTE straight from
+    REST meant this function could never see that data at all, REST failure
+    or not. See CLAUDE.md's "pull everything from a single source" entry."""
     try:
         contract = option_finder.find_current_futures_contract(index)
     except Exception as exc:
@@ -428,21 +449,29 @@ def _futures_volume_by_5min(
         return {}
     if contract is None:
         return {}
-    futures_key = f"{index.symbol}{_FUTURES_CANDLE_SUFFIX}"
-    try:
-        rows = smartapi.get_candles(
-            exchange=contract["exchange"],
-            symboltoken=contract["symboltoken"],
-            interval=FIVE_MINUTE,
-            from_dt=now_ist.strftime("%Y-%m-%d 09:15"),
-            to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+    futures_key = f"{index.symbol}{FUTURES_CANDLE_SUFFIX}"
+    age = latest_bar_age_seconds(db, futures_key, ONE_MINUTE, now_ist)
+    if age is not None and age <= BAR_FRESHNESS_SECONDS:
+        logger.debug(
+            "[VALIDATED_SIGNAL] %s: futures 1-min history is %.0fs old (WebSocket-fed), skipping REST refresh",
+            index.symbol, age,
         )
-        if rows:
-            store_bars(db, futures_key, FIVE_MINUTE, [parse_smartapi_row(row) for row in rows])
-    except Exception as exc:
-        logger.info("[VALIDATED_SIGNAL] %s: futures candle refresh failed (%s)", index.symbol, exc)
-    bars = load_bars(db, futures_key, FIVE_MINUTE)
-    return {b.ts_ist: b.volume for b in bars if b.ts_ist.date() == now_ist.date() and b.volume}
+    else:
+        try:
+            rows = smartapi.get_candles(
+                exchange=contract["exchange"],
+                symboltoken=contract["symboltoken"],
+                interval=ONE_MINUTE,
+                from_dt=now_ist.strftime("%Y-%m-%d 09:15"),
+                to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+            )
+            if rows:
+                store_bars(db, futures_key, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
+        except Exception as exc:
+            logger.info("[VALIDATED_SIGNAL] %s: futures candle refresh failed (%s)", index.symbol, exc)
+    bars_1m = load_bars(db, futures_key, ONE_MINUTE)
+    bars_5m = resample(bars_1m, FIVE_MINUTE)
+    return {b.ts_ist: b.volume for b in bars_5m if b.ts_ist.date() == now_ist.date() and b.volume}
 
 
 def _load_index_features(
@@ -452,24 +481,59 @@ def _load_index_features(
     session_bars/volumes are TODAY's 5-min spot bars only, index-aligned 1:1.
     refresh_failed True halts new-entry evaluation for this cycle (same
     convention as every other live-candle-driven strategy in this
-    codebase)."""
+    codebase).
+
+    16 Sep 2026: reads/writes ONE_MINUTE (resampled to 5-min locally)
+    instead of fetching/storing FIVE_MINUTE directly -- the same pattern
+    app.ai.originator's _load_market_context and app.ai.autonomous's
+    _compute_features already use for their own spot data. This is the
+    real fix for this module's own repeat "refresh failed -- halting new
+    signals" pattern: FIVE_MINUTE was a key nothing but this function's own
+    REST calls ever wrote to, so a REST failure had no live fallback at
+    all. ONE_MINUTE is the key the live WebSocket feed (app.quick_scalp_
+    feed.ScalpBarAggregator) already writes to continuously for both
+    indexes -- a REST failure now falls back to genuinely fresh,
+    WebSocket-fed bars instead of stale-or-nothing. The REST call is also
+    skipped entirely (not just tolerated on failure) when that history is
+    already fresher than BAR_FRESHNESS_SECONDS, which is what actually
+    removes this module's own contribution to the shared quote-throttle
+    contention. See CLAUDE.md's "pull everything from a single source"
+    entry."""
     refresh_failed = False
     if index.spot_token:
-        try:
-            rows = smartapi.get_candles(
-                exchange=index.spot_exchange,
-                symboltoken=index.spot_token,
-                interval=FIVE_MINUTE,
-                from_dt=(now_ist - timedelta(days=_CANDLE_LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M"),
-                to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+        age = latest_bar_age_seconds(db, index.symbol, ONE_MINUTE, now_ist)
+        if age is not None and age <= BAR_FRESHNESS_SECONDS:
+            logger.debug(
+                "[VALIDATED_SIGNAL] %s: 1-min history is %.0fs old (WebSocket-fed), skipping REST refresh",
+                index.symbol, age,
             )
-            if rows:
-                store_bars(db, index.symbol, FIVE_MINUTE, [parse_smartapi_row(row) for row in rows])
-        except Exception as exc:
-            refresh_failed = True
-            logger.info("[VALIDATED_SIGNAL] %s: spot candle refresh failed (%s), using stored history", index.symbol, exc)
+        else:
+            try:
+                rows = smartapi.get_candles(
+                    exchange=index.spot_exchange,
+                    symboltoken=index.spot_token,
+                    interval=ONE_MINUTE,
+                    from_dt=(now_ist - timedelta(days=_CANDLE_LOOKBACK_DAYS)).strftime("%Y-%m-%d %H:%M"),
+                    to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+                )
+                if rows:
+                    store_bars(db, index.symbol, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
+            except Exception as exc:
+                refresh_failed = True
+                logger.info("[VALIDATED_SIGNAL] %s: spot candle refresh failed (%s), using stored history", index.symbol, exc)
 
-    all_bars = load_bars(db, index.symbol, FIVE_MINUTE, limit=2500)
+    bars_1m = load_bars(db, index.symbol, ONE_MINUTE, limit=_CANDLE_LOAD_LIMIT)
+    all_bars = resample(bars_1m, FIVE_MINUTE)
+    # resample() deliberately returns its trailing bucket even when still
+    # forming (see its own docstring) -- a real REST get_candles(interval=
+    # FIVE_MINUTE) call, what this module always read before 16 Sep 2026,
+    # never returned a partial bar. Drop it here so the box/ORB/trigger
+    # logic below keeps seeing only fully CLOSED 5-min candles, matching
+    # this module's own "a completed bar must close beyond a level" spec
+    # exactly as before the switch to resampling from 1-min bars.
+    now_naive = now_ist.replace(tzinfo=None) if now_ist.tzinfo is not None else now_ist
+    if all_bars and all_bars[-1].ts_ist + timedelta(minutes=5) > now_naive:
+        all_bars = all_bars[:-1]
     levels = compute_levels(all_bars, now_ist.date())
     session_bars = [b for b in all_bars if b.ts_ist.date() == now_ist.date()]
 

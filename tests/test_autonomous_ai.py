@@ -26,6 +26,7 @@ from app.ai.autonomous import (
     _build_entry_prompt,
     _build_exit_prompt,
     _chop_label,
+    _compute_features,
     _compute_futures_vwap,
     _has_open_autonomous_trade,
     _parse_entry_response,
@@ -44,7 +45,7 @@ from app.ai.autonomous import (
     open_autonomous_trade,
     run_autonomous_checks,
 )
-from app.market_data import ONE_MINUTE, load_bars, store_bars
+from app.market_data import ONE_MINUTE, Bar, load_bars, store_bars
 
 
 def _make_session() -> Session:
@@ -360,6 +361,74 @@ def test_compute_futures_vwap_does_not_pollute_real_index_candle_history():
     _compute_futures_vwap(db, index, option_finder, _FuturesSmartAPI(), now_ist)
     assert load_bars(db, "BANKNIFTY", ONE_MINUTE) == []
     assert len(load_bars(db, "BANKNIFTY_FUT", ONE_MINUTE)) == 1
+
+
+class _ExplodingSmartAPI(FakeSmartAPI):
+    """Raises if get_candles is ever called -- proves a REST refresh was
+    skipped rather than merely tolerated on failure."""
+
+    def get_candles(self, *_args, **_kwargs):
+        raise AssertionError("REST get_candles should have been skipped -- WebSocket-fed history was fresh")
+
+
+def test_compute_futures_vwap_skips_rest_when_websocket_fed_history_is_fresh():
+    db = _make_session()
+    index = _make_index()
+    now_ist = datetime(2026, 8, 31, 10, 0, tzinfo=IST)
+    # A bar 60s old (well under BAR_FRESHNESS_SECONDS) already sitting under
+    # the shared _FUT key, as if app.quick_scalp_feed.ScalpBarAggregator had
+    # just finalized it off the live WebSocket feed.
+    store_bars(db, "BANKNIFTY_FUT", ONE_MINUTE, [
+        Bar(ts_ist=datetime(2026, 8, 31, 9, 59), open=100.0, high=101.0, low=99.0, close=100.5, volume=50.0),
+    ])
+    option_finder = FakeOptionFinder(_make_contract(), futures={
+        "exchange": "NFO", "tradingsymbol": "BANKNIFTY28AUG26FUT", "symboltoken": "999", "expiry": "28AUG2026",
+    })
+    vwap = _compute_futures_vwap(db, index, option_finder, _ExplodingSmartAPI(), now_ist)
+    # typical price (101+99+100.5)/3 = 100.1667, single bar so VWAP == it.
+    assert vwap == round((101.0 + 99.0 + 100.5) / 3, 2)
+
+
+def test_compute_futures_vwap_still_refreshes_when_websocket_fed_history_is_stale():
+    db = _make_session()
+    index = _make_index()
+    now_ist = datetime(2026, 8, 31, 10, 0, tzinfo=IST)
+    # 30 minutes old -- well past BAR_FRESHNESS_SECONDS, e.g. a disconnected
+    # feed -- must still fall through to REST.
+    store_bars(db, "BANKNIFTY_FUT", ONE_MINUTE, [
+        Bar(ts_ist=datetime(2026, 8, 31, 9, 30), open=100.0, high=101.0, low=99.0, close=100.5, volume=50.0),
+    ])
+    rows = [_futures_row(datetime(2026, 8, 31, 9, 15), 200.0, 20.0)]
+
+    class _FuturesSmartAPI(FakeSmartAPI):
+        def get_candles(self, *_args, **_kwargs):
+            return rows
+
+    option_finder = FakeOptionFinder(_make_contract(), futures={
+        "exchange": "NFO", "tradingsymbol": "X", "symboltoken": "999", "expiry": "28AUG2026",
+    })
+    vwap = _compute_futures_vwap(db, index, option_finder, _FuturesSmartAPI(), now_ist)
+    # If the stale bar alone were used, VWAP would read 100.5 -- confirms
+    # the REST refresh actually ran and its data was incorporated.
+    assert vwap != 100.5
+
+
+def test_compute_features_skips_rest_when_websocket_fed_history_is_fresh():
+    db = _make_session()
+    index = _make_index()
+    now_ist = datetime(2026, 8, 31, 10, 0, tzinfo=IST)
+    rows = _trending_1m_rows(200, datetime(2026, 8, 31, 6, 0))
+    for row in rows:
+        from app.market_data import parse_smartapi_row
+        store_bars(db, "BANKNIFTY", ONE_MINUTE, [parse_smartapi_row(row)])
+    # The trending series' last row lands well before now_ist -- overwrite
+    # just the freshness with one more bar 30s old.
+    store_bars(db, "BANKNIFTY", ONE_MINUTE, [
+        Bar(ts_ist=datetime(2026, 8, 31, 9, 59, 30), open=57500.0, high=57510.0, low=57490.0, close=57505.0),
+    ])
+    option_finder = FakeOptionFinder(_make_contract(), futures=None)
+    features = _compute_features(db, index, 57505.0, now_ist, _ExplodingSmartAPI(), option_finder)
+    assert features is not None
 
 
 # ---------------------------------------------------------------------------

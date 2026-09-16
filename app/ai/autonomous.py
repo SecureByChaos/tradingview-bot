@@ -334,9 +334,12 @@ from app.database import SessionLocal
 from app.db_models import AISettings, IndexConfig, SLMode, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.market_context import build_market_context
 from app.market_data import (
+    BAR_FRESHNESS_SECONDS,
     FIFTEEN_MINUTE,
     FIVE_MINUTE,
+    FUTURES_CANDLE_SUFFIX,
     ONE_MINUTE,
+    latest_bar_age_seconds,
     load_bars,
     parse_smartapi_row,
     resample,
@@ -430,11 +433,12 @@ _SESSION_CLOSE_WARNING_MINUTES = 15
 _CANDLE_WARMUP_DAYS = 7
 _CANDLE_LOAD_LIMIT = 3000
 
-# Synthetic index_symbol suffix futures candles are stored under (see
-# _compute_futures_vwap) -- keeps them entirely out of the real index candle
-# history every other consumer (build_market_context, CPR, PDH/PDL, AI
-# Origination) relies on.
-_FUTURES_CANDLE_SUFFIX = "_FUT"
+# The synthetic index_symbol suffix futures candles are stored under (see
+# _compute_futures_vwap) moved to app.market_data.FUTURES_CANDLE_SUFFIX 16
+# Sep 2026 -- app.quick_scalp_feed.ScalpBarAggregator now writes to this
+# exact key too (real WebSocket-fed futures bars, not just Quick Scalp's own
+# volume substitution), so this module and that one must agree on the
+# literal string rather than each carrying its own copy that could drift.
 
 SYSTEM_PROMPT_ENTRY = """You are a conservative trade-execution filter for intraday Indian index options (Nifty/Bank Nifty).
 Your primary job is capital preservation. Your default decision MUST BE "NONE" unless strict, objective criteria are verified.
@@ -791,8 +795,11 @@ def _compute_futures_vwap(
     they cannot support a real VWAP at all -- this is why the original
     build of this module, and every previously-declined-VWAP mechanism in
     this project, could not compute one. Stored under a synthetic
-    index_symbol key (see _FUTURES_CANDLE_SUFFIX) so this never mixes into
-    the real index candle history every other consumer relies on.
+    index_symbol key (see app.market_data.FUTURES_CANDLE_SUFFIX) so this
+    never mixes into the real index candle history every other consumer
+    relies on. Since 16 Sep 2026 also written directly by the live
+    WebSocket feed (app.quick_scalp_feed.ScalpBarAggregator), not just this
+    function's own REST pull -- see that module's docstring.
 
     Fails closed -- returns None, never fabricates a value -- when the
     futures contract can't be resolved, the candle fetch fails with nothing
@@ -807,19 +814,33 @@ def _compute_futures_vwap(
         logger.info("[AUTONOMOUS_AI] %s: no futures contract found, VWAP unavailable", index.symbol)
         return None
 
-    futures_key = f"{index.symbol}{_FUTURES_CANDLE_SUFFIX}"
-    try:
-        rows = smartapi.get_candles(
-            exchange=contract["exchange"],
-            symboltoken=contract["symboltoken"],
-            interval=ONE_MINUTE,
-            from_dt=now_ist.strftime("%Y-%m-%d 09:15"),
-            to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+    futures_key = f"{index.symbol}{FUTURES_CANDLE_SUFFIX}"
+    # 16 Sep 2026: app.quick_scalp_feed.ScalpBarAggregator now writes real
+    # futures OHLC bars to this exact key off the same live WebSocket
+    # connection every futures tick already flows through -- skip the REST
+    # call entirely when that history is already fresh, same reasoning as
+    # the index-spot refresh below and app.ai.originator's own
+    # _load_market_context. See CLAUDE.md's "pull everything from a single
+    # source" entry.
+    age = latest_bar_age_seconds(db, futures_key, ONE_MINUTE, now_ist)
+    if age is not None and age <= BAR_FRESHNESS_SECONDS:
+        logger.debug(
+            "[AUTONOMOUS_AI] %s: futures 1-min history is %.0fs old (WebSocket-fed), skipping REST refresh",
+            index.symbol, age,
         )
-        if rows:
-            store_bars(db, futures_key, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
-    except Exception as exc:
-        logger.info("[AUTONOMOUS_AI] %s: futures candle refresh failed (%s), using stored history", index.symbol, exc)
+    else:
+        try:
+            rows = smartapi.get_candles(
+                exchange=contract["exchange"],
+                symboltoken=contract["symboltoken"],
+                interval=ONE_MINUTE,
+                from_dt=now_ist.strftime("%Y-%m-%d 09:15"),
+                to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+            )
+            if rows:
+                store_bars(db, futures_key, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
+        except Exception as exc:
+            logger.info("[AUTONOMOUS_AI] %s: futures candle refresh failed (%s), using stored history", index.symbol, exc)
 
     bars = load_bars(db, futures_key, ONE_MINUTE)
     today_bars = [b for b in bars if b.ts_ist.date() == now_ist.date()]
@@ -847,18 +868,30 @@ def _compute_features(
     enough history for ADX/EMA/PDH-PDL."""
     if not index.spot_token:
         return None
-    try:
-        rows = smartapi.get_candles(
-            exchange=index.spot_exchange,
-            symboltoken=index.spot_token,
-            interval=ONE_MINUTE,
-            from_dt=(now_ist - timedelta(days=_CANDLE_WARMUP_DAYS)).strftime("%Y-%m-%d %H:%M"),
-            to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+    # 16 Sep 2026: skip the REST call when app.quick_scalp_feed.
+    # ScalpBarAggregator has already written a 1-minute bar this fresh off
+    # the shared WebSocket feed -- see app.ai.originator's own
+    # _load_market_context for the identical reasoning and CLAUDE.md's
+    # "pull everything from a single source" entry.
+    age = latest_bar_age_seconds(db, index.symbol, ONE_MINUTE, now_ist)
+    if age is not None and age <= BAR_FRESHNESS_SECONDS:
+        logger.debug(
+            "[AUTONOMOUS_AI] %s: 1-min history is %.0fs old (WebSocket-fed), skipping REST refresh",
+            index.symbol, age,
         )
-        if rows:
-            store_bars(db, index.symbol, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
-    except Exception as exc:
-        logger.info("[AUTONOMOUS_AI] %s: candle refresh failed (%s), using stored history", index.symbol, exc)
+    else:
+        try:
+            rows = smartapi.get_candles(
+                exchange=index.spot_exchange,
+                symboltoken=index.spot_token,
+                interval=ONE_MINUTE,
+                from_dt=(now_ist - timedelta(days=_CANDLE_WARMUP_DAYS)).strftime("%Y-%m-%d %H:%M"),
+                to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+            )
+            if rows:
+                store_bars(db, index.symbol, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
+        except Exception as exc:
+            logger.info("[AUTONOMOUS_AI] %s: candle refresh failed (%s), using stored history", index.symbol, exc)
 
     bars_1m = load_bars(db, index.symbol, ONE_MINUTE, limit=_CANDLE_LOAD_LIMIT)
     if not bars_1m:
