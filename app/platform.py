@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
 from app.database import SessionLocal
-from app.db_models import AIOriginationLog, BotState, BotStatus, Candle, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
+from app.db_models import AIOriginationLog, AutonomousAILog, BotState, BotStatus, Candle, DailyStats, IndexConfig, IndexPriceTick, IndexSymbol, LogEvent, PlatformSettings, StrategyConfig, StrategyDailyStats, StrategyStats, StrategyTrade, StrategyTradeTick, TradeRecord, TradeResult, TradeStatus, TradingMode
 from app.market_context import ADX_NO_TREND, ADX_TRENDING
 from app.market_data import ONE_MINUTE
 from app.signal_validation import check_market_hours
@@ -883,6 +883,64 @@ def get_market_conditions(db: Session) -> list[dict[str, Any]]:
     return conditions
 
 
+def get_autonomous_ai_market_conditions(db: Session) -> list[dict[str, Any]]:
+    """Latest Autonomous AI market-condition snapshot per enabled index --
+    the same read-only, zero-new-computation pattern as get_market_conditions
+    above, reading app/ai/autonomous_log.py's AutonomousAILog instead of
+    AIOriginationLog. Replaced get_market_conditions on the live dashboard
+    17 Sep 2026, once AI Origination was paused and Autonomous AI became the
+    only AI subsystem actually running (see CLAUDE.md's 17 Sep entry).
+
+    Field shape deliberately differs from AI Origination's version rather
+    than forcing a fit into the same dict -- Autonomous AI's feature engine
+    has no CPR, no setups list, and no setup_quality/entry_quality/risk_
+    quality/market_alignment sub-scores; it does have trend_regime, session_
+    phase, vwap_relation and recent_price_change_percent, which AI
+    Origination's snapshot doesn't carry. Every field not computed by this
+    subsystem is simply absent (None), never fabricated to match the old
+    shape.
+
+    A row is written on every cycle for every index regardless of outcome,
+    including a POSITION_OPEN marker when a trade is already open on that
+    index (see check_autonomous_entry) -- so, like the AI-Origination
+    version, this never goes stale just because a position is open."""
+    conditions: list[dict[str, Any]] = []
+    for index in db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)):
+        entry: dict[str, Any] = {
+            "symbol": index.symbol,
+            "display_name": index.display_name or index.symbol,
+            "trend_regime": None,
+            "adx": None,
+            "session_phase": None,
+            "vwap_relation": None,
+            "recent_price_change_percent": None,
+            "last_updated": None,
+            "tradability": "UNKNOWN",
+            "chop_efficiency_ratio": None,
+            "chop_label": "UNKNOWN",
+            "confidence": None,
+        }
+        latest = db.scalar(
+            select(AutonomousAILog)
+            .where(AutonomousAILog.index_name == index.symbol)
+            .order_by(AutonomousAILog.timestamp.desc())
+            .limit(1)
+        )
+        if latest is not None:
+            entry["trend_regime"] = latest.trend_regime
+            entry["adx"] = latest.adx
+            entry["session_phase"] = latest.session_phase
+            entry["vwap_relation"] = latest.vwap_relation
+            entry["recent_price_change_percent"] = latest.recent_price_change_percent
+            entry["last_updated"] = iso_utc(latest.timestamp)
+            entry["tradability"] = _classify_tradability(latest.adx)
+            entry["chop_efficiency_ratio"] = latest.chop_efficiency_ratio
+            entry["chop_label"] = _classify_chop(latest.chop_efficiency_ratio)
+            entry["confidence"] = latest.confidence
+        conditions.append(entry)
+    return conditions
+
+
 def origin_label(origin: str | None) -> str:
     if not origin or origin == "SIGNAL":
         return "Signal"
@@ -1100,6 +1158,114 @@ def get_ai_origination_today_highlights(db: Session) -> dict[str, Any]:
         {
             "index_display_name": _index_display_name(row.index_name),
             "action": row.decision,
+            "confidence": row.confidence,
+            "reasoning": row.reasoning or "",
+            "time_label": to_ist(row.timestamp).strftime("%I:%M %p") if to_ist(row.timestamp) else "",
+        }
+        for row in near_misses
+    ]
+
+    return {
+        "funnel": funnel,
+        "index_comparison": index_comparison,
+        "sharpest_call": sharpest_call,
+        "near_misses": near_miss_entries,
+    }
+
+
+def get_autonomous_ai_today_highlights(db: Session) -> dict[str, Any]:
+    """Same four-piece shape as get_ai_origination_today_highlights above,
+    reading AutonomousAILog/origin=="AUTONOMOUS_AI" instead. Replaced the
+    AI-Origination version on the live dashboard 17 Sep 2026, once AI
+    Origination was paused (see CLAUDE.md's 17 Sep entry) -- built rather
+    than shown side by side, per explicit direction.
+
+    origin is matched with == "AUTONOMOUS_AI" exactly, not LIKE -- one single
+    fixed value, not a provider-suffixed family (see get_autonomous_ai_
+    trades' own docstring for the same convention).
+
+    POSITION_OPEN marker rows (see check_autonomous_entry, 17 Sep 2026 fix)
+    are excluded from every count here, the same way AI Origination's own
+    SLOT_OCCUPIED marker rows are excluded above -- neither is a real
+    decision; the model was never asked because a position was already open.
+    """
+    today = today_ist()
+
+    logs_today = [
+        row
+        for row in db.scalars(
+            select(AutonomousAILog).where(AutonomousAILog.timestamp >= utc_now() - timedelta(hours=30))
+        )
+        if to_ist(row.timestamp) is not None and to_ist(row.timestamp).date() == today
+    ]
+    real_decisions = [row for row in logs_today if row.block_reason != "POSITION_OPEN"]
+    wanted_to_trade = [row for row in real_decisions if row.raw_decision in ("BUY_CE", "BUY_PE")]
+    blocked_decisions = [row for row in wanted_to_trade if not row.trade_id]
+
+    funnel = {
+        "total_cycles": len(real_decisions),
+        "declined": sum(1 for row in real_decisions if row.raw_decision == "NONE"),
+        "opened": sum(1 for row in wanted_to_trade if row.trade_id),
+        "blocked": len(blocked_decisions),
+        "errors": sum(1 for row in real_decisions if row.raw_decision == "ERROR"),
+    }
+
+    closed_autonomous_today = [
+        trade
+        for trade in db.scalars(
+            select(StrategyTrade).where(
+                StrategyTrade.origin == "AUTONOMOUS_AI",
+                StrategyTrade.status == TradeStatus.CLOSED,
+            )
+        )
+        if to_ist(trade.exit_time) is not None and to_ist(trade.exit_time).date() == today
+    ]
+
+    index_comparison: list[dict[str, Any]] = []
+    for index in db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)):
+        trades = [trade for trade in closed_autonomous_today if trade.index_symbol == index.symbol]
+        wins = sum(1 for trade in trades if trade.result == TradeResult.WIN)
+        losses = sum(1 for trade in trades if trade.result == TradeResult.LOSS)
+        total = len(trades)
+        index_comparison.append(
+            {
+                "symbol": index.symbol,
+                "display_name": index.display_name or index.symbol,
+                "trades": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+                "net_pnl": round(sum(trade.net_pnl for trade in trades), 2),
+            }
+        )
+
+    sharpest_call: dict[str, Any] | None = None
+    if closed_autonomous_today:
+        best = max(closed_autonomous_today, key=lambda trade: trade.pnl_percent)
+        sharpest_call = {
+            "kind": "trade",
+            "index_display_name": _index_display_name(best.index_symbol),
+            "strike": best.strike,
+            "position_label": "Long Call" if best.option_type == "CE" else "Long Put",
+            "pnl_percent": best.pnl_percent,
+            "reasoning": best.ai_reasoning or "",
+        }
+    else:
+        none_decisions = [row for row in real_decisions if row.raw_decision == "NONE" and row.confidence is not None]
+        if none_decisions:
+            best_none = max(none_decisions, key=lambda row: row.confidence)
+            sharpest_call = {
+                "kind": "decline",
+                "index_display_name": _index_display_name(best_none.index_name),
+                "confidence": best_none.confidence,
+                "reasoning": best_none.reasoning or "",
+            }
+
+    near_misses = sorted(blocked_decisions, key=lambda row: row.timestamp, reverse=True)[:5]
+    near_miss_entries = [
+        {
+            "index_display_name": _index_display_name(row.index_name),
+            "action": row.raw_decision,
             "confidence": row.confidence,
             "reasoning": row.reasoning or "",
             "time_label": to_ist(row.timestamp).strftime("%I:%M %p") if to_ist(row.timestamp) else "",

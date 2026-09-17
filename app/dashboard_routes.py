@@ -23,6 +23,8 @@ from app.db_models import BotStatus, IndexConfig, PlatformSettings, SLMode, Stra
 from app.platform import (
     compute_performance_kpis,
     get_ai_origination_today_highlights,
+    get_autonomous_ai_market_conditions,
+    get_autonomous_ai_today_highlights,
     get_dashboard_summary,
     get_index_live_figures,
     get_live_trading_status,
@@ -125,11 +127,18 @@ def _live_dashboard_data(db: Session, smartapi: object, live_feed_store: object)
     return {
         "indices": get_index_live_figures(db, smartapi, live_feed_store),
         "trades": get_open_trades_with_ticks(db),
-        "today_highlights": get_ai_origination_today_highlights(db),
-        # Pure DB read of what AI Origination already computed and persisted
-        # on its own 5-min cycle (app/ai/origination_log.py) -- no new
-        # SmartAPI calls, no new computation. See get_market_conditions.
-        "conditions": get_market_conditions(db),
+        # 17 Sep 2026: AI Origination is paused (see CLAUDE.md's 17 Sep
+        # entry), so the dashboard now shows Autonomous AI's own equivalents
+        # instead -- get_ai_origination_today_highlights/get_market_
+        # conditions are left intact in app/platform.py, unwired rather than
+        # deleted, per this project's established "unwire but don't delete"
+        # precedent (see the 15 Aug AI Reviews/Alternatives removal entry).
+        "today_highlights": get_autonomous_ai_today_highlights(db),
+        # Pure DB read of what Autonomous AI already computed and persisted
+        # on its own 5-min cycle (app/ai/autonomous_log.py) -- no new
+        # SmartAPI calls, no new computation. See get_autonomous_ai_market_
+        # conditions.
+        "conditions": get_autonomous_ai_market_conditions(db),
         # 14 Aug 2026: lets the frontend distinguish "market is genuinely
         # closed" from "the live feed is having a transient outage during
         # real trading hours" -- both render a per-index "stale" badge today,

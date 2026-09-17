@@ -1098,7 +1098,13 @@ def test_check_entry_logs_trade_id_on_a_real_opened_trade(monkeypatch):
     assert row.trade_id == result.trade_id
 
 
-def test_check_entry_does_not_log_when_a_position_is_already_open(monkeypatch):
+def test_check_entry_logs_position_open_marker_when_a_position_is_already_open(monkeypatch):
+    # 17 Sep 2026: without this marker row, the dashboard's market-conditions
+    # read for this index would freeze for as long as the position stays
+    # open -- the same "Market Conditions panel froze" failure AI Origination
+    # hit for its own slot-occupied case on 26 Aug 2026. features is already
+    # computed for every index every cycle regardless of open-trade status
+    # (see run_autonomous_checks), so logging it here costs nothing new.
     import app.ai.autonomous as module
     db = _make_session()
     index = _make_index()
@@ -1106,7 +1112,23 @@ def test_check_entry_does_not_log_when_a_position_is_already_open(monkeypatch):
     option_finder = FakeOptionFinder(_make_contract())
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call the model")))
 
-    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    result = check_autonomous_entry(db, index, _make_features(adx=27.4), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    assert result is None
+    row = _only_log_row(db)
+    assert row.raw_decision == "NONE"
+    assert row.block_reason == "POSITION_OPEN"
+    assert row.trade_id is None
+    assert row.adx == 27.4  # the real feature snapshot, not fabricated
+
+
+def test_check_entry_does_not_log_when_position_open_and_no_features():
+    db = _make_session()
+    index = _make_index()
+    _add_trade(db, trade_id="t1")
+    option_finder = FakeOptionFinder(_make_contract())
+
+    result = check_autonomous_entry(db, index, None, to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    assert result is None
     assert list(db.scalars(select(AutonomousAILog))) == []
 
 
