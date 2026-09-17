@@ -7,7 +7,7 @@
 
 <div class="section-header">
   <h4 class="mb-0">Market conditions</h4>
-  <span class="text-body-secondary" style="font-size:.8rem;">Informational -- reflects AI Origination's own regime read, not a second trading gate</span>
+  <span class="text-body-secondary" style="font-size:.8rem;">Informational -- reflects Autonomous AI's own regime read, not a second trading gate</span>
 </div>
 <div class="metric-grid mb-4" id="condition-cards"></div>
 
@@ -93,44 +93,41 @@ function timeAgoLabel(isoTimestamp) {
   return minutes + 'm ago';
 }
 
+// 17 Sep 2026: reads Autonomous AI's own feature snapshot (get_autonomous_
+// ai_market_conditions), replacing the AI-Origination-specific version now
+// that AI Origination is paused. Field shape genuinely differs -- no CPR, no
+// setups list, no setup/entry/risk/alignment sub-scores -- so this renders
+// what Autonomous AI actually has (trend regime, session phase, VWAP
+// relation, recent ~15-min price action) rather than forcing the old shape.
 function renderConditions(conditions) {
   const container = document.getElementById('condition-cards');
   container.innerHTML = (conditions || []).map(function (c) {
     const status = TRADABILITY_LABEL[c.tradability] || TRADABILITY_LABEL.UNKNOWN;
     const adxText = c.adx === null || c.adx === undefined ? '--' : c.adx.toFixed(1);
-    const setups = (c.setups || []).map(function (s) {
-      return '<span class="badge text-bg-secondary" style="margin:.15rem .25rem .15rem 0;">' + s + '</span>';
-    }).join('');
-    const staleBadge = c.data_stale
-      ? ' <span class="badge text-bg-warning" title="Built from stale stored history -- the last candle refresh failed">stale data</span>'
-      : '';
-    // Chop and confidence/sub-scores line -- both null on a SLOT_OCCUPIED
-    // marker row (context was built, but no real decision was made that
-    // cycle), so both lines are omitted entirely rather than showing a
+    const humanize = function (value) { return value ? String(value).replace(/_/g, ' ') : '--'; };
+    // Chop/confidence lines are both null on a POSITION_OPEN marker row (a
+    // position is already open on this index, so the model was never
+    // asked that cycle) -- omitted entirely rather than showing a
     // fabricated "--" that could be mistaken for a real reading.
     const chop = CHOP_LABEL[c.chop_label] || CHOP_LABEL.UNKNOWN;
     const chopLine = c.chop_efficiency_ratio === null || c.chop_efficiency_ratio === undefined
       ? ''
       : '<div style="font-size:.85rem; margin-top:.2rem;">Efficiency ratio (last hour): ' +
         c.chop_efficiency_ratio.toFixed(2) + ' &middot; ' + chop.emoji + ' ' + chop.text + '</div>';
-    const scorePart = function (label, value) {
-      return value === null || value === undefined ? '' : label + ' ' + Math.round(value);
-    };
-    const scoreParts = [
-      scorePart('Setup', c.setup_quality), scorePart('Entry', c.entry_quality),
-      scorePart('Risk', c.risk_quality), scorePart('Alignment', c.market_alignment),
-    ].filter(Boolean);
     const confidenceLine = c.confidence === null || c.confidence === undefined
       ? ''
-      : '<div style="font-size:.85rem; margin-top:.2rem;">Confidence: ' + Math.round(c.confidence * 100) + '%' +
-        (scoreParts.length ? ' &middot; ' + scoreParts.join(' &middot; ') : '') + '</div>';
+      : '<div style="font-size:.85rem; margin-top:.2rem;">Confidence: ' + Math.round(c.confidence * 100) + '%</div>';
+    const recentMove = c.recent_price_change_percent === null || c.recent_price_change_percent === undefined
+      ? '--'
+      : (c.recent_price_change_percent >= 0 ? '+' : '') + c.recent_price_change_percent.toFixed(2) + '%';
     return '<div class="metric">' +
-      '<div class="label">' + c.display_name + staleBadge + '</div>' +
+      '<div class="label">' + c.display_name + '</div>' +
       '<div class="value">' + status.emoji + ' ' + status.text + '</div>' +
-      '<div style="font-size:.85rem; margin-top:.2rem;">Regime: ' + (c.regime || '--') +
-      ' &middot; ADX: ' + adxText + ' &middot; CPR: ' + (c.cpr || '--') + '</div>' +
+      '<div style="font-size:.85rem; margin-top:.2rem;">Regime: ' + humanize(c.trend_regime) +
+      ' &middot; ADX: ' + adxText + ' &middot; Session: ' + humanize(c.session_phase) + '</div>' +
+      '<div style="font-size:.85rem; margin-top:.2rem;">Spot vs VWAP: ' + humanize(c.vwap_relation) +
+      ' &middot; Recent (~15m): ' + recentMove + '</div>' +
       chopLine + confidenceLine +
-      '<div style="margin-top:.4rem;">' + (setups || '<span class="text-body-secondary" style="font-size:.8rem;">No active setups</span>') + '</div>' +
       '<div class="text-body-secondary" style="font-size:.75rem; margin-top:.4rem;">Last snapshot: ' + timeAgoLabel(c.last_updated) + '</div>' +
       '</div>';
   }).join('');
@@ -188,12 +185,13 @@ function renderTrades(trades) {
   });
 }
 
-// Today's Highlights (AI Origination only, 28 Aug 2026) -- replaces the old
-// SIGNAL-strategy activity feed, which had nothing to say once rule-based
-// strategies stopped being used. Four pieces: an index head-to-head, a
-// decision funnel (cycles -> declined -> opened/blocked), the day's single
-// most notable decision with its own reasoning, and a row of "wanted to
-// trade but didn't" near-misses.
+// Today's Highlights -- originally AI Origination only (28 Aug 2026),
+// replaced with Autonomous AI's own equivalent (17 Sep 2026) once AI
+// Origination was paused. Four pieces: an index head-to-head, a decision
+// funnel (cycles -> declined -> opened/blocked), the day's single most
+// notable decision with its own reasoning, and a row of "wanted to trade
+// but didn't" near-misses. Rendering code below is generic over both
+// sources' identical dict shape -- unchanged by the 17 Sep swap.
 
 function renderIndexComparison(indexComparison) {
   const container = document.getElementById('vs-cards');

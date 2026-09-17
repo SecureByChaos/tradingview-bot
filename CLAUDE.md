@@ -295,6 +295,94 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Dashboard's Market Conditions panel and Today's Highlights now read Autonomous AI, not AI Origination (17 Sep 2026, same day)
+
+**Requested**, directly after the CE/PE bias investigation and its `AutonomousAILog` fix (PR #99, entry
+directly below this one) shipped and merged: "On dashboard we created market stats such as choppy or not
+also what origination trades doing. Now we have disabled origination ai, can we show same things for
+autonomous ai live?" AI Origination's live-dashboard "Market conditions" panel (regime/ADX/chop per index,
+27 Aug) and "Today's Highlights" section (index head-to-head, decision funnel, sharpest call, near-misses,
+28 Aug) both went dark the moment AI Origination was paused earlier today -- neither reads anything but
+`AIOriginationLog`, and nothing writes to that table anymore. Asked via `AskUserQuestion` how to scope this:
+**replace** the existing panels rather than show both side by side, and build **both** pieces (Market
+Conditions and the full Today's Highlights treatment), not just one.
+
+**`get_autonomous_ai_market_conditions(db)` and `get_autonomous_ai_today_highlights(db)`** (`app/platform.py`)
+mirror `get_market_conditions`/`get_ai_origination_today_highlights` exactly in shape and cost --
+zero-new-computation, zero-new-SmartAPI-call reads of whatever `app/ai/autonomous_log.py`'s
+`record_entry_decision()` already persisted on Autonomous AI's own 5-min cycle -- but read `AutonomousAILog`
+and are NOT byte-for-byte copies: the two subsystems' feature engines genuinely differ. Autonomous AI has no
+CPR, no setups list, and no `setup_quality`/`entry_quality`/`risk_quality`/`market_alignment` sub-scores;
+it does have `trend_regime`, `session_phase`, `vwap_relation` and `recent_price_change_percent`, which AI
+Origination's snapshot never carried. Every field the new subsystem doesn't compute is simply absent
+(`None`), never forced into the old shape or fabricated to fill a card. `origin == "AUTONOMOUS_AI"` (exact
+match, not `LIKE`) throughout, per this file's own "origin field is the isolation mechanism" rule -- one
+single fixed value, not a provider-suffixed family.
+
+**A real, analogous staleness bug found and fixed while building this, not left to reproduce silently.**
+`check_autonomous_entry` (`app/ai/autonomous.py`) returns immediately, with no log write at all, whenever a
+position is already open on that index (`_has_open_autonomous_trade`) -- meaning the market-conditions panel
+would freeze for as long as a trade stays open, exactly the "Market Conditions panel froze" failure AI
+Origination hit for its own multi-provider slot-occupied case (26 Aug 2026 entry, above). Since
+`features_by_index` is already computed for every index every cycle regardless of open-trade status (see
+`run_autonomous_checks`), fixed the same way: a `POSITION_OPEN` marker row (`raw_decision="NONE",
+block_reason="POSITION_OPEN"`) is now logged whenever features are already in hand, costing nothing new.
+Both new platform functions exclude `POSITION_OPEN` rows from every count and from the near-misses/
+sharpest-call population, the same way AI Origination's own `SLOT_OCCUPIED` marker is excluded -- neither is
+a real decision, since the model was never asked either way.
+
+**`app/dashboard_routes.py`'s `_live_dashboard_data()` swapped over to the two new functions** -- per the
+explicit "replace" choice, not a side-by-side toggle. `get_market_conditions`/`get_ai_origination_today_
+highlights` are left completely intact and still exported from `app/platform.py`, unwired rather than
+deleted, per this project's established "unwire but don't delete" precedent (see the 15 Aug AI Reviews/
+Alternatives/Exit-Calls/Context-Inspector removal entry, and `option_chain_collection_enabled`'s own
+default-off-but-present module). If AI Origination is ever re-enabled and needs its dashboard panels back,
+the read side is already there -- only the two call sites in `_live_dashboard_data` would need to flip back.
+
+**`live_dashboard.html`'s `renderConditions()` JS rewritten for the new field shape** -- Regime/ADX/Session
+line, a new Spot-vs-VWAP/Recent-~15-min-move line, the existing chop-efficiency and confidence lines
+(unchanged rendering, just no sub-scores to append since Autonomous AI doesn't have them), no stale-data
+badge (Autonomous AI's feature engine has no `data_stale` equivalent -- omitted rather than always showing
+`false`), no setups badges (nothing to show). `renderIndexComparison`/`renderFunnel`/`renderSharpestCall`/
+`renderNearMisses` needed **zero** changes -- both subsystems' Today's Highlights dicts share an identical
+shape by construction, so only the section-header copy ("Autonomous AI's own regime read") and the one
+comment block above the rendering functions were updated.
+
+16 new tests: `tests/test_autonomous_market_conditions.py` (8 -- unknown-placeholder default, latest-row-
+wins-not-highest-ADX, the shared tradability-band thresholds, session_phase/vwap_relation/recent-move
+pass-through, disabled-index exclusion, per-index latest-row isolation, chop+confidence read-through, and
+confidence correctly `None` on a `POSITION_OPEN` marker), `tests/test_autonomous_today_highlights.py` (8 --
+empty-day defaults, funnel counting with `POSITION_OPEN` excluded, index comparison using `net_pnl` and
+excluding AI-Origination/other-day/still-open trades, sharpest-call trade-vs-decline-fallback branches (plus
+a dedicated case confirming a `POSITION_OPEN` marker's always-null confidence can never win the "highest-
+confidence NONE" fallback), near-miss ordering/cap, and the same-day filter). `tests/test_autonomous_ai.py`'s
+existing `test_check_entry_does_not_log_when_a_position_is_already_open` renamed and rewritten to assert the
+new marker-row behavior instead of no-log-at-all, plus one new test confirming the pre-existing no-log
+outcome is unchanged when `features` itself is `None` (nothing to log in that case either). Full suite: 1041
+collected, 1040 passed, 1 pre-existing unrelated wall-clock-dependent flake in `tests/test_validated_
+signal.py::test_exits_no_stagnation_when_move_is_genuinely_favorable` (documented repeatedly elsewhere in
+this file -- fails after Validated Signal's own 15:10 IST hard session-exit cutoff, confirmed by real IST
+clock time at the moment this ran). `python -c "import app.main"` imports cleanly.
+
+**Verified live**: seeded a scratch SQLite DB with one `AutonomousAILog` row per outcome (a real `BUY_PE`
+decision with confidence/reasoning/full feature snapshot on Bank Nifty, a genuine `NONE` decline on a second
+index) and one closed winning `AUTONOMOUS_AI` trade, started the real app via uvicorn (not just the unit
+tests), logged in over HTTP, and confirmed both `/` and `/api/live-dashboard` return the new shape exactly
+as designed -- `conditions` carries `trend_regime`/`session_phase`/`vwap_relation`/`recent_price_change_
+percent` with the seeded values, `today_highlights.funnel` reads `{"total_cycles": 2, "declined": 1,
+"opened": 0, "blocked": 1, "errors": 0}` matching the two seeded logs, `index_comparison`/`sharpest_call`/
+`near_misses` all reflect the seeded trade and blocked decision correctly, and the rendered HTML embeds the
+new field shape (`"trend_regime": "BEARISH"`) with the updated "Autonomous AI's own regime read" copy and no
+Jinja/traceback errors. Also confirmed `/autonomous-ai`, `/settings` and `/history` still render 200,
+unaffected by this change.
+
+**Not verified against a real live Autonomous AI cycle** -- this sandbox cannot run a real 5-minute cycle
+against a live index feed. After deploying, confirm the dashboard's Market Conditions and Today's Highlights
+sections update on the existing 10s poll as real Autonomous AI decisions accumulate, and specifically watch
+an index with an open Autonomous AI position through a full cycle to confirm its condition card keeps
+advancing (`Last snapshot: Xs ago` resetting each cycle) rather than freezing at the entry-time snapshot --
+the exact case the new `POSITION_OPEN` marker exists to prevent.
+
 ### Autonomous AI's CE/PE lean investigated, and a real gap closed: NONE decisions had no queryable reasoning at all (17 Sep 2026)
 
 **Reported**: "I have already paused [AI Origination]... I want to find out how many ce trades autonomous ai

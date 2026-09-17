@@ -1269,6 +1269,20 @@ def check_autonomous_entry(
     option_finder: OptionFinder,
 ) -> Optional[StrategyTrade]:
     if _has_open_autonomous_trade(db, index.symbol):
+        # Still log a marker row when features are already in hand -- they
+        # are computed for every index this cycle regardless of open-trade
+        # status (see run_autonomous_checks), so this costs nothing new.
+        # Without it, the dashboard's market-conditions read for this index
+        # freezes for as long as a position stays open -- the exact "Market
+        # Conditions panel froze" failure AI Origination hit for its own
+        # multi-provider slot-occupied case (26 Aug 2026), reproduced here
+        # for Autonomous AI's single-position-per-index case if left unfixed.
+        if features is not None:
+            record_entry_decision(
+                db, index_symbol=index.symbol, features=features, raw_decision="NONE",
+                block_reason="POSITION_OPEN",
+                reasoning="Skipped -- a position is already open on this index",
+            )
         return None
     if features is None:
         logger.info("[AUTONOMOUS_AI] %s: Skipped, insufficient data for the feature engine", index.symbol)
