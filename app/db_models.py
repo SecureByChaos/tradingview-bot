@@ -676,6 +676,87 @@ class AIOriginationLog(Base):
     )
 
 
+class AutonomousAILog(Base):
+    """One row per Autonomous AI entry-decision cycle, including NONE, a
+    deterministic pre-call block, or a post-decision override -- see
+    CLAUDE.md's "Autonomous AI CE/PE bias investigation" entry (17 Sep 2026).
+
+    WHY THIS EXISTS
+    ---------------
+    Autonomous AI's own dominant output is NONE (325 of 402 raw decisions
+    across a real 30-day window sampled 17 Sep 2026), and until now a NONE
+    decision left no queryable trace at all -- only a bare
+    `logger.info("... -> NONE")` line with no reasoning attached, eventually
+    rotated away by journald. AI Origination already solved exactly this gap
+    for itself on 26 Aug 2026 (see AIOriginationLog above); this table gives
+    Autonomous AI the same capability.
+
+    The concrete question this exists to answer: that same 30-day sample
+    found Autonomous AI's raw decisions skewed 10:1 toward BUY_PE (70) over
+    BUY_CE (7), against a real but comparatively modest -2.5% to -3.5% market
+    move over the same window on both indices -- a lean that looked
+    disproportionate to the move, but could not be checked further because
+    the model's own stated reasoning for its 325 NONE decisions was never
+    captured anywhere. This table exists so that question, and the next one
+    like it, is answerable from stored data.
+
+    PURE INSTRUMENTATION. Nothing here influences a decision, a trade, or a
+    gate.
+    """
+
+    __tablename__ = "autonomous_ai_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    index_name: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    # The model's own raw, intended action -- BUY_CE / BUY_PE / NONE / ERROR
+    # -- never the post-override outcome, so a query for "what did the model
+    # actually want to do" is never contaminated by what a downstream gate
+    # did about it afterward. A deterministic pre-call block that never
+    # reached the model is recorded as NONE here (no decision was ever made
+    # to have an opinion about), with block_reason naming why.
+    raw_decision: Mapped[str] = mapped_column(String(24), nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Non-null only when a deterministic mechanism changed what would
+    # otherwise have happened: SESSION_PHASE / ADX_FLOOR (a pre-call gate
+    # that never reached the model), EMA_REGIME_OVERRIDE (a post-decision
+    # veto back to NONE), or EXECUTION_FAILED (the model's own BUY_CE/BUY_PE
+    # survived the override but couldn't resolve a contract/LTP). Null means
+    # raw_decision above is exactly what happened.
+    block_reason: Mapped[str | None] = mapped_column(String(24), nullable=True)
+
+    # Null unless this decision actually opened a trade.
+    trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Feature snapshot -- see app.ai.autonomous._Features, the module's own
+    # deterministic feature set, computed fresh each cycle for this index.
+    spot: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vwap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vwap_relation: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    fast_ema: Mapped[float | None] = mapped_column(Float, nullable=True)
+    slow_ema: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trend_regime: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    adx: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dist_to_pdh: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dist_to_pdl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    session_phase: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    chop_efficiency_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    recent_price_change_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_autonomous_ai_logs_index_timestamp", "index_name", "timestamp"),
+    )
+
+
 class TradeRecord(Base):
     __tablename__ = "trades"
 

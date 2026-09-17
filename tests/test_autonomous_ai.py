@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from app.db_models import Base, IndexConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.db_models import AutonomousAILog, Base, IndexConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.models import OptionContract, Signal
 from app.multi_strategy import MultiStrategyTradeManager
 from app.time_utils import IST, to_ist, utc_now
@@ -955,6 +955,159 @@ def test_check_entry_provider_error_opens_nothing(monkeypatch):
     result = check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder)
     assert result is None
     assert option_finder.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# AutonomousAILog -- 17 Sep 2026, the CE/PE bias investigation. Every branch
+# of check_autonomous_entry must now write one queryable row, since the
+# concrete gap this closed was "the model's own reasoning for a NONE
+# decision was never captured anywhere" (see app.ai.autonomous_log's own
+# module docstring for the real numbers that motivated it).
+# ---------------------------------------------------------------------------
+
+def _only_log_row(db) -> AutonomousAILog:
+    rows = list(db.scalars(select(AutonomousAILog)))
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_check_entry_logs_deterministic_session_phase_block(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call")))
+
+    check_autonomous_entry(
+        db, index, _make_features(session_phase="CHOP_ZONE"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+    row = _only_log_row(db)
+    assert row.raw_decision == "NONE"
+    assert row.block_reason == "SESSION_PHASE"
+    assert row.session_phase == "CHOP_ZONE"
+    assert row.trade_id is None
+
+
+def test_check_entry_logs_deterministic_adx_floor_block():
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+
+    check_autonomous_entry(
+        db, index, _make_features(adx=17.9), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+    row = _only_log_row(db)
+    assert row.raw_decision == "NONE"
+    assert row.block_reason == "ADX_FLOOR"
+    assert row.adx == 17.9
+
+
+def test_check_entry_logs_a_none_decision_with_full_reasoning(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall('{"decision": "NONE", "confidence": 0.3, "reasoning": "no clean setup"}', None, 9.5),
+    )
+
+    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    row = _only_log_row(db)
+    assert row.raw_decision == "NONE"
+    assert row.block_reason is None
+    assert row.confidence == 0.3
+    assert row.reasoning == "no clean setup"
+    assert row.latency_ms == 9.5
+
+
+def test_check_entry_logs_provider_error(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: module._RawCall(None, "HTTP 500", None))
+
+    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    row = _only_log_row(db)
+    assert row.raw_decision == "ERROR"
+    assert row.reasoning == "HTTP 500"
+
+
+def test_check_entry_logs_the_raw_direction_even_when_ema_regime_overrides_it(monkeypatch):
+    # The one that matters most: raw_decision must show BUY_PE, the model's
+    # real intent, not the NONE the override actually produced -- otherwise
+    # a query for the CE/PE bias question would be answering the wrong thing.
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall(
+            '{"decision": "BUY_PE", "confidence": 0.61, "reasoning": "bearish despite bullish EMA stack"}', None, 12.0,
+        ),
+    )
+
+    check_autonomous_entry(
+        db, index, _make_features(fast_ema=57000.0, slow_ema=56800.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+    row = _only_log_row(db)
+    assert row.raw_decision == "BUY_PE"
+    assert row.block_reason == "EMA_REGIME_OVERRIDE"
+    assert row.trade_id is None
+
+
+def test_check_entry_logs_execution_failed_when_open_trade_declines(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(None)  # raises ValueError -> open_autonomous_trade returns None
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall('{"decision": "BUY_PE", "confidence": 0.6, "reasoning": "drifting down"}', None, 12.0),
+    )
+
+    result = check_autonomous_entry(
+        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+    assert result is None
+    row = _only_log_row(db)
+    assert row.raw_decision == "BUY_PE"
+    assert row.block_reason == "EXECUTION_FAILED"
+    assert row.trade_id is None
+
+
+def test_check_entry_logs_trade_id_on_a_real_opened_trade(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall('{"decision": "BUY_PE", "confidence": 0.6, "reasoning": "drifting down"}', None, 12.0),
+    )
+
+    result = check_autonomous_entry(
+        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder,
+    )
+    assert result is not None
+    row = _only_log_row(db)
+    assert row.raw_decision == "BUY_PE"
+    assert row.block_reason is None
+    assert row.trade_id == result.trade_id
+
+
+def test_check_entry_does_not_log_when_a_position_is_already_open(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    _add_trade(db, trade_id="t1")
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call the model")))
+
+    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    assert list(db.scalars(select(AutonomousAILog))) == []
 
 
 # ---------------------------------------------------------------------------

@@ -345,6 +345,7 @@ from app.market_data import (
     resample,
     store_bars,
 )
+from app.ai.autonomous_log import record_entry_decision
 from app.models import ExitReason, Signal
 from app.option_finder import OptionFinder
 from app.platform import get_index_live_figures, get_or_create_settings, list_index_configs, log_event
@@ -1283,11 +1284,21 @@ def check_autonomous_entry(
         logger.info(
             "[AUTONOMOUS_AI] %s: Deterministic block -- session phase %s", index.symbol, features.session_phase
         )
+        record_entry_decision(
+            db, index_symbol=index.symbol, features=features, raw_decision="NONE",
+            block_reason="SESSION_PHASE",
+            reasoning=f"Blocked before any model call -- session phase {features.session_phase}",
+        )
         return None
     if features.adx is None or features.adx < _ADX_HARD_FLOOR:
         logger.info(
             "[AUTONOMOUS_AI] %s: Deterministic block -- ADX %s below %.0f floor",
             index.symbol, features.adx, _ADX_HARD_FLOOR,
+        )
+        record_entry_decision(
+            db, index_symbol=index.symbol, features=features, raw_decision="NONE",
+            block_reason="ADX_FLOOR",
+            reasoning=f"Blocked before any model call -- ADX {features.adx} below {_ADX_HARD_FLOOR:.0f} floor",
         )
         return None
 
@@ -1297,13 +1308,25 @@ def check_autonomous_entry(
     if raw.error:
         logger.error("[AUTONOMOUS_AI] %s entry call FAILED: %s", index.symbol, raw.error)
         log_event(db, "AUTONOMOUS_AI", f"[{index.symbol}] entry call failed: {raw.error}", level="ERROR")
+        record_entry_decision(
+            db, index_symbol=index.symbol, features=features, raw_decision="ERROR",
+            reasoning=raw.error, latency_ms=raw.latency_ms,
+        )
         return None
     decision = _parse_entry_response(raw.text)
     if decision.action == "ERROR":
         logger.error("[AUTONOMOUS_AI] %s entry response unparseable: %s", index.symbol, decision.reasoning)
+        record_entry_decision(
+            db, index_symbol=index.symbol, features=features, raw_decision="ERROR",
+            reasoning=decision.reasoning, latency_ms=raw.latency_ms,
+        )
         return None
     logger.info("[AUTONOMOUS_AI] %s -> %s", index.symbol, decision.action)
     if decision.action == "NONE":
+        record_entry_decision(
+            db, index_symbol=index.symbol, features=features, raw_decision="NONE",
+            confidence=decision.confidence, reasoning=decision.reasoning, latency_ms=raw.latency_ms,
+        )
         return None
 
     # Deterministic override, checked after the model's own decision --
@@ -1322,9 +1345,20 @@ def check_autonomous_entry(
             f"({features.trend_regime}); model reasoning: {decision.reasoning}",
             level="WARNING",
         )
+        record_entry_decision(
+            db, index_symbol=index.symbol, features=features, raw_decision=decision.action,
+            block_reason="EMA_REGIME_OVERRIDE", confidence=decision.confidence,
+            reasoning=decision.reasoning, latency_ms=raw.latency_ms,
+        )
         return None
 
-    return open_autonomous_trade(db, index, decision.action, decision.reasoning, smartapi, option_finder)
+    trade = open_autonomous_trade(db, index, decision.action, decision.reasoning, smartapi, option_finder)
+    record_entry_decision(
+        db, index_symbol=index.symbol, features=features, raw_decision=decision.action,
+        block_reason=None if trade else "EXECUTION_FAILED", confidence=decision.confidence,
+        reasoning=decision.reasoning, trade=trade, latency_ms=raw.latency_ms,
+    )
+    return trade
 
 
 def check_autonomous_exits(
