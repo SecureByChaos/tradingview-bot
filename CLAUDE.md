@@ -295,6 +295,92 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### CHOP_ZONE gate backtest tooling built -- a real Nifty rally never once cleared it, question not yet resolved with data (17 Sep 2026, same day)
+
+**Trigger**: with AI Origination disabled and Validated Signal also paused, a real Nifty rally (~50 points,
+roughly 11:00 AM-1:00 PM IST) went untraded by anything in this app. Investigated with real production
+evidence, not guessed at: `autonomous_ai_logs` (today's new decision-logging table, PR #99/#100) had **zero**
+rows for NIFTY -- confirmed the table doesn't even exist yet on production, meaning **today's earlier deploy
+work has not reached the live server**. Fell back to `journalctl` (the pre-existing bare log line, unaffected
+by the undeployed table) for the same window and got a complete, unambiguous answer: 10:45-11:11 AM, Nifty
+was blocked by the **ADX hard floor** (`ADX 15.36-17.28`, below the `18.0` minimum -- the move hadn't built
+trend strength yet); from 11:15 AM through 1:27 PM, **every single 5-minute cycle on both indices** logged
+`Deterministic block -- session phase CHOP_ZONE`. Nifty never once cleared both of Autonomous AI's
+deterministic pre-model gates during the entire visible move -- the model was never asked.
+
+**Not a new risk -- a previously-named one playing out live.** When the CHOP_ZONE block shipped (3 Sep 2026,
+built "without judgement" per an external design document), this file's own notes at the time stated it
+plainly: the block "contradicts the ONE Bonferroni-significant finding this project's entire two-year
+backtest history has produced" -- `EMA_STACK`/`ST_ALIGNED`/`ORB_BREAK`/`PDH_PDL_BREAK` setups replicate a
+real forward edge specifically in the 11:00-14:00 IST window (31 Jul 2026 walk-forward), which CHOP_ZONE
+(11:15-13:30) sits almost entirely inside of. It shipped anyway, per explicit instruction, with that tension
+named rather than resolved. Today is that tension actually costing a real opportunity, not a hypothetical.
+
+**Investigate loosening the gate -- but per this project's own standing discipline, that means build the
+backtest first, not react to one day.** `data/trading.db` has no historical `autonomous_ai_logs` to answer
+this from (the table is brand new and undeployed), so this falls back on the same 2-year index-level candle
+archive every other gate-validation script in this project uses in exactly this situation (`adx_gate_
+backtest.py`'s PART 4, `break_confirmation_backtest.py`'s PART 2, `trend_age_gate_backtest.py`).
+
+**Built `scripts/chop_zone_gate_backtest.py`, two parts:**
+
+- **PART A** reconstructs Autonomous AI's own two deterministic entry ingredients directly from
+  `app/ai/autonomous.py` -- `_trend_direction()` mirrors `_trend_regime`'s exact EMA9-vs-EMA21 comparison,
+  `_adx_floor_eligible()` reuses the exact `ADX_HARD_FLOOR = 18.0`. Among bars clearing the ADX floor with a
+  real EMA9/21 direction, asks whether forward index-direction edge inside CHOP_ZONE (11:15-13:30) is
+  reliably worse than during the two windows the gate actually lets through (MORNING_MOMENTUM/AFTERNOON_
+  TREND portions of Autonomous AI's own 09:45-15:00 trading window) -- `_session_phase_buckets()` partitions
+  the trading window into exactly those two buckets, nothing else, since OPENING_VOLATILITY/SQUARE_OFF_ZONE
+  fall outside the 09:45-15:00 window by construction already.
+- **PART B** cross-checks with `ST_ALIGNED`/`EMA_STACK` from `scripts/backtest/setups.py` -- the exact two
+  setups the 31 Jul walk-forward already found carry a real, replicated edge overlapping this window, now
+  re-sliced strictly to CHOP_ZONE's own 11:15-13:30 boundary rather than the original wider 11:00-14:00.
+
+Same session-block bootstrap shape (`_evaluate`) as `adx_gate_backtest.py`'s own PART 4 `_evaluate_index`,
+duplicated per this project's established per-script convention, not shared. Same limitation stated
+explicitly: index-direction-only, no real trades, no premium P&L, no confidence score, no model in the loop
+-- this measures whether the underlying market during CHOP_ZONE looks structurally different from the rest
+of the day, not whether Autonomous AI's own LLM exit judgment would have captured the edge if let through.
+
+Per this project's own replication standard: the gate is supported only if CHOP_ZONE reads reliably worse
+than the open window on **both** indices; a single-index result, or CHOP_ZONE reading comparable-to-or-
+better-than the open window, is real evidence the block is over-broad. **No change made to `app/ai/
+autonomous.py` from this pass** -- that stays a deliberate follow-up decision, gated on what the real run
+shows, same standard every other candidate gate in this project has been held to.
+
+9 new tests (`tests/test_chop_zone_gate_backtest.py`): the boundary constants pinned against `app/ai/
+autonomous.py`'s own values (so a future change to the live gate doesn't silently desync this backtest from
+what it's testing), the two session-phase buckets partitioning the trading window exactly (mutually
+exclusive, jointly exhaustive, pre-open/post-square-off excluded from both), `_trend_direction` matching a
+real EMA9-vs-EMA21 comparison bar-by-bar and reading 0 before warm-up, `_adx_floor_eligible` excluding both
+cold bars and sub-18 ADX, and the edge/verdict helpers on hand-computed values. Full suite: 1050 collected,
+1049 passed, 1 pre-existing unrelated wall-clock-dependent flake (documented repeatedly elsewhere in this
+file). `python -c "import app.main"` and `python -c "import scripts.chop_zone_gate_backtest"` both import
+cleanly. Smoke-tested the full CLI against ~60 sessions of synthetic random-walk candles for both indices
+(2 years of real data would be too large to construct in a sandbox) -- ran clean, correctly formatted every
+row, and correctly showed no consistent cross-index signal (expected: synthetic random-walk data carries no
+real embedded edge, and a script that found one anyway would itself be the bug).
+
+**Not run against real data** -- this sandbox has no real `data/trading.db` or 2-year candle archive. Run on
+the machine with the real archive:
+
+```bash
+python -m scripts.chop_zone_gate_backtest --db data/trading.db
+```
+
+Read PART A first -- it's the closest reconstruction of Autonomous AI's own actual construction. Read PART B
+as corroboration if available, not a requirement -- it measures a related but not identical signal. If
+CHOP_ZONE reads POSITIVE (or at least not reliably worse than the open window) on both indices in PART A,
+that's real, sample-adequate support for loosening or removing the block; if it reads BACKWARDS on both,
+the block is doing its job and today's rally was a real but atypical exception. A mixed or single-index
+result is the correct "not yet enough evidence" outcome per this project's own standard -- not a reason to
+change the gate from one day's anecdote, however clean that one day looked.
+
+Separately, still open from earlier today: **the deploy carrying `autonomous_ai_logs` (PR #99/#100) has not
+reached production** -- confirmed via the empty-table check above. Worth deploying regardless of what this
+backtest finds, since every future investigation like this one should be answerable from real Autonomous AI
+decisions and reasoning directly, not reconstructed from `journalctl` text.
+
 ### Dashboard's Market Conditions panel and Today's Highlights now read Autonomous AI, not AI Origination (17 Sep 2026, same day)
 
 **Requested**, directly after the CE/PE bias investigation and its `AutonomousAILog` fix (PR #99, entry
