@@ -295,6 +295,129 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI's CE/PE lean investigated, and a real gap closed: NONE decisions had no queryable reasoning at all (17 Sep 2026)
+
+**Reported**: "I have already paused [AI Origination]... I want to find out how many ce trades autonomous ai
+has taken. I suspect it is weighing pe trades." Investigated with real production data, not guessed at.
+
+**AI Origination decommission decision, made first and separately, on real full-history numbers.** The user
+re-enabled AI Origination, took another loss, and considered removing it permanently in favour of Autonomous
+AI. Rather than act on one more bad day, pulled the actual all-time comparison from `strategy_trades`:
+AI Origination (blended Claude+OpenAI, 257 closed trades) read 36.6% win rate / -₹58,736 net / -1.87%
+capital-weighted return; Autonomous AI (65 closed trades) read 46.2% win rate / -₹6,281 net / -0.75%
+capital-weighted. Since the user had already disabled Claude "a couple of months" ago, re-ran isolating
+OpenAI only (232 of the 257 trades): still 37.1% win rate / -₹44,381.85 net / -1.11% mean P&L -- removing
+Claude does not rescue the comparison, OpenAI's own AI Origination track record is the one that trails
+Autonomous AI on every metric. One caveat stated plainly rather than glossed over: Autonomous AI's own
+capital-weighted return is still negative (-0.75%, a real ₹6,281 loss) -- "working much better" is accurate
+relative to AI Origination, it is not evidence Autonomous AI is itself profitable. AI Origination was already
+paused via its existing dedicated toggle (7 Sep 2026) -- left there rather than stripping the code, since a
+reversible pause achieves the same practical outcome with zero risk; code removal offered but not requested.
+
+**The CE/PE suspicion, checked against real data, confirmed and found disproportionate to the real market
+move.** `strategy_trades` showed Autonomous AI's closed history is 63 `BUY_PE` against only 7 `BUY_CE` --
+a 9:1 ratio, with `BUY_CE`'s own win rate (28.6%) well below `BUY_PE`'s (46.0%), though the CE sample (7
+trades, 3-4 per index) is too thin to judge CE's own quality reliably on its own (Bank Nifty CE's 0% win
+rate at n=4 is anecdote-level). Two real log-based checks (not guessed) to find the root cause:
+
+1. **`logs` table** (`event_type='AUTONOMOUS_AI'`, `message LIKE '%overridden to NONE%'`) -- the EMA-regime
+   override (`_regime_matches_action`, 4 Sep 2026) had blocked `BUY_PE` 5 times and `BUY_CE` zero times.
+   The override runs slightly AGAINST the PE lean, not toward it -- ruled out as the cause.
+2. **journalctl, single-pass and time-bounded** (`grep "\[AUTONOMOUS_AI\]" | grep -oE -- "-> (BUY_CE|BUY_PE|
+   NONE)" | sort | uniq -c`, `--since "30 days ago"`, since an unbounded three-pass version was too slow) --
+   the model's OWN raw decisions, before any gate or override touches direction, were already 7 `BUY_CE` /
+   70 `BUY_PE` / 325 `NONE` -- a 10:1 raw skew. Conversion from raw decision to executed trade is close to
+   1:1 on both sides once the override and ordinary execution declines are accounted for, so the imbalance
+   originates in what the model proposes, not in a downstream filter disproportionately vetoing CE.
+
+**Checked against the real market before concluding it's a bias, not a legitimate read.** Queried stored
+`candles` (`FIVE_MINUTE`, since that interval covers a full historical window -- `ONE_MINUTE` is WebSocket-
+fed and only goes back to the 16 Sep single-source fix for genuinely live data, though it turned out to
+separately hold real history back to 1 Jul 2026 once actually checked) for spot at the start and end of the
+same window: Bank Nifty -2.5%, Nifty -3.47% over roughly 18 Aug-15 Sep (the window `FIVE_MINUTE` actually
+covers, since nothing has written to it since the 16 Sep switch to `ONE_MINUTE`+resample -- flagged as an
+accuracy caveat on the numbers, not swept under). A real, sustained decline exists -- this is not a case of
+the model inventing bearishness in a flat market -- but a 10:1 lean looks disproportionate to a -2.5% to
+-3.5% monthly move; an ordinary month-long mild downtrend still contains real counter-trend bounces, and
+essentially never proposing `BUY_CE` for one of them (7 of 402 cycles) suggests the model may be reading
+"trending down" and discounting the bounce case rather than weighing each cycle independently -- a milder
+version of the "reads being at an extreme as directional evidence" failure this project already diagnosed
+once for AI Origination's own entry signal (30 Jul 2026). **Not proven, stated as a real, well-evidenced
+concern rather than a closed case** -- there is no rigorous baseline here for how many CE opportunities a
+balanced reader "should" find in a mild monthly downtrend.
+
+**The investigation hit a real, separate gap while trying to go one level deeper.** Wanted to read the
+model's actual stored reasoning from `NONE` decisions on days with a real intraday bounce, to see whether
+the model considered `BUY_CE` and rejected it or never entertained it at all. Checked `check_autonomous_
+entry` directly: for a `NONE` decision, only `logger.info("... -> %s", decision.action)` fires -- the bare
+action, never `decision.reasoning` -- and since no trade opens, nothing reaches the DB either. **325 of 402
+decisions in the sampled window had their full reasoning permanently unrecoverable**, by design, not by
+accident. AI Origination solved exactly this for itself on 26 Aug 2026 (`app.ai.origination_log`,
+`AIOriginationLog` -- "AI Origination's most common output is NONE... only a `logger.info` line that
+journalctl eventually rotates away"); Autonomous AI never got the equivalent.
+
+**Fixed with the same pattern, not a new one.** New `app.ai.autonomous_log.record_entry_decision()` (mirrors
+`origination_log.record_decision()`'s shape exactly: one isolated module, one import, never raises -- a
+logging table must never be able to stop a trading cycle) and new `AutonomousAILog` model
+(`autonomous_ai_logs` table, a brand-new table so `Base.metadata.create_all()` in `init_db()` creates it
+automatically on next deploy -- no `_ensure_columns()` migration needed, same as `AIOriginationLog`'s own
+original introduction). Wired into every return point of `check_autonomous_entry`:
+
+- **Deterministic pre-call blocks** (`SESSION_PHASE`, `ADX_FLOOR`) -- the model was never even asked;
+  `raw_decision="NONE"`, `block_reason` names which gate fired, before any LLM cost.
+- **Provider error / unparseable response** -- `raw_decision="ERROR"`, `reasoning` carries the real cause
+  (HTTP status, parse failure), same audit value the 5 Aug 2026 AI Origination error-logging fix established.
+- **A genuine model NONE** -- `raw_decision="NONE"`, full `reasoning`/`confidence` from the model itself.
+  This is the row type that closes the actual gap: 325 of 402 decisions in the sample would now be fully
+  auditable going forward.
+- **EMA-regime override** -- `raw_decision` is the model's own real intended action (`BUY_CE`/`BUY_PE`),
+  `block_reason="EMA_REGIME_OVERRIDE"`. Deliberately NOT logged as `NONE` -- the whole point of this table is
+  answering "what did the model actually want to do," and collapsing an overridden call to `NONE` would
+  silently re-break the exact CE/PE bias question this exists to investigate.
+- **Contract/LTP resolution failure inside `open_autonomous_trade`** -- new `block_reason="EXECUTION_FAILED"`
+  distinguishes "the model wanted to trade and a gate stopped it" from "the model wanted to trade and the
+  broker side declined," a real, previously-invisible third category (accounts for the small gap between raw
+  `BUY_PE` proposals and actually-closed `BUY_PE` trades that the override count alone didn't fully explain).
+- **A real opened trade** -- `raw_decision` matches, `block_reason=None`, `trade_id` set.
+
+Every field is a snapshot of `_Features` (spot, VWAP, EMA9/21, trend regime, ADX, PDH/PDL distance, session
+phase, chop efficiency ratio, recent price action) at decision time, so a future query can correlate the
+CE/PE lean against any of these directly rather than needing a second investigation to reconstruct context.
+`_has_open_autonomous_trade` and the `features is None` (insufficient data) skips are deliberately NOT
+logged here -- neither is a real directional decision (no direction was ever considered in either case),
+kept out to avoid diluting the table with rows that answer a different question.
+
+New tests: `tests/test_autonomous_log.py` (9, new file -- full feature-snapshot capture, a deterministic
+block with no model involved, the raw-decision-preserved-under-override case, `trade_id` set on a real open,
+`EXECUTION_FAILED`, a provider error, empty reasoning stored as `None` not `""`, the write-failure-never-
+raises guarantee, and a `None` features object not crashing) and 8 in `tests/test_autonomous_ai.py`
+(integration-level: `check_autonomous_entry` writes the correct row for every one of the six paths above,
+plus confirmation nothing is logged when a position is already open). Full suite: 1024 passed (was 1006,
+both verified directly via `git stash -u` against this exact tree rather than trusted from a running tally
+-- some of this project's tests are collected in shapes a plain `def test_` count doesn't fully capture, so
+the stash-verified before/after is the trustworthy number here, not a manual sum of new function defs).
+`python -c "import app.main"` and `python -c "import app.ai.autonomous"` both import cleanly. Verified the
+new table auto-creates via `init_db()`'s existing `Base.metadata.create_all()` against a scratch SQLite DB
+with the correct column set -- no migration needed.
+
+**Not verified live** -- this sandbox cannot run a real Autonomous AI cycle against a live index feed or a
+real provider. After deploying, the concrete next step this table exists for:
+
+```sql
+-- Read a real day's NONE reasoning directly, something that was previously impossible:
+SELECT timestamp, index_name, raw_decision, block_reason, trend_regime, adx, recent_price_change_percent, reasoning
+FROM autonomous_ai_logs WHERE index_name IN ('NIFTY','BANKNIFTY') AND date(timestamp) = '<a bounce day>'
+ORDER BY timestamp;
+```
+
+Specifically: the next time either index has a genuine intraday bounce during a NONE-heavy stretch, read
+whether the model's own reasoning ever names the bounce and rejects it, or never mentions upside at all --
+that distinguishes "the model considered CE and had a real reason not to" from "the model isn't looking for
+CE opportunities in a downtrend," which is the open question this whole investigation could not close
+without this table. Also worth a second full month's `journalctl` raw-decision count (the same
+`grep -oE -- "-> (BUY_CE|BUY_PE|NONE)"` pass used here) once enough `autonomous_ai_logs` history accumulates,
+to confirm the two sources agree and the 10:1 lean isn't itself a one-month anomaly.
+
 ### AI Origination, Autonomous AI and Validated Signal now read candles from the same live WebSocket-fed source Quick Scalp already used -- fixes a real multi-day Validated Signal outage (16 Sep 2026)
 
 **Reported**: "I havent seen validated signal trades from last few days." Investigated with real production
