@@ -546,6 +546,31 @@ def test_system_prompt_exit_has_chop_protection_section():
 
 
 # ---------------------------------------------------------------------------
+# CHOP_ZONE downgraded from a hard Python block to a model-weighed caution
+# -- 18 Sep 2026, explicit instruction ("allow autonomous ai to trade in
+# chop zone time but with caution") after a real Nifty rally went entirely
+# untraded because this window was a Python-level pre-call block. See the
+# module docstring's dated entry for the full incident.
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_entry_no_longer_bare_rejects_chop_zone():
+    # The old unconditional reject ("Current session is CHOP_ZONE... ") is
+    # gone -- session phase alone must not appear as a Mandatory Reject
+    # condition any more.
+    assert 'Current session is "CHOP_ZONE"' not in SYSTEM_PROMPT_ENTRY
+
+
+def test_system_prompt_entry_has_chop_zone_caution_section():
+    assert "CHOP_ZONE Caution" in SYSTEM_PROMPT_ENTRY
+    assert "NOT by itself a reject" in SYSTEM_PROMPT_ENTRY
+    # The stricter bar must name all three readings this module can actually
+    # show the model -- ADX, Market Efficiency, Recent Price Action.
+    assert "ADX comfortably above 20" in SYSTEM_PROMPT_ENTRY
+    assert "reading CLEAN, not MIXED" in SYSTEM_PROMPT_ENTRY
+    assert "Recent Price Action agreeing with your direction" in SYSTEM_PROMPT_ENTRY
+
+
+# ---------------------------------------------------------------------------
 # _recent_momentum_label / Recent Price Action (~15 min) awareness --
 # 11 Sep 2026, prompted by two real same-day entries (BankNifty BUY_PE at
 # Market Efficiency=MIXED, Nifty BUY_PE at Market Efficiency=CLEAN) that both
@@ -747,18 +772,28 @@ def test_check_entry_skips_when_no_features(monkeypatch):
     assert result is None
 
 
-def test_check_entry_deterministic_block_on_chop_zone(monkeypatch):
+def test_check_entry_reaches_llm_during_chop_zone(monkeypatch):
+    # 18 Sep 2026: CHOP_ZONE was removed from _ENTRY_BLOCKED_SESSION_PHASES
+    # -- the model is now asked during this window (SYSTEM_PROMPT_ENTRY's
+    # own "CHOP_ZONE Caution" section is what raises the bar, not a Python
+    # pre-call block). This reproduces what the real 17 Sep 2026 incident
+    # needed: a genuine setup during CHOP_ZONE must actually reach the model
+    # rather than being blocked before it's ever asked.
     import app.ai.autonomous as module
     db = _make_session()
     index = _make_index()
     option_finder = FakeOptionFinder(_make_contract())
-    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call during CHOP_ZONE")))
+    calls = []
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: calls.append(1) or module._RawCall('{"decision": "NONE", "reasoning": "marginal"}', None, 5.0),
+    )
 
     result = check_autonomous_entry(
         db, index, _make_features(session_phase="CHOP_ZONE"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
     )
-    assert result is None
-    assert option_finder.calls == 0
+    assert result is None  # NONE decision, but the model was actually reached
+    assert len(calls) == 1
 
 
 def test_check_entry_deterministic_block_on_opening_volatility(monkeypatch):
@@ -972,6 +1007,9 @@ def _only_log_row(db) -> AutonomousAILog:
 
 
 def test_check_entry_logs_deterministic_session_phase_block(monkeypatch):
+    # CHOP_ZONE no longer triggers this block (see 18 Sep 2026's dated
+    # module docstring entry) -- OPENING_VOLATILITY is one of the two
+    # phases still hard-blocked in Python.
     import app.ai.autonomous as module
     db = _make_session()
     index = _make_index()
@@ -979,12 +1017,12 @@ def test_check_entry_logs_deterministic_session_phase_block(monkeypatch):
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call")))
 
     check_autonomous_entry(
-        db, index, _make_features(session_phase="CHOP_ZONE"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(session_phase="OPENING_VOLATILITY"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
     )
     row = _only_log_row(db)
     assert row.raw_decision == "NONE"
     assert row.block_reason == "SESSION_PHASE"
-    assert row.session_phase == "CHOP_ZONE"
+    assert row.session_phase == "OPENING_VOLATILITY"
     assert row.trade_id is None
 
 
@@ -1733,9 +1771,10 @@ def test_run_autonomous_checks_still_enters_before_the_3pm_cutoff(monkeypatch):
     import app.ai.autonomous as module
     from app.ai.repository import create_settings
 
-    # 10:00 IST -- MORNING_MOMENTUM, not CHOP_ZONE (11:15-13:30 is
-    # deterministically blocked per the design document, so noon would not
-    # reach the model at all -- this must land in an allowed phase).
+    # 10:00 IST -- MORNING_MOMENTUM. (CHOP_ZONE, 11:15-13:30, is no longer
+    # deterministically blocked as of 18 Sep 2026 -- either window would now
+    # reach the model -- this just keeps the test unambiguous about which
+    # phase it's exercising.)
     monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 10, 0, tzinfo=IST))
     db = _make_session()
     db.add(_make_index())
