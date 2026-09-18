@@ -116,7 +116,8 @@ Two deterministic hard gates block a fresh entry before any LLM call, per
 the document's own AutonomousOptionsAgent.evaluate_entry sample code
 specifically (not every criterion the prompt text lists -- see
 _ENTRY_BLOCKED_SESSION_PHASES and _ADX_HARD_FLOOR):
-  - session_phase in {CHOP_ZONE, OPENING_VOLATILITY, SQUARE_OFF_ZONE}
+  - session_phase in {OPENING_VOLATILITY, SQUARE_OFF_ZONE} (CHOP_ZONE was
+    removed from this set 18 Sep 2026 -- see the dated entry below)
   - ADX < 18
 
 VWAP relation, ADX >= 20, and PDH/PDL proximity remain the model's own
@@ -246,6 +247,64 @@ twice already, for the same-day-history feature and for Market Efficiency
 itself), remains to be seen -- read the next several days of `ai_reasoning`
 on any entry or HOLD decision made while Recent Price Action disagrees with
 the position/direction in question.
+
+CHOP_ZONE downgraded from a hard Python block to a model-weighed caution
+(18 Sep 2026)
+------------------------------------------------------------------------------
+Trigger: a real Nifty rally (~50 points, roughly 11:00 AM-1:00 PM IST) went
+completely untraded by this module on 17 Sep 2026 -- confirmed via
+journalctl (the CHOP_ZONE-gate-backtest table hadn't deployed yet):
+10:45-11:11 AM blocked by the ADX floor (the move hadn't built strength
+yet), then EVERY cycle from 11:15 AM through 1:27 PM blocked by this exact
+CHOP_ZONE hard gate. The model was never once asked about a real, visible
+move. This was a previously-named tension, not a new discovery: when the
+CHOP_ZONE block first shipped (3 Sep 2026), this project's own notes
+already flagged that its window sits almost entirely inside the ONE
+Bonferroni-significant finding this project's entire two-year backtest
+history has produced -- EMA_STACK/ST_ALIGNED/ORB_BREAK/PDH_PDL_BREAK setups
+carry a real, replicated forward edge specifically in 11:00-14:00 IST (31
+Jul 2026 walk-forward). `scripts/chop_zone_gate_backtest.py` was built the
+same day to test whether the block was over-broad, per this project's own
+standing discipline of backtesting before touching a gate -- but the
+explicit instruction that followed ("allow autonomous ai to trade in chop
+zone time but with caution") settles the *shape* of the fix directly,
+independent of that backtest's still-pending result: not remove the
+caution, replace the hard Python block with a model-weighed one.
+
+CHOP_ZONE is removed from _ENTRY_BLOCKED_SESSION_PHASES -- the model is now
+asked during this window exactly as it is during MORNING_MOMENTUM/
+AFTERNOON_TREND, since features.session_phase was already shown to it in
+_build_entry_prompt regardless of whether Python blocked the call. What
+changed is SYSTEM_PROMPT_ENTRY: the old "Current session is CHOP_ZONE" bare
+Mandatory Reject bullet is gone, replaced by a new numbered "CHOP_ZONE
+Caution" section that does not reject on session phase alone, but requires
+a materially stricter bar during this window specifically -- ADX
+comfortably above (not merely at) the 20 floor, Market Efficiency reading
+CLEAN rather than merely non-CHOPPY, and Recent Price Action agreeing with
+the direction rather than just failing to disagree -- and requires the
+model's own reasoning to name which of those three justified trading
+through the window, so a marginal pass cannot hide behind a vague
+justification. OPENING_VOLATILITY and SQUARE_OFF_ZONE remain hard-blocked
+in Python, unchanged -- neither was in question here, and both describe
+conditions (pre-open illiquidity, imminent square-off) with no equivalent
+"but there might be real edge here" tension to weigh.
+
+This is the same escalation pattern this module already uses in the
+opposite direction elsewhere (chop efficiency and recent-price-action are
+both soft, prompt-only cautions layered onto entry decisions rather than
+hard gates) -- here a hard gate is being loosened into a soft one, on
+direct instruction, rather than a soft one being tightened. Whether the
+model actually applies the stricter CHOP_ZONE bar in practice, or trades
+through it citing the readings without them being genuinely clean, is the
+same open question this project has repeatedly flagged for every other
+soft caution in this module (the same-day-history feature, Market
+Efficiency, Recent Price Action) -- unverified until real CHOP_ZONE
+decisions accumulate. `scripts/chop_zone_gate_backtest.py`'s real-data run
+is still worth doing once available: it answers a related but different
+question (does CHOP_ZONE show worse forward edge than the rest of the day
+at all), which is useful context for judging this prompt's real effect
+even though it no longer gates whether the model gets asked in the first
+place.
 
 EXIT MATRIX -- DETERMINISTIC RULES CHECKED BEFORE THE MODEL, IN ORDER
 --------------------------------------------------------------------------
@@ -394,7 +453,16 @@ _MORNING_MOMENTUM_START = (9, 30)
 _CHOP_ZONE_START = (11, 15)
 _AFTERNOON_TREND_START = (13, 30)
 
-_ENTRY_BLOCKED_SESSION_PHASES = frozenset({"CHOP_ZONE", "OPENING_VOLATILITY", "SQUARE_OFF_ZONE"})
+# 18 Sep 2026: CHOP_ZONE removed from this hard block, per explicit
+# instruction ("allow autonomous ai to trade in chop zone time but with
+# caution") -- see the module docstring's dated entry for the real incident
+# that prompted it (a genuine Nifty rally, 11:00 AM-1:00 PM, that this gate
+# blocked outright, in a window this project's own strongest validated
+# finding says carries real setup edge). CHOP_ZONE is now a caution the
+# model itself must weigh (SYSTEM_PROMPT_ENTRY's own "CHOP_ZONE Caution"
+# section), not a Python pre-call block. OPENING_VOLATILITY and
+# SQUARE_OFF_ZONE remain hard-blocked -- neither was in question here.
+_ENTRY_BLOCKED_SESSION_PHASES = frozenset({"OPENING_VOLATILITY", "SQUARE_OFF_ZONE"})
 
 # "ADX < 18: Choppy, trendless market. Zero option buying allowed" -- the
 # document's own Python-level hard gate. ADX >= 20 ("Trending conditions
@@ -461,7 +529,6 @@ Evaluation Protocol:
 
 3. Mandatory Reject ("NONE") Conditions:
    - Price is oscillating near VWAP or ADX indicates low trend strength / consolidation (< 20).
-   - Current session is "CHOP_ZONE" (11:15 AM - 1:30 PM).
    - Market Efficiency (last ~1 hour) reads CHOPPY. ADX and the EMA stack are both lagging and can still
      read "trending" from the session's cumulative history even while the last hour has actually been
      back-and-forth with little net progress -- a CHOPPY efficiency reading is its own independent reject
@@ -475,6 +542,21 @@ Evaluation Protocol:
      minutes are actually doing, even if every longer-window criterion above is satisfied.
    - Contradictory signals exist (e.g., price above VWAP but momentum trending down).
    - Any required indicator or confirmation is ambiguous or missing.
+
+4. CHOP_ZONE Caution (11:15 AM - 1:30 PM) -- raises the bar, is NOT by itself a reject:
+   - This window is this session's most common false-breakout/whipsaw stretch, but it is not
+     automatically untradeable -- do not reject a setup for the session phase alone.
+   - Hold every CHOP_ZONE setup to a materially stricter standard than MORNING_MOMENTUM or
+     AFTERNOON_TREND: ADX comfortably above 20, not merely at or just past it; Market Efficiency
+     reading CLEAN, not MIXED; and Recent Price Action agreeing with your direction, not merely
+     failing to disagree with it.
+   - If any of those three readings is marginal rather than clearly satisfied, output NONE during
+     this window even when the base BUY_CE/BUY_PE criteria technically pass -- "technically passes"
+     is not the same bar as "clearly passes" here.
+   - State explicitly in your reasoning that this decision was made during CHOP_ZONE and name which
+     of the three stricter readings (ADX, Market Efficiency, Recent Price Action) justified trading
+     through it, so a real setup is not silently indistinguishable from a marginal one that happened
+     to pass.
 
 Do not guess, predict reversals, or anticipate breakouts. If there is any doubt or lack of edge, output NONE.
 

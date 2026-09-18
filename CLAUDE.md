@@ -295,6 +295,75 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### CHOP_ZONE downgraded from a hard Python gate to a model-weighed caution, per explicit instruction (18 Sep 2026)
+
+**Requested**: "Allow autonomous ai to trade in chop zone time but with caution" -- directly following the
+17 Sep 2026 incident (below) where a real, tradeable Nifty rally went entirely untraded because every
+5-minute cycle from 11:15 AM through 1:27 PM was blocked by this exact `CHOP_ZONE` session-phase gate
+before the model was ever asked. `scripts/chop_zone_gate_backtest.py` was built the same day to test
+whether the block was over-broad, per this project's standing discipline of backtesting a gate before
+touching it -- that backtest is still pending real production data. This instruction settles the *shape*
+of the fix directly and doesn't need to wait on it: not "remove the caution," but "replace the hard Python
+block with a model-weighed one." The backtest is still worth running once available -- it answers a
+related question (does `CHOP_ZONE` actually show worse forward edge than the rest of the day), useful
+context for judging this prompt's real effect -- but it no longer gates whether this change ships.
+
+**Implementation, `app/ai/autonomous.py`:**
+
+- `_ENTRY_BLOCKED_SESSION_PHASES` no longer includes `CHOP_ZONE` -- only `OPENING_VOLATILITY` and
+  `SQUARE_OFF_ZONE` remain hard-blocked in Python. Neither of those was in question; both describe
+  conditions (pre-open illiquidity, imminent square-off) with no "but there might be real edge here"
+  tension the way `CHOP_ZONE` does, per this project's own strongest validated finding (setups carry real,
+  replicated edge specifically in 11:00-14:00 IST -- the 31 Jul 2026 walk-forward, which `CHOP_ZONE`'s
+  11:15-13:30 window sits almost entirely inside of).
+- `SYSTEM_PROMPT_ENTRY`'s old bare Mandatory Reject bullet ("Current session is CHOP_ZONE") is gone,
+  replaced with a new numbered "CHOP_ZONE Caution" section: NOT a reject on session phase alone, but a
+  materially stricter bar during this window specifically than `MORNING_MOMENTUM`/`AFTERNOON_TREND` get --
+  ADX comfortably above (not merely at) the 20 floor, Market Efficiency reading CLEAN (not merely
+  non-CHOPPY/MIXED), and Recent Price Action agreeing with the direction (not merely failing to disagree).
+  If any of those three is marginal rather than clearly satisfied, the model is told to output NONE even
+  when the base `BUY_CE`/`BUY_PE` criteria technically pass. The model is also required to name, in its own
+  `reasoning`, which of the three stricter readings justified trading through the window -- so a marginal
+  pass can't hide behind vague language the way "technically passes the checklist" could.
+- `features.session_phase` was already shown to the model in `_build_entry_prompt` regardless of whether
+  Python blocked the call -- so removing the Python gate needed no new plumbing to make the model aware of
+  which window it's in; only the prompt's own instructions for that window changed.
+
+**Same escalation pattern this module already uses, just run in the opposite direction.** Chop efficiency
+and Recent Price Action are both soft, prompt-only cautions this module already layered onto entry
+decisions rather than hard gates (10/11 Sep 2026 entries above); this is the same soft-caution shape, just
+applied by loosening an existing hard gate into one, on direct instruction, rather than by tightening a
+soft one after real trades showed it wasn't enough. Whether the model actually applies the stricter
+`CHOP_ZONE` bar in practice, or trades through it citing the readings without them being genuinely clean,
+is the same open question already flagged for every other soft caution in this module -- unverified until
+real `CHOP_ZONE` decisions accumulate. `autonomous_ai_logs` now records every one of them either way
+(raw decision, block reason if any, and the full feature snapshot), so this is answerable directly once the
+still-pending deploy (see the entry below) reaches production.
+
+4 tests changed/added in `tests/test_autonomous_ai.py` (114 total, was 112): `test_check_entry_deterministic_
+block_on_chop_zone` replaced with `test_check_entry_reaches_llm_during_chop_zone` (confirms the model is now
+actually called during `CHOP_ZONE`, not just that a `NONE` decision falls out); `test_check_entry_logs_
+deterministic_session_phase_block` repointed at `OPENING_VOLATILITY` (the two still-blocked phases); two new
+prompt-content tests confirming the old bare reject is gone and the new "CHOP_ZONE Caution" section names all
+three stricter readings (ADX/Market Efficiency/Recent Price Action); a stale comment on an unrelated 3pm-cutoff
+test corrected (it no longer picks 10:00 IST to dodge a `CHOP_ZONE` block that doesn't exist anymore, just to
+stay unambiguous about which phase it exercises). Full suite: 1052 passed (`tests/` directory; the repo also
+carries a pre-existing, unrelated, untracked-by-this-change orphaned script at `test_run_shadow_review.py`
+outside `tests/` that fails plain `pytest` collection from the old, already-removed AI Reviews feature -- not
+touched here, pre-existing on `main`). `python -c "import app.main"` and `python -c "import app.ai.autonomous"`
+both import cleanly. `/autonomous-ai`'s own banner updated to describe the new caution in place of the old
+hard-block wording.
+
+**Not verified live** -- this sandbox cannot run a real Autonomous AI cycle against a live index feed or a
+real provider. After deploying, the concrete check: watch for `CHOP_ZONE`-phase entries in `autonomous_ai_
+logs` (`session_phase='CHOP_ZONE'`) and read whether `reasoning` actually names which of the three stricter
+readings justified the trade, or just restates the ordinary checklist as if the window carried no extra
+weight -- the latter would mean the caution isn't landing and this specific mechanism is a candidate for the
+same "soft caution isn't enough, escalate" pattern already applied twice elsewhere in this module (the
+same-direction gate, the EMA-regime override). Also worth a first read of real `CHOP_ZONE` win rate once a
+handful of trades accumulate, alongside whatever `scripts/chop_zone_gate_backtest.py` eventually reports
+against the archive -- two independent signals on the same question, not a substitute for each other.
+
 ### CHOP_ZONE gate backtest tooling built -- a real Nifty rally never once cleared it, question not yet resolved with data (17 Sep 2026, same day)
 
 **Trigger**: with AI Origination disabled and Validated Signal also paused, a real Nifty rally (~50 points,
