@@ -14,6 +14,7 @@ from app.quick_scalp import (
     _COST_BUFFER_POINTS,
     _HARD_TIME_STOP_MINUTES,
     _MAX_INDEX_STOP_POINTS,
+    _MIN_STRUCTURAL_STOP_POINTS,
     _MIN_TARGET_POINTS,
     _RSI_OVERBOUGHT,
     _RSI_OVERSOLD,
@@ -316,6 +317,21 @@ def test_structural_stop_level_pe_capped_when_raw_too_far():
     signal = _make_signal("BUY_PE", trigger_level=23990.0, setup_low=23990.0, setup_high=24050.0)
     level = _structural_stop_level(signal)
     assert level == 23990.0 + _MAX_INDEX_STOP_POINTS
+
+
+def test_structural_stop_level_ce_floored_when_c0_range_is_narrow():
+    # C0.low = 24005 is only 6pts below the trigger (24010) -- narrower than
+    # _MIN_STRUCTURAL_STOP_POINTS (10), same shape as real 19 Sep production
+    # data (structural stops 6.25-8.30pts wide, most closing within seconds).
+    signal = _make_signal("BUY_CE", trigger_level=24010.0, setup_low=24005.0, setup_high=24010.0)
+    level = _structural_stop_level(signal)
+    assert level == 24010.0 - _MIN_STRUCTURAL_STOP_POINTS
+
+
+def test_structural_stop_level_pe_floored_when_c0_range_is_narrow():
+    signal = _make_signal("BUY_PE", trigger_level=23990.0, setup_low=23990.0, setup_high=23995.0)
+    level = _structural_stop_level(signal)
+    assert level == 23990.0 + _MIN_STRUCTURAL_STOP_POINTS
 
 
 # ---------------------------------------------------------------------------

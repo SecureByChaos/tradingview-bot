@@ -295,6 +295,122 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Dashboard now shows, per index, whether Autonomous AI's CE/PE lean matched how the market actually moved that day (19 Sep 2026)
+
+**Requested**: "I want comparison at the end of the day how actual market was for nifty50 and banknifty and did
+our autonomous ai trades did accordingly or not." Scoped to Autonomous AI specifically (the population the
+dashboard's "Today's Highlights" section already covers since the 17 Sep switch away from AI Origination) and
+extended the existing feature rather than building a new page or report -- the same incremental pattern this
+section of the dashboard has already gone through twice (chop+confidence sub-scores added to Market
+Conditions, 27 Aug; the Autonomous AI swap-over, 17 Sep).
+
+**"How the market actually moved" reuses the exact previous-close mechanism already fixed twice for this
+purpose** (`get_index_live_figures`'s 21/25 Aug entries above) -- change against the previous session's real
+close, not today's own open, since those two routinely disagree by whatever the index gapped overnight. New
+`_todays_market_direction(db, index_symbol, today)` in `app/platform.py` deliberately does NOT call
+`get_index_live_figures` itself, since that function needs `smartapi`/`feed_store` for the *live* current
+price -- this only needs a number that settles once trading ends, so it reads the previous day's last stored
+`ONE_MINUTE` `Candle` close (falling back to the last `IndexPriceTick` before today, same fallback order as
+the live-figures function) as the reference, and today's own last stored candle/tick as "now." Zero live
+dependency, same fail-closed convention as everywhere else in this module: `change_percent=None,
+direction="UNKNOWN"` when there isn't yet a real reference AND a real current value, never a fabricated 0%.
+Classified BULLISH/BEARISH/FLAT against a +-0.15% band around zero -- a reasoned starting point (wider than
+`_recent_momentum_label`'s +-0.03% band, since that measures a ~15-minute move and this measures a whole
+session), not backtested.
+
+**Alignment is a whole-day, whole-population comparison, not a per-trade check, on purpose.** For each index,
+`get_autonomous_ai_today_highlights()`'s existing `index_comparison` entries now also carry `ce_count`/
+`pe_count` (today's closed Autonomous AI trades for that index, split by `option_type`), `market_change_
+percent`/`market_direction`, and an `alignment` verdict: `ALIGNED` (the side AI took more of matches the
+day's net direction), `MISALIGNED` (it doesn't), `MIXED` (equal CE/PE count, no lean either way), `NO_CLEAR_
+DIRECTION` (market read FLAT or UNKNOWN), `NO_TRADES` (nothing closed today for that index). Deliberately NOT
+a per-trade entry-to-exit check -- a correct CE bet can still stop out on an intraday dip inside a bullish
+day, so this answers "was the overall lean right for the day," not "was every individual trade vindicated,"
+which is a different, already-answered question (the existing win/loss/net_pnl columns right next to it).
+
+`live_dashboard.html`'s `renderIndexComparison` renders a new line per index card: "Market today: +X.XX%
+(BULLISH) · Traded with the day" (or the matching label for each alignment value), colored green/red to match
+the existing win/loss convention on the card. No new route, no new poll cycle -- rides the same 10s `/api/
+live-dashboard` fetch this section already used.
+
+9 new tests in `tests/test_autonomous_today_highlights.py` (now 17, was 8): `_todays_market_direction`'s
+BULLISH/BEARISH/FLAT classification from real candle rows, the IndexPriceTick fallback when no candles exist,
+the UNKNOWN case with zero data at all, and five `index_comparison` integration cases covering all five
+alignment verdicts (ALIGNED on a CE lean matching a bullish day, MISALIGNED on a PE lean against one, NO_
+TRADES, NO_CLEAR_DIRECTION when the market itself is UNKNOWN, and MIXED on a tied CE/PE count). Full suite:
+1061 passed (was 1052), plus the same 2 pre-existing unrelated failures already documented elsewhere in this
+file (`test_daily_report_origination.py`'s and `test_validated_signal.py`'s own wall-clock-dependent flakes,
+confirmed present identically on this tree before this change). `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox cannot run a real Autonomous AI trading day. After deploying, confirm
+the "Market today" line renders correctly through a full real session and settles to a stable end-of-day
+figure once trading closes, and read the alignment verdicts against a few real days once Autonomous AI has
+closed trades again on both indices (currently paused for the CHOP_ZONE-caution observation window, per the
+18 Sep entry below) -- specifically watch whether `ALIGNED` days actually correlate with better net P&L than
+`MISALIGNED` ones, which this pass only surfaces as a readable fact, not yet as anything backtested or
+correlated against outcome.
+
+### Quick Scalp's structural stop gets a minimum-width floor -- narrow C0 bars were producing near-instant stops (19 Sep 2026)
+
+**Reported**: "I observed that scalping trades buy and sell on same time within few seconds" -- following the
+18 Sep export's own 6-second `SCALP_STRUCTURAL_STOP` at an unchanged premium (173.8->173.8), flagged the same
+day as worth a second look if it recurred. Investigated with real production data rather than guessed at.
+
+**Pulled every `QUICK_SCALP` trade closed via `SCALP_STRUCTURAL_STOP`** (9-18 Sep, 7 trades) and computed the
+gap between `spot_at_entry` (the trigger level) and `structural_stop_level` against each trade's own closing
+duration:
+
+| gap (pts) | duration |
+|---|---|
+| 6.25 | 3s |
+| 7.05 | 7s |
+| 7.50 | 68s |
+| 8.30 | 28s |
+| 14.00 (cap) | 1s |
+| 14.00 (cap) | 13s |
+| 14.00 (cap) | 133s |
+
+**Root cause, confirmed by the data, not just read off the code**: `_structural_stop_level()` picks whichever
+of two candidate levels is *tighter* -- `max(raw, capped)` for CE, `min(raw, capped)` for PE, where `raw` is
+C0's own rejection extreme +-1pt and `capped` is the trigger level +-14pts (`_MAX_INDEX_STOP_POINTS`, existing
+since the 4 Sep build). The 14pt cap only ever bounds the stop from getting too WIDE. Nothing bounded it from
+getting too NARROW -- the setup criteria requires a wick covering >=30% of C0's own range, but places no floor
+on that range's absolute size, so a tight rejection bar (range under ~13pts) makes `raw` tighter than the cap,
+and `max()`/`min()` picks it. Four of the seven real exits landed exactly here (6.25-8.30pts), and three of
+those four closed inside 30 seconds -- a stop that close to entry gives almost no room to survive ordinary
+post-entry noise on a setup that, by construction, just printed a volatile wick.
+
+**Fixed**: new `_MIN_STRUCTURAL_STOP_POINTS = 10.0`, applied as a second clamp in `_structural_stop_level()`
+symmetric to the existing 14pt cap -- after the existing `max`/`min` selection, the result is pushed out to at
+least 10pts from the trigger level if it was narrower, on both the CE and PE side. A reasoned starting point
+(comfortably above the narrowest real gaps, comfortably below the existing cap), not backtested -- same status
+`_MAX_INDEX_STOP_POINTS` itself carried before this fix, and every other new threshold in this module.
+
+**The 14-point-cap outlier is a separate, unresolved question, deliberately not fixed here.** One of the three
+at-cap (widest possible) trades still closed in **1 second** -- a clean 14-point round-trip on Bank Nifty
+within a second of entry is not ordinary noise, and the other two at-cap trades took 13s and 133s respectively,
+so this one doesn't fit the "narrow C0 range" mechanism at all. More likely explanation, not yet confirmed:
+entry execution (contract resolution + LTP fetch, a real network round trip inside `_resolve_scalp_entry`) has
+enough latency that live spot can move meaningfully between C1's bar-close being detected and the trade
+actually finishing its write -- meaning the position could already be past invalidation by the time it opens.
+Left open rather than guessed at; the next diagnostic step is comparing the C1 bar's own close timestamp
+against `trade.entry_time` for this specific trade to measure the real lag, not a code change yet.
+
+2 new tests in `tests/test_quick_scalp.py` (58 total, was 56): the floor engaging on both CE and PE when C0's
+range is narrow (mirrors the real 19 Sep production shape directly), confirmed not to disturb any of the four
+existing structural-stop tests (their fixture gaps are 12 or 14pts, both already at or above the new floor).
+Full suite: 1052 passed, plus the same 2 pre-existing, unrelated failures already documented elsewhere in this
+file (`test_daily_report_origination.py`'s and `test_validated_signal.py`'s own wall-clock-dependent flakes,
+confirmed present identically via `git stash` on this exact tree before this change). `python -c "import
+app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox cannot run a real Quick Scalp cycle against a live index feed. After
+deploying, confirm no new `SCALP_STRUCTURAL_STOP` exit has a `structural_stop_level` narrower than 10pts from
+its own `spot_at_entry`, and watch whether narrow-gap near-instant closes stop appearing in the same way they
+did 9-18 Sep. Separately, if another 1-second-or-faster stop occurs at or near the 14pt cap, that's the signal
+to actually investigate the entry-execution-lag hypothesis above rather than leave it as a named-but-unproven
+possibility.
+
 ### CHOP_ZONE downgraded from a hard Python gate to a model-weighed caution, per explicit instruction (18 Sep 2026)
 
 **Requested**: "Allow autonomous ai to trade in chop zone time but with caution" -- directly following the

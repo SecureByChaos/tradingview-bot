@@ -197,6 +197,20 @@ _LOT_MULTIPLIER = 2
 # ---------------------------------------------------------------------------
 
 _MAX_INDEX_STOP_POINTS = 14.0     # carried over from the 4 Sep build -- see NAMED DEVIATIONS #5
+# 19 Sep 2026: real production data (7 SCALP_STRUCTURAL_STOP exits, 9-18 Sep)
+# showed 4 of 7 sitting well under the 14pt cap (6.25-8.30pts, since a narrow
+# C0 range makes "raw" -- C0's own extreme +-1pt -- tighter than the cap, and
+# max()/min() always pick whichever candidate is tighter) -- 3 of those 4
+# closed inside 30 seconds of entry, one in 3s. A rejection bar's own range
+# has no lower bound in the setup criteria (only a 30% wick RATIO is
+# required), so a tight C0 can produce a structural stop with almost no room
+# before ordinary post-entry noise closes it. This floor bounds the OTHER
+# side of the same clamp the 14pt cap already bounds -- never tighter than
+# 10pts, same as _MAX_INDEX_STOP_POINTS never wider than 14. A reasoned
+# starting point (comfortably above the narrowest real gaps, comfortably
+# below the existing cap), not backtested -- same status the cap itself
+# carried before this fix.
+_MIN_STRUCTURAL_STOP_POINTS = 10.0
 _STRUCTURAL_BUFFER_POINTS = 1.0   # "C0.Low - 1pt" / "C0.High + 1pt"
 _STOP_PERCENT = 0.025             # "-2.5%"
 _TARGET_PERCENT = 0.0375          # midpoint of "+3.5% to +4.0%"
@@ -328,16 +342,24 @@ def vwap_scalp_action(features: _ScalpFeatures) -> Optional[_ScalpSignal]:
 
 
 def _structural_stop_level(signal: _ScalpSignal) -> float:
-    """Section 5's structural invalidation stop, capped at
-    _MAX_INDEX_STOP_POINTS from the trigger price (see NAMED DEVIATIONS #5
-    for why this cap is kept despite the new spec's own silence on it)."""
+    """Section 5's structural invalidation stop, bounded on both sides of the
+    trigger price: never wider than _MAX_INDEX_STOP_POINTS (see NAMED
+    DEVIATIONS #5 for why this cap is kept despite the new spec's own silence
+    on it), and -- since 19 Sep 2026 -- never tighter than
+    _MIN_STRUCTURAL_STOP_POINTS, so a narrow C0 rejection bar can't produce a
+    stop with almost no room to survive ordinary post-entry noise (see that
+    constant's own dated comment for the real production data behind it)."""
     if signal.action == "BUY_CE":
         raw = signal.setup_low - _STRUCTURAL_BUFFER_POINTS
         capped = signal.trigger_level - _MAX_INDEX_STOP_POINTS
-        return max(raw, capped)
+        level = max(raw, capped)
+        floor = signal.trigger_level - _MIN_STRUCTURAL_STOP_POINTS
+        return min(level, floor)
     raw = signal.setup_high + _STRUCTURAL_BUFFER_POINTS
     capped = signal.trigger_level + _MAX_INDEX_STOP_POINTS
-    return min(raw, capped)
+    level = min(raw, capped)
+    floor = signal.trigger_level + _MIN_STRUCTURAL_STOP_POINTS
+    return max(level, floor)
 
 
 def _load_scalp_features(db: Session, index_symbol: str, now_ist) -> Optional[_ScalpFeatures]:
