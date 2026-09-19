@@ -193,6 +193,15 @@ function renderTrades(trades) {
 // but didn't" near-misses. Rendering code below is generic over both
 // sources' identical dict shape -- unchanged by the 17 Sep swap.
 
+const ALIGNMENT_LABELS = {
+  ALIGNED: 'Traded with the day',
+  MISALIGNED: 'Traded against the day',
+  MIXED: 'Both sides taken',
+  NO_CLEAR_DIRECTION: 'No clear market direction',
+  NO_TRADES: 'No trades today',
+};
+const ALIGNMENT_CLASS = { ALIGNED: 'profit', MISALIGNED: 'loss', MIXED: '', NO_CLEAR_DIRECTION: '', NO_TRADES: '' };
+
 function renderIndexComparison(indexComparison) {
   const container = document.getElementById('vs-cards');
   const items = indexComparison || [];
@@ -202,12 +211,26 @@ function renderIndexComparison(indexComparison) {
     const cls = i.net_pnl >= 0 ? 'profit' : 'loss';
     const barPct = Math.min(100, Math.round(Math.abs(i.net_pnl) / maxAbs * 100));
     const record = i.trades
-      ? (i.wins + 'W - ' + i.losses + 'L &middot; ' + i.win_rate + '% win rate')
+      ? (i.wins + 'W - ' + i.losses + 'L &middot; ' + i.win_rate + '% win rate &middot; ' + i.ce_count + ' CE / ' + i.pe_count + ' PE')
       : 'No closed trades yet today';
+    // 19 Sep 2026: the day's own realized move (previous close -> now/close)
+    // alongside whether Autonomous AI's CE/PE lean for this index actually
+    // matched it -- see _todays_market_direction's own docstring for why
+    // this is a whole-day lean comparison, not a per-trade check.
+    let marketLine = '';
+    if (i.market_change_percent !== null && i.market_change_percent !== undefined) {
+      const marketCls = i.market_change_percent >= 0 ? 'profit' : 'loss';
+      const alignCls = ALIGNMENT_CLASS[i.alignment] || '';
+      marketLine = '<div class="vs-card-record" style="margin-top:4px;">' +
+        'Market today: <span class="' + marketCls + '">' + (i.market_change_percent >= 0 ? '+' : '') + i.market_change_percent + '%</span>' +
+        ' (' + i.market_direction + ') &middot; ' +
+        '<span class="' + alignCls + '">' + (ALIGNMENT_LABELS[i.alignment] || i.alignment) + '</span></div>';
+    }
     return '<div class="vs-card">' +
       '<div class="vs-card-header"><span class="vs-card-index">' + i.display_name + '</span>' +
       '<span class="' + cls + '" style="font-weight:700;">' + (i.net_pnl >= 0 ? '+' : '') + '₹' + i.net_pnl.toFixed(2) + '</span></div>' +
       '<div class="vs-card-record">' + record + '</div>' +
+      marketLine +
       '<div class="vs-bar-track"><div class="vs-bar-fill ' + cls + '" style="width:' + barPct + '%;"></div></div>' +
       '</div>';
   }).join('');

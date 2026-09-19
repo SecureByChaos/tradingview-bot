@@ -7,13 +7,14 @@ Origination version on the live dashboard 17 Sep 2026. See CLAUDE.md's
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.db_models import AutonomousAILog, Base, IndexConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
-from app.platform import get_autonomous_ai_today_highlights
+from app.db_models import AutonomousAILog, Base, Candle, IndexConfig, IndexPriceTick, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.market_data import ONE_MINUTE
+from app.platform import _todays_market_direction, get_autonomous_ai_today_highlights, today_ist
 from app.time_utils import utc_now
 
 
@@ -222,3 +223,149 @@ def test_yesterdays_data_is_excluded():
     assert result["funnel"]["total_cycles"] == 0
     assert result["sharpest_call"] is None
     assert all(entry["trades"] == 0 for entry in result["index_comparison"])
+
+
+# ---------------------------------------------------------------------------
+# _todays_market_direction (19 Sep 2026) -- "how the market actually moved
+# today," and (via index_comparison's alignment field) whether Autonomous
+# AI's CE/PE lean for the day matched it.
+# ---------------------------------------------------------------------------
+
+def _candle(index_symbol: str, ts_ist, close: float, interval: str = ONE_MINUTE) -> Candle:
+    return Candle(index_symbol=index_symbol, interval=interval, ts_ist=ts_ist, open=close, high=close, low=close, close=close)
+
+
+def test_market_direction_bullish_from_previous_candle_close_to_today():
+    db = _make_session()
+    today = today_ist()
+    yesterday = today - timedelta(days=1)
+    db.add(_candle("BANKNIFTY", datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=15), 57000.0))
+    db.add(_candle("BANKNIFTY", datetime.combine(today, datetime.min.time()) + timedelta(hours=10), 57200.0))
+    db.commit()
+
+    result = _todays_market_direction(db, "BANKNIFTY", today)
+
+    assert result["direction"] == "BULLISH"
+    assert result["change_percent"] > 0
+
+
+def test_market_direction_bearish_and_flat_bands():
+    db = _make_session()
+    today = today_ist()
+    yesterday = today - timedelta(days=1)
+    db.add(_candle("NIFTY", datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=15), 24000.0))
+    db.add(_candle("NIFTY", datetime.combine(today, datetime.min.time()) + timedelta(hours=10), 23900.0))
+    db.commit()
+    bearish = _todays_market_direction(db, "NIFTY", today)
+    assert bearish["direction"] == "BEARISH"
+
+    db2 = _make_session()
+    db2.add(_candle("NIFTY", datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=15), 24000.0))
+    db2.add(_candle("NIFTY", datetime.combine(today, datetime.min.time()) + timedelta(hours=10), 24010.0))
+    db2.commit()
+    flat = _todays_market_direction(db2, "NIFTY", today)
+    assert flat["direction"] == "FLAT"
+
+
+def test_market_direction_falls_back_to_index_price_ticks_when_no_candles():
+    db = _make_session()
+    today = today_ist()
+    yesterday = today - timedelta(days=1)
+    db.add(IndexPriceTick(index_symbol="NIFTY", price=24000.0, recorded_at=datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=15)))
+    db.add(IndexPriceTick(index_symbol="NIFTY", price=24200.0, recorded_at=datetime.combine(today, datetime.min.time()) + timedelta(hours=10)))
+    db.commit()
+
+    result = _todays_market_direction(db, "NIFTY", today)
+
+    assert result["direction"] == "BULLISH"
+
+
+def test_market_direction_unknown_with_no_data_at_all():
+    db = _make_session()
+    result = _todays_market_direction(db, "NIFTY", today_ist())
+    assert result == {"change_percent": None, "direction": "UNKNOWN"}
+
+
+def test_index_comparison_alignment_matches_ce_lean_to_bullish_day():
+    db = _make_session()
+    _seed_indexes(db)
+    today = today_ist()
+    yesterday = today - timedelta(days=1)
+    db.add(_candle("BANKNIFTY", datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=15), 57000.0))
+    db.add(_candle("BANKNIFTY", datetime.combine(today, datetime.min.time()) + timedelta(hours=10), 57500.0))
+    now = utc_now()
+    db.add(_trade(trade_id="t1", index_symbol="BANKNIFTY", option_type="CE", exit_time=now))
+    db.add(_trade(trade_id="t2", index_symbol="BANKNIFTY", option_type="CE", exit_time=now))
+    db.commit()
+
+    result = get_autonomous_ai_today_highlights(db)
+    entry = next(e for e in result["index_comparison"] if e["symbol"] == "BANKNIFTY")
+
+    assert entry["market_direction"] == "BULLISH"
+    assert entry["ce_count"] == 2
+    assert entry["pe_count"] == 0
+    assert entry["alignment"] == "ALIGNED"
+
+
+def test_index_comparison_alignment_flags_pe_lean_on_bullish_day_as_misaligned():
+    db = _make_session()
+    _seed_indexes(db)
+    today = today_ist()
+    yesterday = today - timedelta(days=1)
+    db.add(_candle("BANKNIFTY", datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=15), 57000.0))
+    db.add(_candle("BANKNIFTY", datetime.combine(today, datetime.min.time()) + timedelta(hours=10), 57500.0))
+    now = utc_now()
+    db.add(_trade(trade_id="t1", index_symbol="BANKNIFTY", option_type="PE", exit_time=now))
+    db.commit()
+
+    result = get_autonomous_ai_today_highlights(db)
+    entry = next(e for e in result["index_comparison"] if e["symbol"] == "BANKNIFTY")
+
+    assert entry["alignment"] == "MISALIGNED"
+
+
+def test_index_comparison_alignment_is_no_trades_when_nothing_closed():
+    db = _make_session()
+    _seed_indexes(db)
+    today = today_ist()
+    yesterday = today - timedelta(days=1)
+    db.add(_candle("BANKNIFTY", datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=15), 57000.0))
+    db.add(_candle("BANKNIFTY", datetime.combine(today, datetime.min.time()) + timedelta(hours=10), 57500.0))
+    db.commit()
+
+    result = get_autonomous_ai_today_highlights(db)
+    entry = next(e for e in result["index_comparison"] if e["symbol"] == "BANKNIFTY")
+
+    assert entry["alignment"] == "NO_TRADES"
+
+
+def test_index_comparison_alignment_is_no_clear_direction_when_market_unknown():
+    db = _make_session()
+    _seed_indexes(db)
+    now = utc_now()
+    db.add(_trade(trade_id="t1", index_symbol="BANKNIFTY", option_type="CE", exit_time=now))
+    db.commit()
+
+    result = get_autonomous_ai_today_highlights(db)
+    entry = next(e for e in result["index_comparison"] if e["symbol"] == "BANKNIFTY")
+
+    assert entry["market_direction"] == "UNKNOWN"
+    assert entry["alignment"] == "NO_CLEAR_DIRECTION"
+
+
+def test_index_comparison_alignment_is_mixed_when_ce_and_pe_counts_tie():
+    db = _make_session()
+    _seed_indexes(db)
+    today = today_ist()
+    yesterday = today - timedelta(days=1)
+    db.add(_candle("BANKNIFTY", datetime.combine(yesterday, datetime.min.time()) + timedelta(hours=15), 57000.0))
+    db.add(_candle("BANKNIFTY", datetime.combine(today, datetime.min.time()) + timedelta(hours=10), 57500.0))
+    now = utc_now()
+    db.add(_trade(trade_id="t1", index_symbol="BANKNIFTY", option_type="CE", exit_time=now))
+    db.add(_trade(trade_id="t2", index_symbol="BANKNIFTY", option_type="PE", exit_time=now))
+    db.commit()
+
+    result = get_autonomous_ai_today_highlights(db)
+    entry = next(e for e in result["index_comparison"] if e["symbol"] == "BANKNIFTY")
+
+    assert entry["alignment"] == "MIXED"

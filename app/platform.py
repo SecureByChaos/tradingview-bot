@@ -1173,6 +1173,82 @@ def get_ai_origination_today_highlights(db: Session) -> dict[str, Any]:
     }
 
 
+_MARKET_DIRECTION_BAND_PERCENT = 0.15
+"""19 Sep 2026: band around zero within which a day's net move is called FLAT
+rather than BULLISH/BEARISH -- a reasoned starting point (wider than the
++-0.03% band _recent_momentum_label uses for a ~15-min move, since this is a
+whole-session change and ordinary index noise over a full day is larger),
+not backtested. See _todays_market_direction's own docstring."""
+
+
+def _todays_market_direction(db: Session, index_symbol: str, today: date) -> dict[str, Any]:
+    """How the index itself actually moved today, end-to-end -- change vs the
+    previous session's real close, not today's own open, same reasoning
+    get_index_live_figures' own docstring already gives (21/25 Aug 2026
+    entries): "change since open" and "change since previous close" routinely
+    disagree by whatever the index gapped overnight.
+
+    Deliberately reuses that same candle-preferred/tick-fallback previous-
+    close pattern rather than smartapi/feed_store -- this function has no
+    live dependency at all, only what's already stored, so it settles
+    correctly once trading ends for the day and needs no network access to
+    compute a genuine end-of-day comparison.
+
+    Returns change_percent=None/direction="UNKNOWN" when there isn't yet a
+    real previous-close AND a real today's-price to compare -- never a
+    fabricated 0.0%, same missing-value convention as everywhere else in
+    this module."""
+    previous_day_candle = db.scalar(
+        select(Candle)
+        .where(
+            Candle.index_symbol == index_symbol,
+            Candle.interval == ONE_MINUTE,
+            func.date(Candle.ts_ist) < today,
+        )
+        .order_by(Candle.ts_ist.desc())
+        .limit(1)
+    )
+    if previous_day_candle is not None:
+        reference = previous_day_candle.close
+    else:
+        previous_day_tick = db.scalar(
+            select(IndexPriceTick)
+            .where(IndexPriceTick.index_symbol == index_symbol, func.date(IndexPriceTick.recorded_at) < today)
+            .order_by(IndexPriceTick.recorded_at.desc())
+            .limit(1)
+        )
+        reference = previous_day_tick.price if previous_day_tick is not None else None
+
+    today_candle = db.scalar(
+        select(Candle)
+        .where(Candle.index_symbol == index_symbol, Candle.interval == ONE_MINUTE, func.date(Candle.ts_ist) == today)
+        .order_by(Candle.ts_ist.desc())
+        .limit(1)
+    )
+    if today_candle is not None:
+        current = today_candle.close
+    else:
+        today_tick = db.scalar(
+            select(IndexPriceTick)
+            .where(IndexPriceTick.index_symbol == index_symbol, func.date(IndexPriceTick.recorded_at) == today)
+            .order_by(IndexPriceTick.recorded_at.desc())
+            .limit(1)
+        )
+        current = today_tick.price if today_tick is not None else None
+
+    if reference is None or current is None or not reference:
+        return {"change_percent": None, "direction": "UNKNOWN"}
+
+    change_percent = round(((current - reference) / reference) * 100, 2)
+    if change_percent >= _MARKET_DIRECTION_BAND_PERCENT:
+        direction = "BULLISH"
+    elif change_percent <= -_MARKET_DIRECTION_BAND_PERCENT:
+        direction = "BEARISH"
+    else:
+        direction = "FLAT"
+    return {"change_percent": change_percent, "direction": direction}
+
+
 def get_autonomous_ai_today_highlights(db: Session) -> dict[str, Any]:
     """Same four-piece shape as get_ai_origination_today_highlights above,
     reading AutonomousAILog/origin=="AUTONOMOUS_AI" instead. Replaced the
@@ -1227,6 +1303,30 @@ def get_autonomous_ai_today_highlights(db: Session) -> dict[str, Any]:
         wins = sum(1 for trade in trades if trade.result == TradeResult.WIN)
         losses = sum(1 for trade in trades if trade.result == TradeResult.LOSS)
         total = len(trades)
+        market = _todays_market_direction(db, index.symbol, today)
+        ce_count = sum(1 for trade in trades if trade.option_type == "CE")
+        pe_count = sum(1 for trade in trades if trade.option_type == "PE")
+        # 19 Sep 2026: "did our trades match how the market actually moved
+        # today" -- compares the day's realized net direction against which
+        # side (CE/PE) Autonomous AI leaned on, by trade count, for this
+        # index. Deliberately a whole-day, whole-population comparison, not
+        # a per-trade entry-to-exit check -- a trade can win or lose for
+        # reasons independent of whether the day's net direction ultimately
+        # agreed with it (a correct CE bet can still stop out on an
+        # intraday dip inside a bullish day), so this answers "was the
+        # overall lean right," not "was every trade individually vindicated."
+        if total == 0:
+            alignment = "NO_TRADES"
+        elif market["direction"] in ("UNKNOWN", "FLAT"):
+            alignment = "NO_CLEAR_DIRECTION"
+        elif ce_count == pe_count:
+            alignment = "MIXED"
+        elif (ce_count > pe_count and market["direction"] == "BULLISH") or (
+            pe_count > ce_count and market["direction"] == "BEARISH"
+        ):
+            alignment = "ALIGNED"
+        else:
+            alignment = "MISALIGNED"
         index_comparison.append(
             {
                 "symbol": index.symbol,
@@ -1236,6 +1336,11 @@ def get_autonomous_ai_today_highlights(db: Session) -> dict[str, Any]:
                 "losses": losses,
                 "win_rate": round((wins / total) * 100, 2) if total else 0.0,
                 "net_pnl": round(sum(trade.net_pnl for trade in trades), 2),
+                "ce_count": ce_count,
+                "pe_count": pe_count,
+                "market_change_percent": market["change_percent"],
+                "market_direction": market["direction"],
+                "alignment": alignment,
             }
         )
 

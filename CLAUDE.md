@@ -295,6 +295,61 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Dashboard now shows, per index, whether Autonomous AI's CE/PE lean matched how the market actually moved that day (19 Sep 2026)
+
+**Requested**: "I want comparison at the end of the day how actual market was for nifty50 and banknifty and did
+our autonomous ai trades did accordingly or not." Scoped to Autonomous AI specifically (the population the
+dashboard's "Today's Highlights" section already covers since the 17 Sep switch away from AI Origination) and
+extended the existing feature rather than building a new page or report -- the same incremental pattern this
+section of the dashboard has already gone through twice (chop+confidence sub-scores added to Market
+Conditions, 27 Aug; the Autonomous AI swap-over, 17 Sep).
+
+**"How the market actually moved" reuses the exact previous-close mechanism already fixed twice for this
+purpose** (`get_index_live_figures`'s 21/25 Aug entries above) -- change against the previous session's real
+close, not today's own open, since those two routinely disagree by whatever the index gapped overnight. New
+`_todays_market_direction(db, index_symbol, today)` in `app/platform.py` deliberately does NOT call
+`get_index_live_figures` itself, since that function needs `smartapi`/`feed_store` for the *live* current
+price -- this only needs a number that settles once trading ends, so it reads the previous day's last stored
+`ONE_MINUTE` `Candle` close (falling back to the last `IndexPriceTick` before today, same fallback order as
+the live-figures function) as the reference, and today's own last stored candle/tick as "now." Zero live
+dependency, same fail-closed convention as everywhere else in this module: `change_percent=None,
+direction="UNKNOWN"` when there isn't yet a real reference AND a real current value, never a fabricated 0%.
+Classified BULLISH/BEARISH/FLAT against a +-0.15% band around zero -- a reasoned starting point (wider than
+`_recent_momentum_label`'s +-0.03% band, since that measures a ~15-minute move and this measures a whole
+session), not backtested.
+
+**Alignment is a whole-day, whole-population comparison, not a per-trade check, on purpose.** For each index,
+`get_autonomous_ai_today_highlights()`'s existing `index_comparison` entries now also carry `ce_count`/
+`pe_count` (today's closed Autonomous AI trades for that index, split by `option_type`), `market_change_
+percent`/`market_direction`, and an `alignment` verdict: `ALIGNED` (the side AI took more of matches the
+day's net direction), `MISALIGNED` (it doesn't), `MIXED` (equal CE/PE count, no lean either way), `NO_CLEAR_
+DIRECTION` (market read FLAT or UNKNOWN), `NO_TRADES` (nothing closed today for that index). Deliberately NOT
+a per-trade entry-to-exit check -- a correct CE bet can still stop out on an intraday dip inside a bullish
+day, so this answers "was the overall lean right for the day," not "was every individual trade vindicated,"
+which is a different, already-answered question (the existing win/loss/net_pnl columns right next to it).
+
+`live_dashboard.html`'s `renderIndexComparison` renders a new line per index card: "Market today: +X.XX%
+(BULLISH) · Traded with the day" (or the matching label for each alignment value), colored green/red to match
+the existing win/loss convention on the card. No new route, no new poll cycle -- rides the same 10s `/api/
+live-dashboard` fetch this section already used.
+
+9 new tests in `tests/test_autonomous_today_highlights.py` (now 17, was 8): `_todays_market_direction`'s
+BULLISH/BEARISH/FLAT classification from real candle rows, the IndexPriceTick fallback when no candles exist,
+the UNKNOWN case with zero data at all, and five `index_comparison` integration cases covering all five
+alignment verdicts (ALIGNED on a CE lean matching a bullish day, MISALIGNED on a PE lean against one, NO_
+TRADES, NO_CLEAR_DIRECTION when the market itself is UNKNOWN, and MIXED on a tied CE/PE count). Full suite:
+1061 passed (was 1052), plus the same 2 pre-existing unrelated failures already documented elsewhere in this
+file (`test_daily_report_origination.py`'s and `test_validated_signal.py`'s own wall-clock-dependent flakes,
+confirmed present identically on this tree before this change). `python -c "import app.main"` imports cleanly.
+
+**Not verified live** -- this sandbox cannot run a real Autonomous AI trading day. After deploying, confirm
+the "Market today" line renders correctly through a full real session and settles to a stable end-of-day
+figure once trading closes, and read the alignment verdicts against a few real days once Autonomous AI has
+closed trades again on both indices (currently paused for the CHOP_ZONE-caution observation window, per the
+18 Sep entry below) -- specifically watch whether `ALIGNED` days actually correlate with better net P&L than
+`MISALIGNED` ones, which this pass only surfaces as a readable fact, not yet as anything backtested or
+correlated against outcome.
+
 ### Quick Scalp's structural stop gets a minimum-width floor -- narrow C0 bars were producing near-instant stops (19 Sep 2026)
 
 **Reported**: "I observed that scalping trades buy and sell on same time within few seconds" -- following the
