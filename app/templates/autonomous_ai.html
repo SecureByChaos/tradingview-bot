@@ -18,6 +18,11 @@
   AFTER the model answers: if it decides BUY_CE/BUY_PE while the EMA9/21 regime it was shown actually
   points the other way, the decision is overridden to NONE in Python rather than trusted -- added after
   real trades showed the model naming that exact contradiction in its own reasoning and trading anyway.
+  A fourth check, added 22 Sep 2026, runs the same way: Recent Price Action (last ~15 min) is only ever a
+  categorical RISING/FALLING/FLAT label with no magnitude behind it, so a reading barely past the 0.03%
+  noise band was carrying exactly as much weight in the model's own reasoning as a decisive move -- a real
+  Nifty BUY_PE opened on a -0.035% reading directly into a reversal that had already begun. If the model's
+  decision relies on a Recent Price Action reading under 0.10%, it is overridden to NONE the same way.
   Every open position is re-asked, every ~5 minutes, whether to hold or exit -- an EXIT answer really
   does close the trade immediately.</p>
   <p class="mb-2"><strong>Exit matrix, checked in order before the model is asked, each one closing the

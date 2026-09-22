@@ -34,6 +34,8 @@ from app.ai.autonomous import (
     _peak_pnl_percent,
     _recent_history_text,
     _recent_momentum_label,
+    _recent_move_confirms_action,
+    _recent_move_is_marginal,
     _regime_matches_action,
     _session_phase,
     _todays_closed_trades,
@@ -639,6 +641,161 @@ def test_system_prompt_entry_rejects_recent_reversal_independent_of_hourly_readi
 def test_system_prompt_exit_has_recent_reversal_rule():
     assert "Recent Reversal" in SYSTEM_PROMPT_EXIT
     assert "Recent Price Action" in SYSTEM_PROMPT_EXIT
+
+
+# ---------------------------------------------------------------------------
+# _recent_move_is_marginal / _recent_move_confirms_action (22 Sep 2026)
+#
+# Real production trigger: a Nifty BUY_PE opened on recent_price_change_
+# percent=-0.035%, only 0.005pp past _RECENT_MOVE_FLAT_BAND_PERCENT (0.03%)
+# -- labelled a full FALLING by _recent_momentum_label and shown to the model
+# identically to a decisive move, with no magnitude weighting. The same
+# reading flipped to +0.052% five minutes later -- a reversal already
+# underway, not a confirmed down-move. See _recent_move_confirms_action's
+# own docstring for the full account.
+# ---------------------------------------------------------------------------
+
+def test_recent_move_is_marginal_boundaries():
+    assert _recent_move_is_marginal(None) is False
+    assert _recent_move_is_marginal(0.02) is False  # below the flat band entirely
+    assert _recent_move_is_marginal(-0.02) is False
+    assert _recent_move_is_marginal(0.03) is True  # exactly at the flat-band edge
+    assert _recent_move_is_marginal(-0.035) is True  # the real trigger trade's own reading
+    assert _recent_move_is_marginal(0.09) is True
+    assert _recent_move_is_marginal(0.10) is False  # clears the marginal ceiling -- decisive
+    assert _recent_move_is_marginal(-0.5) is False
+
+
+def test_recent_move_confirms_action_blocks_marginal_agreement():
+    # The exact real shape: BUY_PE relying on a barely-past-threshold FALLING reading.
+    marginal_falling = _make_features(recent_price_change_percent=-0.035)
+    marginal_rising = _make_features(recent_price_change_percent=0.05)
+    assert _recent_move_confirms_action(marginal_falling, "BUY_PE") is False
+    assert _recent_move_confirms_action(marginal_rising, "BUY_CE") is False
+
+
+def test_recent_move_confirms_action_allows_marginal_disagreement():
+    # A marginal reading that opposes the trade is a weak contradiction
+    # already covered by SYSTEM_PROMPT_ENTRY's own Mandatory Reject language
+    # -- not this function's concern, so it must not block here.
+    marginal_falling = _make_features(recent_price_change_percent=-0.035)
+    marginal_rising = _make_features(recent_price_change_percent=0.05)
+    assert _recent_move_confirms_action(marginal_falling, "BUY_CE") is True
+    assert _recent_move_confirms_action(marginal_rising, "BUY_PE") is True
+
+
+def test_recent_move_confirms_action_allows_decisive_moves():
+    decisive_falling = _make_features(recent_price_change_percent=-0.4)
+    decisive_rising = _make_features(recent_price_change_percent=0.4)
+    assert _recent_move_confirms_action(decisive_falling, "BUY_PE") is True
+    assert _recent_move_confirms_action(decisive_rising, "BUY_CE") is True
+
+
+def test_recent_move_confirms_action_allows_flat_and_unknown():
+    flat = _make_features(recent_price_change_percent=0.01)
+    unknown = _make_features(recent_price_change_percent=None)
+    assert _recent_move_confirms_action(flat, "BUY_CE") is True
+    assert _recent_move_confirms_action(flat, "BUY_PE") is True
+    assert _recent_move_confirms_action(unknown, "BUY_CE") is True
+    assert _recent_move_confirms_action(unknown, "BUY_PE") is True
+
+
+def test_recent_move_confirms_action_none_always_passes():
+    marginal_falling = _make_features(recent_price_change_percent=-0.035)
+    assert _recent_move_confirms_action(marginal_falling, "NONE") is True
+
+
+def test_check_entry_overridden_when_recent_move_is_marginal(monkeypatch):
+    # Reproduces the real 22 Sep 2026 trigger trade exactly: bearish EMA
+    # regime (so the earlier EMA override does NOT fire), model decides
+    # BUY_PE citing a FALLING recent-price reading that is in fact only
+    # -0.035%, barely past the noise band.
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall(
+            '{"decision": "BUY_PE", "confidence": 0.62, '
+            '"reasoning": "bearish regime, ADX confirms trend, spot below VWAP, recent price action FALLING"}',
+            None, 12.0,
+        ),
+    )
+
+    result = check_autonomous_entry(
+        db, index,
+        _make_features(fast_ema=56800.0, slow_ema=57000.0, recent_price_change_percent=-0.035),
+        to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+
+    assert result is None
+    assert option_finder.calls == 0
+
+
+def test_check_entry_not_overridden_when_recent_move_is_decisive(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall('{"decision": "BUY_PE", "confidence": 0.7, "reasoning": "clean bearish setup"}', None, 12.0),
+    )
+
+    result = check_autonomous_entry(
+        db, index,
+        _make_features(fast_ema=56800.0, slow_ema=57000.0, recent_price_change_percent=-0.4),
+        to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+
+    assert result is not None
+    assert result.signal == "BUY_PE"
+
+
+def test_check_entry_not_overridden_when_recent_move_is_marginal_but_opposing(monkeypatch):
+    # A marginal reading that runs counter to the trade direction is left to
+    # the model's own Mandatory Reject language, not this deterministic gate.
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall('{"decision": "BUY_PE", "confidence": 0.65, "reasoning": "bearish setup"}', None, 12.0),
+    )
+
+    result = check_autonomous_entry(
+        db, index,
+        _make_features(fast_ema=56800.0, slow_ema=57000.0, recent_price_change_percent=0.05),
+        to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+
+    assert result is not None
+    assert result.signal == "BUY_PE"
+
+
+def test_check_entry_logs_the_raw_direction_even_when_recent_move_overrides_it(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: module._RawCall(
+            '{"decision": "BUY_PE", "confidence": 0.62, "reasoning": "bearish, FALLING recent action"}', None, 12.0,
+        ),
+    )
+
+    check_autonomous_entry(
+        db, index,
+        _make_features(fast_ema=56800.0, slow_ema=57000.0, recent_price_change_percent=-0.035),
+        to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+    )
+    row = _only_log_row(db)
+    assert row.raw_decision == "BUY_PE"
+    assert row.block_reason == "RECENT_MOVE_MARGINAL"
+    assert row.trade_id is None
 
 
 # ---------------------------------------------------------------------------

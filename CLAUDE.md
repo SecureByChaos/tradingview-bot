@@ -295,6 +295,70 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Recent Price Action gets a fourth deterministic gate -- a threshold-grazing reading was carrying as much weight as a decisive one (22 Sep 2026)
+
+**Reported**: pasted a TradingView chart showing a Nifty reversal alongside a losing Autonomous AI `BUY_PE`
+trade, and asked directly why it took a put when Nifty looked bullish. Rather than guess from the chart,
+pulled the real `autonomous_ai_logs` rows spanning the entry (`SELECT timestamp, decision, recent_price_
+change_percent, reasoning FROM autonomous_ai_logs WHERE index_symbol='NIFTY' ...` around the entry
+timestamp, provided by the user). The decision that opened the trade shows `recent_price_change_percent =
+-0.035%` -- only 0.005 percentage points past `_RECENT_MOVE_FLAT_BAND_PERCENT` (0.03%), the noise band
+`_recent_momentum_label()` (11 Sep 2026) already uses to separate FLAT from a real RISING/FALLING move. The
+very next logged row, five minutes later, reads `+0.052%` -- the reversal had already begun; the entry
+traded directly into it. Root cause, confirmed by reading `_recent_momentum_label()`: it is a purely
+categorical split with no magnitude behind it -- `-0.035%` and `-0.50%` are both labelled FALLING and shown
+to the model identically, even though the raw percentage IS already printed alongside the label in both
+prompts. The model is not discounting a threshold-grazing reading on its own, the same self-enforcement gap
+already found and fixed for EMA regime (4 Sep 2026) and, indirectly, the same class of gap `chop_efficiency_
+ratio`'s own hourly window and this exact ~15-minute signal were each built to close for something coarser
+missing it (11 Sep 2026's own trigger).
+
+**Fixed with a second post-decision override, same shape as `_regime_matches_action`, not a prompt change.**
+The existing prompt-level Mandatory Reject (RISING while evaluating BUY_PE, or the reverse) already covers a
+genuine contradiction and is untouched. What was missing is the mirror case actually observed: a marginal
+reading that happens to numerically *agree* with the trade direction, treated as real support when it is
+statistically indistinguishable from noise. New `_RECENT_MOVE_MARGINAL_PERCENT = 0.10` (over 3x the existing
+0.03% flat band -- a reasoned starting point, not backtested, same status every other threshold in this
+module carries before real history looks at it) and `_recent_move_is_marginal(pct)` mark a reading that has
+only just cleared the flat band. New `_recent_move_confirms_action(features, action)` blocks only the
+specific case that happened: a marginal reading whose sign matches what the trade needs (marginal positive
+for `BUY_CE`, marginal negative for `BUY_PE`). A marginal reading that instead opposes the trade is left
+alone -- that's the existing Mandatory Reject language's job, not this gate's; FLAT and `UNKNOWN` readings
+are neither agreement nor contradiction and are also left alone. Wired into `check_autonomous_entry`
+directly after the existing EMA-regime override, same `log_event`-at-WARNING-with-the-model's-own-reasoning
+audit trail, same `record_entry_decision()` persistence with `raw_decision` preserving what the model
+actually chose and a new `block_reason="RECENT_MOVE_MARGINAL"` -- distinguishable from `EMA_REGIME_OVERRIDE`
+in any future query, per this project's own standing "origin/block-reason is the isolation mechanism" habit
+applied here to decision auditing rather than trade population.
+
+`_recent_momentum_label()` itself, its `0.03%` flat band, and the Mandatory Reject prompt language are all
+byte-for-byte unchanged -- this is a second, narrower check layered on top, not a retuning of the existing
+one. `SYSTEM_PROMPT_ENTRY`/`SYSTEM_PROMPT_EXIT` are also unchanged; the model is not told about this gate
+because there is nothing new to tell it -- it already saw the exact percentage and traded through it, so the
+fix is enforcement, not better information.
+
+10 new tests in `tests/test_autonomous_ai.py` (1085 total, was 1075): `_recent_move_is_marginal`'s exact
+boundaries including the real trigger reading (-0.035%) and the marginal-ceiling edge (0.10% is no longer
+marginal); `_recent_move_confirms_action` blocking marginal agreement on both `BUY_CE`/`BUY_PE`, allowing
+marginal disagreement, allowing decisive moves, allowing FLAT/`UNKNOWN`, and the `NONE`-always-passes case;
+and four `check_autonomous_entry` integration tests reproducing the real trigger trade exactly (bearish EMA
+regime so the earlier override doesn't fire, model decides `BUY_PE` on the -0.035% reading, gets overridden,
+`option_finder.calls == 0`), confirming a decisive reading is NOT overridden, confirming a marginal-but-
+opposing reading is NOT overridden by this gate, and confirming `raw_decision`/`block_reason` are persisted
+correctly. Full suite: 1085 passed. `python -c "import app.main"` imports cleanly.
+
+**Verified live**: seeded a scratch SQLite DB with an open Autonomous AI trade, started the real app via
+uvicorn, logged in, and confirmed `/autonomous-ai` renders 200 with the updated banner describing the fourth
+check and no Jinja errors, and that `/` still renders 200 unaffected.
+
+**Not verified live against a real decision cycle** -- this sandbox cannot call either provider's real API.
+After deploying, watch for `Deterministic override -- model chose ... on a marginal Recent Price Action
+reading` lines and confirm the override rate isn't so high it's effectively vetoing a large share of what
+the model tries to do (which would suggest marginal readings are a bigger share of real decisions than this
+one incident implies) -- two real trades (this one and the 21 Sep entry that prompted the investigation, a
+related but distinct staleness-of-window issue not addressed by this gate) is a real, confirmed pattern for
+this specific mechanism, but not yet a large sample.
+
 ### Market-alignment comparison persisted into the Daily Report, not just the live "today" dashboard (22 Sep 2026)
 
 **Requested**: after walking through a real Autonomous AI trade live (17-Sep-style investigation, this time a
