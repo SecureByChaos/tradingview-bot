@@ -295,6 +295,65 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Market-alignment comparison persisted into the Daily Report, not just the live "today" dashboard (22 Sep 2026)
+
+**Requested**: after walking through a real Autonomous AI trade live (17-Sep-style investigation, this time a
+21 Sep Nifty entry that chased the top of a fresh rally leg), asked to see the market-vs-AI-lean comparison for
+that day -- and the 19 Sep dashboard feature (below) turned out unable to show it: it's scoped to `today_ist()`
+and the date had already rolled past 21 Sep by the time it was asked for. Reconstructed 21 Sep's numbers by hand
+from raw SQL in the same conversation, then asked directly: **"I want you to implement this in the portal end
+of the day"** -- a durable, browsable-after-the-fact version, not a live-only snapshot.
+
+**Extracted, not rebuilt.** `get_autonomous_ai_today_highlights()`'s own `index_comparison` loop (19 Sep) is
+pulled out into a new `autonomous_ai_market_alignment_for_day(db, day)` in `app/platform.py`, parameterized on
+an arbitrary `day` instead of hardcoding `today_ist()` -- the alignment logic itself (ALIGNED/MISALIGNED/MIXED/
+NO_CLEAR_DIRECTION/NO_TRADES, `_todays_market_direction`'s previous-close-vs-current-close read) is byte-for-
+byte unchanged, confirmed by a dedicated regression test asserting the live dashboard's own "today" output now
+equals a direct call to the extracted function with `today_ist()`. The live dashboard still calls this with
+`today_ist()` for its real-time view -- nothing about `/`'s own live behavior changes.
+
+**Wired into `generate_daily_summary()` (`app/reports.py`), Daily only -- not Weekly/Monthly/Pattern
+Discovery.** This report already runs once per trading day at 16:00 IST (after the 15:00 square-off, already
+gated on `trading_day_reason()` per the 18 Sep holiday-awareness fix) and persists to `AIReport.stats_json`,
+browsable historically on `/reports` -- exactly the "portal, end of day, still there tomorrow" mechanism this
+was asked for, with zero new page, route, or scheduler job. Scoped to Daily deliberately: "market direction"
+and "CE/PE lean" are inherently single-day concepts here (unlike `origination_stats`, which got added to all
+four report types on 25 Aug since a trade population sums cleanly over any date range) -- extending this to a
+week or month would need a genuinely different definition of "the period's direction," which wasn't asked for
+and wasn't built.
+
+New `stats["market_alignment"]` key (a list, one entry per enabled index, same shape as the dashboard's own
+`index_comparison` entries) plus a new `_market_alignment_narrative_lines()` helper in `app/reports.py` --
+same no-op-when-absent convention `_origination_narrative_lines` already established, so Weekly/Monthly/
+Pattern Discovery's narratives are provably unaffected (a dedicated test confirms the key's absence for all
+three). Renders as e.g. *"Bank Nifty moved 0.54% (BULLISH) today; Autonomous AI closed 1 trade(s) (1 CE / 0
+PE) -- ALIGNED."* in the daily narrative, both the template fallback and (via one added sentence in the
+OpenAI-narrative prompt, same pattern as `origination_stats`' own addition) the real AI-generated summary when
+a provider is configured.
+
+16 new tests: `tests/test_autonomous_today_highlights.py` (+4 -- the extracted function producing a real,
+non-UNKNOWN comparison for a day three days in the past, excluding trades closed on other days, and the
+byte-for-byte-equality regression test against the live dashboard's own "today" call) and
+`tests/test_daily_report_origination.py` (+12 -- `market_alignment` populated correctly for an explicit
+`report_date` including its narrative line, the zero-Autonomous-AI-trades case, absence confirmed for Weekly/
+Monthly/Pattern Discovery, the narrative helper's ALIGNED/NO_TRADES/UNKNOWN-direction rendering, the
+key-absent no-op case, and the empty-when-absent narrative-text case). Full suite: 1075 passed (was 1063,
+both counts confirmed via `git stash` on this exact tree). `python -c "import app.main"` imports cleanly.
+
+**Verified live**, not just unit-tested: seeded a scratch SQLite DB with two enabled indexes, a Bank Nifty
+candle pair showing a real +0.54% day, and one closed Autonomous AI Bank Nifty CE win on 21 Sep 2026, called
+`generate_daily_summary(db, report_date=date(2026,9,21))` directly and confirmed the persisted narrative and
+raw `stats_json` both carry the exact expected numbers -- then started the real app via uvicorn, logged in
+over HTTP, and confirmed `/reports?report_type=DAILY` renders 200 with *"Bank Nifty moved 0.54% (BULLISH)
+today... -- ALIGNED."* visible in the rendered page (narrative text and the raw JSON dump both), and that `/`
+and `/autonomous-ai` still render 200 unaffected.
+
+**Not verified against a real trading day's own scheduled 16:00 IST firing** -- this sandbox cannot run the
+scheduler through a real market close. After deploying, confirm `ai-daily-summary` actually persists a
+`market_alignment` block on the next real trading day's Daily Report, and that it reads correctly against real
+closed Autonomous AI trades once it resumes trading past the CHOP_ZONE observation window (see the 19 Sep
+entry below) -- currently that block will mostly show `NO_TRADES` per index until real trades close again.
+
 ### Dashboard now shows, per index, whether Autonomous AI's CE/PE lean matched how the market actually moved that day (19 Sep 2026)
 
 **Requested**: "I want comparison at the end of the day how actual market was for nifty50 and banknifty and did

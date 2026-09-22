@@ -13,7 +13,7 @@ from app.ai.client import AIClient
 from app.ai.repository import get_settings as get_ai_settings
 from app.database import SessionLocal
 from app.db_models import AIReport, AISettings, AITradeReview, ReportType, StrategyTrade, TradeResult, TradeStatus
-from app.platform import log_event, today_ist
+from app.platform import autonomous_ai_market_alignment_for_day, log_event, today_ist
 from app.signal_validation import trading_day_reason
 from app.time_utils import to_ist, utc_now
 
@@ -465,8 +465,35 @@ def _template_narrative(report_label: str, period_label: str, stats: dict[str, A
             lines.append(f"Longest losing streak in the period: {stats['max_consecutive_losses']} trades.")
 
     lines.extend(_origination_narrative_lines(stats.get("origination_stats")))
+    lines.extend(_market_alignment_narrative_lines(stats.get("market_alignment")))
     lines.append("(Generated from raw statistics; configure an AI provider in AI Settings for a narrative summary.)")
     return "\n".join(lines)
+
+
+def _market_alignment_narrative_lines(market_alignment: list[dict[str, Any]] | None) -> list[str]:
+    """Autonomous AI's end-of-day market-direction-vs-CE/PE-lean comparison
+    (built for the live dashboard 19 Sep 2026, persisted into the Daily
+    Report 22 Sep 2026 -- see generate_daily_summary's own comment). Returns
+    [] when the caller's stats dict never set market_alignment at all (every
+    report kind except Daily, which is the only one this is wired into --
+    "market direction" and "CE/PE lean" are inherently single-day concepts),
+    same no-op convention _origination_narrative_lines already uses."""
+    if market_alignment is None:
+        return []
+    lines: list[str] = []
+    for entry in market_alignment:
+        if entry["market_change_percent"] is None:
+            market_bit = f"{entry['display_name']}'s market direction today is unknown"
+        else:
+            market_bit = f"{entry['display_name']} moved {entry['market_change_percent']}% ({entry['market_direction']}) today"
+        if entry["trades"] == 0:
+            lines.append(f"{market_bit}; no Autonomous AI trades closed.")
+        else:
+            lines.append(
+                f"{market_bit}; Autonomous AI closed {entry['trades']} trade(s) "
+                f"({entry['ce_count']} CE / {entry['pe_count']} PE) -- {entry['alignment']}."
+            )
+    return lines
 
 
 def _origination_narrative_lines(origination_stats: dict[str, Any] | None) -> list[str]:
@@ -580,8 +607,10 @@ def _generate_narrative(db: Session, report_label: str, period_label: str, stats
             "Call out the best and worst performing strategies, notable win-rate patterns, and any risk "
             "concerns such as loss streaks or a low win rate. If an origination_stats block is present, "
             "summarize AI Origination's performance for the period as its own point -- it is a separate "
-            "population from the strategy trades above, not a strategy itself. If a data point is missing "
-            "or zero, do not speculate about the reason."
+            "population from the strategy trades above, not a strategy itself. If a market_alignment block "
+            "is present (Daily reports only), summarize per index whether Autonomous AI's CE/PE trade lean "
+            "matched that day's actual market direction (the alignment field), as its own point. If a data "
+            "point is missing or zero, do not speculate about the reason."
         )
         content, error = _call_openai_narrative(settings, user_prompt)
         if content:
@@ -636,6 +665,15 @@ def generate_daily_summary(db: Session, report_date: date | None = None) -> AIRe
     origination_trades = _origination_trades_between(db, day, day)
     stats = _trade_stats(trades)
     stats["origination_stats"] = _origination_trade_stats(origination_trades)
+    # 22 Sep 2026: "implement this in the portal end of the day" -- the live
+    # dashboard's market-alignment comparison (19 Sep) is scoped to "today"
+    # and disappears once the date rolls over. Daily-only, not Weekly/Monthly/
+    # Pattern Discovery: "market direction" and "CE/PE lean" are inherently
+    # single-day concepts here, and this report already runs once per trading
+    # day (16:00 IST, after the 15:00 square-off) and persists historically
+    # on /reports -- exactly the durable, browsable-after-the-fact record
+    # this was asked for, with no new page or scheduler job needed.
+    stats["market_alignment"] = autonomous_ai_market_alignment_for_day(db, day)
     period_label = day.strftime("%d %b %Y")
     summary_text, provider, model = _generate_narrative(db, "daily summary", period_label, stats)
     return _save_report(db, ReportType.DAILY, day, day, f"Daily Summary - {period_label}", summary_text, stats, provider, model)
