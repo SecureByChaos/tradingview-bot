@@ -1146,6 +1146,57 @@ def _recent_momentum_label(pct: float | None) -> str:
     return "RISING" if pct > 0 else "FALLING"
 
 
+# A reading only just past _RECENT_MOVE_FLAT_BAND_PERCENT is labelled a full
+# RISING/FALLING by _recent_momentum_label, identically to a decisive move --
+# the label is purely categorical with no magnitude weighting. Real trigger
+# trade, 22 Sep 2026: Nifty BUY_PE opened on recent_price_change_percent =
+# -0.035%, only 0.005pp past the 0.03% noise band, labelled FALLING and shown
+# to the model as if it were unambiguous. The same reading flipped to +0.052%
+# five minutes later -- a reversal that had already begun, not a confirmed
+# down-move. Set comfortably above the flat band (over 3x), a reasoned
+# starting point rather than backtested, same status every other threshold in
+# this module carries before real history looks at it.
+_RECENT_MOVE_MARGINAL_PERCENT = 0.10
+
+
+def _recent_move_is_marginal(pct: float | None) -> bool:
+    """True when a reading has cleared the flat/noise band just enough to be
+    labelled RISING/FALLING, but not by enough margin to trust as a genuine
+    directional move rather than noise grazing the threshold."""
+    if pct is None:
+        return False
+    return _RECENT_MOVE_FLAT_BAND_PERCENT <= abs(pct) < _RECENT_MOVE_MARGINAL_PERCENT
+
+
+def _recent_move_confirms_action(features: _Features, action: str) -> bool:
+    """Cross-check the model's own chosen direction against how much real
+    weight its own Recent Price Action reading can bear. SYSTEM_PROMPT_ENTRY
+    only ever treats Recent Price Action as a Mandatory Reject when it
+    directly contradicts the trade direction (RISING while evaluating
+    BUY_PE, or the reverse) -- it is never required to affirmatively confirm
+    a trade outside CHOP_ZONE, and the model is shown the label with no
+    indication of how close a RISING/FALLING reading sits to the flat band
+    it just cleared. In practice the model still leans on a marginal
+    same-direction reading as if it were real support (the 22 Sep trigger
+    trade's own reasoning cited the FALLING label as part of its case for
+    BUY_PE). Enforced here rather than relying on the model to discount a
+    marginal reading unprompted, the same escalation already applied to EMA
+    regime and ADX. Only blocks the case actually observed -- a marginal
+    reading whose direction happens to match the trade being evaluated. A
+    marginal reading that instead opposes the trade is a weak contradiction
+    already covered by SYSTEM_PROMPT_ENTRY's own Mandatory Reject language,
+    not this function's concern; FLAT and UNKNOWN readings are neither
+    agreement nor contradiction and are left alone too."""
+    pct = features.recent_price_change_percent
+    if pct is None or not _recent_move_is_marginal(pct):
+        return True
+    if action == "BUY_CE":
+        return pct <= 0
+    if action == "BUY_PE":
+        return pct >= 0
+    return True
+
+
 def _build_entry_prompt(features: _Features, index_display_name: str, history_text: str = "") -> str:
     adx_label = "Trending" if (features.adx or 0.0) >= _ADX_LLM_FLOOR else "Range-bound/Chop"
     adx_text = f"{features.adx:.1f}" if features.adx is not None else "unavailable"
@@ -1444,6 +1495,31 @@ def check_autonomous_entry(
         record_entry_decision(
             db, index_symbol=index.symbol, features=features, raw_decision=decision.action,
             block_reason="EMA_REGIME_OVERRIDE", confidence=decision.confidence,
+            reasoning=decision.reasoning, latency_ms=raw.latency_ms,
+        )
+        return None
+
+    # Second deterministic override, same post-decision shape as the EMA
+    # regime check above -- see _recent_move_confirms_action's own docstring
+    # for the real 22 Sep 2026 trigger trade.
+    if not _recent_move_confirms_action(features, decision.action):
+        logger.info(
+            "[AUTONOMOUS_AI] %s: Deterministic override -- model chose %s on a marginal "
+            "Recent Price Action reading (%.3f%%, within %.2f%% of the flat band), too close "
+            "to noise to trust as real confirmation",
+            index.symbol, decision.action, features.recent_price_change_percent or 0.0,
+            _RECENT_MOVE_MARGINAL_PERCENT,
+        )
+        log_event(
+            db, "AUTONOMOUS_AI",
+            f"[{index.symbol}] overridden to NONE -- {decision.action} relies on a marginal "
+            f"Recent Price Action reading ({features.recent_price_change_percent}%, within "
+            f"{_RECENT_MOVE_MARGINAL_PERCENT}% of the flat band); model reasoning: {decision.reasoning}",
+            level="WARNING",
+        )
+        record_entry_decision(
+            db, index_symbol=index.symbol, features=features, raw_decision=decision.action,
+            block_reason="RECENT_MOVE_MARGINAL", confidence=decision.confidence,
             reasoning=decision.reasoning, latency_ms=raw.latency_ms,
         )
         return None
