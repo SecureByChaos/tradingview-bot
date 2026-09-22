@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.db_models import Base, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.db_models import Base, Candle, IndexConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.market_data import ONE_MINUTE
 from app.reports import (
+    _market_alignment_narrative_lines,
     _template_narrative,
     _template_pattern_narrative,
     generate_daily_summary,
@@ -16,6 +18,10 @@ from app.reports import (
     generate_weekly_report,
 )
 from app.time_utils import utc_now
+
+
+def _candle(index_symbol: str, ts_ist, close: float) -> Candle:
+    return Candle(index_symbol=index_symbol, interval=ONE_MINUTE, ts_ist=ts_ist, open=close, high=close, low=close, close=close)
 
 
 def _make_session() -> Session:
@@ -240,3 +246,119 @@ def test_pattern_narrative_unaffected_when_origination_stats_absent():
     text = _template_pattern_narrative("25 Aug 2026", stats)
 
     assert "AI Origination" not in text
+
+
+# ---------------------------------------------------------------------------
+# 22 Sep 2026: "implement this in the portal end of the day" -- Autonomous
+# AI's market-direction-vs-CE/PE-lean comparison, persisted into the Daily
+# Report (Daily only, not Weekly/Monthly/Pattern Discovery) so it survives
+# past the day it describes, instead of only existing on the live dashboard
+# for the few hours before the date rolls over.
+# ---------------------------------------------------------------------------
+
+def test_generate_daily_summary_includes_market_alignment_for_the_report_date():
+    db = _make_session()
+    db.add(IndexConfig(symbol="BANKNIFTY", display_name="Bank Nifty", enabled=True))
+    db.add(IndexConfig(symbol="NIFTY", display_name="Nifty 50", enabled=True))
+    report_date = date(2026, 9, 21)
+    prev_day = report_date - timedelta(days=1)
+    db.add(_candle("BANKNIFTY", datetime.combine(prev_day, datetime.min.time()) + timedelta(hours=15), 56000.0))
+    db.add(_candle("BANKNIFTY", datetime.combine(report_date, datetime.min.time()) + timedelta(hours=10), 56300.0))
+    db.add(_trade(
+        trade_id="a-1", origin="AUTONOMOUS_AI", index_symbol="BANKNIFTY", option_type="CE",
+        result=TradeResult.WIN, profit_loss=100.0, pnl_percent=10.0,
+        exit_time=datetime.combine(report_date, datetime.min.time()) + timedelta(hours=9),
+    ))
+    db.commit()
+
+    report = generate_daily_summary(db, report_date=report_date)
+
+    stats = json.loads(report.stats_json)
+    assert "market_alignment" in stats
+    bn = next(e for e in stats["market_alignment"] if e["symbol"] == "BANKNIFTY")
+    assert bn["market_direction"] == "BULLISH"
+    assert bn["trades"] == 1
+    assert bn["alignment"] == "ALIGNED"
+    assert "Bank Nifty moved" in report.summary_text
+    assert "ALIGNED" in report.summary_text
+
+
+def test_generate_daily_summary_reports_no_autonomous_trades_correctly():
+    db = _make_session()
+    db.add(IndexConfig(symbol="BANKNIFTY", display_name="Bank Nifty", enabled=True))
+    db.add(_trade(trade_id="s-1", origin="SIGNAL"))
+    db.commit()
+
+    report = generate_daily_summary(db, report_date=date.today())
+
+    stats = json.loads(report.stats_json)
+    bn = next(e for e in stats["market_alignment"] if e["symbol"] == "BANKNIFTY")
+    assert bn["trades"] == 0
+    assert bn["alignment"] in ("NO_TRADES",)
+
+
+def test_generate_weekly_report_does_not_include_market_alignment():
+    db = _make_session()
+    db.add(_trade(trade_id="s-1", origin="SIGNAL"))
+    db.commit()
+
+    report = generate_weekly_report(db, reference=date.today())
+
+    stats = json.loads(report.stats_json)
+    assert "market_alignment" not in stats
+
+
+def test_generate_monthly_report_does_not_include_market_alignment():
+    db = _make_session()
+    db.add(_trade(trade_id="s-1", origin="SIGNAL"))
+    db.commit()
+
+    report = generate_monthly_report(db, reference=date.today())
+
+    stats = json.loads(report.stats_json)
+    assert "market_alignment" not in stats
+
+
+def test_generate_pattern_discovery_does_not_include_market_alignment():
+    db = _make_session()
+    db.add(_trade(trade_id="s-1", origin="SIGNAL"))
+    db.commit()
+
+    report = generate_pattern_discovery(db, lookback_days=7)
+
+    stats = json.loads(report.stats_json)
+    assert "market_alignment" not in stats
+
+
+def test_market_alignment_narrative_lines_reports_aligned_case():
+    lines = _market_alignment_narrative_lines([
+        {
+            "display_name": "Nifty 50", "market_change_percent": 0.32, "market_direction": "BULLISH",
+            "trades": 1, "ce_count": 1, "pe_count": 0, "alignment": "ALIGNED",
+        },
+    ])
+
+    assert lines == ["Nifty 50 moved 0.32% (BULLISH) today; Autonomous AI closed 1 trade(s) (1 CE / 0 PE) -- ALIGNED."]
+
+
+def test_market_alignment_narrative_lines_handles_no_trades_and_unknown_direction():
+    lines = _market_alignment_narrative_lines([
+        {
+            "display_name": "Bank Nifty", "market_change_percent": None, "market_direction": "UNKNOWN",
+            "trades": 0, "ce_count": 0, "pe_count": 0, "alignment": "NO_TRADES",
+        },
+    ])
+
+    assert lines == ["Bank Nifty's market direction today is unknown; no Autonomous AI trades closed."]
+
+
+def test_market_alignment_narrative_lines_returns_empty_when_key_absent():
+    assert _market_alignment_narrative_lines(None) == []
+
+
+def test_template_narrative_omits_market_alignment_section_when_key_absent():
+    stats = {"total_trades": 1, "wins": 1, "losses": 0, "win_rate": 100.0, "net_pnl": 50.0}
+
+    text = _template_narrative("daily summary", "21 Sep 2026", stats)
+
+    assert "moved" not in text

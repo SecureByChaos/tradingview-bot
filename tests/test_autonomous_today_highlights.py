@@ -14,7 +14,12 @@ from sqlalchemy.orm import Session
 
 from app.db_models import AutonomousAILog, Base, Candle, IndexConfig, IndexPriceTick, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.market_data import ONE_MINUTE
-from app.platform import _todays_market_direction, get_autonomous_ai_today_highlights, today_ist
+from app.platform import (
+    _todays_market_direction,
+    autonomous_ai_market_alignment_for_day,
+    get_autonomous_ai_today_highlights,
+    today_ist,
+)
 from app.time_utils import utc_now
 
 
@@ -369,3 +374,65 @@ def test_index_comparison_alignment_is_mixed_when_ce_and_pe_counts_tie():
     entry = next(e for e in result["index_comparison"] if e["symbol"] == "BANKNIFTY")
 
     assert entry["alignment"] == "MIXED"
+
+
+def test_market_alignment_for_day_works_for_a_past_day_not_just_today():
+    # 22 Sep 2026: this is the whole point of extracting the function --
+    # a day that is no longer "today" must still produce a real comparison,
+    # not the UNKNOWN/NO_TRADES defaults a today_ist()-scoped call would give
+    # once the date has rolled past it.
+    db = _make_session()
+    _seed_indexes(db)
+    target_day = today_ist() - timedelta(days=3)
+    day_before = target_day - timedelta(days=1)
+    db.add(_candle("BANKNIFTY", datetime.combine(day_before, datetime.min.time()) + timedelta(hours=15), 57000.0))
+    db.add(_candle("BANKNIFTY", datetime.combine(target_day, datetime.min.time()) + timedelta(hours=10), 57200.0))
+    db.add(
+        _trade(
+            trade_id="t-past",
+            index_symbol="BANKNIFTY",
+            option_type="CE",
+            result=TradeResult.WIN,
+            exit_time=datetime.combine(target_day, datetime.min.time()) + timedelta(hours=9),
+        )
+    )
+    db.commit()
+
+    result = autonomous_ai_market_alignment_for_day(db, target_day)
+    entry = next(e for e in result if e["symbol"] == "BANKNIFTY")
+
+    assert entry["market_direction"] == "BULLISH"
+    assert entry["trades"] == 1
+    assert entry["ce_count"] == 1
+    assert entry["alignment"] == "ALIGNED"
+
+
+def test_market_alignment_for_day_ignores_trades_closed_on_other_days():
+    db = _make_session()
+    _seed_indexes(db)
+    target_day = today_ist() - timedelta(days=2)
+    other_day = target_day - timedelta(days=1)
+    db.add(_trade(trade_id="t-other-day", index_symbol="BANKNIFTY", exit_time=datetime.combine(other_day, datetime.min.time()) + timedelta(hours=9)))
+    db.commit()
+
+    result = autonomous_ai_market_alignment_for_day(db, target_day)
+    entry = next(e for e in result if e["symbol"] == "BANKNIFTY")
+
+    assert entry["trades"] == 0
+    assert entry["alignment"] == "NO_TRADES"
+
+
+def test_today_highlights_index_comparison_matches_extracted_function_for_today():
+    # Confirms the 22 Sep 2026 refactor (extracting the loop out of
+    # get_autonomous_ai_today_highlights) is behavior-preserving for the
+    # live dashboard's own "today" case.
+    db = _make_session()
+    _seed_indexes(db)
+    now = utc_now()
+    db.add(_trade(trade_id="t1", index_symbol="BANKNIFTY", option_type="CE", exit_time=now))
+    db.commit()
+
+    highlights = get_autonomous_ai_today_highlights(db)
+    extracted = autonomous_ai_market_alignment_for_day(db, today_ist())
+
+    assert highlights["index_comparison"] == extracted

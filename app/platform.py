@@ -1249,6 +1249,79 @@ def _todays_market_direction(db: Session, index_symbol: str, today: date) -> dic
     return {"change_percent": change_percent, "direction": direction}
 
 
+def autonomous_ai_market_alignment_for_day(db: Session, day: date) -> list[dict[str, Any]]:
+    """Per-index "did Autonomous AI's CE/PE lean match how the market actually
+    moved" comparison -- extracted 22 Sep 2026 from get_autonomous_ai_today_
+    highlights' own index_comparison loop (19 Sep 2026) so it can be computed
+    for ANY past day, not just "today".
+
+    The live dashboard's version is scoped to the current IST calendar day and
+    goes blank the moment the date rolls over past midnight -- there was no
+    way to look back at a day's own comparison once it was no longer "today".
+    Requested directly: "implement this in the portal end of the day" -- this
+    is now wired into generate_daily_summary() (app/reports.py), which already
+    runs once per trading day (16:00 IST, well after the 15:00 square-off) and
+    persists to AIReport.stats_json, browsable historically on /reports. The
+    live dashboard keeps calling this with today_ist() for the real-time view;
+    the Daily Report calls it with its own report_date so the comparison for
+    a given day survives past that day, matching the persistence every other
+    per-day stat in that report already has.
+
+    Same alignment verdicts, same whole-day/whole-population comparison (not
+    a per-trade entry-to-exit check) as when this was built -- see that
+    function's own comment for the full reasoning, unchanged by this move.
+    """
+    closed_autonomous_that_day = [
+        trade
+        for trade in db.scalars(
+            select(StrategyTrade).where(
+                StrategyTrade.origin == "AUTONOMOUS_AI",
+                StrategyTrade.status == TradeStatus.CLOSED,
+            )
+        )
+        if to_ist(trade.exit_time) is not None and to_ist(trade.exit_time).date() == day
+    ]
+
+    index_comparison: list[dict[str, Any]] = []
+    for index in db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)):
+        trades = [trade for trade in closed_autonomous_that_day if trade.index_symbol == index.symbol]
+        wins = sum(1 for trade in trades if trade.result == TradeResult.WIN)
+        losses = sum(1 for trade in trades if trade.result == TradeResult.LOSS)
+        total = len(trades)
+        market = _todays_market_direction(db, index.symbol, day)
+        ce_count = sum(1 for trade in trades if trade.option_type == "CE")
+        pe_count = sum(1 for trade in trades if trade.option_type == "PE")
+        if total == 0:
+            alignment = "NO_TRADES"
+        elif market["direction"] in ("UNKNOWN", "FLAT"):
+            alignment = "NO_CLEAR_DIRECTION"
+        elif ce_count == pe_count:
+            alignment = "MIXED"
+        elif (ce_count > pe_count and market["direction"] == "BULLISH") or (
+            pe_count > ce_count and market["direction"] == "BEARISH"
+        ):
+            alignment = "ALIGNED"
+        else:
+            alignment = "MISALIGNED"
+        index_comparison.append(
+            {
+                "symbol": index.symbol,
+                "display_name": index.display_name or index.symbol,
+                "trades": total,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round((wins / total) * 100, 2) if total else 0.0,
+                "net_pnl": round(sum(trade.net_pnl for trade in trades), 2),
+                "ce_count": ce_count,
+                "pe_count": pe_count,
+                "market_change_percent": market["change_percent"],
+                "market_direction": market["direction"],
+                "alignment": alignment,
+            }
+        )
+    return index_comparison
+
+
 def get_autonomous_ai_today_highlights(db: Session) -> dict[str, Any]:
     """Same four-piece shape as get_ai_origination_today_highlights above,
     reading AutonomousAILog/origin=="AUTONOMOUS_AI" instead. Replaced the
@@ -1297,52 +1370,7 @@ def get_autonomous_ai_today_highlights(db: Session) -> dict[str, Any]:
         if to_ist(trade.exit_time) is not None and to_ist(trade.exit_time).date() == today
     ]
 
-    index_comparison: list[dict[str, Any]] = []
-    for index in db.scalars(select(IndexConfig).where(IndexConfig.enabled.is_(True)).order_by(IndexConfig.symbol)):
-        trades = [trade for trade in closed_autonomous_today if trade.index_symbol == index.symbol]
-        wins = sum(1 for trade in trades if trade.result == TradeResult.WIN)
-        losses = sum(1 for trade in trades if trade.result == TradeResult.LOSS)
-        total = len(trades)
-        market = _todays_market_direction(db, index.symbol, today)
-        ce_count = sum(1 for trade in trades if trade.option_type == "CE")
-        pe_count = sum(1 for trade in trades if trade.option_type == "PE")
-        # 19 Sep 2026: "did our trades match how the market actually moved
-        # today" -- compares the day's realized net direction against which
-        # side (CE/PE) Autonomous AI leaned on, by trade count, for this
-        # index. Deliberately a whole-day, whole-population comparison, not
-        # a per-trade entry-to-exit check -- a trade can win or lose for
-        # reasons independent of whether the day's net direction ultimately
-        # agreed with it (a correct CE bet can still stop out on an
-        # intraday dip inside a bullish day), so this answers "was the
-        # overall lean right," not "was every trade individually vindicated."
-        if total == 0:
-            alignment = "NO_TRADES"
-        elif market["direction"] in ("UNKNOWN", "FLAT"):
-            alignment = "NO_CLEAR_DIRECTION"
-        elif ce_count == pe_count:
-            alignment = "MIXED"
-        elif (ce_count > pe_count and market["direction"] == "BULLISH") or (
-            pe_count > ce_count and market["direction"] == "BEARISH"
-        ):
-            alignment = "ALIGNED"
-        else:
-            alignment = "MISALIGNED"
-        index_comparison.append(
-            {
-                "symbol": index.symbol,
-                "display_name": index.display_name or index.symbol,
-                "trades": total,
-                "wins": wins,
-                "losses": losses,
-                "win_rate": round((wins / total) * 100, 2) if total else 0.0,
-                "net_pnl": round(sum(trade.net_pnl for trade in trades), 2),
-                "ce_count": ce_count,
-                "pe_count": pe_count,
-                "market_change_percent": market["change_percent"],
-                "market_direction": market["direction"],
-                "alignment": alignment,
-            }
-        )
+    index_comparison = autonomous_ai_market_alignment_for_day(db, today)
 
     sharpest_call: dict[str, Any] | None = None
     if closed_autonomous_today:
