@@ -1,6 +1,17 @@
-"""Pull 1-minute historical candles for the option contracts AI Origination
-actually traded, so the trailing-stop parameters can be tuned against the real
+"""Pull 1-minute historical candles for the option contracts a strategy
+actually traded, so stop/target parameters can be tuned against the real
 premium path instead of against MFE/MAE extremes alone.
+
+ORIGIN IS A FILTER, DEFAULTED TO AI ORIGINATION FOR BACKWARD COMPATIBILITY
+---------------------------------------------------------------------------
+Originally built for AI Origination's own trailing-stop tuning, and
+`--origin` defaults to `AI_ORIGIN_%` (a LIKE pattern, matching both provider
+suffixes) so every existing invocation behaves exactly as before. Pass
+`--origin QUICK_SCALP` (an exact match -- `.like()` on a pattern with no `%`
+degrades to one) to archive a different strategy's traded contracts instead.
+2 Oct 2026: `scripts.quick_scalp_stop_trend_backtest`'s PART A found 0 of 67
+closed Quick Scalp trades reconstructible specifically because this script
+had never pulled any of them -- not a missing deadline, a missing filter.
 
 WHY THIS IS TIME-CRITICAL, EVERY TIME YOU RUN IT
 -------------------------------------------------
@@ -28,10 +39,15 @@ have taken, not only on trades production actually took.
 
 USAGE
 -----
-    # --start/--end must cover dates with actual AI Origination trades already
-    # recorded for the contract(s) you want archived -- this pulls candles for
-    # contracts that were traded, not a symbol/expiry you name directly.
+    # --start/--end must cover dates with actual trades already recorded for
+    # the contract(s) you want archived -- this pulls candles for contracts
+    # that were traded, not a symbol/expiry you name directly. Defaults to
+    # AI Origination; use --origin for another strategy (see below).
     python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07
+
+    # a different strategy's traded contracts -- exact match, not a LIKE pattern
+    python -m scripts.pull_option_candles --start 2026-09-01 --end 2026-10-01 \
+        --origin QUICK_SCALP
 
     # dry run: show what would be fetched, make no API calls
     python -m scripts.pull_option_candles --start 2026-08-03 --end 2026-08-07 --dry-run
@@ -99,13 +115,15 @@ SESSION_START = "09:15"
 SESSION_END = "15:30"
 
 
-def _traded_contracts(start: date, end: date) -> list[dict[str, Any]]:
-    """Every distinct option contract AI Origination traded in the window."""
+def _traded_contracts(start: date, end: date, origin_pattern: str = "AI_ORIGIN_%") -> list[dict[str, Any]]:
+    """Every distinct option contract traded in the window, filtered by
+    origin_pattern (a SQL LIKE pattern -- an exact origin like "QUICK_SCALP"
+    with no wildcard matches only itself)."""
     with SessionLocal() as session:
         trades = list(
             session.scalars(
                 select(StrategyTrade).where(
-                    StrategyTrade.origin.like("AI_ORIGIN_%"),
+                    StrategyTrade.origin.like(origin_pattern),
                 )
             )
         )
@@ -409,6 +427,14 @@ def main() -> int:
     # returning nothing rather than telling the caller their dates are wrong.
     parser.add_argument("--start", required=True, help="First session date to fetch (YYYY-MM-DD)")
     parser.add_argument("--end", required=True, help="Last session date to fetch (YYYY-MM-DD)")
+    parser.add_argument(
+        "--origin", default="AI_ORIGIN_%",
+        help=(
+            "SQL LIKE pattern selecting which strategy's traded contracts to archive "
+            "(ignored in --expiry mode). Default AI_ORIGIN_%% matches both provider "
+            "suffixes. Pass an exact origin, e.g. QUICK_SCALP, for another strategy."
+        ),
+    )
     parser.add_argument("--strike-band", type=int, default=2, help="Strikes either side of ATM / each traded strike")
     parser.add_argument(
         "--expiry", default="",
@@ -474,12 +500,12 @@ def main() -> int:
             len(all_contracts), args.index.upper(), args.expiry, args.strike_band,
         )
     else:
-        contracts = _traded_contracts(start, end)
+        contracts = _traded_contracts(start, end, args.origin)
         if not contracts:
             logger.error(
-                "No AI Origination trades found between %s and %s. If you meant to archive a "
-                "specific expiry regardless of what was traded, use --expiry/--index.",
-                start, end,
+                "No trades matching origin '%s' found between %s and %s. If you meant to "
+                "archive a specific expiry regardless of what was traded, use --expiry/--index.",
+                args.origin, start, end,
             )
             return 1
         logger.info("Found %s distinct traded contracts", len(contracts))

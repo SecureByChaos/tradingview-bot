@@ -295,6 +295,48 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### `pull_option_candles.py` run for real against production -- found hardcoded to AI Origination only, generalized with `--origin` (2 Oct 2026, same day)
+
+**Run for real on production, directly after the backtest tooling above merged and deployed.** PART A
+(stop-width sweep) reported "0 of 67 reconstructible," and PART B (ADX trend filter) came back real but
+every bucket (`NO_TREND`/`MARGINAL`/`TRENDING`) net-negative, with only `TRENDING` (n=44) clearing the
+trust minimum -- and running counter to the hypothesis (least-bad of the three, not worst). Tried to fix
+PART A by running `scripts.pull_option_candles` to archive Quick Scalp's traded contracts -- it refused
+with `--start`/`--end required`, surfacing a real gap once those were supplied: `_traded_contracts()` was
+hardcoded to `StrategyTrade.origin.like("AI_ORIGIN_%")`, built 3 Aug for AI Origination's own trailing-stop
+tuning and never generalized. No date range would have found Quick Scalp's contracts -- the filter itself
+excluded them, not a missing deadline.
+
+**Fixed**: `_traded_contracts()` takes an `origin_pattern` parameter (default `"AI_ORIGIN_%"`, preserving
+every existing invocation's behavior byte-for-byte), and the CLI gained `--origin` (same default) so a
+caller can point this at any strategy's own trade history -- `--origin QUICK_SCALP` is an exact match,
+not a wildcard, since `.like()` on a pattern with no `%` degrades to one. `--expiry` mode is unaffected
+(it was never origin-filtered to begin with, per its own docstring -- it archives a named expiry's ATM
+band regardless of what was traded). The one log line that assumed AI Origination specifically ("No AI
+Origination trades found...") now names whatever `--origin` pattern was actually passed.
+
+4 new tests (`tests/test_pull_option_candles.py`, new file -- this script had no tests before this pass):
+the default pattern still matches both AI Origination provider suffixes, an exact `QUICK_SCALP` origin
+pulls only that strategy's contracts, the date window is respected regardless of origin, and an
+origin with zero matching trades returns empty rather than falling back to anything. Full suite: 1113
+passed (was 1109). `python -c "import app.main"` and `python -c "import scripts.pull_option_candles"`
+both import cleanly; `python -m scripts.pull_option_candles --help` shows the new flag.
+
+**Not yet re-run against real data** -- this fix was built and tested in the sandbox; the actual pull
+still needs to happen on the production box:
+
+```bash
+python -m scripts.pull_option_candles --start <first Quick Scalp trade date> --end <today> --origin QUICK_SCALP --dry-run
+python -m scripts.pull_option_candles --start <first Quick Scalp trade date> --end <today> --origin QUICK_SCALP
+```
+
+Angel only serves ~28 days of 1-minute history per contract -- some of the 67 closed Quick Scalp trades'
+contracts may already be unrecoverable if they're older than that window; the script reports "No candles
+returned... contract may already have expired" for each, not a silent gap. Re-run PART A of
+`scripts.quick_scalp_stop_trend_backtest` once the archive has whatever is still reachable, and keep
+re-running `pull_option_candles --origin QUICK_SCALP` periodically going forward so new trades don't fall
+out of the 28-day window before they're archived.
+
 ### Quick Scalp stop-width and ADX-trend-filter backtest tooling built -- not run, no real data in this sandbox (2 Oct 2026)
 
 **Requested**: after a user-facing review of September's trade history showed Quick Scalp's `STOPLOSS`
