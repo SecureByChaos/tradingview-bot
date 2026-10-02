@@ -295,6 +295,75 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp stop-width and ADX-trend-filter backtest tooling built -- not run, no real data in this sandbox (2 Oct 2026)
+
+**Requested**: after a user-facing review of September's trade history showed Quick Scalp's `STOPLOSS`
+exits alone (-₹8,366 across 15 trades) exceeding the strategy's entire month-long net loss (-₹8,194) --
+every other exit reason combined was roughly flat -- asked directly to backtest whether a wider stop or a
+trend filter would have helped, rather than guess from the pattern alone.
+
+**Built `scripts/quick_scalp_stop_trend_backtest.py`, two independent parts:**
+
+- **PART A -- stop-width sweep.** Every closed `QUICK_SCALP` `sl_mode=FIXED` trade (all of them -- this
+  strategy never trails) is replayed from its own real `entry_price`/`entry_time`, using its own real
+  target held fixed, against swept stop distances (2.5% actual baseline, plus 3.5/4/5/6% wider candidates)
+  -- same real-option-premium-archive approach, same pessimistic intrabar ordering, and the same
+  `load_premium_series`/`db_timestamp_to_ist` helpers `scripts/stop_distance_backtest.py` already
+  established and this script reuses directly rather than reimplementing. Deliberately does NOT simulate
+  the structural (index-level) stop or the 3-minute breakeven-trail/scratch mechanic -- layering either on
+  top would conflate the pure premium-stop-width question with two other, separately-tunable mechanisms,
+  same reasoning `stop_distance_backtest.py` already gives for leaving trailing/`STALL_EXIT` out of its own
+  replay.
+- **PART B -- ADX trend filter.** Quick Scalp is a mean-reversion engine (VWAP 2-sigma band pierce + wick
+  rejection) with no awareness of whether the broader index is actually trending underneath it. For every
+  closed `QUICK_SCALP` trade (any exit reason), ADX(14) is recomputed from the index's own real
+  `FIVE_MINUTE` candle history as of the entry bar -- deliberately 5-minute, not Quick Scalp's own
+  1-minute feed bars (a 14-period ADX on 1-minute data is only a 14-minute lookback, too short to mean what
+  this project's existing ADX convention already means elsewhere) -- using the exact same `ADX_NO_TREND`/
+  `ADX_TRENDING` bands (`app/market_context.py`) every other trend-aware part of this codebase already
+  uses, not a new threshold invented for this question. Buckets into `NO_TREND`/`MARGINAL`/`TRENDING` and
+  reports win rate, mean P&L, and `STOPLOSS`-rate per bucket, plus a bootstrap 90% CI on whether `TRENDING`
+  is reliably worse than `NO_TREND` -- the direct test of "should this mean-reversion engine refuse to fire
+  while the index is clearly trending."
+
+Per this project's standing discipline: nothing ships into `app/quick_scalp.py` from this pass regardless
+of what either part finds -- this is measurement only.
+
+24 new tests (`tests/test_quick_scalp_stop_trend_backtest.py`): PART A's replay/noise-hit/aggregation logic
+mirrored directly from `stop_distance_backtest.py`'s own already-trusted test shapes, rescaled to Quick
+Scalp's real 2.5%/3.75% stop/target levels; the population filter (`QUICK_SCALP` + `FIXED` only, excludes
+open trades); PART B's ADX-band boundaries at the exact 20/25 edges, `_adx_at_entry` picking the last bar
+AT OR BEFORE entry (not simply the latest bar in the series) against a seeded trending candle series, the
+no-candle-history `None` case, the per-index cache being populated and reused, and the bootstrap helper on
+both a clear synthetic gap and a straddles-zero null case. Full suite: 1109 passed (was 1085).
+`python -c "import app.main"` and `python -c "import scripts.quick_scalp_stop_trend_backtest"` both import
+cleanly; `python -m scripts.quick_scalp_stop_trend_backtest --help` renders without error.
+
+**Smoke-tested end to end against a seeded scratch DB** (5 synthetic Quick Scalp trades, a 70-bar synthetic
+`BANKNIFTY` `FIVE_MINUTE` uptrend) -- ran clean: PART A correctly reported "0 of 5 reconstructible" and
+exited 1 (no `data/option_candles/` archive in this sandbox, same expected behavior
+`stop_distance_backtest.py` already has for this exact case); PART B correctly classified all 5 synthetic
+trades as `TRENDING` (matching the seeded uptrend) and correctly flagged the bucket as below the 20-trade
+trust minimum rather than fabricating a verdict from 5 observations.
+
+**Not run against real data** -- this sandbox has no `data/trading.db` with a real schema and no
+`data/option_candles/` archive (confirmed again this session: `data/` here holds only a 103-byte
+`trades.csv` stub). Run on the machine with both:
+
+```bash
+python -m scripts.quick_scalp_stop_trend_backtest --db data/trading.db
+python -m scripts.quick_scalp_stop_trend_backtest --db data/trading.db --stops 2.5,3.5,4,5,6 --part a
+python -m scripts.quick_scalp_stop_trend_backtest --db data/trading.db --part b
+```
+
+Read PART A's "clears both bars" verdicts first (net expectancy > 0 AND noise-hit rate < 50%, no split
+below the 10-trade minimum, on both the in-sample and out-of-sample chronological slices) -- per this
+project's own standard, "2.5% stays the best option tested" is as reportable an outcome as finding a wider
+stop that helps. Read PART B's bootstrap CI only once both `NO_TREND` and `TRENDING` clear the 20-trade
+minimum; given Quick Scalp's real trade count so far (46 trades logged across September, per the same-day
+cross-strategy review), expect this to run thin on the first pass -- "not yet enough evidence" is the
+correct, expected outcome at this sample size, not a failure of the check.
+
 ### Recent Price Action gets a fourth deterministic gate -- a threshold-grazing reading was carrying as much weight as a decisive one (22 Sep 2026)
 
 **Reported**: pasted a TradingView chart showing a Nifty reversal alongside a losing Autonomous AI `BUY_PE`
