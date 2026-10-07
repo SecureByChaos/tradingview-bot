@@ -44,7 +44,7 @@ class OpenAIReviewer(AIReviewer):
                 },
                 payload={
                     "model": self.settings.model,
-                    "temperature": self.settings.temperature,
+                    "reasoning_effort": self.settings.reasoning_effort,
                     "messages": [
                         {"role": "system", "content": prompt["system_prompt"]},
                         {"role": "user", "content": prompt["user_prompt"]},

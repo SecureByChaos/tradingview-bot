@@ -417,7 +417,7 @@ def _call_openai_narrative(settings: AISettings, user_prompt: str) -> tuple[Opti
         headers={"Authorization": f"Bearer {settings.api_key}", "Content-Type": "application/json"},
         payload={
             "model": settings.model,
-            "temperature": settings.temperature,
+            "reasoning_effort": settings.reasoning_effort,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

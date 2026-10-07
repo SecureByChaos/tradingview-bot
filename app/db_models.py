@@ -93,7 +93,15 @@ class AISettings(Base):
     model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     api_key: Mapped[str] = mapped_column(String(512), default="", nullable=False)
     base_url: Mapped[str] = mapped_column(String(512), default="", nullable=False)
-    temperature: Mapped[float] = mapped_column(Float, default=0.2, nullable=False)
+    # Replaces the old `temperature` float (6 Oct 2026) -- newer OpenAI model
+    # families (e.g. gpt-6-luna) reject any non-default temperature outright
+    # ("Unsupported value: 'temperature' does not support 0.2 with this
+    # model"), the same class of hard rejection Claude's newer families
+    # already forced onto claude.py (see that module's own comment).
+    # temperature was OpenAI-specific anyway -- Claude has never been sent it
+    # -- so this is a rename to the parameter OpenAI's reasoning-model API
+    # actually accepts, not a new cross-provider field.
+    reasoning_effort: Mapped[str] = mapped_column(String(16), default="medium", nullable=False)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     confidence_threshold: Mapped[int] = mapped_column(Integer, default=90, nullable=False)
     system_prompt: Mapped[str] = mapped_column(Text, default="", nullable=False)

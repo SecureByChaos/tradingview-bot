@@ -133,7 +133,7 @@ def test_ai_settings_route_persists_ai_origination_enabled_toggle():
 
     update_ai_settings_page(
         db=db, mode="SHADOW", provider="dummy", model="", api_key="", base_url="",
-        temperature=0.2, timeout_seconds=20, confidence_threshold=60, system_prompt="",
+        reasoning_effort="medium", timeout_seconds=20, confidence_threshold=60, system_prompt="",
         enabled="on", ai_origination_enabled=None,
     )
 
@@ -142,7 +142,7 @@ def test_ai_settings_route_persists_ai_origination_enabled_toggle():
 
     update_ai_settings_page(
         db=db, mode="SHADOW", provider="dummy", model="", api_key="", base_url="",
-        temperature=0.2, timeout_seconds=20, confidence_threshold=60, system_prompt="",
+        reasoning_effort="medium", timeout_seconds=20, confidence_threshold=60, system_prompt="",
         enabled="on", ai_origination_enabled="on",
     )
 

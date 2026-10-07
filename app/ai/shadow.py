@@ -378,7 +378,7 @@ def run_shadow_review(
                     model=settings.secondary_model,
                     api_key=settings.secondary_api_key,
                     base_url=settings.secondary_base_url,
-                    temperature=settings.temperature,
+                    reasoning_effort=settings.reasoning_effort,
                     timeout_seconds=settings.timeout_seconds,
                     system_prompt=settings.system_prompt,
                 )

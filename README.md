@@ -229,7 +229,7 @@ No Alembic, no manual migration step. `init_db()` calls `_ensure_columns()` (`ap
 - **General** — trading start/close time, Telegram bot token and chat ID.
 - **Strategies** — add/edit/enable/disable/delete rule-based strategies (see Multi-Strategy Operation).
 - **Instruments** — per-index config: enabled, exchange segment, spot symbol/token, lot size, strike interval, and the AI Origination live-trading opt-in.
-- **AI** — provider (primary + optional secondary), model, API key, base URL, temperature, timeout, confidence threshold, system prompt, and AI Origination's own risk knobs (max stop-loss %, max consecutive same-direction losses).
+- **AI** — provider (primary + optional secondary), model, API key, base URL, reasoning effort (none/low/medium/high/xhigh/max), timeout, confidence threshold, system prompt, and AI Origination's own risk knobs (max stop-loss %, max consecutive same-direction losses).
 
 The AI tab's **Test Connection** button runs the configured provider independently of trading and displays only provider, model, latency, status, and a sanitized error — never the raw API key or full prompt/response.
 
