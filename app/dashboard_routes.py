@@ -806,7 +806,7 @@ def update_ai_settings_page(
     model: Annotated[str, Form()],
     api_key: Annotated[str, Form()],
     base_url: Annotated[str, Form()],
-    temperature: Annotated[float, Form()],
+    reasoning_effort: Annotated[str, Form()],
     timeout_seconds: Annotated[int, Form()],
     confidence_threshold: Annotated[int, Form()],
     system_prompt: Annotated[str, Form()],
@@ -829,7 +829,7 @@ def update_ai_settings_page(
         mode not in {"DISABLED", "SHADOW", "ADVISORY", "BLOCKING"}
         or provider not in valid_providers
         or secondary_provider not in valid_providers
-        or not 0 <= temperature <= 2
+        or reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}
         or timeout_seconds < 1
         or not 0 <= confidence_threshold <= 100
         # 5.0 mirrors app/ai/originator.py's _MIN_SL_TARGET_PERCENT floor --
@@ -849,7 +849,7 @@ def update_ai_settings_page(
         "provider": provider,
         "model": model.strip(),
         "base_url": base_url.strip(),
-        "temperature": temperature,
+        "reasoning_effort": reasoning_effort,
         "timeout_seconds": timeout_seconds,
         "confidence_threshold": confidence_threshold,
         "system_prompt": system_prompt,
@@ -909,7 +909,7 @@ def test_secondary_ai_settings(
         model=settings.secondary_model,
         api_key=settings.secondary_api_key,
         base_url=settings.secondary_base_url,
-        temperature=settings.temperature,
+        reasoning_effort=settings.reasoning_effort,
         timeout_seconds=settings.timeout_seconds,
         system_prompt=settings.system_prompt,
     )

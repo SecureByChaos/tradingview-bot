@@ -23,7 +23,7 @@ class ClaudeReviewer(AIReviewer):
     Mirrors OpenAIReviewer's structure (same AIClient, AILogger, PromptBuilder,
     AIResponseValidator) so the two providers can be compared apples-to-apples on
     identical context/prompts. Any object exposing .provider/.model/.api_key/
-    .base_url/.temperature/.timeout_seconds/.system_prompt works as `settings`
+    .base_url/.reasoning_effort/.timeout_seconds/.system_prompt works as `settings`
     (not necessarily the AISettings ORM row itself -- see shadow.py's secondary
     review path, which builds a lightweight view over the secondary_* columns).
     """
