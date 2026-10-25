@@ -19,7 +19,7 @@ from app.ai.context_builder import SignalContextBuilder
 from app.ai.factory import create_reviewer
 from app.ai.repository import create_settings as create_ai_settings, get_settings as get_ai_settings, update_settings as update_ai_settings
 from app.database import get_db
-from app.db_models import BotStatus, IndexConfig, PlatformSettings, SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeStatus, TradingMode
+from app.db_models import AgenticAISettings, BotStatus, IndexConfig, PlatformSettings, SLMode, StrategyConfig, StrategyTrade, StrategyTradeTick, TradeStatus, TradingMode
 from app.platform import (
     compute_performance_kpis,
     get_ai_origination_today_highlights,
@@ -42,7 +42,9 @@ from app.platform import (
     get_validated_signal_trades,
     get_autonomous_ai_trades,
     get_quick_scalp_trades,
+    get_agentic_ai_trades,
 )
+from app.ai import agentic as agentic_ai
 from sqlalchemy import func, select
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIError
@@ -316,6 +318,89 @@ def quick_scalp_page(
             **performance,
         },
     )
+
+
+@router.get("/agentic-ai", response_class=HTMLResponse)
+def agentic_ai_page(
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> HTMLResponse:
+    """Dedicated page for the new Agentic AI strategy (app.ai.agentic) --
+    scaffolding plus the backtest/QA agent only (no entry/exit agents yet,
+    see that module's own docstring). Empty trade table until a future PR
+    adds live trading; the settings form and QA-report generator are both
+    already real and usable."""
+    settings = agentic_ai.get_agentic_settings(db)
+    trades = get_agentic_ai_trades(db)
+    open_trades = [trade for trade in trades if trade.status == TradeStatus.OPEN]
+    closed_trades = [trade for trade in trades if trade.status == TradeStatus.CLOSED]
+    performance = compute_performance_kpis(closed_trades)
+    qa_reports = [
+        {"report": report, "stats": _context_json(report.stats_json)}
+        for report in reports.list_reports(db, "AGENTIC_QA")
+    ]
+    return templates.TemplateResponse(
+        "agentic_ai.html",
+        {
+            "request": request,
+            "settings": settings,
+            "trades": trades,
+            "open_trades": open_trades,
+            "closed_count": len(closed_trades),
+            "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
+            "qa_reports": qa_reports,
+            **performance,
+        },
+    )
+
+
+@router.post("/agentic-ai/settings")
+def update_agentic_ai_settings_page(
+    db: Annotated[Session, Depends(get_db)],
+    live_model: Annotated[str, Form()],
+    live_reasoning_effort: Annotated[str, Form()],
+    qa_model: Annotated[str, Form()],
+    qa_reasoning_effort: Annotated[str, Form()],
+    base_url: Annotated[str, Form()],
+    timeout_seconds: Annotated[int, Form()],
+    api_key: Annotated[str, Form()] = "",
+    enabled: Annotated[str | None, Form()] = None,
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    valid_effort = {"none", "low", "medium", "high", "xhigh", "max"}
+    if live_reasoning_effort not in valid_effort or qa_reasoning_effort not in valid_effort or timeout_seconds < 1:
+        raise HTTPException(status_code=400, detail="Invalid Agentic AI configuration")
+    settings = agentic_ai.get_agentic_settings(db) or agentic_ai.create_agentic_settings(db, id=1)
+    values: dict[str, object] = {
+        "enabled": enabled == "on",
+        "live_model": live_model.strip(),
+        "live_reasoning_effort": live_reasoning_effort,
+        "qa_model": qa_model.strip(),
+        "qa_reasoning_effort": qa_reasoning_effort,
+        "base_url": base_url.strip(),
+        "timeout_seconds": timeout_seconds,
+    }
+    if api_key:
+        values["api_key"] = api_key
+    agentic_ai.update_agentic_settings(db, settings, **values)
+    return RedirectResponse("/agentic-ai", status_code=303)
+
+
+@router.post("/agentic-ai/qa-report")
+def run_agentic_ai_qa_report(
+    db: Annotated[Session, Depends(get_db)],
+    origin_pattern: Annotated[str, Form()] = "AGENTIC_AI",
+    label: Annotated[str, Form()] = "Agentic AI (own history)",
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    """Runs the backtest/QA agent on demand. origin_pattern defaults to this
+    strategy's own origin (empty today, by design -- see app/ai/agentic.py),
+    but accepts any SQL LIKE pattern so it's testable against real, already-
+    live data (e.g. AUTONOMOUS_AI, AI_ORIGIN_%, QUICK_SCALP) before this
+    strategy has any trade history of its own."""
+    agentic_ai.run_qa_report(db, origin_pattern, label)
+    return RedirectResponse("/agentic-ai", status_code=303)
 
 
 @router.get("/history/export")

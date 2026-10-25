@@ -166,6 +166,41 @@ class AISettings(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class AgenticAISettings(Base):
+    """25 Oct 2026: config for the new AGENTIC_AI strategy (app.ai.agentic) --
+    deliberately a separate table from AISettings, not a reuse of it. AI
+    Origination and Autonomous AI both read the one shared AISettings row,
+    which is exactly why a mid-session provider/model/reasoning_effort swap
+    on one (the gpt-6-luna episode) silently changed the other's behaviour
+    too. This strategy gets its own independent credentials and models so
+    tuning it can never leak into AI Origination/Autonomous AI, or vice
+    versa. OpenAI-only by explicit choice -- no provider field, unlike
+    AISettings, since there is nothing to select between.
+
+    Two model tiers, not one, matching the different roles the live-trading
+    and post-trade/QA agents actually play: live_model/live_reasoning_effort
+    is the fast, low-latency model behind entry/exit signalling (not yet
+    built -- this PR is scaffolding plus the QA/backtest agent only);
+    qa_model/qa_reasoning_effort is the slower, more thorough model behind
+    post-trade analysis and the backtest agent, run far less often so a
+    heavier (max reasoning effort) model is affordable there.
+    """
+
+    __tablename__ = "agentic_ai_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    api_key: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    base_url: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    live_model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    live_reasoning_effort: Mapped[str] = mapped_column(String(16), default="medium", nullable=False)
+    qa_model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    qa_reasoning_effort: Mapped[str] = mapped_column(String(16), default="max", nullable=False)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=20, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class AITradeReview(Base):
     __tablename__ = "ai_trade_reviews"
 
@@ -816,6 +851,10 @@ class ReportType:
     MONTHLY = "MONTHLY"
     PATTERN = "PATTERN"
     ORIGINATION = "ORIGINATION"
+    # 25 Oct 2026: app.ai.agentic's backtest/QA agent -- reuses AIReport
+    # wholesale (same table, same _save_report shape) rather than a new
+    # report table, same precedent as ORIGINATION above (15 Aug 2026).
+    AGENTIC_QA = "AGENTIC_QA"
 
 
 class AIReport(Base):
