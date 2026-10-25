@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% from "components.html" import page_header, empty_state %}
+{% from "components.html" import page_header, empty_state, collapsible_info %}
 {% block content %}
 {{ page_header("Quick Scalp", "Experimental · Paper Only", "text-bg-warning") }}
 
-<div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
+{% call collapsible_info("quickScalpInfo", "What this is") %}
   <p class="mb-2"><strong>What this is:</strong> rebuilt 8 Sep 2026 -- same VWAP 2&sigma; mean-reversion
   signal as the 4 Sep build, on a genuinely real-time engine and a tightened risk construction. Each
   1-minute bar is now finalized the instant a live tick's minute rolls over (a persistent WebSocket feed,
@@ -30,7 +30,7 @@
   pressure worsens, this feed (like AI Origination before it) is a specific, known thing to consider pausing.
   Paper trading only -- no live-order code path exists for this strategy, so "hard broker-level SL-M" is a
   fast, deterministic paper stop, not a real exchange order.</p>
-</div>
+{% endcall %}
 
 <div class="metric-grid mb-3">
   <div class="metric"><div class="label">Net return</div><div class="value {% if kpis.net_return_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(kpis.net_return_percent) }}%</div></div>
