@@ -39,6 +39,7 @@ def create_scheduler(
     option_chain_interval_minutes: int = 5,
     closing_auction_job: Callable[[], None] | None = None,
     autonomous_job: Callable[[], None] | None = None,
+    agentic_entry_exit_job: Callable[[], None] | None = None,
     quick_scalp_job: Callable[[], None] | None = None,
     validated_signal_entry_job: Callable[[], None] | None = None,
     validated_signal_exit_job: Callable[[], None] | None = None,
@@ -103,6 +104,20 @@ def create_scheduler(
             autonomous_job,
             trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
             id="autonomous-ai-check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
+    if agentic_entry_exit_job is not None:
+        # Same coarse-cron-plus-in-job-market-hours-gate shape as
+        # autonomous-ai-check directly above -- app.ai.agentic.
+        # run_agentic_entry_exit_checks calls check_market_hours() itself as
+        # its first real gate.
+        scheduler.add_job(
+            agentic_entry_exit_job,
+            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
+            id="agentic-ai-check",
             replace_existing=True,
             max_instances=1,
             coalesce=True,

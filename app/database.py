@@ -335,6 +335,8 @@ def _ensure_columns() -> None:
             "max_daily_loss_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN max_daily_loss_percent FLOAT NOT NULL DEFAULT 3.0",
             "max_concurrent_positions": "ALTER TABLE agentic_ai_settings ADD COLUMN max_concurrent_positions INTEGER NOT NULL DEFAULT 1",
             "max_capital_deployed_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN max_capital_deployed_percent FLOAT NOT NULL DEFAULT 20.0",
+            "nominal_stop_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN nominal_stop_percent FLOAT NOT NULL DEFAULT 15.0",
+            "nominal_target_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN nominal_target_percent FLOAT NOT NULL DEFAULT 30.0",
         }
         with engine.begin() as connection:
             for column, statement in agentic_statements.items():

@@ -28,6 +28,7 @@ from sqlalchemy import select
 from app.risk import RiskProtectionService
 from app.signal_validation import check_duplicate_signal, check_market_hours, check_webhook_staleness
 from app.ai.autonomous import run_autonomous_checks
+from app.ai.agentic import run_agentic_entry_exit_checks
 from app.ai.originator import run_origination_checks
 from app.quick_scalp import make_bar_closed_callback, run_quick_scalp_exit_checks
 from app.quick_scalp_feed import ScalpBarAggregator
@@ -102,6 +103,7 @@ scheduler = create_scheduler(
     option_chain_interval_minutes=settings.option_chain_interval_minutes,
     closing_auction_job=lambda: capture_closing_auction(smartapi, SessionLocal),
     autonomous_job=lambda: run_autonomous_checks(smartapi, option_finder, multi_strategy_manager, live_feed_store),
+    agentic_entry_exit_job=lambda: run_agentic_entry_exit_checks(smartapi, option_finder, multi_strategy_manager, live_feed_store),
     quick_scalp_job=lambda: run_quick_scalp_exit_checks(smartapi, multi_strategy_manager),
     validated_signal_entry_job=lambda: run_validated_signal_entry_checks(smartapi, option_finder),
     validated_signal_exit_job=lambda: run_validated_signal_exit_checks(smartapi, multi_strategy_manager),

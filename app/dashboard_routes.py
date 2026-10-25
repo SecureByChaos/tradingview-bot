@@ -404,6 +404,8 @@ def update_agentic_ai_settings_page(
     max_daily_loss_percent: Annotated[float, Form()] = 3.0,
     max_concurrent_positions: Annotated[int, Form()] = 1,
     max_capital_deployed_percent: Annotated[float, Form()] = 20.0,
+    nominal_stop_percent: Annotated[float, Form()] = 15.0,
+    nominal_target_percent: Annotated[float, Form()] = 30.0,
     api_key: Annotated[str, Form()] = "",
     enabled: Annotated[str | None, Form()] = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
@@ -417,6 +419,8 @@ def update_agentic_ai_settings_page(
         or not (0 < max_daily_loss_percent <= 100)
         or max_concurrent_positions < 1
         or not (0 < max_capital_deployed_percent <= 100)
+        or not (0 < nominal_stop_percent <= 100)
+        or not (0 < nominal_target_percent <= 100)
     ):
         raise HTTPException(status_code=400, detail="Invalid Agentic AI risk/sizing configuration")
     settings = agentic_ai.get_agentic_settings(db) or agentic_ai.create_agentic_settings(db, id=1)
@@ -433,6 +437,8 @@ def update_agentic_ai_settings_page(
         "max_daily_loss_percent": max_daily_loss_percent,
         "max_concurrent_positions": max_concurrent_positions,
         "max_capital_deployed_percent": max_capital_deployed_percent,
+        "nominal_stop_percent": nominal_stop_percent,
+        "nominal_target_percent": nominal_target_percent,
     }
     if api_key:
         values["api_key"] = api_key

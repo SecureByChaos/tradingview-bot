@@ -212,6 +212,16 @@ class AgenticAISettings(Base):
     max_concurrent_positions: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     max_capital_deployed_percent: Mapped[float] = mapped_column(Float, default=20.0, nullable=False)
 
+    # Entry/exit agent (25 Oct 2026) -- the two stop/target nominal percents
+    # the deterministic side owns. The live_model only ever decides direction
+    # (BUY_CE/BUY_PE/NONE, EXIT/HOLD); it never proposes a stop, target, or
+    # quantity -- those stay entirely in Python, via these two fields plus
+    # the five risk/sizing fields above. Defaults mirror app.ai.autonomous's
+    # own backstop nominal values (15%/30%), a reasoned starting point this
+    # project has already used for a comparable fully-AI-driven strategy.
+    nominal_stop_percent: Mapped[float] = mapped_column(Float, default=15.0, nullable=False)
+    nominal_target_percent: Mapped[float] = mapped_column(Float, default=30.0, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
