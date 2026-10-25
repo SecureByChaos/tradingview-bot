@@ -215,6 +215,34 @@ def test_build_exit_prompt_includes_position_numbers():
     assert "10.0" in prompt
 
 
+def test_build_entry_prompt_includes_headlines_when_given():
+    figures = {"price": 100.0, "change_abs": 1.0, "change_percent": 1.0, "day_low": 99, "day_high": 101}
+    prompt = _build_entry_prompt("Nifty 50", figures, headlines_text='- "RBI holds rates steady" (ET Markets)')
+    assert "Recent market headlines" in prompt
+    assert "RBI holds rates steady" in prompt
+
+
+def test_build_entry_prompt_omits_headlines_section_when_empty():
+    figures = {"price": 100.0, "change_abs": 1.0, "change_percent": 1.0, "day_low": 99, "day_high": 101}
+    prompt = _build_entry_prompt("Nifty 50", figures, headlines_text="")
+    assert "Recent market headlines" not in prompt
+
+
+def test_build_exit_prompt_includes_headlines_when_given():
+    db = _make_db()
+    trade = _seed_trade(db, "t1", "AGENTIC_AI")
+    prompt = _build_exit_prompt(trade, to_ist(utc_now()), headlines_text='- "Market dips on profit booking" (Moneycontrol)')
+    assert "Recent market headlines" in prompt
+    assert "Market dips on profit booking" in prompt
+
+
+def test_build_exit_prompt_omits_headlines_section_when_empty():
+    db = _make_db()
+    trade = _seed_trade(db, "t1", "AGENTIC_AI")
+    prompt = _build_exit_prompt(trade, to_ist(utc_now()))
+    assert "Recent market headlines" not in prompt
+
+
 # ---------------------------------------------------------------------------
 # _has_open_agentic_trade
 # ---------------------------------------------------------------------------
@@ -356,6 +384,34 @@ def test_check_agentic_entry_skips_when_position_already_open(monkeypatch):
     assert result is None
 
 
+def test_check_agentic_entry_blocked_by_news_kill_switch(monkeypatch):
+    monkeypatch.setattr(agentic_module, "_call_openai_live", _exploding_call)
+    db = _make_db()
+    index = _make_index()
+    settings = _make_settings()
+    result = check_agentic_entry(
+        db, index, _ist_now(), settings, FakeSmartAPI(), FakeOptionFinder(None), {"NIFTY": {"price": 100.0}},
+        is_severe=True,
+    )
+    assert result is None
+
+
+def test_check_agentic_entry_not_blocked_when_not_severe(monkeypatch):
+    monkeypatch.setattr(agentic_module, "symmetric_premium_percent", _identity_rescale)
+    monkeypatch.setattr(
+        agentic_module, "_call_openai_live",
+        lambda *a, **k: agentic_module._LiveCallResult('{"decision":"NONE","confidence":0.3,"reasoning":"unclear"}', None),
+    )
+    db = _make_db()
+    index = _make_index()
+    settings = _make_settings()
+    result = check_agentic_entry(
+        db, index, _ist_now(), settings, FakeSmartAPI(), FakeOptionFinder(None), {"NIFTY": {"price": 100.0}},
+        is_severe=False,
+    )
+    assert result is None  # declined on NONE, not on the kill switch -- the model WAS reached here
+
+
 def test_check_agentic_entry_skips_when_risk_gate_blocks(monkeypatch):
     monkeypatch.setattr(agentic_module, "_call_openai_live", _exploding_call)
     db = _make_db()
@@ -448,6 +504,18 @@ def test_check_agentic_entry_handles_unparseable_response_without_raising(monkey
 # ---------------------------------------------------------------------------
 
 
+def _freeze_clock(monkeypatch, hh: int, mm: int) -> None:
+    """check_agentic_exits computes now_ist from the REAL wall clock
+    (to_ist(utc_now())), and every test below passes a fixed (15, 15)
+    cutoff -- without freezing the clock, a test written mid-morning starts
+    failing on its own the moment real IST time crosses 15:15, the exact
+    class of flake CLAUDE.md documents repeatedly elsewhere in this
+    project. Every test that isn't deliberately exercising the past-cutoff
+    branch itself must call this with a safe pre-cutoff time."""
+    monkeypatch.setattr(agentic_module, "utc_now", lambda: _ist_now(hh=hh, mm=mm).astimezone(IST))
+    monkeypatch.setattr(agentic_module, "to_ist", lambda dt: _ist_now(hh=hh, mm=mm))
+
+
 def test_check_agentic_exits_squares_off_past_cutoff_without_calling_model(monkeypatch):
     monkeypatch.setattr(agentic_module, "_call_openai_live", _exploding_call)
     db = _make_db()
@@ -455,8 +523,7 @@ def test_check_agentic_exits_squares_off_past_cutoff_without_calling_model(monke
     trade_manager = _make_trade_manager()
     settings = _make_settings()
 
-    monkeypatch.setattr(agentic_module, "utc_now", lambda: _ist_now(hh=15, mm=20).astimezone(IST))
-    monkeypatch.setattr(agentic_module, "to_ist", lambda dt: _ist_now(hh=15, mm=20))
+    _freeze_clock(monkeypatch, 15, 20)
 
     check_agentic_exits(db, trade_manager, settings, (15, 15))
 
@@ -467,6 +534,7 @@ def test_check_agentic_exits_squares_off_past_cutoff_without_calling_model(monke
 
 def test_check_agentic_exits_skips_a_trade_with_no_current_premium(monkeypatch):
     monkeypatch.setattr(agentic_module, "_call_openai_live", _exploding_call)
+    _freeze_clock(monkeypatch, 11, 0)
     db = _make_db()
     trade = StrategyTrade(
         trade_id="t1", strategy_name="Agentic AI - Nifty 50", signal="BUY_CE",
@@ -491,6 +559,7 @@ def test_check_agentic_exits_closes_on_model_exit_decision(monkeypatch):
         agentic_module, "_call_openai_live",
         lambda *a, **k: agentic_module._LiveCallResult('{"decision":"EXIT","confidence":0.8,"reasoning":"thesis broke"}', None),
     )
+    _freeze_clock(monkeypatch, 11, 0)
     db = _make_db()
     trade = _seed_trade(db, "t1", "AGENTIC_AI")
     trade_manager = _make_trade_manager()
@@ -508,6 +577,7 @@ def test_check_agentic_exits_leaves_trade_open_on_hold(monkeypatch):
         agentic_module, "_call_openai_live",
         lambda *a, **k: agentic_module._LiveCallResult('{"decision":"HOLD","confidence":0.6,"reasoning":"still fine"}', None),
     )
+    _freeze_clock(monkeypatch, 11, 0)
     db = _make_db()
     trade = _seed_trade(db, "t1", "AGENTIC_AI")
     trade_manager = _make_trade_manager()
@@ -521,6 +591,7 @@ def test_check_agentic_exits_leaves_trade_open_on_hold(monkeypatch):
 
 def test_check_agentic_exits_other_origins_are_never_touched(monkeypatch):
     monkeypatch.setattr(agentic_module, "_call_openai_live", _exploding_call)
+    _freeze_clock(monkeypatch, 11, 0)
     db = _make_db()
     trade = _seed_trade(db, "t1", "AUTONOMOUS_AI")
     trade_manager = _make_trade_manager()
@@ -537,12 +608,45 @@ def test_check_agentic_exits_provider_error_leaves_trade_untouched_without_raisi
         agentic_module, "_call_openai_live",
         lambda *a, **k: agentic_module._LiveCallResult(None, "network error"),
     )
+    _freeze_clock(monkeypatch, 11, 0)
     db = _make_db()
     trade = _seed_trade(db, "t1", "AGENTIC_AI")
     trade_manager = _make_trade_manager()
     settings = _make_settings()
 
     check_agentic_exits(db, trade_manager, settings, (15, 15))
+
+    db.refresh(trade)
+    assert trade.status == TradeStatus.OPEN
+
+
+def test_check_agentic_exits_news_kill_switch_closes_every_open_position(monkeypatch):
+    monkeypatch.setattr(agentic_module, "_call_openai_live", _exploding_call)
+    _freeze_clock(monkeypatch, 11, 0)
+    db = _make_db()
+    trade = _seed_trade(db, "t1", "AGENTIC_AI")
+    trade_manager = _make_trade_manager()
+    settings = _make_settings()
+
+    check_agentic_exits(db, trade_manager, settings, (15, 15), is_severe=True, severe_matches=["War declared"])
+
+    db.refresh(trade)
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == ExitReason.NEWS_KILL_SWITCH.value
+
+
+def test_check_agentic_exits_no_kill_switch_when_not_severe(monkeypatch):
+    monkeypatch.setattr(
+        agentic_module, "_call_openai_live",
+        lambda *a, **k: agentic_module._LiveCallResult('{"decision":"HOLD","confidence":0.6,"reasoning":"fine"}', None),
+    )
+    _freeze_clock(monkeypatch, 11, 0)
+    db = _make_db()
+    trade = _seed_trade(db, "t1", "AGENTIC_AI")
+    trade_manager = _make_trade_manager()
+    settings = _make_settings()
+
+    check_agentic_exits(db, trade_manager, settings, (15, 15), is_severe=False)
 
     db.refresh(trade)
     assert trade.status == TradeStatus.OPEN
@@ -583,3 +687,23 @@ def test_run_checks_skipped_when_live_model_or_api_key_missing(monkeypatch):
     db.commit()
     run_agentic_entry_exit_checks(FakeSmartAPI(), FakeOptionFinder(None), _make_trade_manager(), None, db)
     assert db.query(StrategyTrade).count() == 0
+
+
+def test_run_checks_news_kill_switch_closes_open_positions_end_to_end(monkeypatch):
+    from app.ai.news import Headline
+
+    monkeypatch.setattr(agentic_module, "check_market_hours", lambda _now: None)
+    monkeypatch.setattr(
+        agentic_module, "fetch_market_headlines",
+        lambda: [Headline("War declared, markets panic", "Test Feed", None)],
+    )
+    db = _make_db()
+    db.add(AgenticAISettings(id=1, enabled=True, live_model="gpt-6-luna", api_key="sk-real"))
+    trade = _seed_trade(db, "open1", "AGENTIC_AI")
+    db.commit()
+
+    run_agentic_entry_exit_checks(FakeSmartAPI(), FakeOptionFinder(None), _make_trade_manager(), None, db)
+
+    db.refresh(trade)
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == ExitReason.NEWS_KILL_SWITCH.value

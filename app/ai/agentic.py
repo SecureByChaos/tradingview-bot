@@ -99,8 +99,22 @@ and nothing schedules it. What exists:
     non-AI_ORIGIN_* trade already gets for free from monitor_open_trades'
     shared branch, zero new code there.
 
-A future news-reading agent (not this one) is the next and final piece of
-the originally agreed five-agent plan.
+  - The news agent (app.ai.news, 25 Oct 2026) -- the final piece of the
+    original five-agent plan. Fetches recent India-market headlines from
+    free, keyless RSS feeds. Two effects, both wired into run_agentic_
+    entry_exit_checks() once per cycle (shared by every index, not
+    refetched per index): real headlines are shown as plain-text context
+    in both the entry and exit prompts (never a fabricated sentiment
+    score); and a separate, deterministic "severe event" keyword match
+    (circuit breaker, war, bank run, ...) blocks all new entries and
+    force-closes every open AGENTIC_AI position via ExitReason.NEWS_KILL_
+    SWITCH, before the model is ever asked -- the same "the model never
+    decides risk" principle the risk/sizing agent established for P&L,
+    applied here to a market-wide shock. See app/ai/news.py's own
+    docstring for why this doesn't need the same backtest-before-shipping
+    discipline a directional signal would, and for the real limitation
+    that this sandbox cannot verify any of the three feed URLs are
+    actually reachable.
 """
 
 from __future__ import annotations
@@ -119,6 +133,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.client import AIClient
 from app.ai.json_utils import extract_json_object
+from app.ai.news import classify_severe_event, fetch_market_headlines, format_headlines_for_prompt
 from app.db_models import (
     AgenticAISettings,
     AIReport,
@@ -711,10 +726,18 @@ Your primary job is capital preservation, not finding trades. Your default decis
 a genuinely clear, specific reason to act -- a plausible-sounding story is not enough.
 
 You are shown only the current price, the change versus the previous trading day's close, and today's
-high/low range so far. You have no indicators (no EMA, ADX, VWAP, RSI, or Supertrend), no candle history, no
-option chain, and no news. This is a deliberate, known limitation of what you can see right now, not an
-oversight -- weigh your own confidence accordingly, and prefer NONE whenever the picture in front of you
-could plausibly be read either way.
+high/low range so far. You have no indicators (no EMA, ADX, VWAP, RSI, or Supertrend) and no candle history
+or option chain. This is a deliberate, known limitation of what you can see right now, not an oversight --
+weigh your own confidence accordingly, and prefer NONE whenever the picture in front of you could plausibly
+be read either way.
+
+If a "Recent market headlines" section is shown below, treat it as real context about what's happening
+right now, not as something to react to just because it's mentioned -- ordinary business/market headlines
+are routine noise and most of them changed nothing about today's price action. Give a headline real weight
+only when it plausibly explains the price action you are already seeing, or describes a genuinely specific,
+concrete event (a rate decision, an index-level policy announcement, a named company's results materially
+moving the index) rather than generic commentary. The mere presence of news, on its own, is not directional
+evidence.
 
 You do not choose a stop-loss, target, or position size -- a separate, deterministic system owns those
 entirely, regardless of what you say here. Your only job is to decide whether there is a clear enough
@@ -731,9 +754,12 @@ rules cannot make: whether to exit now because the original case for this trade 
 though neither the stop nor the target has been hit yet.
 
 You are shown the position's own entry price, current price, running P&L, and how long it has been open --
-the same minimal, indicator-free view the entry decision was made from. Prefer HOLD when you have no
-specific reason to exit -- cutting a position early on vague unease is not better risk management than
-letting the fixed stop/target do their job; it is a different, unmeasured kind of risk.
+the same minimal, indicator-free view the entry decision was made from. If a "Recent market headlines"
+section is shown below, use the same judgment as at entry: weigh a headline that plausibly explains an
+adverse move against this specific position, but ordinary market news is not by itself a reason to exit a
+position that is otherwise fine. Prefer HOLD when you have no specific reason to exit -- cutting a position
+early on vague unease is not better risk management than letting the fixed stop/target do their job; it is
+a different, unmeasured kind of risk.
 
 Respond with a single valid JSON object only, with no markdown fences or extra text:
 {"decision": "EXIT" | "HOLD", "confidence": 0.0-1.0, "reasoning": "A few direct sentences"}"""
@@ -843,13 +869,13 @@ def _has_open_agentic_trade(db: Session, index_symbol: str) -> bool:
     )
 
 
-def _build_entry_prompt(index_display_name: str, figures: dict[str, Any]) -> str:
+def _build_entry_prompt(index_display_name: str, figures: dict[str, Any], headlines_text: str = "") -> str:
     price = figures.get("price")
     change_abs = figures.get("change_abs")
     change_percent = figures.get("change_percent")
     day_low = figures.get("day_low")
     day_high = figures.get("day_high")
-    return (
+    base = (
         f"Index: {index_display_name}\n"
         f"Current price: {price}\n"
         f"Change vs previous close: "
@@ -857,21 +883,26 @@ def _build_entry_prompt(index_display_name: str, figures: dict[str, Any]) -> str
         + "\n"
         f"Today's range so far: "
         + (f"{day_low} - {day_high}" if day_low is not None and day_high is not None else "unavailable")
-        + "\n\nApply the evaluation rules above and respond with your decision."
+        + "\n"
     )
+    if headlines_text:
+        base += f"\nRecent market headlines (most recent first):\n{headlines_text}\n"
+    return base + "\nApply the evaluation rules above and respond with your decision."
 
 
-def _build_exit_prompt(trade: StrategyTrade, now_ist: datetime) -> str:
+def _build_exit_prompt(trade: StrategyTrade, now_ist: datetime, headlines_text: str = "") -> str:
     entry_time_ist = to_ist(trade.entry_time) if trade.entry_time is not None else None
     elapsed_minutes = (now_ist - entry_time_ist).total_seconds() / 60 if entry_time_ist else None
-    return (
+    base = (
         f"Position: {trade.signal} on {trade.index_symbol}, strike {trade.strike} {trade.option_type}\n"
         f"Entry price: {trade.entry_price}\n"
         f"Current price: {trade.current_premium}\n"
         f"Running P&L: {trade.pnl_percent}%\n"
-        f"Time open: {f'{elapsed_minutes:.0f} minutes' if elapsed_minutes is not None else 'unknown'}\n\n"
-        "Apply the evaluation rules above and respond with your decision."
+        f"Time open: {f'{elapsed_minutes:.0f} minutes' if elapsed_minutes is not None else 'unknown'}\n"
     )
+    if headlines_text:
+        base += f"\nRecent market headlines (most recent first):\n{headlines_text}\n"
+    return base + "\nApply the evaluation rules above and respond with your decision."
 
 
 def open_agentic_trade(
@@ -991,13 +1022,24 @@ def check_agentic_entry(
     smartapi: Any,
     option_finder: Any,
     figures_by_symbol: dict[str, dict[str, Any]],
+    is_severe: bool = False,
+    headlines_text: str = "",
 ) -> Optional[StrategyTrade]:
-    """One index's entry evaluation for this cycle. Gated, in order, by: an
-    already-open AGENTIC_AI position on this specific index (cheap, no risk-
-    gate query needed); the deterministic risk/sizing agent's check_risk_
-    gates() (global across both indices -- see that function's own
-    docstring); and a live price actually being available. Only once all
-    three pass does this spend an LLM call."""
+    """One index's entry evaluation for this cycle. Gated, in order, by: the
+    news agent's severe-event kill switch (app.ai.news.classify_severe_
+    event -- cheapest and most decisive, so checked first); an already-open
+    AGENTIC_AI position on this specific index (cheap, no risk-gate query
+    needed); the deterministic risk/sizing agent's check_risk_gates()
+    (global across both indices -- see that function's own docstring); and
+    a live price actually being available. Only once all four pass does
+    this spend an LLM call. headlines_text (recent real headlines, never a
+    fabricated score) is shown to the model as soft context regardless of
+    is_severe -- the two are independent: ordinary news always reaches the
+    model's own judgment, a genuine black-swan match never does."""
+    if is_severe:
+        logger.info("[AGENTIC_AI] %s: Entry blocked -- severe-event news kill switch is active", index.symbol)
+        return None
+
     if _has_open_agentic_trade(db, index.symbol):
         return None
 
@@ -1011,7 +1053,7 @@ def check_agentic_entry(
         logger.info("[AGENTIC_AI] %s: Skipped, no live price available", index.symbol)
         return None
 
-    user_prompt = _build_entry_prompt(index.display_name or index.symbol, figures)
+    user_prompt = _build_entry_prompt(index.display_name or index.symbol, figures, headlines_text)
     raw = _call_openai_live(settings, SYSTEM_PROMPT_ENTRY, user_prompt)
     if raw.error:
         logger.error("[AGENTIC_AI] %s entry call FAILED: %s", index.symbol, raw.error)
@@ -1037,16 +1079,26 @@ def check_agentic_exits(
     trade_manager: Any,
     settings: AgenticAISettings,
     end_hm: tuple[int, int],
+    is_severe: bool = False,
+    severe_matches: Optional[list[str]] = None,
+    headlines_text: str = "",
 ) -> None:
     """Re-asks the live model, for every currently open AGENTIC_AI trade not
-    already past the hard square-off time, whether to HOLD or EXIT -- and
-    actually closes on EXIT via trade_manager.close_trade (the same helper
-    monitor_open_trades' own backstop uses), so every exit path records a
-    close identically. The backstop stop/target/time-exit this trade
-    already carries (sl_mode=FIXED) keeps enforcing independently of
-    whatever this function decides, every 30 seconds via the shared
-    monitor -- this is a second, faster-reacting line of judgment on top of
-    that, not a replacement for it."""
+    already past the hard square-off time or caught by the news kill
+    switch, whether to HOLD or EXIT -- and actually closes on EXIT via
+    trade_manager.close_trade (the same helper monitor_open_trades' own
+    backstop uses), so every exit path records a close identically. The
+    backstop stop/target/time-exit this trade already carries
+    (sl_mode=FIXED) keeps enforcing independently of whatever this function
+    decides, every 30 seconds via the shared monitor -- this is a second,
+    faster-reacting line of judgment on top of that, not a replacement for
+    it.
+
+    is_severe (app.ai.news.classify_severe_event) force-closes every open
+    position via ExitReason.NEWS_KILL_SWITCH, checked before the hard
+    square-off cutoff -- a genuine black-swan match is reported with its
+    own distinct reason even when the cutoff would also apply, which is
+    the more informative of the two in that rare overlap."""
     trades = list(
         db.scalars(
             select(StrategyTrade).where(
@@ -1063,6 +1115,20 @@ def check_agentic_exits(
             if trade.current_premium is None:
                 continue
 
+            if is_severe:
+                trade_manager.close_trade(db, trade, trade.current_premium, ExitReason.NEWS_KILL_SWITCH)
+                log_event(
+                    db, "AGENTIC_AI",
+                    f"[{trade.strategy_name}] closed by the news kill switch: {severe_matches}",
+                    level="WARNING",
+                    payload={"trade_id": trade.trade_id, "pnl_percent": trade.pnl_percent, "matched_headlines": severe_matches},
+                )
+                logger.warning(
+                    "[AGENTIC_AI] %s closed by news kill switch (%.2f%%): %s",
+                    trade.trade_id, trade.pnl_percent or 0.0, severe_matches,
+                )
+                continue
+
             if past_cutoff:
                 trade_manager.close_trade(db, trade, trade.current_premium, ExitReason.TIME_EXIT)
                 log_event(
@@ -1076,7 +1142,7 @@ def check_agentic_exits(
                 )
                 continue
 
-            user_prompt = _build_exit_prompt(trade, now_ist)
+            user_prompt = _build_exit_prompt(trade, now_ist, headlines_text)
             raw = _call_openai_live(settings, SYSTEM_PROMPT_EXIT, user_prompt)
             if raw.error:
                 logger.error("[AGENTIC_AI] %s exit call FAILED: %s", trade.trade_id, raw.error)
@@ -1138,13 +1204,28 @@ def run_agentic_entry_exit_checks(
         indexes = [index for index in list_index_configs(session) if index.enabled]
         figures_by_symbol = {row["symbol"]: row for row in get_index_live_figures(session, smartapi, feed_store)}
 
+        # News fetched once per cycle, shared by every index's entry check
+        # and by the exit check -- not once per index. fetch_market_
+        # headlines() is fail-soft (a total feed outage just means an empty
+        # list), so a news-fetch problem degrades this cycle's context,
+        # never blocks trading.
+        headlines = fetch_market_headlines()
+        is_severe, severe_matches = classify_severe_event(headlines)
+        headlines_text = format_headlines_for_prompt(headlines)
+        if is_severe:
+            logger.warning("[AGENTIC_AI] Severe-event news kill switch triggered: %s", severe_matches)
+            log_event(
+                session, "AGENTIC_AI", f"Severe-event news kill switch triggered: {severe_matches}",
+                level="WARNING", payload={"matched_headlines": severe_matches},
+            )
+
         platform_settings = get_or_create_settings(session)
         end_hm = parse_hhmm(platform_settings.square_off_time, _DEFAULT_TRADING_END)
 
         # Exits first -- closing a stale position frees its slot for a
         # fresh entry the same cycle, same ordering app.ai.autonomous
         # already uses for the same reason.
-        check_agentic_exits(session, trade_manager, settings, end_hm)
+        check_agentic_exits(session, trade_manager, settings, end_hm, is_severe, severe_matches, headlines_text)
 
         start_hm = parse_hhmm(platform_settings.trading_start_time, _DEFAULT_TRADING_START)
         if (now_ist.hour, now_ist.minute) < start_hm or (now_ist.hour, now_ist.minute) >= end_hm:
@@ -1152,7 +1233,10 @@ def run_agentic_entry_exit_checks(
 
         for index in indexes:
             try:
-                check_agentic_entry(session, index, now_ist, settings, smartapi, option_finder, figures_by_symbol)
+                check_agentic_entry(
+                    session, index, now_ist, settings, smartapi, option_finder, figures_by_symbol,
+                    is_severe, headlines_text,
+                )
             except Exception:
                 logger.exception("[AGENTIC_AI] entry check failed for %s", index.symbol)
     finally:

@@ -140,6 +140,14 @@ class ExitReason(str, Enum):
     # different window, different measured quantity (elapsed time only, no
     # P&L band), different population.
     VS_STAGNATION_EXIT = "VS_STAGNATION_EXIT"
+    # app.ai.agentic's news agent (25 Oct 2026) -- a deterministic, safety-
+    # only kill switch: every open AGENTIC_AI position is force-closed the
+    # instant a recent headline matches a short, deliberately extreme list
+    # of black-swan keywords (circuit breaker, war, bank run, etc.), before
+    # the model is even asked. Not origin-prefixed -- the mechanism is
+    # generic and any future strategy could reuse it the same way TIME_EXIT
+    # already is, this is just its first caller.
+    NEWS_KILL_SWITCH = "NEWS_KILL_SWITCH"
 
 
 class WebhookPayload(BaseModel):

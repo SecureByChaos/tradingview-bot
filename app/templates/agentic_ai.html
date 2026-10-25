@@ -1,24 +1,27 @@
 {% extends "base.html" %}
 {% from "components.html" import page_header, empty_state %}
 {% block content %}
-{{ page_header("Agentic AI", "Paper trading · Entry/exit agent live", "text-bg-warning") }}
+{{ page_header("Agentic AI", "Paper trading · All five agents live", "text-bg-warning") }}
 
 <div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
   <p class="mb-2"><strong>What this is:</strong> a brand-new, isolated fifth strategy (25 Oct 2026),
   built as a set of specialized agents rather than one prompt doing everything -- entry, exit, risk/sizing,
-  logging, and backtest/QA, each its own agent. OpenAI-only by explicit choice, with its own independent
+  logging, backtest/QA, and news, each its own agent. OpenAI-only by explicit choice, with its own independent
   configuration below -- never the shared Settings &gt; AI row AI Origination and Autonomous AI both read,
   so tuning one can never silently change the other (the exact confusion the gpt-6-luna reasoning_effort
   episode exposed on that shared row). Structurally paper-only -- no live order path exists anywhere in
   this module, same construction as every other experimental strategy in this project.</p>
   <p class="mb-0"><strong>What exists right now:</strong> the backtest/QA agent, pointable at any existing
   strategy's real trade history; the logging agent, a scheduled cross-strategy daily digest; the risk/sizing
-  agent (a deterministic pre-entry gate and position-size calculator, below); and the entry/exit agent, which
-  now actually opens and closes real (paper) trades every ~5 minutes during market hours. The model only ever
-  decides direction (BUY_CE/BUY_PE/NONE, EXIT/HOLD) -- stop, target, and position size are computed entirely
-  by the risk/sizing agent, never proposed by the model. Market input is deliberately minimal for this first
-  pass (price, change, today's range -- no indicators yet). The news-reading agent is the one piece still to
-  come.</p>
+  agent (a deterministic pre-entry gate and position-size calculator, below); the entry/exit agent, which
+  opens and closes real (paper) trades every ~5 minutes during market hours; and the news agent, which pulls
+  recent India-market headlines from free RSS feeds into both the entry and exit prompts, plus a separate,
+  deterministic "severe event" kill switch that blocks all new entries and force-closes every open position
+  the instant a genuine black-swan headline (war, bank run, trading halt, ...) is detected -- before the
+  model is ever asked. The model only ever decides direction (BUY_CE/BUY_PE/NONE, EXIT/HOLD) -- stop, target,
+  position size, and the news kill switch are all computed deterministically, never by the model. Market
+  input is otherwise still minimal for this first pass (price, change, today's range -- no technical
+  indicators yet).</p>
 </div>
 
 <div class="section-header"><h4 class="mb-0">Configuration</h4></div>
