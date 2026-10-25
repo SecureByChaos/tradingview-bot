@@ -45,45 +45,117 @@ and nothing schedules it. What exists:
     AGENTIC_AI trade -- built and proven correct ahead of that agent existing,
     not alongside it under time pressure.
 
-  - The entry/exit agent: check_agentic_entry() + check_agentic_exits(),
-    wired via run_agentic_entry_exit_checks() (the "agentic-ai-check"
-    scheduler job). This strategy's first and only live_model-backed
-    component -- the fast, low-latency tier, per the user's explicit model
-    tiering (live_model for entry/exit signalling, qa_model for the
-    backtest/QA agent above, both already configured on AgenticAISettings).
+  - The entry/exit agent, rebuilt into TRUE multi-agent fusion (25 Oct
+    2026, same day as the news agent above): a dedicated Technical & Flow
+    Agent, a dedicated News & Sentiment Agent, and a final Master
+    Orchestrator Agent that reconciles both verdicts into the actual
+    decision -- three independent live_model calls per index per cycle
+    (two shared across indices) instead of one flat prompt, per explicit
+    instruction ("Idea was to build agents for each process and make a
+    decesion combinin all the intelligence" / "i want everything in
+    combination which helps in taking better trades"), choosing this over
+    the cheaper single-combined-call alternative with the stated tradeoff
+    (3-4x the live_model calls and latency per cycle, each extra call a
+    new source of noise) explicitly accepted. Wired via run_agentic_entry_
+    exit_checks() (the "agentic-ai-check" scheduler job), all three calls
+    on the same live_model/live_reasoning_effort tier -- no new settings
+    field, since this is a change to how many calls are made and what each
+    one sees, not a change to which model answers them.
 
-    THE MODEL NEVER DECIDES RISK. It only ever outputs a direction
-    (BUY_CE/BUY_PE/NONE at entry, EXIT/HOLD at exit) plus confidence and
-    reasoning -- stop, target, and position size are computed entirely by
-    the deterministic risk/sizing agent above (nominal_stop_percent/
-    nominal_target_percent + compute_position_size()/check_risk_gates()).
-    This is a deliberate departure from AI Origination's own model-proposed-
-    stop pattern: the whole point of building the risk/sizing agent BEFORE
-    this one was so a model-proposed risk number would never need to be
-    trusted here, consistent with the user's own framing for this strategy
-    ("the system understands the financial losses which must be least").
+    THE MODEL NEVER DECIDES RISK, unchanged by this rebuild. Across all
+    three calls, the only things ever produced are a directional lean/
+    decision, a confidence, and reasoning text -- stop, target, and
+    position size are still computed entirely by the deterministic risk/
+    sizing agent above (nominal_stop_percent/nominal_target_percent +
+    compute_position_size()/check_risk_gates()), exactly as before this
+    rebuild. The Orchestrator is a fourth opinion on DIRECTION, never a
+    second opinion on SIZE.
 
-    Market input is deliberately minimal for this first pass -- current
-    price, change vs previous close, today's range (app.platform.
-    get_index_live_figures(), the same zero-SmartAPI-cost read app.ai.
-    autonomous originally used), no indicators at all. This mirrors
-    Autonomous AI's own first build rather than reusing its now-much-
-    larger feature engine (EMA/ADX/VWAP/chop/recent-momentum, accrued over
-    months of real incidents) -- richer market context for Agentic AI is a
-    deliberate, separate future enhancement (most likely folded into the
-    news-reading agent's own work, since both are about giving this
-    strategy a fuller picture of "what is actually happening"), not
-    something to build speculatively ahead of any real trade history here.
+    Technical & Flow Agent (_compute_technical_features + get_technical_
+    verdict): per enabled index, per cycle, builds its OWN candle-fetch-
+    and-refresh orchestration (own WebSocket-freshness check via
+    latest_bar_age_seconds, own REST fallback via smartapi.get_candles,
+    own store_bars/load_bars/resample calls) around the shared, already-
+    battle-tested app.market_context.build_market_context() -- mirroring,
+    not reusing, app.ai.autonomous's private _compute_features for exactly
+    the same reason every AI subsystem in this project keeps its own
+    orchestration layer around that one shared pure-computation function:
+    a change or bug in one module's candle-fetch plumbing must never
+    silently affect another's (see CLAUDE.md's "deliberately independent
+    subsystems" principle). Deliberately narrower than Autonomous AI's own
+    feature set: EMA9/21 regime, ADX, Kaufman chop efficiency ratio,
+    recent ~15-min price change, and PDH/PDL distance -- no futures-VWAP
+    substitution (that needs its own futures-contract resolution and
+    candle fetch, a real added cost this first pass skips; chop+ADX+EMA-
+    regime+recent-momentum already give a genuine, non-trivial technical
+    read without it). Returns None (fails closed, same convention
+    build_market_context itself uses) when there isn't enough INDEX
+    candle history yet -- an index with no technical read this cycle
+    skips its entry decision outright, the same "missing context means
+    skip, never guess" rule this codebase applies everywhere.
 
-    Structurally paper-only, same construction and reasoning as every other
-    experimental strategy in this project: TradingMode.PAPER is hardcoded at
-    open, smartapi.place_market_order is never called anywhere in this
-    module. One position at a time across BOTH indices combined by default
-    (max_concurrent_positions=1, the same global cap check_risk_gates()
-    already enforces), not a separate per-index slot the way AI Origination
-    works -- same Single Active Position Rule precedent Validated Signal
-    already established, and the simplest reading of check_risk_gates()'s
-    own global (not per-index) concurrency count.
+    The LLM call itself is handed the already-computed indicator VALUES
+    (never raw price alone) and asked for a structured, three-way lean
+    (BULLISH/BEARISH/NEUTRAL) plus confidence and reasoning -- the same
+    "show computed context, ask for a read" shape AI Origination's own
+    prompt already uses, scoped down to interpretation rather than a
+    trade decision, since the Orchestrator (not this agent) makes the
+    final call.
+
+    News & Sentiment Agent, upgraded from a flat text dump into its own
+    verdict (get_news_verdict): ONE shared call per cycle (headlines are
+    market-wide, not index-specific, so this is not re-run per index),
+    given the same real headlines app.ai.news.fetch_market_headlines()
+    already fetches, asked for the same three-way lean/confidence/
+    reasoning shape as the Technical Agent so the Orchestrator can weigh
+    both on equal footing. Explicitly told most headlines are routine
+    noise and NEUTRAL is the correct default -- same discipline the old
+    flat-text prompt already stated, now enforced on a dedicated agent
+    whose only job is this read, rather than folded as an aside into the
+    entry prompt. Zero headlines skips the call entirely and returns a
+    real NEUTRAL verdict directly (nothing to assess, not worth spending
+    a call to say so); a call failure ALSO degrades to a NEUTRAL fallback
+    verdict rather than blocking the pipeline -- news is supplementary
+    context, not a required gate, so a provider hiccup on this call must
+    never by itself prevent the Technical Agent and Orchestrator from
+    still running. This is a deliberate asymmetry from the Technical
+    Agent, whose own failure DOES skip the cycle for that index -- the
+    technical read is this pipeline's primary, required signal; the news
+    read is corroborating context.
+
+    Master Orchestrator Agent (_build_orchestrator_prompt + the entry
+    call itself, reusing _EntryDecision/_parse_entry_response's existing
+    BUY_CE/BUY_PE/NONE schema unchanged): the final decision-maker, shown
+    the Technical Agent's verdict, the News Agent's verdict, the raw
+    headline list, and the same price/range context the old single-call
+    design already showed. Explicitly instructed that agreement between
+    the two sub-agents is the strongest case to act, and that disagreement
+    (or either verdict reading NEUTRAL/unavailable) is a reason for
+    caution, not something to average away -- the Orchestrator still
+    defaults to NONE absent a genuinely clear combined picture, same
+    capital-preservation framing the single-call prompt always had.
+
+    The exit side gained the SAME two verdicts as supplementary context
+    (SYSTEM_PROMPT_EXIT / _build_exit_prompt), reusing whatever was
+    already computed for that index this cycle rather than spending two
+    more calls per open position -- an exit re-ask is still exactly one
+    call, same as before this rebuild; only what it's shown grew. A
+    missing technical verdict (e.g. insufficient candle history right
+    now) is shown as "unavailable" rather than skipping the exit call
+    outright -- the backstop stop/target/time-exit protect this trade
+    regardless, so a thin technical read is not a reason to stop asking
+    the model for its own exit judgment.
+
+    Market input beyond the above is still deliberately minimal -- see
+    the Technical Agent's own narrower-than-Autonomous-AI feature set
+    above. Structurally paper-only, same construction and reasoning as
+    every other experimental strategy in this project: TradingMode.PAPER
+    is hardcoded at open, smartapi.place_market_order is never called
+    anywhere in this module. One position at a time across BOTH indices
+    combined by default (max_concurrent_positions=1, the same global cap
+    check_risk_gates() already enforces), not a separate per-index slot
+    the way AI Origination works -- same Single Active Position Rule
+    precedent Validated Signal already established.
 
     Deliberately NOT built in this pass, named rather than silently
     skipped: Autonomous AI's accumulated deterministic exit matrix (peak-
@@ -99,22 +171,20 @@ and nothing schedules it. What exists:
     non-AI_ORIGIN_* trade already gets for free from monitor_open_trades'
     shared branch, zero new code there.
 
-  - The news agent (app.ai.news, 25 Oct 2026) -- the final piece of the
-    original five-agent plan. Fetches recent India-market headlines from
-    free, keyless RSS feeds. Two effects, both wired into run_agentic_
-    entry_exit_checks() once per cycle (shared by every index, not
-    refetched per index): real headlines are shown as plain-text context
-    in both the entry and exit prompts (never a fabricated sentiment
-    score); and a separate, deterministic "severe event" keyword match
-    (circuit breaker, war, bank run, ...) blocks all new entries and
-    force-closes every open AGENTIC_AI position via ExitReason.NEWS_KILL_
-    SWITCH, before the model is ever asked -- the same "the model never
-    decides risk" principle the risk/sizing agent established for P&L,
-    applied here to a market-wide shock. See app/ai/news.py's own
-    docstring for why this doesn't need the same backtest-before-shipping
-    discipline a directional signal would, and for the real limitation
-    that this sandbox cannot verify any of the three feed URLs are
-    actually reachable.
+  - The news agent (app.ai.news, 25 Oct 2026) -- the headline-fetching and
+    deterministic severe-event half of the news agent described above.
+    Fetches recent India-market headlines from free, keyless RSS feeds. A
+    separate, deterministic "severe event" keyword match (circuit
+    breaker, war, bank run, ...) blocks all new entries and force-closes
+    every open AGENTIC_AI position via ExitReason.NEWS_KILL_SWITCH, before
+    the model -- any of the three agents above -- is ever asked, checked
+    first and cheapest every cycle -- the same "the model never decides
+    risk" principle the risk/sizing agent established for P&L, applied
+    here to a market-wide shock. See app/ai/news.py's own docstring for
+    why this doesn't need the same backtest-before-shipping discipline a
+    directional signal would, and for the real limitation that this
+    sandbox cannot verify any of the three feed URLs are actually
+    reachable.
 """
 
 from __future__ import annotations
@@ -124,7 +194,7 @@ import logging
 import random
 from dataclasses import dataclass
 from datetime import date as date_type
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -144,6 +214,18 @@ from app.db_models import (
     TradeResult,
     TradeStatus,
     TradingMode,
+)
+from app.market_context import build_market_context
+from app.market_data import (
+    BAR_FRESHNESS_SECONDS,
+    FIFTEEN_MINUTE,
+    FIVE_MINUTE,
+    ONE_MINUTE,
+    latest_bar_age_seconds,
+    load_bars,
+    parse_smartapi_row,
+    resample,
+    store_bars,
 )
 from app.models import ExitReason, Signal
 from app.platform import get_index_live_figures, get_or_create_settings, list_index_configs, log_event, today_ist
@@ -700,11 +782,12 @@ def evaluate_risk_now(db: Session) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Entry/exit agent -- the live_model tier (fast, low-latency). The model
-# decides direction only (BUY_CE/BUY_PE/NONE at entry, EXIT/HOLD at exit);
-# stop, target, and quantity are computed entirely by the deterministic
-# risk/sizing agent above. See the module docstring's own section on this
-# for the full reasoning.
+# Entry/exit agent, rebuilt into true multi-agent fusion -- see the module
+# docstring's own section on this for the full reasoning. Three live_model
+# calls per index per cycle (two shared across indices): Technical & Flow
+# Agent, News & Sentiment Agent, Master Orchestrator Agent. The model never
+# decides risk, unchanged -- stop, target, and quantity are still computed
+# entirely by the deterministic risk/sizing agent above.
 # ---------------------------------------------------------------------------
 
 # Only used when the shared PlatformSettings row itself is somehow missing
@@ -721,30 +804,278 @@ _DEFAULT_TRADING_END = (15, 15)
 # contract closer than this, rather than accepting the extra risk.
 _MIN_DTE_TO_TRADE = 5
 
-SYSTEM_PROMPT_ENTRY = """You are a conservative trade-execution filter for intraday Indian index options (Nifty/Bank Nifty).
-Your primary job is capital preservation, not finding trades. Your default decision MUST BE "NONE" unless you have
-a genuinely clear, specific reason to act -- a plausible-sounding story is not enough.
+# Same warmup window / load cap app.ai.autonomous's own _compute_features
+# uses for the identical reason -- enough 1-min history to resample 5m/15m
+# bars and warm up ADX/EMA, without loading an unbounded amount of history
+# every cycle. A deliberately separate pair of constants, not imported --
+# see the module docstring's "deliberately independent subsystems" note.
+_CANDLE_WARMUP_DAYS = 7
+_CANDLE_LOAD_LIMIT = 3000
 
-You are shown only the current price, the change versus the previous trading day's close, and today's
-high/low range so far. You have no indicators (no EMA, ADX, VWAP, RSI, or Supertrend) and no candle history
-or option chain. This is a deliberate, known limitation of what you can see right now, not an oversight --
-weigh your own confidence accordingly, and prefer NONE whenever the picture in front of you could plausibly
-be read either way.
 
-If a "Recent market headlines" section is shown below, treat it as real context about what's happening
-right now, not as something to react to just because it's mentioned -- ordinary business/market headlines
-are routine noise and most of them changed nothing about today's price action. Give a headline real weight
-only when it plausibly explains the price action you are already seeing, or describes a genuinely specific,
-concrete event (a rate decision, an index-level policy announcement, a named company's results materially
-moving the index) rather than generic commentary. The mere presence of news, on its own, is not directional
-evidence.
+@dataclass(frozen=True)
+class _TechnicalFeatures:
+    """The Technical & Flow Agent's raw, already-computed indicator values
+    for one index, one cycle -- never raw price alone. Deliberately
+    narrower than app.ai.autonomous's own _Features (no futures-VWAP
+    substitution in this first pass; see the module docstring)."""
+
+    ema9: Optional[float]
+    ema21: Optional[float]
+    trend_regime: str  # BULLISH / BEARISH / NEUTRAL / UNKNOWN
+    adx: Optional[float]
+    chop_efficiency_ratio: Optional[float]
+    chop_label: str  # CHOPPY / MIXED / CLEAN / UNKNOWN
+    recent_price_change_percent: Optional[float]
+    pdh: Optional[float]
+    pdl: Optional[float]
+    dist_to_pdh: Optional[float]
+    dist_to_pdl: Optional[float]
+
+
+def _trend_regime_label(fast_ema: Optional[float], slow_ema: Optional[float]) -> str:
+    """Same EMA9-vs-EMA21 comparison app.ai.autonomous's own _trend_regime
+    already uses, duplicated rather than imported per this module's
+    established "deliberately independent" convention (see the module
+    docstring)."""
+    if fast_ema is None or slow_ema is None:
+        return "UNKNOWN"
+    if fast_ema > slow_ema:
+        return "BULLISH"
+    if fast_ema < slow_ema:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _chop_label(ratio: Optional[float]) -> str:
+    """Same 0.3/0.5 Kaufman Efficiency Ratio band boundaries app.ai.
+    autonomous's own _chop_label (and, before it, app.ai.originator's
+    _efficiency_ratio_text) already use, duplicated rather than imported."""
+    if ratio is None:
+        return "UNKNOWN"
+    if ratio < 0.3:
+        return "CHOPPY"
+    if ratio < 0.5:
+        return "MIXED"
+    return "CLEAN"
+
+
+def _compute_technical_features(
+    db: Session,
+    index: IndexConfig,
+    spot: float,
+    now_ist: datetime,
+    smartapi: Any,
+) -> Optional[_TechnicalFeatures]:
+    """This agent's OWN candle-fetch-and-refresh orchestration around the
+    shared, already-battle-tested app.market_context.build_market_context()
+    -- see the module docstring for why this mirrors rather than reuses
+    app.ai.autonomous's private _compute_features. Returns None (fails
+    closed) when there isn't enough INDEX candle history yet to compute
+    ADX/EMA honestly, same convention build_market_context itself uses."""
+    if not index.spot_token:
+        return None
+
+    age = latest_bar_age_seconds(db, index.symbol, ONE_MINUTE, now_ist)
+    if age is not None and age <= BAR_FRESHNESS_SECONDS:
+        logger.debug(
+            "[AGENTIC_AI][TECH] %s: 1-min history is %.0fs old (WebSocket-fed), skipping REST refresh",
+            index.symbol, age,
+        )
+    else:
+        try:
+            rows = smartapi.get_candles(
+                exchange=index.spot_exchange,
+                symboltoken=index.spot_token,
+                interval=ONE_MINUTE,
+                from_dt=(now_ist - timedelta(days=_CANDLE_WARMUP_DAYS)).strftime("%Y-%m-%d %H:%M"),
+                to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+            )
+            if rows:
+                store_bars(db, index.symbol, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
+        except Exception as exc:
+            logger.info("[AGENTIC_AI][TECH] %s: candle refresh failed (%s), using stored history", index.symbol, exc)
+
+    bars_1m = load_bars(db, index.symbol, ONE_MINUTE, limit=_CANDLE_LOAD_LIMIT)
+    if not bars_1m:
+        return None
+    bars_5m = resample(bars_1m, FIVE_MINUTE)
+    bars_15m = resample(bars_1m, FIFTEEN_MINUTE)
+    context = build_market_context(
+        index_symbol=index.symbol,
+        bars_1m=bars_1m,
+        bars_5m=bars_5m,
+        bars_15m=bars_15m,
+        spot=spot,
+        as_of=now_ist.replace(tzinfo=None),
+    )
+    if context is None:
+        return None
+
+    pdh = context.levels.previous_day_high
+    pdl = context.levels.previous_day_low
+    return _TechnicalFeatures(
+        ema9=context.ema9,
+        ema21=context.ema21,
+        trend_regime=_trend_regime_label(context.ema9, context.ema21),
+        adx=context.adx,
+        chop_efficiency_ratio=context.chop_efficiency_ratio,
+        chop_label=_chop_label(context.chop_efficiency_ratio),
+        recent_price_change_percent=context.recent_price_change_percent,
+        pdh=pdh,
+        pdl=pdl,
+        dist_to_pdh=round(pdh - spot, 2) if pdh is not None else None,
+        dist_to_pdl=round(spot - pdl, 2) if pdl is not None else None,
+    )
+
+
+@dataclass(frozen=True)
+class _AgentVerdict:
+    """The shared output shape for both sub-agents (Technical & Flow, News
+    & Sentiment) -- a directional LEAN, never a trade decision; only the
+    Orchestrator ever produces BUY_CE/BUY_PE/NONE. lean="ERROR" means the
+    call itself failed (unparseable response, provider error, not
+    configured) -- callers decide whether that's fail-closed (Technical,
+    a required signal) or fail-soft to NEUTRAL (News, supplementary)."""
+
+    lean: str  # BULLISH / BEARISH / NEUTRAL / ERROR
+    confidence: Optional[float]
+    reasoning: str
+
+
+def _parse_agent_verdict(text: Optional[str]) -> _AgentVerdict:
+    if not text:
+        return _AgentVerdict("ERROR", None, "No response text")
+    try:
+        data = json.loads(extract_json_object(text))
+        if not isinstance(data, dict):
+            return _AgentVerdict("ERROR", None, "Invalid AI response (not a JSON object)")
+        lean = str(data.get("lean") or "").strip().upper()
+        if lean not in {"BULLISH", "BEARISH", "NEUTRAL"}:
+            return _AgentVerdict("ERROR", None, f"Unrecognised lean value {lean!r}")
+        return _AgentVerdict(lean, _parse_confidence(data.get("confidence")), str(data.get("reasoning") or ""))
+    except Exception as exc:
+        return _AgentVerdict("ERROR", None, f"Could not parse AI response ({type(exc).__name__}: {exc})")
+
+
+SYSTEM_PROMPT_TECHNICAL = """You are the Technical & Flow Agent, one of three independent agents feeding a final trading decision for
+intraday Indian index options (Nifty/Bank Nifty). You do NOT decide whether to trade -- a separate Orchestrator
+agent does that, combining your read with a News & Sentiment agent's own independent read. Your only job is to
+interpret the already-computed technical indicator values you are shown into a single directional lean.
+
+You are shown: the EMA9-vs-EMA21 regime (BULLISH/BEARISH/NEUTRAL), ADX (trend strength -- below ~20 generally
+means no real trend is established, above ~25 generally means one is), the Kaufman Efficiency Ratio label for
+the last ~1 hour (CHOPPY/MIXED/CLEAN -- how directly price has actually travelled, independent of ADX, which is
+a slower, more lagging signal), the recent ~15-minute price change, and distance to the previous day's high/low.
+Any of these can read UNKNOWN/unavailable -- treat that as missing information, never as a tiebreaker in either
+direction.
+
+A CHOPPY efficiency reading or a NEUTRAL/UNKNOWN regime are both reasons to lean NEUTRAL yourself, even if one
+other reading looks superficially directional -- a single strong-looking number inside an otherwise mixed
+picture is not a clear technical case. Reserve BULLISH/BEARISH for when multiple readings genuinely agree.
+
+Respond with a single valid JSON object only, with no markdown fences or extra text:
+{"lean": "BULLISH" | "BEARISH" | "NEUTRAL", "confidence": 0.0-1.0, "reasoning": "A few direct sentences citing exactly which readings drove this"}"""
+
+
+def _build_technical_prompt(index_display_name: str, features: _TechnicalFeatures) -> str:
+    return (
+        f"Index: {index_display_name}\n"
+        f"EMA9/EMA21 regime: {features.trend_regime}"
+        + (f" (EMA9={features.ema9}, EMA21={features.ema21})" if features.ema9 is not None else "")
+        + "\n"
+        f"ADX: {features.adx if features.adx is not None else 'unavailable'}\n"
+        f"Market efficiency (last ~1hr): {features.chop_label}"
+        + (f" ({features.chop_efficiency_ratio})" if features.chop_efficiency_ratio is not None else "")
+        + "\n"
+        f"Recent price change (last ~15 min): "
+        + (f"{features.recent_price_change_percent:+.2f}%" if features.recent_price_change_percent is not None else "unavailable")
+        + "\n"
+        f"Distance to previous day's high: {features.dist_to_pdh if features.dist_to_pdh is not None else 'unavailable'}\n"
+        f"Distance to previous day's low: {features.dist_to_pdl if features.dist_to_pdl is not None else 'unavailable'}\n"
+        "\nApply the evaluation rules above and respond with your lean."
+    )
+
+
+def get_technical_verdict(settings: AgenticAISettings, index_display_name: str, features: _TechnicalFeatures) -> _AgentVerdict:
+    """The Technical & Flow Agent's own LLM call -- always spent once
+    features are available, since this is this pipeline's primary,
+    required signal (unlike the News agent below, a call failure here is
+    NOT papered over with a NEUTRAL fallback; callers fail closed)."""
+    raw = _call_openai_live(settings, SYSTEM_PROMPT_TECHNICAL, _build_technical_prompt(index_display_name, features))
+    if raw.error:
+        return _AgentVerdict("ERROR", None, raw.error)
+    return _parse_agent_verdict(raw.content)
+
+
+SYSTEM_PROMPT_NEWS = """You are the News & Sentiment Agent, one of three independent agents feeding a final trading decision for
+intraday Indian index options (Nifty/Bank Nifty). You do NOT decide whether to trade -- a separate Orchestrator
+agent does that, combining your read with a Technical & Flow agent's own independent read. Your only job is to
+read the real headlines you are shown and produce a single directional lean for how they bear on Indian equity
+markets right now.
+
+Most ordinary business/market headlines are routine noise and change nothing about today's price action --
+NEUTRAL is the correct default. Give a headline real directional weight only when it describes a genuinely
+specific, concrete event plausibly moving the broad market (a central bank rate decision, a major macro data
+release, an index-level policy announcement) rather than generic commentary, a single company's results, or a
+headline merely describing price action that has already happened (a headline saying "Nifty rallies" is a
+description, not new information). The mere presence of news, on its own, is not directional evidence.
+
+Respond with a single valid JSON object only, with no markdown fences or extra text:
+{"lean": "BULLISH" | "BEARISH" | "NEUTRAL", "confidence": 0.0-1.0, "reasoning": "A few direct sentences citing which headline(s), if any, drove this"}"""
+
+
+def _build_news_prompt(headlines_text: str) -> str:
+    return (
+        f"Recent market headlines (most recent first):\n{headlines_text}\n"
+        "\nApply the evaluation rules above and respond with your lean."
+    )
+
+
+def get_news_verdict(settings: AgenticAISettings, headlines_text: str) -> _AgentVerdict:
+    """The News & Sentiment Agent's own LLM call -- ONE shared call per
+    cycle, not per index, since headlines are market-wide. Zero headlines
+    skips the call entirely (nothing to assess, not worth spending a call
+    to say so); a call failure ALSO degrades to a NEUTRAL fallback rather
+    than an ERROR -- news is supplementary context here, so a provider
+    hiccup on this call must never by itself block the Technical Agent or
+    the Orchestrator from still running (see the module docstring's note
+    on this deliberate asymmetry with the Technical Agent)."""
+    if not headlines_text:
+        return _AgentVerdict("NEUTRAL", None, "No recent headlines available this cycle.")
+    raw = _call_openai_live(settings, SYSTEM_PROMPT_NEWS, _build_news_prompt(headlines_text))
+    if raw.error:
+        logger.info("[AGENTIC_AI][NEWS] verdict call failed, falling back to NEUTRAL: %s", raw.error)
+        return _AgentVerdict("NEUTRAL", None, f"News agent call failed ({raw.error}); treated as no signal.")
+    verdict = _parse_agent_verdict(raw.content)
+    if verdict.lean == "ERROR":
+        logger.info("[AGENTIC_AI][NEWS] verdict unparseable, falling back to NEUTRAL: %s", verdict.reasoning)
+        return _AgentVerdict("NEUTRAL", None, f"News agent response unparseable ({verdict.reasoning}); treated as no signal.")
+    return verdict
+
+
+SYSTEM_PROMPT_ORCHESTRATOR = """You are the Master Orchestrator for intraday Indian index options (Nifty/Bank Nifty) trade entries.
+Two independent agents have already given you their own read: a Technical & Flow Agent's directional lean from
+price/indicator data, and a News & Sentiment Agent's directional lean from real recent headlines. Your job is to
+combine both into the actual trade decision -- you did not compute either read yourself, and you must not
+second-guess the specific readings each agent cites, only weigh their conclusions against each other.
+
+Your primary job is capital preservation, not finding trades. Your default decision MUST BE "NONE" unless you
+have a genuinely clear combined case -- a plausible-sounding story from either agent alone is not enough.
+
+When the two agents' leans AGREE (both BULLISH or both BEARISH), that is the strongest case to act, and you
+may act on BUY_CE (both BULLISH) or BUY_PE (both BEARISH) with confidence proportional to how clear each
+agent's own reasoning was. When they DISAGREE, or either reads NEUTRAL/unavailable, treat that as a reason
+for caution, not something to average or split the difference on -- prefer NONE unless one agent's case is
+exceptionally clear AND the other agent is merely NEUTRAL (not actively contradicting it), and say so
+explicitly in your own reasoning.
 
 You do not choose a stop-loss, target, or position size -- a separate, deterministic system owns those
 entirely, regardless of what you say here. Your only job is to decide whether there is a clear enough
-directional case to act on at all, and which direction.
+combined directional case to act on at all, and which direction.
 
 Respond with a single valid JSON object only, with no markdown fences or extra text:
-{"decision": "BUY_CE" | "BUY_PE" | "NONE", "confidence": 0.0-1.0, "reasoning": "A few direct sentences citing exactly what you saw"}"""
+{"decision": "BUY_CE" | "BUY_PE" | "NONE", "confidence": 0.0-1.0, "reasoning": "A few direct sentences on how the two agents' reads combined"}"""
 
 SYSTEM_PROMPT_EXIT = """You are a disciplined trade-management execution engine for intraday Indian index options (Nifty/Bank Nifty).
 You are reviewing one already-open position. A separate, deterministic system enforces a hard stop-loss,
@@ -753,13 +1084,14 @@ regardless of your answer, so you are not this trade's only protection. Your job
 rules cannot make: whether to exit now because the original case for this trade no longer looks right, even
 though neither the stop nor the target has been hit yet.
 
-You are shown the position's own entry price, current price, running P&L, and how long it has been open --
-the same minimal, indicator-free view the entry decision was made from. If a "Recent market headlines"
-section is shown below, use the same judgment as at entry: weigh a headline that plausibly explains an
-adverse move against this specific position, but ordinary market news is not by itself a reason to exit a
-position that is otherwise fine. Prefer HOLD when you have no specific reason to exit -- cutting a position
-early on vague unease is not better risk management than letting the fixed stop/target do their job; it is
-a different, unmeasured kind of risk.
+You are shown the position's own entry price, current price, running P&L, how long it has been open, and the
+same two independent sub-agent reads a fresh entry decision would be shown right now -- a Technical & Flow
+Agent's own directional lean, and a News & Sentiment Agent's own directional lean (either may read
+NEUTRAL/unavailable; treat that as missing information, not as either reassurance or an alarm). Weigh a
+read that plausibly explains an adverse move against this specific position, but ordinary readings are not
+by themselves a reason to exit a position that is otherwise fine. Prefer HOLD when you have no specific
+reason to exit -- cutting a position early on vague unease is not better risk management than letting the
+fixed stop/target do their job; it is a different, unmeasured kind of risk.
 
 Respond with a single valid JSON object only, with no markdown fences or extra text:
 {"decision": "EXIT" | "HOLD", "confidence": 0.0-1.0, "reasoning": "A few direct sentences"}"""
@@ -869,7 +1201,24 @@ def _has_open_agentic_trade(db: Session, index_symbol: str) -> bool:
     )
 
 
-def _build_entry_prompt(index_display_name: str, figures: dict[str, Any], headlines_text: str = "") -> str:
+def _format_verdict(label: str, verdict: Optional[_AgentVerdict]) -> str:
+    """Shared rendering for both sub-agent verdicts into either the
+    Orchestrator's or the exit prompt's text -- "unavailable" (never a
+    fabricated lean) when verdict is None or itself came back ERROR."""
+    if verdict is None or verdict.lean == "ERROR":
+        return f"{label}: unavailable"
+    confidence_text = f", confidence {verdict.confidence:.2f}" if verdict.confidence is not None else ""
+    reasoning_text = f" -- {verdict.reasoning}" if verdict.reasoning else ""
+    return f"{label}: {verdict.lean}{confidence_text}{reasoning_text}"
+
+
+def _build_orchestrator_prompt(
+    index_display_name: str,
+    figures: dict[str, Any],
+    technical_verdict: Optional[_AgentVerdict],
+    news_verdict: Optional[_AgentVerdict],
+    headlines_text: str = "",
+) -> str:
     price = figures.get("price")
     change_abs = figures.get("change_abs")
     change_percent = figures.get("change_percent")
@@ -883,14 +1232,24 @@ def _build_entry_prompt(index_display_name: str, figures: dict[str, Any], headli
         + "\n"
         f"Today's range so far: "
         + (f"{day_low} - {day_high}" if day_low is not None and day_high is not None else "unavailable")
+        + "\n\n"
+        + _format_verdict("Technical & Flow Agent", technical_verdict)
+        + "\n"
+        + _format_verdict("News & Sentiment Agent", news_verdict)
         + "\n"
     )
     if headlines_text:
-        base += f"\nRecent market headlines (most recent first):\n{headlines_text}\n"
+        base += f"\nRaw recent headlines, for your own context (most recent first):\n{headlines_text}\n"
     return base + "\nApply the evaluation rules above and respond with your decision."
 
 
-def _build_exit_prompt(trade: StrategyTrade, now_ist: datetime, headlines_text: str = "") -> str:
+def _build_exit_prompt(
+    trade: StrategyTrade,
+    now_ist: datetime,
+    headlines_text: str = "",
+    technical_verdict: Optional[_AgentVerdict] = None,
+    news_verdict: Optional[_AgentVerdict] = None,
+) -> str:
     entry_time_ist = to_ist(trade.entry_time) if trade.entry_time is not None else None
     elapsed_minutes = (now_ist - entry_time_ist).total_seconds() / 60 if entry_time_ist else None
     base = (
@@ -898,10 +1257,14 @@ def _build_exit_prompt(trade: StrategyTrade, now_ist: datetime, headlines_text: 
         f"Entry price: {trade.entry_price}\n"
         f"Current price: {trade.current_premium}\n"
         f"Running P&L: {trade.pnl_percent}%\n"
-        f"Time open: {f'{elapsed_minutes:.0f} minutes' if elapsed_minutes is not None else 'unknown'}\n"
+        f"Time open: {f'{elapsed_minutes:.0f} minutes' if elapsed_minutes is not None else 'unknown'}\n\n"
+        + _format_verdict("Technical & Flow Agent", technical_verdict)
+        + "\n"
+        + _format_verdict("News & Sentiment Agent", news_verdict)
+        + "\n"
     )
     if headlines_text:
-        base += f"\nRecent market headlines (most recent first):\n{headlines_text}\n"
+        base += f"\nRaw recent headlines, for your own context (most recent first):\n{headlines_text}\n"
     return base + "\nApply the evaluation rules above and respond with your decision."
 
 
@@ -1024,18 +1387,25 @@ def check_agentic_entry(
     figures_by_symbol: dict[str, dict[str, Any]],
     is_severe: bool = False,
     headlines_text: str = "",
+    technical_verdict: Optional[_AgentVerdict] = None,
+    news_verdict: Optional[_AgentVerdict] = None,
 ) -> Optional[StrategyTrade]:
     """One index's entry evaluation for this cycle. Gated, in order, by: the
     news agent's severe-event kill switch (app.ai.news.classify_severe_
     event -- cheapest and most decisive, so checked first); an already-open
     AGENTIC_AI position on this specific index (cheap, no risk-gate query
     needed); the deterministic risk/sizing agent's check_risk_gates()
-    (global across both indices -- see that function's own docstring); and
-    a live price actually being available. Only once all four pass does
-    this spend an LLM call. headlines_text (recent real headlines, never a
-    fabricated score) is shown to the model as soft context regardless of
-    is_severe -- the two are independent: ordinary news always reaches the
-    model's own judgment, a genuine black-swan match never does."""
+    (global across both indices -- see that function's own docstring); a
+    live price actually being available; and a real Technical Agent
+    verdict for this index (computed once per cycle in run_agentic_entry_
+    exit_checks, shared with the exit side -- a missing/ERROR verdict here
+    means insufficient candle history or a failed call, and this is the
+    pipeline's primary required signal, so entry fails closed rather than
+    asking the Orchestrator to decide on half a picture). Only once all
+    five pass does this spend the Orchestrator's own LLM call.
+    news_verdict is always a real verdict by the time this is called
+    (get_news_verdict never returns None -- see its own docstring), so it
+    is passed straight through to the Orchestrator's prompt regardless."""
     if is_severe:
         logger.info("[AGENTIC_AI] %s: Entry blocked -- severe-event news kill switch is active", index.symbol)
         return None
@@ -1053,21 +1423,37 @@ def check_agentic_entry(
         logger.info("[AGENTIC_AI] %s: Skipped, no live price available", index.symbol)
         return None
 
-    user_prompt = _build_entry_prompt(index.display_name or index.symbol, figures, headlines_text)
-    raw = _call_openai_live(settings, SYSTEM_PROMPT_ENTRY, user_prompt)
+    if technical_verdict is None or technical_verdict.lean == "ERROR":
+        logger.info(
+            "[AGENTIC_AI] %s: Skipped, no usable Technical Agent verdict this cycle%s",
+            index.symbol, f" ({technical_verdict.reasoning})" if technical_verdict is not None else "",
+        )
+        return None
+
+    user_prompt = _build_orchestrator_prompt(
+        index.display_name or index.symbol, figures, technical_verdict, news_verdict, headlines_text,
+    )
+    raw = _call_openai_live(settings, SYSTEM_PROMPT_ORCHESTRATOR, user_prompt)
     if raw.error:
-        logger.error("[AGENTIC_AI] %s entry call FAILED: %s", index.symbol, raw.error)
-        log_event(db, "AGENTIC_AI", f"[{index.symbol}] entry call failed: {raw.error}", level="ERROR")
+        logger.error("[AGENTIC_AI] %s orchestrator call FAILED: %s", index.symbol, raw.error)
+        log_event(db, "AGENTIC_AI", f"[{index.symbol}] orchestrator call failed: {raw.error}", level="ERROR")
         return None
     parsed = _parse_entry_response(raw.content)
     if parsed.action == "ERROR":
-        logger.error("[AGENTIC_AI] %s entry response unparseable: %s", index.symbol, parsed.reasoning)
+        logger.error("[AGENTIC_AI] %s orchestrator response unparseable: %s", index.symbol, parsed.reasoning)
         return None
-    logger.info("[AGENTIC_AI] %s -> %s", index.symbol, parsed.action)
+    logger.info(
+        "[AGENTIC_AI] %s -> %s (technical=%s, news=%s)",
+        index.symbol, parsed.action, technical_verdict.lean, news_verdict.lean if news_verdict else "NEUTRAL",
+    )
     if parsed.action == "NONE":
         log_event(
             db, "AGENTIC_AI", f"[{index.symbol}] declined ({parsed.reasoning})",
-            payload={"confidence": parsed.confidence},
+            payload={
+                "confidence": parsed.confidence,
+                "technical_lean": technical_verdict.lean,
+                "news_lean": news_verdict.lean if news_verdict else "NEUTRAL",
+            },
         )
         return None
 
@@ -1082,6 +1468,8 @@ def check_agentic_exits(
     is_severe: bool = False,
     severe_matches: Optional[list[str]] = None,
     headlines_text: str = "",
+    technical_verdicts_by_index: Optional[dict[str, _AgentVerdict]] = None,
+    news_verdict: Optional[_AgentVerdict] = None,
 ) -> None:
     """Re-asks the live model, for every currently open AGENTIC_AI trade not
     already past the hard square-off time or caught by the news kill
@@ -1098,7 +1486,16 @@ def check_agentic_exits(
     position via ExitReason.NEWS_KILL_SWITCH, checked before the hard
     square-off cutoff -- a genuine black-swan match is reported with its
     own distinct reason even when the cutoff would also apply, which is
-    the more informative of the two in that rare overlap."""
+    the more informative of the two in that rare overlap.
+
+    technical_verdicts_by_index/news_verdict are the SAME verdicts already
+    computed once this cycle for the entry side (see run_agentic_entry_
+    exit_checks) -- reused here as supplementary context, never a second
+    Technical/News call per open position. Unlike the entry side, a
+    missing technical verdict here does NOT skip the exit call -- the
+    backstop stop/target/time-exit already protect this trade regardless,
+    so a thin technical read is shown as "unavailable" rather than
+    withholding the model's own exit judgment entirely."""
     trades = list(
         db.scalars(
             select(StrategyTrade).where(
@@ -1109,6 +1506,7 @@ def check_agentic_exits(
     )
     now_ist = to_ist(utc_now())
     past_cutoff = (now_ist.hour, now_ist.minute) >= end_hm
+    technical_verdicts_by_index = technical_verdicts_by_index or {}
 
     for trade in trades:
         try:
@@ -1142,7 +1540,10 @@ def check_agentic_exits(
                 )
                 continue
 
-            user_prompt = _build_exit_prompt(trade, now_ist, headlines_text)
+            user_prompt = _build_exit_prompt(
+                trade, now_ist, headlines_text,
+                technical_verdicts_by_index.get(trade.index_symbol), news_verdict,
+            )
             raw = _call_openai_live(settings, SYSTEM_PROMPT_EXIT, user_prompt)
             if raw.error:
                 logger.error("[AGENTIC_AI] %s exit call FAILED: %s", trade.trade_id, raw.error)
@@ -1219,13 +1620,42 @@ def run_agentic_entry_exit_checks(
                 level="WARNING", payload={"matched_headlines": severe_matches},
             )
 
+        # True multi-agent fusion (25 Oct 2026): the News Agent's own
+        # verdict (ONE shared call, market-wide, not per index) and every
+        # enabled index's Technical Agent verdict (one call per index,
+        # unconditionally -- see the module docstring) are both computed
+        # ONCE here, before either exits or entries run, so the exit side
+        # and the entry side read the exact same picture this cycle rather
+        # than two independent, possibly-divergent reads of the same
+        # moment. Skipped entirely when severe -- every open position is
+        # being force-closed and no new entry can happen this cycle
+        # regardless, so neither verdict would ever be read.
+        news_verdict: Optional[_AgentVerdict] = None
+        technical_verdicts_by_index: dict[str, _AgentVerdict] = {}
+        if not is_severe:
+            news_verdict = get_news_verdict(settings, headlines_text)
+            for index in indexes:
+                figures = figures_by_symbol.get(index.symbol)
+                if not figures or figures.get("price") is None:
+                    continue
+                features = _compute_technical_features(session, index, figures["price"], now_ist, smartapi)
+                if features is None:
+                    logger.info("[AGENTIC_AI][TECH] %s: insufficient candle history this cycle", index.symbol)
+                    continue
+                technical_verdicts_by_index[index.symbol] = get_technical_verdict(
+                    settings, index.display_name or index.symbol, features,
+                )
+
         platform_settings = get_or_create_settings(session)
         end_hm = parse_hhmm(platform_settings.square_off_time, _DEFAULT_TRADING_END)
 
         # Exits first -- closing a stale position frees its slot for a
         # fresh entry the same cycle, same ordering app.ai.autonomous
         # already uses for the same reason.
-        check_agentic_exits(session, trade_manager, settings, end_hm, is_severe, severe_matches, headlines_text)
+        check_agentic_exits(
+            session, trade_manager, settings, end_hm, is_severe, severe_matches, headlines_text,
+            technical_verdicts_by_index, news_verdict,
+        )
 
         start_hm = parse_hhmm(platform_settings.trading_start_time, _DEFAULT_TRADING_START)
         if (now_ist.hour, now_ist.minute) < start_hm or (now_ist.hour, now_ist.minute) >= end_hm:
@@ -1236,6 +1666,7 @@ def run_agentic_entry_exit_checks(
                 check_agentic_entry(
                     session, index, now_ist, settings, smartapi, option_finder, figures_by_symbol,
                     is_severe, headlines_text,
+                    technical_verdicts_by_index.get(index.symbol), news_verdict,
                 )
             except Exception:
                 logger.exception("[AGENTIC_AI] entry check failed for %s", index.symbol)

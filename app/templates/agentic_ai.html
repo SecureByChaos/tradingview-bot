@@ -13,15 +13,18 @@
   this module, same construction as every other experimental strategy in this project.</p>
   <p class="mb-0"><strong>What exists right now:</strong> the backtest/QA agent, pointable at any existing
   strategy's real trade history; the logging agent, a scheduled cross-strategy daily digest; the risk/sizing
-  agent (a deterministic pre-entry gate and position-size calculator, below); the entry/exit agent, which
-  opens and closes real (paper) trades every ~5 minutes during market hours; and the news agent, which pulls
-  recent India-market headlines from free RSS feeds into both the entry and exit prompts, plus a separate,
-  deterministic "severe event" kill switch that blocks all new entries and force-closes every open position
-  the instant a genuine black-swan headline (war, bank run, trading halt, ...) is detected -- before the
-  model is ever asked. The model only ever decides direction (BUY_CE/BUY_PE/NONE, EXIT/HOLD) -- stop, target,
-  position size, and the news kill switch are all computed deterministically, never by the model. Market
-  input is otherwise still minimal for this first pass (price, change, today's range -- no technical
-  indicators yet).</p>
+  agent (a deterministic pre-entry gate and position-size calculator, below); and a TRUE multi-agent entry/exit
+  pipeline (rebuilt 25 Oct 2026) -- a Technical &amp; Flow Agent (its own candle-fetch orchestration feeding
+  EMA regime, ADX, chop efficiency, recent price action and PDH/PDL distance into its own directional lean), a
+  News &amp; Sentiment Agent (its own structured BULLISH/BEARISH/NEUTRAL read of real recent India-market
+  headlines from free RSS feeds, not just a flat text dump), and a Master Orchestrator Agent that combines
+  both verdicts into the final decision -- three independent model calls per index per cycle instead of one,
+  deliberately chosen over a cheaper combined-call design for the extra signal fusion it buys. A separate,
+  deterministic "severe event" kill switch blocks all new entries and force-closes every open position the
+  instant a genuine black-swan headline (war, bank run, trading halt, ...) is detected -- before any of the
+  three agents is ever asked. All three agents only ever decide direction (a lean, or BUY_CE/BUY_PE/NONE,
+  or EXIT/HOLD) -- stop, target, position size, and the news kill switch are all computed deterministically,
+  never by any model call.</p>
 </div>
 
 <div class="section-header"><h4 class="mb-0">Configuration</h4></div>
@@ -40,7 +43,7 @@
       <input class="form-control" type="number" min="1" name="timeout_seconds" value="{{ settings.timeout_seconds if settings else 20 }}"></div>
 
     <div class="col-12"><hr class="my-1"></div>
-    <div class="col-md-6"><label class="form-label">Live model <span class="text-muted">(entry/exit, fast/low-latency)</span></label>
+    <div class="col-md-6"><label class="form-label">Live model <span class="text-muted">(Technical/News/Orchestrator agents, fast/low-latency)</span></label>
       <input class="form-control" type="text" name="live_model" value="{{ settings.live_model if settings else '' }}" placeholder="e.g. gpt-6-luna"></div>
     <div class="col-md-6"><label class="form-label">Live reasoning effort</label>
       <select class="form-control" name="live_reasoning_effort">
@@ -84,7 +87,7 @@
     <div class="col-md-6"><label class="form-label">Nominal stop-loss (%)</label>
       <input class="form-control" type="number" min="0.01" max="100" step="0.01" name="nominal_stop_percent"
         value="{{ settings.nominal_stop_percent if settings else 15.0 }}"
-        title="The entry/exit agent's own model never proposes a stop -- this is the only number it's computed from."></div>
+        title="None of the three entry/exit agents (Technical, News, Orchestrator) ever propose a stop -- this is the only number it's computed from."></div>
     <div class="col-md-6"><label class="form-label">Nominal target (%)</label>
       <input class="form-control" type="number" min="0.01" max="100" step="0.01" name="nominal_target_percent"
         value="{{ settings.nominal_target_percent if settings else 30.0 }}"></div>
@@ -93,9 +96,10 @@
 </form>
 
 <div class="section-header"><h4 class="mb-0">Risk / Sizing Agent</h4></div>
-<p class="text-muted mb-2">Entirely deterministic -- no model call. The gate below is what the entry/exit agent
-must pass before opening any AGENTIC_AI trade; the calculator sizes a hypothetical trade against the
-risk-per-trade % configured above -- the exact same function the entry agent itself calls.</p>
+<p class="text-muted mb-2">Entirely deterministic -- no model call. The gate below is what must pass before any
+of the three entry/exit agents (Technical, News, Orchestrator) is ever asked for this cycle; the calculator
+sizes a hypothetical trade against the risk-per-trade % configured above -- the exact same function a real
+entry opened by the Orchestrator itself calls.</p>
 
 <div class="panel mb-3" style="border-left: 3px solid {{ '#3ea04a' if risk_status.allowed else '#c0392b' }};">
   <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
@@ -216,5 +220,5 @@ not instead of it, until the numbers here have earned trust.</p>
     </tbody>
   </table>
 </div>
-{% else %}{{ empty_state("No Agentic AI trades yet -- the entry/exit agent only opens a trade when it decides there's a genuinely clear case; NONE is expected to be the common outcome.") }}{% endif %}
+{% else %}{{ empty_state("No Agentic AI trades yet -- the Master Orchestrator Agent only opens a trade when the Technical and News agents combine into a genuinely clear case; NONE is expected to be the common outcome.") }}{% endif %}
 {% endblock %}
