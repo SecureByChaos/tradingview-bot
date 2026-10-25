@@ -21,6 +21,7 @@ TradingView strategies and AI Origination are independent entry paths that share
 - Dynamic multi-strategy engine driven by database strategy configuration — no code changes to add a strategy.
 - Multi-index support (Bank Nifty, Nifty 50 today; Sensex planned) configured per-index in Settings > Instruments.
 - **AI Origination**: an independent engine that opens its own trades from price/technical structure alone, with no TradingView signal involved. Runs on its own 5-minute cycle during a configurable trading window, supports Claude and OpenAI as independent providers (each gets its own trade slot per index), and carries its own risk gates (confidence floor, DTE floor, same-direction consecutive-loss gate, admin-configurable max stop-loss).
+- **Agentic AI** (`app/ai/agentic.py`): a fifth, isolated strategy under active build-out as a set of specialized agents (entry, exit, risk/sizing, logging, backtest) rather than one prompt doing everything. OpenAI-only, with its own independent configuration separate from AI Origination/Autonomous AI's shared settings. Currently ships the backtest/QA agent only — no live trading yet.
 - Configurable trading start/close time (Settings > General), enforced for both rule-based strategies and AI Origination — not just displayed.
 - Strategy-specific PAPER/LIVE mode, TP/SL (FIXED or TRAILING), max active trades, max trades/day, consecutive-loss limit, daily loss limit, and lot sizing.
 - Two-key live-trading safety: a per-entity opt-in (strategy or index) **and** a server-side environment variable must both be on before any real order is placed.
@@ -188,6 +189,17 @@ Exit reasons: `STOPLOSS`, `TARGET`, `TRAIL_EXIT` (after an activation threshold,
 
 Configure providers, the confidence threshold, and the risk knobs above from Settings > AI.
 
+## Agentic AI
+
+A fifth, isolated strategy (`origin="AGENTIC_AI"`, `app/ai/agentic.py`), under active build-out as a set of specialized agents rather than one prompt handling entry, exit, risk, and reporting together. Deliberately separate from every other strategy's configuration — **OpenAI-only, with its own independent settings table** (`AgenticAISettings`), never the shared Settings > AI row AI Origination and Autonomous AI both read. A model or reasoning-effort change here can never leak into either of those, or vice versa.
+
+Two model tiers, configured from `/agentic-ai`:
+
+- **Live model** — fast, low-latency, intended for the entry/exit agents (not yet built).
+- **QA model** — reasoning-heavy, for the backtest/risk/reporting agents, run far less often so a heavier model is affordable.
+
+**Current scope: the backtest/QA agent only.** No entry or exit logic exists yet, and nothing in this strategy opens a trade. `compute_origin_stats()` computes win rate, net P&L, and a bootstrap 90% confidence interval for any strategy's closed trades (not just Agentic AI's own — it accepts any SQL `LIKE` origin pattern, so it's already usable against AI Origination, Autonomous AI, Quick Scalp, or Validated Signal's real history). `run_qa_report()` asks the configured QA model to narrate those already-computed statistics — the model never invents a number — and saves the result as an `AIReport` (`ReportType.AGENTIC_QA`), browsable alongside every other report type on `/reports`. Trigger it on demand from `/agentic-ai`.
+
 ## PAPER and LIVE Modes
 
 `PAPER` records simulated trades using live premium data for entry and monitoring — no broker order is placed.
@@ -332,6 +344,7 @@ Authenticated session required:
 
 - `/` — live index prices, day range, market-conditions read (informational, not a second trading gate), and open positions across every strategy and AI Origination.
 - `/history` — filtered trade history plus performance KPIs and charts (equity curve, daily P&L, win/loss).
+- `/agentic-ai` — Agentic AI's own settings, on-demand backtest/QA report generation, and trade history (empty until a future entry/exit agent lands).
 - `/smartapi-health` — pre-market health checks and broker connectivity status.
 - `/control` — start, stop, restart, kill switch, and daily-lock reset.
 - `/settings` — General, Strategies, Instruments, and AI tabs (see Settings above).
