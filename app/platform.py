@@ -1041,6 +1041,22 @@ def get_autonomous_ai_trades(db: Session) -> list[StrategyTrade]:
     )
 
 
+def get_agentic_ai_trades(db: Session) -> list[StrategyTrade]:
+    """All Agentic AI trades (app.ai.agentic), open and closed, newest
+    first -- the sole population behind the /agentic-ai page. Same exact
+    == match convention as get_autonomous_ai_trades/get_quick_scalp_trades:
+    one single fixed origin value. Empty until a future PR adds the actual
+    entry/exit agents -- this PR is scaffolding plus the backtest/QA agent
+    only, see app/ai/agentic.py's own module docstring."""
+    return list(
+        db.scalars(
+            select(StrategyTrade)
+            .where(StrategyTrade.origin == "AGENTIC_AI")
+            .order_by(StrategyTrade.entry_time.desc())
+        )
+    )
+
+
 def get_quick_scalp_trades(db: Session) -> list[StrategyTrade]:
     """All Quick Scalp trades (app.quick_scalp), open and closed, newest
     first -- the sole population behind the /quick-scalp page. Same exact
