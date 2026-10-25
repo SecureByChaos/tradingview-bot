@@ -220,7 +220,7 @@ def test_cron_jobs_get_explicit_60_second_misfire_grace_time_once_started():
         cron_job_ids = [
             "ai-origination-check", "autonomous-ai-check", "validated-signal-entry-check",
             "option-chain-collect", "daily-square-off", "pre-market-health",
-            "ai-daily-summary", "ai-weekly-report", "ai-monthly-report",
+            "ai-daily-summary", "ai-weekly-report", "ai-monthly-report", "agentic-daily-log",
         ]
         for job_id in cron_job_ids:
             job = scheduler.get_job(job_id)
@@ -228,6 +228,20 @@ def test_cron_jobs_get_explicit_60_second_misfire_grace_time_once_started():
             assert job.misfire_grace_time == 60, f"{job_id} expected 60, got {job.misfire_grace_time}"
     finally:
         scheduler.shutdown(wait=False)
+
+
+def test_agentic_daily_log_job_registers_five_minutes_after_the_existing_daily_summary():
+    # 25 Oct 2026: deliberately offset from ai-daily-summary (16:00) so the
+    # two independent report jobs don't open DB sessions / make LLM calls at
+    # the exact same instant.
+    scheduler = create_scheduler(_FakeMonitor())
+    job = scheduler.get_job("agentic-daily-log")
+    assert job is not None
+    assert isinstance(job.trigger, CronTrigger)
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert fields["hour"] == "16"
+    assert fields["minute"] == "5"
+    assert fields["day_of_week"] == "mon-fri"
 
 
 def test_fast_interval_jobs_keep_the_30_second_default_once_started():

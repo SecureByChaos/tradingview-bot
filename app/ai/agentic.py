@@ -21,6 +21,17 @@ and nothing schedules it. What exists:
     AI, AI Origination, Quick Scalp, Validated Signal) from day one, rather
     than sitting unused until this strategy starts trading.
 
+  - The logging agent: run_daily_log(). Replaces the manual "upload today's
+    StrikeVault export, I'll read it" routine with a real scheduled report --
+    reads closed trades directly from the live DB for a given IST calendar
+    day across every tracked strategy (AI Origination, Autonomous AI, Quick
+    Scalp, Validated Signal, plus this strategy's own still-empty AGENTIC_AI
+    bucket), reuses compute_origin_stats() per strategy, and persists via
+    the same AIReport table the QA agent already writes to. Runs alongside
+    the existing manual chat-based routine at first, not as a replacement
+    for it yet -- same validate-before-trusting discipline as everything
+    else in this project.
+
 Future PRs (not this one): a live_model-backed entry agent, an exit agent,
 a risk/sizing agent (mostly deterministic, LLM only where real judgement is
 needed -- see CLAUDE.md's 25 Oct 2026 discussion), and a news-reading agent.
@@ -34,6 +45,7 @@ import json
 import logging
 import random
 from dataclasses import dataclass
+from datetime import date as date_type
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -42,6 +54,7 @@ from sqlalchemy.orm import Session
 from app.ai.client import AIClient
 from app.db_models import AgenticAISettings, AIReport, ReportType, StrategyTrade, TradeStatus
 from app.platform import log_event, today_ist
+from app.time_utils import to_ist
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +115,11 @@ def _bootstrap_mean_ci(values: list[float], rounds: int = BOOTSTRAP_ROUNDS) -> O
     return lo, hi
 
 
-def compute_origin_stats(db: Session, origin_pattern: str) -> dict[str, Any]:
+def compute_origin_stats(
+    db: Session,
+    origin_pattern: str,
+    on_date: Optional[date_type] = None,
+) -> dict[str, Any]:
     """Win rate / P&L / exit-reason breakdown for every CLOSED trade matching
     origin_pattern, plus a bootstrap 90% CI on mean net P&L and an explicit
     below_trust_minimum flag -- never silently presented as reliable below
@@ -110,6 +127,15 @@ def compute_origin_stats(db: Session, origin_pattern: str) -> dict[str, Any]:
     plain string with no % degrades to an exact match, same convention
     pull_option_candles.py's --origin already established), so this works
     unmodified against "AGENTIC_AI", "AUTONOMOUS_AI", "AI_ORIGIN_%", etc.
+
+    on_date, when given, scopes to trades that closed on that single IST
+    calendar day (used by run_daily_log()). Filtered in Python via to_ist()
+    after an unfiltered SQL fetch, not a SQL-level date range -- exit_time
+    is stored in UTC and SQLite does not round-trip tzinfo, so a naive
+    column-level date comparison would be wrong by the UTC/IST offset (the
+    same reason every other "today" filter in this codebase, e.g.
+    get_ai_origination_today_highlights, does this in Python). None (the
+    default) means all-time, unchanged from this function's original shape.
     """
     trades = list(
         db.scalars(
@@ -119,12 +145,20 @@ def compute_origin_stats(db: Session, origin_pattern: str) -> dict[str, Any]:
             )
         )
     )
+    if on_date is not None:
+        trades = [t for t in trades if t.exit_time is not None and to_ist(t.exit_time).date() == on_date]
     n = len(trades)
     if n == 0:
+        note = (
+            f"No closed trades matching this origin pattern on {on_date}."
+            if on_date is not None
+            else "No closed trades matching this origin pattern."
+        )
         return {
             "origin_pattern": origin_pattern,
+            "on_date": str(on_date) if on_date is not None else None,
             "n": 0,
-            "note": "No closed trades matching this origin pattern.",
+            "note": note,
         }
 
     wins = sum(1 for t in trades if t.result == "WIN")
@@ -141,6 +175,7 @@ def compute_origin_stats(db: Session, origin_pattern: str) -> dict[str, Any]:
 
     return {
         "origin_pattern": origin_pattern,
+        "on_date": str(on_date) if on_date is not None else None,
         "n": n,
         "wins": wins,
         "losses": losses,
@@ -268,3 +303,129 @@ def run_qa_report(db: Session, origin_pattern: str, label: str) -> AIReport:
     db.refresh(report)
     log_event(db, "REPORT", f"{report.title} generated", "INFO", {"report_id": report.id, "report_type": ReportType.AGENTIC_QA})
     return report
+
+
+# ---------------------------------------------------------------------------
+# Logging agent -- a scheduled daily cross-strategy digest, replacing the
+# manual "upload today's StrikeVault export, I'll read it" chat routine.
+# ---------------------------------------------------------------------------
+
+# Every strategy this project currently tracks daily by hand, plus this
+# strategy's own (still-empty) bucket so it starts appearing automatically
+# the moment a future entry/exit agent opens its first trade -- no code
+# change needed here when that lands. AI_ORIGIN_% stays a LIKE pattern (both
+# provider suffixes); every other value is a single fixed origin, matched
+# exactly via the same LIKE-degrades-to-equality behaviour compute_origin_
+# stats already relies on.
+DAILY_LOG_STRATEGIES: dict[str, str] = {
+    "AI Origination": "AI_ORIGIN_%",
+    "Autonomous AI": "AUTONOMOUS_AI",
+    "Quick Scalp": "QUICK_SCALP",
+    "Validated Signal": "VALIDATED_SIGNAL",
+    "Agentic AI": "AGENTIC_AI",
+}
+
+
+def _template_daily_log_narrative(report_date: date_type, by_strategy: dict[str, dict[str, Any]]) -> str:
+    """Fallback used when no QA model is configured -- mirrors the shape
+    this project's own manual daily chat recaps have used throughout."""
+    lines = [f"Daily log for {report_date}:"]
+    any_trades = False
+    day_total = 0.0
+    for label, stats in by_strategy.items():
+        if stats.get("n", 0) == 0:
+            continue
+        any_trades = True
+        day_total += stats["net_pnl_total"]
+        lines.append(
+            f"- {label}: {stats['n']} trades ({stats['wins']}W/{stats['losses']}L), "
+            f"net Rs {stats['net_pnl_total']:,.2f}."
+        )
+    if not any_trades:
+        return f"No closed trades across any tracked strategy on {report_date}."
+    lines.append(f"Day total net P&L: Rs {day_total:,.2f}.")
+    return "\n".join(lines)
+
+
+def run_daily_log(db: Session, report_date: Optional[date_type] = None) -> AIReport:
+    """Computes real per-strategy stats for report_date (default: today IST)
+    across every strategy in DAILY_LOG_STRATEGIES, asks the QA model (if
+    configured) to narrate the combined picture, and persists the result as
+    an AIReport (ReportType.AGENTIC_DAILY_LOG) -- the same reuse precedent
+    run_qa_report already established, not a new table.
+
+    Runs alongside the existing manual chat-based daily routine, not as a
+    replacement for it yet -- same validate-before-trusting discipline as
+    every other change in this project. Nothing here stops the admin's own
+    scheduled reminder to upload a StrikeVault export; this is a second,
+    independent source of the same numbers to cross-check against until
+    this one has earned trust."""
+    if report_date is None:
+        report_date = today_ist()
+
+    by_strategy = {
+        label: compute_origin_stats(db, pattern, on_date=report_date)
+        for label, pattern in DAILY_LOG_STRATEGIES.items()
+    }
+    day_total_net_pnl = round(
+        sum(s["net_pnl_total"] for s in by_strategy.values() if s.get("n", 0) > 0), 2
+    )
+    stats: dict[str, Any] = {
+        "report_date": str(report_date),
+        "by_strategy": by_strategy,
+        "day_total_net_pnl": day_total_net_pnl,
+    }
+
+    settings = get_agentic_settings(db)
+    provider = "dummy"
+    model = ""
+    narrative = _template_daily_log_narrative(report_date, by_strategy)
+    if settings is not None and settings.enabled and settings.api_key and settings.qa_model:
+        user_prompt = (
+            f"Daily cross-strategy trading log for {report_date}\n\n" + json.dumps(stats, default=str, indent=2) +
+            "\n\nWrite a concise (4-8 sentence) plain-text daily recap strictly from the statistics above -- "
+            "per-strategy results and the day total. Call out the day's best and worst performing strategies "
+            "if there's more than one with closed trades. If a strategy has zero closed trades, do not "
+            "speculate about why."
+        )
+        result = _call_openai_qa(settings, user_prompt)
+        if result.content:
+            narrative = result.content
+            provider = "openai"
+            model = settings.qa_model
+        else:
+            logger.info("[AGENTIC][LOG] Model call failed, using template fallback: %s", result.error)
+
+    report = AIReport(
+        report_type=ReportType.AGENTIC_DAILY_LOG,
+        period_start=report_date,
+        period_end=report_date,
+        title=f"Agentic AI Daily Log -- {report_date}",
+        summary_text=narrative,
+        stats_json=json.dumps(stats, default=str),
+        provider=provider,
+        model=model,
+    )
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    log_event(db, "REPORT", f"{report.title} generated", "INFO", {"report_id": report.id, "report_type": ReportType.AGENTIC_DAILY_LOG})
+    return report
+
+
+def run_daily_log_job() -> None:
+    """Scheduler entry point -- mirrors app/reports.py's run_daily_summary_job
+    exactly: skips on a weekend/NSE holiday (CronTrigger's day_of_week
+    doesn't know about holidays) and opens its own session, never raising
+    out of a scheduler tick."""
+    from app.database import SessionLocal
+    from app.signal_validation import trading_day_reason
+    from app.time_utils import utc_now
+
+    if trading_day_reason(to_ist(utc_now())) is not None:
+        return
+    with SessionLocal() as db:
+        try:
+            run_daily_log(db)
+        except Exception:
+            logger.exception("[AGENTIC][LOG] Daily log generation failed")
