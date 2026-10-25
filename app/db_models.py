@@ -197,6 +197,31 @@ class AgenticAISettings(Base):
     qa_model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     qa_reasoning_effort: Mapped[str] = mapped_column(String(16), default="max", nullable=False)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=20, nullable=False)
+
+    # Risk/sizing agent (25 Oct 2026) -- deterministic, no LLM involved. These
+    # five fields are the whole configuration surface for both pieces of that
+    # agent: compute_position_size() (how many lots a given stop distance
+    # justifies) and check_risk_gates() (whether a new entry is allowed at
+    # all right now). Defaults are deliberately conservative -- this strategy
+    # has no entry agent yet, so nothing reads these for real trading
+    # decisions today, but a future entry agent landing with permissive
+    # defaults already in the DB would be the wrong failure direction.
+    account_capital_rupees: Mapped[float] = mapped_column(Float, default=100000.0, nullable=False)
+    max_risk_percent_per_trade: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+    max_daily_loss_percent: Mapped[float] = mapped_column(Float, default=3.0, nullable=False)
+    max_concurrent_positions: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    max_capital_deployed_percent: Mapped[float] = mapped_column(Float, default=20.0, nullable=False)
+
+    # Entry/exit agent (25 Oct 2026) -- the two stop/target nominal percents
+    # the deterministic side owns. The live_model only ever decides direction
+    # (BUY_CE/BUY_PE/NONE, EXIT/HOLD); it never proposes a stop, target, or
+    # quantity -- those stay entirely in Python, via these two fields plus
+    # the five risk/sizing fields above. Defaults mirror app.ai.autonomous's
+    # own backstop nominal values (15%/30%), a reasoned starting point this
+    # project has already used for a comparable fully-AI-driven strategy.
+    nominal_stop_percent: Mapped[float] = mapped_column(Float, default=15.0, nullable=False)
+    nominal_target_percent: Mapped[float] = mapped_column(Float, default=30.0, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

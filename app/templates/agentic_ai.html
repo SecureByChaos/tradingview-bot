@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% from "components.html" import page_header, empty_state %}
 {% block content %}
-{{ page_header("Agentic AI", "Scaffolding · No live trading yet", "text-bg-secondary") }}
+{{ page_header("Agentic AI", "Paper trading · Entry/exit agent live", "text-bg-warning") }}
 
 <div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
   <p class="mb-2"><strong>What this is:</strong> a brand-new, isolated fifth strategy (25 Oct 2026),
@@ -9,12 +9,16 @@
   logging, and backtest/QA, each its own agent. OpenAI-only by explicit choice, with its own independent
   configuration below -- never the shared Settings &gt; AI row AI Origination and Autonomous AI both read,
   so tuning one can never silently change the other (the exact confusion the gpt-6-luna reasoning_effort
-  episode exposed on that shared row).</p>
-  <p class="mb-0"><strong>What exists right now:</strong> this page, its settings, and the backtest/QA agent
-  below -- which can already be pointed at any existing strategy's real trade history (Autonomous AI, AI
-  Origination, Quick Scalp, Validated Signal) to test it before this strategy has any trades of its own.
-  <strong>No entry or exit logic exists yet</strong> -- nothing here opens a trade. That, the risk/sizing
-  agent, and the news-reading agent are each their own future, separately-built pass.</p>
+  episode exposed on that shared row). Structurally paper-only -- no live order path exists anywhere in
+  this module, same construction as every other experimental strategy in this project.</p>
+  <p class="mb-0"><strong>What exists right now:</strong> the backtest/QA agent, pointable at any existing
+  strategy's real trade history; the logging agent, a scheduled cross-strategy daily digest; the risk/sizing
+  agent (a deterministic pre-entry gate and position-size calculator, below); and the entry/exit agent, which
+  now actually opens and closes real (paper) trades every ~5 minutes during market hours. The model only ever
+  decides direction (BUY_CE/BUY_PE/NONE, EXIT/HOLD) -- stop, target, and position size are computed entirely
+  by the risk/sizing agent, never proposed by the model. Market input is deliberately minimal for this first
+  pass (price, change, today's range -- no indicators yet). The news-reading agent is the one piece still to
+  come.</p>
 </div>
 
 <div class="section-header"><h4 class="mb-0">Configuration</h4></div>
@@ -51,9 +55,73 @@
         {% endfor %}
       </select>
     </div>
+
+    <div class="col-12"><hr class="my-1"></div>
+    <div class="col-12"><p class="text-muted mb-0">Risk / sizing -- deterministic, no model involved. Governs the
+      risk-gate status card and position-size calculator below, and is the configuration a future entry agent
+      will be required to read before opening any trade.</p></div>
+    <div class="col-md-4"><label class="form-label">Account capital (₹)</label>
+      <input class="form-control" type="number" min="1" step="0.01" name="account_capital_rupees"
+        value="{{ settings.account_capital_rupees if settings else 100000.0 }}"></div>
+    <div class="col-md-4"><label class="form-label">Max risk per trade (%)</label>
+      <input class="form-control" type="number" min="0.01" max="100" step="0.01" name="max_risk_percent_per_trade"
+        value="{{ settings.max_risk_percent_per_trade if settings else 1.0 }}"
+        title="The rupee loss if a trade's own stop is hit must never exceed this % of account capital."></div>
+    <div class="col-md-4"><label class="form-label">Max daily loss (%)</label>
+      <input class="form-control" type="number" min="0.01" max="100" step="0.01" name="max_daily_loss_percent"
+        value="{{ settings.max_daily_loss_percent if settings else 3.0 }}"
+        title="Circuit breaker -- once today's realized net P&amp;L reaches this % of capital underwater, no new entries for the rest of the day."></div>
+    <div class="col-md-6"><label class="form-label">Max concurrent positions</label>
+      <input class="form-control" type="number" min="1" step="1" name="max_concurrent_positions"
+        value="{{ settings.max_concurrent_positions if settings else 1 }}"></div>
+    <div class="col-md-6"><label class="form-label">Max capital deployed (%)</label>
+      <input class="form-control" type="number" min="0.01" max="100" step="0.01" name="max_capital_deployed_percent"
+        value="{{ settings.max_capital_deployed_percent if settings else 20.0 }}"
+        title="Combined investment across all open AGENTIC_AI positions must leave room under this % of capital."></div>
+    <div class="col-md-6"><label class="form-label">Nominal stop-loss (%)</label>
+      <input class="form-control" type="number" min="0.01" max="100" step="0.01" name="nominal_stop_percent"
+        value="{{ settings.nominal_stop_percent if settings else 15.0 }}"
+        title="The entry/exit agent's own model never proposes a stop -- this is the only number it's computed from."></div>
+    <div class="col-md-6"><label class="form-label">Nominal target (%)</label>
+      <input class="form-control" type="number" min="0.01" max="100" step="0.01" name="nominal_target_percent"
+        value="{{ settings.nominal_target_percent if settings else 30.0 }}"></div>
   </div>
   <button class="btn btn-primary mt-3" type="submit">Save Configuration</button>
 </form>
+
+<div class="section-header"><h4 class="mb-0">Risk / Sizing Agent</h4></div>
+<p class="text-muted mb-2">Entirely deterministic -- no model call. The gate below is what the entry/exit agent
+must pass before opening any AGENTIC_AI trade; the calculator sizes a hypothetical trade against the
+risk-per-trade % configured above -- the exact same function the entry agent itself calls.</p>
+
+<div class="panel mb-3" style="border-left: 3px solid {{ '#3ea04a' if risk_status.allowed else '#c0392b' }};">
+  <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+    <strong>{% if risk_status.allowed %}Clear to trade{% else %}Entries blocked -- {{ risk_status.reason }}{% endif %}</strong>
+    <span class="small text-muted">Evaluated {{ risk_status.evaluated_at }}</span>
+  </div>
+  <p class="mb-0 mt-2">{{ risk_status.detail }}</p>
+</div>
+
+<form method="post" action="/agentic-ai/position-size" class="panel mb-4 d-flex flex-wrap gap-2 align-items-end">
+  <div><label class="form-label">Entry price</label>
+    <input class="form-control" type="number" min="0.01" step="0.01" name="entry_price" required style="width: 9rem;"></div>
+  <div><label class="form-label">Stop-loss price</label>
+    <input class="form-control" type="number" min="0" step="0.01" name="stop_loss_price" required style="width: 9rem;"></div>
+  <div><label class="form-label">Lot size</label>
+    <input class="form-control" type="number" min="1" step="1" name="lot_size" value="75" required style="width: 7rem;"></div>
+  <div><button class="btn btn-outline-info" type="submit">Compute Size</button></div>
+</form>
+
+{% if size_result %}
+<div class="panel mb-4">
+  <p class="mb-1">Entry ₹{{ size_result.entry_price }} · Stop ₹{{ size_result.stop_loss_price }} · Lot size {{ size_result.lot_size }}
+  risked at {{ size_result.max_risk_percent_per_trade }}% of ₹{{ "%.2f"|format(size_result.account_capital_rupees) }} capital:</p>
+  <p class="mb-0"><strong>{{ size_result.lots }} lot(s)</strong> ({{ size_result.quantity }} units) --
+  ₹{{ "%.2f"|format(size_result.rupees_at_risk) }} at risk if the stop is hit.</p>
+  {% if size_result.lots == 0 %}<p class="mb-0 text-muted small">Zero lots: the stop distance's risk per unit exceeds
+  the configured risk budget for even one lot, or an input was invalid.</p>{% endif %}
+</div>
+{% endif %}
 
 <div class="section-header"><h4 class="mb-0">Backtest / QA Agent</h4></div>
 <form method="post" action="/agentic-ai/qa-report" class="panel mb-4 d-flex flex-wrap gap-2 align-items-end">
@@ -145,5 +213,5 @@ not instead of it, until the numbers here have earned trust.</p>
     </tbody>
   </table>
 </div>
-{% else %}{{ empty_state("No Agentic AI trades yet -- expected until a future PR adds the entry/exit agents.") }}{% endif %}
+{% else %}{{ empty_state("No Agentic AI trades yet -- the entry/exit agent only opens a trade when it decides there's a genuinely clear case; NONE is expected to be the common outcome.") }}{% endif %}
 {% endblock %}

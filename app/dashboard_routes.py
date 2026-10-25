@@ -324,13 +324,22 @@ def quick_scalp_page(
 def agentic_ai_page(
     request: Request,
     db: Annotated[Session, Depends(get_db)],
+    size_entry: float | None = None,
+    size_stop: float | None = None,
+    size_lot: int | None = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     """Dedicated page for the new Agentic AI strategy (app.ai.agentic) --
-    scaffolding plus the backtest/QA agent and the logging agent (no entry/
-    exit agents yet, see that module's own docstring). Empty trade table
-    until a future PR adds live trading; the settings form and both
-    on-demand report generators are already real and usable."""
+    scaffolding plus the backtest/QA, logging, and risk/sizing agents (no
+    entry/exit agents yet, see that module's own docstring). Empty trade
+    table until a future PR adds live trading; the settings form, both
+    on-demand report generators, the live risk-gate status card, and the
+    position-size calculator are already real and usable.
+
+    size_entry/size_stop/size_lot are optional query params set by a
+    redirect from the sizing calculator's own POST route below -- recomputed
+    here (compute_position_size is pure/deterministic) rather than persisted
+    anywhere, since a quick what-if calculation isn't a report."""
     settings = agentic_ai.get_agentic_settings(db)
     trades = get_agentic_ai_trades(db)
     open_trades = [trade for trade in trades if trade.status == TradeStatus.OPEN]
@@ -344,6 +353,25 @@ def agentic_ai_page(
         {"report": report, "stats": _context_json(report.stats_json)}
         for report in reports.list_reports(db, "AGENTIC_DAILY_LOG")
     ]
+    risk_status = agentic_ai.evaluate_risk_now(db)
+
+    size_result = None
+    if size_entry is not None and size_stop is not None and size_lot is not None:
+        resolved_risk = agentic_ai.resolve_risk_settings(settings)
+        capital = resolved_risk["account_capital_rupees"]
+        risk_pct = resolved_risk["max_risk_percent_per_trade"]
+        lots = agentic_ai.compute_position_size(capital, risk_pct, size_entry, size_stop, size_lot)
+        size_result = {
+            "entry_price": size_entry,
+            "stop_loss_price": size_stop,
+            "lot_size": size_lot,
+            "account_capital_rupees": capital,
+            "max_risk_percent_per_trade": risk_pct,
+            "lots": lots,
+            "quantity": lots * size_lot,
+            "rupees_at_risk": round(lots * size_lot * abs(size_entry - size_stop), 2),
+        }
+
     return templates.TemplateResponse(
         "agentic_ai.html",
         {
@@ -355,6 +383,8 @@ def agentic_ai_page(
             "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
             "qa_reports": qa_reports,
             "daily_logs": daily_logs,
+            "risk_status": risk_status,
+            "size_result": size_result,
             **performance,
         },
     )
@@ -369,6 +399,13 @@ def update_agentic_ai_settings_page(
     qa_reasoning_effort: Annotated[str, Form()],
     base_url: Annotated[str, Form()],
     timeout_seconds: Annotated[int, Form()],
+    account_capital_rupees: Annotated[float, Form()] = 100000.0,
+    max_risk_percent_per_trade: Annotated[float, Form()] = 1.0,
+    max_daily_loss_percent: Annotated[float, Form()] = 3.0,
+    max_concurrent_positions: Annotated[int, Form()] = 1,
+    max_capital_deployed_percent: Annotated[float, Form()] = 20.0,
+    nominal_stop_percent: Annotated[float, Form()] = 15.0,
+    nominal_target_percent: Annotated[float, Form()] = 30.0,
     api_key: Annotated[str, Form()] = "",
     enabled: Annotated[str | None, Form()] = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
@@ -376,6 +413,16 @@ def update_agentic_ai_settings_page(
     valid_effort = {"none", "low", "medium", "high", "xhigh", "max"}
     if live_reasoning_effort not in valid_effort or qa_reasoning_effort not in valid_effort or timeout_seconds < 1:
         raise HTTPException(status_code=400, detail="Invalid Agentic AI configuration")
+    if (
+        account_capital_rupees <= 0
+        or not (0 < max_risk_percent_per_trade <= 100)
+        or not (0 < max_daily_loss_percent <= 100)
+        or max_concurrent_positions < 1
+        or not (0 < max_capital_deployed_percent <= 100)
+        or not (0 < nominal_stop_percent <= 100)
+        or not (0 < nominal_target_percent <= 100)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid Agentic AI risk/sizing configuration")
     settings = agentic_ai.get_agentic_settings(db) or agentic_ai.create_agentic_settings(db, id=1)
     values: dict[str, object] = {
         "enabled": enabled == "on",
@@ -385,11 +432,32 @@ def update_agentic_ai_settings_page(
         "qa_reasoning_effort": qa_reasoning_effort,
         "base_url": base_url.strip(),
         "timeout_seconds": timeout_seconds,
+        "account_capital_rupees": account_capital_rupees,
+        "max_risk_percent_per_trade": max_risk_percent_per_trade,
+        "max_daily_loss_percent": max_daily_loss_percent,
+        "max_concurrent_positions": max_concurrent_positions,
+        "max_capital_deployed_percent": max_capital_deployed_percent,
+        "nominal_stop_percent": nominal_stop_percent,
+        "nominal_target_percent": nominal_target_percent,
     }
     if api_key:
         values["api_key"] = api_key
     agentic_ai.update_agentic_settings(db, settings, **values)
     return RedirectResponse("/agentic-ai", status_code=303)
+
+
+@router.post("/agentic-ai/position-size")
+def compute_agentic_ai_position_size(
+    entry_price: Annotated[float, Form()],
+    stop_loss_price: Annotated[float, Form()],
+    lot_size: Annotated[int, Form()],
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    """A quick what-if sizing calculator -- compute_position_size() is pure
+    and deterministic, so nothing here is persisted; the inputs just ride
+    back to the GET route as query params and get recomputed on render."""
+    query = urlencode({"size_entry": entry_price, "size_stop": stop_loss_price, "size_lot": lot_size})
+    return RedirectResponse(f"/agentic-ai?{query}", status_code=303)
 
 
 @router.post("/agentic-ai/qa-report")
