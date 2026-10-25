@@ -51,6 +51,16 @@ h1, h2, h3, h4, h5 { letter-spacing: 0; }
 .form-grid .full { grid-column: 1 / -1; }
 .form-actions { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.25rem; }
 .empty-state { width: 100%; padding: .9rem 1rem; color: var(--muted); background: var(--surface); border: 1px dashed var(--border); border-radius: 8px; }
+.info-collapsible-toggle {
+  display: flex; align-items: center; gap: .5rem; width: 100%; text-align: left;
+  background: none; border: none; padding: 0; margin: 0; color: inherit; font-weight: 600;
+  font-size: .95rem; cursor: pointer;
+}
+.info-collapsible-toggle:hover { color: var(--warning); }
+.info-collapsible-caret { display: inline-block; font-size: .7rem; transition: transform .15s ease; }
+.info-collapsible-toggle[aria-expanded="true"] .info-collapsible-caret { transform: rotate(90deg); }
+.info-collapsible-body { padding-top: .9rem; }
+.info-collapsible-body p:last-child { margin-bottom: 0 !important; }
 .profit { color: var(--success) !important; }
 .loss { color: var(--danger) !important; }
 .warn { color: var(--warning) !important; }

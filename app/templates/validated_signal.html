@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% from "components.html" import page_header, empty_state %}
+{% from "components.html" import page_header, empty_state, collapsible_info %}
 {% block content %}
 {{ page_header("Validated Signal", "Experimental · Paper Only", "text-bg-warning") }}
 
-<div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
+{% call collapsible_info("validatedSignalInfo", "What this is") %}
   <p class="mb-2"><strong>What this is (rebuilt 5 Sep 2026):</strong> a fully deterministic Morning &amp;
   Afternoon breakout engine, built to an external specification exactly as written. Two independent windows:
   a Morning Trend Impulse (09:25-10:45 IST) breaking out of max(previous-day high, opening range high) / the
@@ -27,7 +27,7 @@
   is the external spec's own number, not something this project's own backtesting has produced or confirmed.
   Every number below is a live, ongoing measurement with no minimum sample size met yet. Paper trading only
   -- no live-order code path exists for this strategy.</p>
-</div>
+{% endcall %}
 
 <div class="metric-grid mb-3">
   <div class="metric"><div class="label">Net return</div><div class="value {% if kpis.net_return_percent >= 0 %}profit{% else %}loss{% endif %}">{{ "%.2f"|format(kpis.net_return_percent) }}%</div></div>

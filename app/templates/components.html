@@ -6,3 +6,17 @@
 <div class="empty-state">{{ message }}</div>
 {%- endmacro %}
 
+{% macro collapsible_info(panel_id, summary, border_color="#e0b03e") -%}
+<div class="panel mb-3 info-collapsible" style="border-left: 3px solid {{ border_color }};">
+  <button class="info-collapsible-toggle" type="button" data-bs-toggle="collapse"
+    data-bs-target="#{{ panel_id }}" aria-expanded="false" aria-controls="{{ panel_id }}">
+    <span class="info-collapsible-caret">&#9656;</span> {{ summary }}
+  </button>
+  <div class="collapse" id="{{ panel_id }}">
+    <div class="info-collapsible-body">
+      {{ caller() }}
+    </div>
+  </div>
+</div>
+{%- endmacro %}
+

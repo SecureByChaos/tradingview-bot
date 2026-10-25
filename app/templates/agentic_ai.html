@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% from "components.html" import page_header, empty_state %}
+{% from "components.html" import page_header, empty_state, collapsible_info %}
 {% block content %}
 {{ page_header("Agentic AI", "Paper trading · All five agents live", "text-bg-warning") }}
 
-<div class="panel mb-3" style="border-left: 3px solid #e0b03e;">
+{% call collapsible_info("agenticAiInfo", "What this is / what exists right now") %}
   <p class="mb-2"><strong>What this is:</strong> a brand-new, isolated fifth strategy (25 Oct 2026),
   built as a set of specialized agents rather than one prompt doing everything -- entry, exit, risk/sizing,
   logging, backtest/QA, and news, each its own agent. OpenAI-only by explicit choice, with its own independent
@@ -25,7 +25,7 @@
   three agents is ever asked. All three agents only ever decide direction (a lean, or BUY_CE/BUY_PE/NONE,
   or EXIT/HOLD) -- stop, target, position size, and the news kill switch are all computed deterministically,
   never by any model call.</p>
-</div>
+{% endcall %}
 
 <div class="section-header"><h4 class="mb-0">Configuration</h4></div>
 <form method="post" action="/agentic-ai/settings" class="panel mb-4">
