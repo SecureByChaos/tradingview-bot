@@ -128,12 +128,23 @@ and nothing schedules it. What exists:
     BUY_CE/BUY_PE/NONE schema unchanged): the final decision-maker, shown
     the Technical Agent's verdict, the News Agent's verdict, the raw
     headline list, and the same price/range context the old single-call
-    design already showed. Explicitly instructed that agreement between
-    the two sub-agents is the strongest case to act, and that disagreement
-    (or either verdict reading NEUTRAL/unavailable) is a reason for
-    caution, not something to average away -- the Orchestrator still
-    defaults to NONE absent a genuinely clear combined picture, same
-    capital-preservation framing the single-call prompt always had.
+    design already showed. News is deliberately an INDICATOR, not a
+    second required gate (26 Oct 2026 -- the first prompt wording made any
+    disagreement a near-veto over even a clear Technical case, which is
+    not what was asked for): the Technical Agent's read is the primary
+    driver; News is corroborating weight, read against its own stated
+    confidence, not against its mere presence or absence. Agreement
+    between the two still makes the strongest case to act; a NEUTRAL news
+    read is explicitly not disagreement; genuine disagreement only lowers
+    confidence or forces NONE in proportion to how confident each agent
+    actually was, never automatically. The Orchestrator still defaults to
+    NONE absent a genuinely clear case, same capital-preservation framing
+    the single-call prompt always had. The deterministic severe-event
+    kill switch (app.ai.news.classify_severe_event) is a different
+    category entirely and is NOT softened by this -- it is a safety
+    circuit breaker for a genuine black-swan headline, not an alpha
+    signal, and stays an absolute block checked before any of the three
+    agents is ever asked.
 
     The exit side gained the SAME two verdicts as supplementary context
     (SYSTEM_PROMPT_EXIT / _build_exit_prompt), reusing whatever was
@@ -1061,14 +1072,19 @@ combine both into the actual trade decision -- you did not compute either read y
 second-guess the specific readings each agent cites, only weigh their conclusions against each other.
 
 Your primary job is capital preservation, not finding trades. Your default decision MUST BE "NONE" unless you
-have a genuinely clear combined case -- a plausible-sounding story from either agent alone is not enough.
+have a genuinely clear case -- a plausible-sounding story from either agent alone is not enough.
 
-When the two agents' leans AGREE (both BULLISH or both BEARISH), that is the strongest case to act, and you
-may act on BUY_CE (both BULLISH) or BUY_PE (both BEARISH) with confidence proportional to how clear each
-agent's own reasoning was. When they DISAGREE, or either reads NEUTRAL/unavailable, treat that as a reason
-for caution, not something to average or split the difference on -- prefer NONE unless one agent's case is
-exceptionally clear AND the other agent is merely NEUTRAL (not actively contradicting it), and say so
-explicitly in your own reasoning.
+Treat the Technical & Flow Agent's read as the primary driver of your decision -- it is built from real
+price/indicator data about this specific index right now. Treat the News & Sentiment Agent's read as one
+additional, corroborating signal, not a second gate the trade must also clear -- most headlines are routine
+noise, and the News Agent's own instructions already tell it to default to NEUTRAL when that's the case.
+When the two agents AGREE, that is the strongest case to act, and confidence should be higher than the
+Technical read alone would justify. A NEUTRAL news read is not disagreement -- decide on the Technical read
+alone when News has nothing to add. When News actively DISAGREES with a Technical lean that is itself only
+moderately confident, that is a real reason to lower your confidence or prefer NONE. But when the Technical
+read is clear and well-supported and News's own opposing confidence is low, do not let a single weak
+contrarian headline override a clear technical case on disagreement alone -- name the disagreement in your
+reasoning and weigh it by how confident each agent actually was, not by its mere presence.
 
 You do not choose a stop-loss, target, or position size -- a separate, deterministic system owns those
 entirely, regardless of what you say here. Your only job is to decide whether there is a clear enough

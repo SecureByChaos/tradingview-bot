@@ -833,6 +833,19 @@ def test_check_agentic_entry_orchestrator_receives_both_verdicts(monkeypatch):
     assert "weak PMI print" in captured["user_prompt"]
 
 
+def test_orchestrator_system_prompt_treats_news_as_an_indicator_not_a_gate():
+    # 26 Oct 2026: the first version made any News disagreement a near-veto
+    # over even a clear Technical case -- fixed so News is corroborating
+    # weight read against its own confidence, never an automatic override.
+    assert "Technical & Flow Agent's read as the primary driver" in SYSTEM_PROMPT_ORCHESTRATOR
+    assert "not a second gate the trade must also clear" in SYSTEM_PROMPT_ORCHESTRATOR
+    assert "A NEUTRAL news read is not disagreement" in SYSTEM_PROMPT_ORCHESTRATOR
+    assert "do not let a single weak" in SYSTEM_PROMPT_ORCHESTRATOR
+    assert "override a clear technical case on disagreement alone" in SYSTEM_PROMPT_ORCHESTRATOR
+    # The old near-veto phrasing must actually be gone, not just supplemented.
+    assert "prefer NONE unless one agent's case is exceptionally clear" not in SYSTEM_PROMPT_ORCHESTRATOR
+
+
 def test_check_agentic_entry_handles_provider_error_without_raising(monkeypatch):
     monkeypatch.setattr(
         agentic_module, "_call_openai_live",
