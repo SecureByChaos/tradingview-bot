@@ -32,11 +32,24 @@ and nothing schedules it. What exists:
     for it yet -- same validate-before-trusting discipline as everything
     else in this project.
 
-Future PRs (not this one): a live_model-backed entry agent, an exit agent,
-a risk/sizing agent (mostly deterministic, LLM only where real judgement is
-needed -- see CLAUDE.md's 25 Oct 2026 discussion), and a news-reading agent.
-Each should land as its own PR, same incremental discipline every other
-strategy in this project has followed.
+  - The risk/sizing agent: compute_position_size() + check_risk_gates().
+    Entirely deterministic, no LLM involved -- per the user's own framing
+    for this strategy ("the system understands the financial losses which
+    must be least"), position sizing and hard risk limits are exactly the
+    kind of decision that should never depend on a model call succeeding or
+    being well-calibrated. Like the QA agent, both functions are usable and
+    testable today even though nothing yet calls them from a real entry
+    path: compute_position_size() is a pure function callable from the
+    dashboard's own sizing calculator right now, and check_risk_gates() is
+    the exact gate a future entry agent MUST call before opening any
+    AGENTIC_AI trade -- built and proven correct ahead of that agent existing,
+    not alongside it under time pressure.
+
+Future PRs (not this one): a live_model-backed entry agent and an exit
+agent, which will call check_risk_gates()/compute_position_size() before
+ever opening a trade, and a news-reading agent. Each should land as its own
+PR, same incremental discipline every other strategy in this project has
+followed.
 """
 
 from __future__ import annotations
@@ -46,6 +59,7 @@ import logging
 import random
 from dataclasses import dataclass
 from datetime import date as date_type
+from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -429,3 +443,179 @@ def run_daily_log_job() -> None:
             run_daily_log(db)
         except Exception:
             logger.exception("[AGENTIC][LOG] Daily log generation failed")
+
+
+# ---------------------------------------------------------------------------
+# Risk/sizing agent -- entirely deterministic, no LLM. Per the user's own
+# framing for this strategy ("the system understands the financial losses
+# which must be least"), position sizing and hard risk limits are exactly
+# the kind of decision that should never depend on a model call succeeding
+# or being well-calibrated. A future entry agent MUST call check_risk_gates()
+# before opening any AGENTIC_AI trade, and should size whatever it opens via
+# compute_position_size() -- both already usable and testable today, ahead
+# of that agent existing.
+# ---------------------------------------------------------------------------
+
+# This strategy's own fixed origin value, once it starts trading -- an exact
+# match, never a LIKE pattern (unlike AI Origination's provider-suffixed
+# AI_ORIGIN_%), same convention DAILY_LOG_STRATEGIES' own "Agentic AI" entry
+# already uses.
+AGENTIC_AI_ORIGIN = "AGENTIC_AI"
+
+# Mirrors AgenticAISettings' own column defaults exactly -- used only when
+# no settings row exists yet, so check_risk_gates()/evaluate_risk_now() are
+# always callable (the dashboard's live risk-status card must render
+# correctly before an admin has ever saved anything on this page).
+_DEFAULT_RISK_SETTINGS = {
+    "account_capital_rupees": 100000.0,
+    "max_risk_percent_per_trade": 1.0,
+    "max_daily_loss_percent": 3.0,
+    "max_concurrent_positions": 1,
+    "max_capital_deployed_percent": 20.0,
+}
+
+
+def resolve_risk_settings(settings: Optional[AgenticAISettings]) -> dict[str, float]:
+    """The five risk/sizing fields, resolved to _DEFAULT_RISK_SETTINGS when
+    settings is None (no row saved yet) -- the one place both
+    check_risk_gates() and any caller building its own what-if calculation
+    (e.g. the dashboard's position-size form) read these from, so neither
+    can silently drift from the other's idea of what "unconfigured" means."""
+    if settings is None:
+        return dict(_DEFAULT_RISK_SETTINGS)
+    return {
+        "account_capital_rupees": settings.account_capital_rupees,
+        "max_risk_percent_per_trade": settings.max_risk_percent_per_trade,
+        "max_daily_loss_percent": settings.max_daily_loss_percent,
+        "max_concurrent_positions": settings.max_concurrent_positions,
+        "max_capital_deployed_percent": settings.max_capital_deployed_percent,
+    }
+
+
+def compute_position_size(
+    account_capital: float,
+    max_risk_percent_per_trade: float,
+    entry_price: float,
+    stop_loss_price: float,
+    lot_size: int,
+) -> int:
+    """Risk-based position sizing: the rupee loss if this trade's own stop
+    is hit must never exceed max_risk_percent_per_trade% of account_capital.
+    Returns a whole number of lots, floored -- rounding up would silently
+    risk more than the configured percent, the wrong direction to round in
+    a function whose whole job is capping risk. Returns 0 (never a
+    fabricated size) when any input is non-positive or the proposed stop
+    carries no real per-unit risk (entry_price == stop_loss_price, which
+    would otherwise divide by zero)."""
+    if account_capital <= 0 or max_risk_percent_per_trade <= 0 or lot_size <= 0:
+        return 0
+    per_unit_risk = abs(entry_price - stop_loss_price)
+    if per_unit_risk <= 0:
+        return 0
+    risk_amount = account_capital * (max_risk_percent_per_trade / 100.0)
+    max_units = risk_amount / per_unit_risk
+    return max(int(max_units // lot_size), 0)
+
+
+@dataclass(frozen=True)
+class RiskDecision:
+    """allowed=False means a future entry agent must not open a new
+    AGENTIC_AI trade right now -- reason is a stable, machine-checkable
+    code; detail is the human-readable explanation, with the real numbers
+    that produced the decision, for the dashboard and for logging."""
+
+    allowed: bool
+    reason: str
+    detail: str
+
+
+def check_risk_gates(db: Session, settings: Optional[AgenticAISettings], now_ist: datetime) -> RiskDecision:
+    """The pre-entry gate a future entry agent MUST call before opening any
+    AGENTIC_AI trade. Three independent checks, evaluated in a fixed order
+    (most operationally urgent first) -- the first one that fails wins,
+    rather than trying to rank severity across different kinds of limits:
+
+      1. Daily loss circuit breaker -- today's already-REALIZED net P&L for
+         AGENTIC_AI (closed trades only; an open trade's unrealized P&L is
+         deliberately not counted here, same reasoning this project's other
+         daily-loss gates use -- a floating loss can still recover, a
+         realized one cannot) must not already be at or below the
+         configured floor.
+      2. Max concurrent open positions -- a hard cap on how many AGENTIC_AI
+         trades can be open at once, independent of their size.
+      3. Max capital deployed -- the combined investment_amount of every
+         currently open AGENTIC_AI trade must leave room for at least one
+         more at the configured ceiling.
+
+    settings=None (not yet configured) falls back to resolve_risk_settings()'s
+    own defaults, so this function never raises for lack of a settings row."""
+    resolved = resolve_risk_settings(settings)
+    capital = resolved["account_capital_rupees"]
+    max_daily_loss_percent = resolved["max_daily_loss_percent"]
+    max_concurrent = resolved["max_concurrent_positions"]
+    max_deployed_percent = resolved["max_capital_deployed_percent"]
+
+    today_stats = compute_origin_stats(db, AGENTIC_AI_ORIGIN, on_date=now_ist.date())
+    realized_today = today_stats["net_pnl_total"] if today_stats.get("n", 0) > 0 else 0.0
+    daily_loss_floor = -abs(capital * (max_daily_loss_percent / 100.0))
+    if realized_today <= daily_loss_floor:
+        return RiskDecision(
+            False,
+            "DAILY_LOSS_LIMIT",
+            f"Today's realized net P&L (Rs {realized_today:,.2f}) has reached the daily loss limit "
+            f"(Rs {daily_loss_floor:,.2f}, {max_daily_loss_percent}% of Rs {capital:,.2f} capital). "
+            "No new entries for the rest of the day.",
+        )
+
+    open_trades = list(
+        db.scalars(
+            select(StrategyTrade).where(
+                StrategyTrade.origin == AGENTIC_AI_ORIGIN,
+                StrategyTrade.status == TradeStatus.OPEN,
+            )
+        )
+    )
+    if len(open_trades) >= max_concurrent:
+        return RiskDecision(
+            False,
+            "MAX_CONCURRENT_POSITIONS",
+            f"{len(open_trades)} AGENTIC_AI position(s) already open, at the configured limit "
+            f"({max_concurrent}). No new entries until one closes.",
+        )
+
+    deployed = round(sum(t.investment_amount or 0.0 for t in open_trades), 2)
+    deployed_ceiling = round(capital * (max_deployed_percent / 100.0), 2)
+    if deployed >= deployed_ceiling:
+        return RiskDecision(
+            False,
+            "MAX_CAPITAL_DEPLOYED",
+            f"Rs {deployed:,.2f} already deployed across open AGENTIC_AI positions, at or above the "
+            f"configured ceiling (Rs {deployed_ceiling:,.2f}, {max_deployed_percent}% of Rs {capital:,.2f} "
+            "capital). No new entries until capital frees up.",
+        )
+
+    return RiskDecision(
+        True,
+        "OK",
+        f"Clear to trade -- realized P&L today Rs {realized_today:,.2f} (floor Rs {daily_loss_floor:,.2f}), "
+        f"{len(open_trades)}/{max_concurrent} positions open, Rs {deployed:,.2f}/{deployed_ceiling:,.2f} "
+        "capital deployed.",
+    )
+
+
+def evaluate_risk_now(db: Session) -> dict[str, Any]:
+    """Convenience wrapper for the dashboard's live risk-status card --
+    check_risk_gates() evaluated at the real current moment, with its
+    inputs/output flattened into a plain dict the template can render
+    directly without reaching into a dataclass."""
+    from app.time_utils import utc_now
+
+    settings = get_agentic_settings(db)
+    now_ist_dt = to_ist(utc_now())
+    decision = check_risk_gates(db, settings, now_ist_dt)
+    return {
+        "allowed": decision.allowed,
+        "reason": decision.reason,
+        "detail": decision.detail,
+        "evaluated_at": now_ist_dt.isoformat(),
+    }

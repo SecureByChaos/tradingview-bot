@@ -327,6 +327,19 @@ def _ensure_columns() -> None:
             for column, statement in ai_statements.items():
                 if column not in existing_ai_columns:
                     connection.execute(text(statement))
+    if "agentic_ai_settings" in table_names:
+        existing_agentic_columns = {column["name"] for column in inspector.get_columns("agentic_ai_settings")}
+        agentic_statements = {
+            "account_capital_rupees": "ALTER TABLE agentic_ai_settings ADD COLUMN account_capital_rupees FLOAT NOT NULL DEFAULT 100000.0",
+            "max_risk_percent_per_trade": "ALTER TABLE agentic_ai_settings ADD COLUMN max_risk_percent_per_trade FLOAT NOT NULL DEFAULT 1.0",
+            "max_daily_loss_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN max_daily_loss_percent FLOAT NOT NULL DEFAULT 3.0",
+            "max_concurrent_positions": "ALTER TABLE agentic_ai_settings ADD COLUMN max_concurrent_positions INTEGER NOT NULL DEFAULT 1",
+            "max_capital_deployed_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN max_capital_deployed_percent FLOAT NOT NULL DEFAULT 20.0",
+        }
+        with engine.begin() as connection:
+            for column, statement in agentic_statements.items():
+                if column not in existing_agentic_columns:
+                    connection.execute(text(statement))
     if "settings" in table_names:
         existing_settings_columns = {column["name"] for column in inspector.get_columns("settings")}
         settings_statements = {
