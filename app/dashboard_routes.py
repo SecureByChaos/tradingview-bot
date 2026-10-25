@@ -327,10 +327,10 @@ def agentic_ai_page(
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> HTMLResponse:
     """Dedicated page for the new Agentic AI strategy (app.ai.agentic) --
-    scaffolding plus the backtest/QA agent only (no entry/exit agents yet,
-    see that module's own docstring). Empty trade table until a future PR
-    adds live trading; the settings form and QA-report generator are both
-    already real and usable."""
+    scaffolding plus the backtest/QA agent and the logging agent (no entry/
+    exit agents yet, see that module's own docstring). Empty trade table
+    until a future PR adds live trading; the settings form and both
+    on-demand report generators are already real and usable."""
     settings = agentic_ai.get_agentic_settings(db)
     trades = get_agentic_ai_trades(db)
     open_trades = [trade for trade in trades if trade.status == TradeStatus.OPEN]
@@ -339,6 +339,10 @@ def agentic_ai_page(
     qa_reports = [
         {"report": report, "stats": _context_json(report.stats_json)}
         for report in reports.list_reports(db, "AGENTIC_QA")
+    ]
+    daily_logs = [
+        {"report": report, "stats": _context_json(report.stats_json)}
+        for report in reports.list_reports(db, "AGENTIC_DAILY_LOG")
     ]
     return templates.TemplateResponse(
         "agentic_ai.html",
@@ -350,6 +354,7 @@ def agentic_ai_page(
             "closed_count": len(closed_trades),
             "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
             "qa_reports": qa_reports,
+            "daily_logs": daily_logs,
             **performance,
         },
     )
@@ -400,6 +405,21 @@ def run_agentic_ai_qa_report(
     live data (e.g. AUTONOMOUS_AI, AI_ORIGIN_%, QUICK_SCALP) before this
     strategy has any trade history of its own."""
     agentic_ai.run_qa_report(db, origin_pattern, label)
+    return RedirectResponse("/agentic-ai", status_code=303)
+
+
+@router.post("/agentic-ai/daily-log")
+def run_agentic_ai_daily_log(
+    db: Annotated[Session, Depends(get_db)],
+    report_date: Annotated[str, Form()] = "",
+    _: Annotated[None, Depends(require_admin_page)] = None,
+) -> RedirectResponse:
+    """Runs the logging agent on demand -- the same report
+    app/ai/agentic.run_daily_log_job generates automatically at 16:05 IST on
+    every trading day. report_date defaults to today (IST) when left blank;
+    a specific past date can be backfilled here too."""
+    parsed = date.fromisoformat(report_date) if report_date else None
+    agentic_ai.run_daily_log(db, parsed)
     return RedirectResponse("/agentic-ai", status_code=303)
 
 

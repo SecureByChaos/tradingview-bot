@@ -855,6 +855,11 @@ class ReportType:
     # wholesale (same table, same _save_report shape) rather than a new
     # report table, same precedent as ORIGINATION above (15 Aug 2026).
     AGENTIC_QA = "AGENTIC_QA"
+    # 25 Oct 2026, same day: app.ai.agentic's logging agent -- a daily
+    # cross-strategy digest (AI Origination, Autonomous AI, Quick Scalp,
+    # Validated Signal, and this strategy's own AGENTIC_AI bucket) replacing
+    # the manual "upload today's export" chat routine. Same AIReport reuse.
+    AGENTIC_DAILY_LOG = "AGENTIC_DAILY_LOG"
 
 
 class AIReport(Base):

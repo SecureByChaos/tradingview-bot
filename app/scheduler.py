@@ -8,6 +8,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo
 
 from app import reports
+from app.ai import agentic
 from app.monitor import TradeMonitor
 from app.signal_validation import trading_day_reason
 from app.time_utils import to_ist, utc_now
@@ -260,6 +261,20 @@ def create_scheduler(
         max_instances=1,
         coalesce=True,
             misfire_grace_time=60,
+    )
+    # 25 Oct 2026: app.ai.agentic's logging agent -- a few minutes after the
+    # existing ai-daily-summary job above, not at the same minute, purely to
+    # avoid two independent report jobs opening DB sessions and (potentially)
+    # making LLM calls in the same instant; no real resource contention risk
+    # otherwise, this job makes no SmartAPI calls at all.
+    scheduler.add_job(
+        agentic.run_daily_log_job,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=5, timezone=IST),
+        id="agentic-daily-log",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
     scheduler.add_job(
         reports.run_weekly_report_job,
