@@ -45,6 +45,25 @@ and nothing schedules it. What exists:
     AGENTIC_AI trade -- built and proven correct ahead of that agent existing,
     not alongside it under time pressure.
 
+    27 Oct 2026, real production evidence, explicit instruction: on day
+    one of the live multi-agent entry/exit agent (below), the Orchestrator
+    repeatedly wanted to trade and compute_position_size() repeatedly came
+    back 0 lots -- the configured risk-per-trade budget genuinely couldn't
+    afford one lot at real Nifty/Bank Nifty ATM premiums against the
+    configured nominal stop. Tightening the math further (a bigger risk %)
+    only narrows the gap, it doesn't close it for every premium -- so per
+    explicit instruction ("I want to trade it whatever it takes as it is
+    paper trades only"), open_agentic_trade() now floors a 0-lot result up
+    to _MIN_LOTS_PAPER_FLOOR (1) rather than declining the trade outright,
+    logged and persisted with an explicit forced_minimum_lot flag every
+    time it fires -- see that constant's own comment for why this is safe
+    specifically because this module is structurally paper-only.
+    compute_position_size() ITSELF is untouched and still floors down to 0
+    normally -- the floor lives only in this one caller, not in the shared
+    sizing function the dashboard's own what-if calculator also uses, so
+    that calculator keeps answering the real question ("could this size
+    at all") rather than a paper-trading-only one.
+
   - The entry/exit agent, rebuilt into TRUE multi-agent fusion (25 Oct
     2026, same day as the news agent above): a dedicated Technical & Flow
     Agent, a dedicated News & Sentiment Agent, and a final Master
@@ -815,6 +834,24 @@ _DEFAULT_TRADING_END = (15, 15)
 # contract closer than this, rather than accepting the extra risk.
 _MIN_DTE_TO_TRADE = 5
 
+# 27 Oct 2026, explicit instruction: a signal that already cleared every
+# other gate (severe-event kill switch, risk-gate, live price, Technical
+# Agent, Orchestrator) should never be thrown away purely because the
+# risk-based lot count rounded down to zero -- "whatever it takes... it is
+# paper trades only." compute_position_size() is left completely untouched
+# (it still floors down normally for the dashboard's own what-if
+# calculator, which has no business inflating what a real account could
+# actually size), and the resolved lots are still computed and logged
+# first for audit -- only open_agentic_trade's own floor is raised, and
+# only because this module is structurally paper-only (TradingMode.PAPER
+# hardcoded, no live order path anywhere in this file): there is no real
+# capital this floor could ever put at risk. The realized risk at this
+# minimum can genuinely exceed max_risk_percent_per_trade's own configured
+# ceiling when it fires -- that is the whole point, and it is flagged
+# explicitly in both the log line and the persisted trade's own event
+# payload, never silently.
+_MIN_LOTS_PAPER_FLOOR = 1
+
 # Same warmup window / load cap app.ai.autonomous's own _compute_features
 # uses for the identical reason -- enough 1-min history to resample 5m/15m
 # bars and warm up ADX/EMA, without loading an unbounded amount of history
@@ -1329,19 +1366,23 @@ def open_agentic_trade(
         settings.account_capital_rupees, settings.max_risk_percent_per_trade,
         entry_price, stoploss, contract.lot_size,
     )
+    forced_minimum_lot = False
     if lots <= 0:
+        # See _MIN_LOTS_PAPER_FLOOR's own comment -- paper-only, so a
+        # signal that cleared every other gate is never declined purely
+        # on sizing arithmetic rounding to zero. The configured risk
+        # budget is still the real number reported everywhere else; only
+        # the quantity is floored, and that override is always flagged,
+        # never silent.
+        lots = _MIN_LOTS_PAPER_FLOOR
+        forced_minimum_lot = True
         logger.info(
-            "[AGENTIC_AI] %s: Declined -- risk budget (%.2f%% of Rs %.2f) too small for one lot "
-            "at this stop distance (entry %.2f, stop %.2f, lot size %s)",
+            "[AGENTIC_AI] %s: risk-based sizing rounded to 0 lots (risk budget %.2f%% of Rs %.2f, entry "
+            "%.2f, stop %.2f, lot size %s) -- forcing the minimum %s lot(s) since this strategy is "
+            "structurally paper-only",
             index.symbol, settings.max_risk_percent_per_trade, settings.account_capital_rupees,
-            entry_price, stoploss, contract.lot_size,
+            entry_price, stoploss, contract.lot_size, _MIN_LOTS_PAPER_FLOOR,
         )
-        log_event(
-            db, "AGENTIC_AI",
-            f"[{index.symbol}] Declined -- risk budget too small for one lot at this stop distance",
-            level="INFO",
-        )
-        return None
     quantity = lots * contract.lot_size
 
     strategy_name = f"Agentic AI - {index.display_name or index.symbol}"
@@ -1386,10 +1427,17 @@ def open_agentic_trade(
 
     log_event(
         db, "AGENTIC_AI",
-        f"[{strategy_name}] opened {signal.value} @ strike {trade.strike}, {lots} lot(s)",
-        payload={"trade_id": trade.trade_id, "reasoning": reasoning, "lots": lots},
+        f"[{strategy_name}] opened {signal.value} @ strike {trade.strike}, {lots} lot(s)"
+        + (" (forced to the paper-only minimum lot -- see reasoning)" if forced_minimum_lot else ""),
+        payload={
+            "trade_id": trade.trade_id, "reasoning": reasoning, "lots": lots,
+            "forced_minimum_lot": forced_minimum_lot,
+        },
     )
-    logger.info("[AGENTIC_AI] opened %s for %s (%s lot(s))", signal.value, index.symbol, lots)
+    logger.info(
+        "[AGENTIC_AI] opened %s for %s (%s lot(s)%s)",
+        signal.value, index.symbol, lots, ", forced minimum" if forced_minimum_lot else "",
+    )
     return trade
 
 
