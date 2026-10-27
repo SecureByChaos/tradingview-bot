@@ -612,7 +612,10 @@ def test_open_agentic_trade_opens_with_correct_fields(monkeypatch):
     assert trade.ai_reasoning == "clean setup"
 
 
-def test_open_agentic_trade_declines_when_risk_budget_too_small_for_one_lot(monkeypatch):
+def test_open_agentic_trade_forces_minimum_lot_when_risk_budget_too_small(monkeypatch):
+    # 27 Oct 2026, explicit instruction ("whatever it takes... paper trades
+    # only"): a 0-lot risk calculation no longer declines the trade -- it
+    # opens at the forced _MIN_LOTS_PAPER_FLOOR instead, flagged explicitly.
     monkeypatch.setattr(agentic_module, "symmetric_premium_percent", _identity_rescale)
     db = _make_db()
     index = _make_index()
@@ -628,8 +631,62 @@ def test_open_agentic_trade_declines_when_risk_budget_too_small_for_one_lot(monk
 
     trade = open_agentic_trade(db, index, "BUY_CE", "clean setup", settings, smartapi, option_finder)
 
-    assert trade is None
-    assert db.query(StrategyTrade).count() == 0
+    assert trade is not None
+    assert trade.quantity == 75  # 1 lot, the forced floor
+    assert trade.mode == "PAPER"
+
+
+def test_open_agentic_trade_logs_forced_minimum_lot_flag(monkeypatch):
+    from app.db_models import LogEvent
+
+    monkeypatch.setattr(agentic_module, "symmetric_premium_percent", _identity_rescale)
+    db = _make_db()
+    index = _make_index()
+    settings = AgenticAISettings(
+        id=1, account_capital_rupees=100000.0, max_risk_percent_per_trade=1.0,
+        nominal_stop_percent=15.0, nominal_target_percent=30.0,
+    )
+    contract = _make_contract(lot_size=75)
+    option_finder = FakeOptionFinder(contract)
+    smartapi = FakeSmartAPI(price=100.0)
+
+    open_agentic_trade(db, index, "BUY_CE", "clean setup", settings, smartapi, option_finder)
+
+    opened_event = db.query(LogEvent).filter(LogEvent.message.like("%opened%")).one()
+    assert '"forced_minimum_lot": true' in opened_event.payload
+
+
+def test_open_agentic_trade_normal_sizing_is_never_flagged_as_forced(monkeypatch):
+    from app.db_models import LogEvent
+
+    monkeypatch.setattr(agentic_module, "symmetric_premium_percent", _identity_rescale)
+    db = _make_db()
+    index = _make_index()
+    # Real, non-zero sizing (10% risk budget) must NOT be flagged as forced.
+    settings = AgenticAISettings(
+        id=1, account_capital_rupees=100000.0, max_risk_percent_per_trade=10.0,
+        nominal_stop_percent=15.0, nominal_target_percent=30.0,
+    )
+    contract = _make_contract(lot_size=75)
+    option_finder = FakeOptionFinder(contract)
+    smartapi = FakeSmartAPI(price=100.0)
+
+    trade = open_agentic_trade(db, index, "BUY_CE", "clean setup", settings, smartapi, option_finder)
+
+    assert trade is not None
+    assert trade.quantity == 600  # the real, unforced 8-lot sizing
+    opened_event = db.query(LogEvent).filter(LogEvent.message.like("%opened%")).one()
+    assert '"forced_minimum_lot": false' in opened_event.payload
+
+
+def test_compute_position_size_itself_still_floors_to_zero(monkeypatch):
+    # The paper-only floor lives only in open_agentic_trade -- the shared
+    # compute_position_size() function (also used by the dashboard's own
+    # what-if calculator) must stay an honest answer to "could this really
+    # size at all", unaffected by this strategy-specific override.
+    from app.ai.agentic import compute_position_size
+
+    assert compute_position_size(100_000.0, 1.0, 100.0, 85.0, 75) == 0
 
 
 def test_open_agentic_trade_sizes_a_real_lot_when_budget_allows(monkeypatch):
