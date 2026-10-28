@@ -176,6 +176,26 @@ and nothing schedules it. What exists:
     regardless, so a thin technical read is not a reason to stop asking
     the model for its own exit judgment.
 
+    28 Oct 2026, real production evidence, explicit instruction: a real
+    position ran up to +19% peak P&L and was still open at +5% by the
+    time the model was re-asked -- and its own exit prompt never showed
+    it the peak at all, only the current snapshot each cycle, so the
+    model had no way to know a giveback had even happened. _peak_pnl_
+    percent() now reads trade.highest_price (already tracked for every
+    open trade by the shared 30s monitor_open_trades backstop regardless
+    of origin, just never previously read here) and _build_exit_prompt
+    shows it alongside current P&L. SYSTEM_PROMPT_EXIT was extended to
+    weigh the two together with the Technical & Flow Agent's own read --
+    a real giveback against a thesis that's lost momentum is a genuine
+    reason to exit and lock in profit; the same giveback against a thesis
+    the Technical Agent still supports is ordinary noise and HOLD stays
+    correct. Deliberately still no hard deterministic peak-giveback rule
+    (per explicit instruction: "determine what's the peak, what's market
+    is behaving, and it should keep it or exit" -- the model's own
+    judgment, not a fixed formula) -- this is additional INFORMATION for
+    the existing exit agent, not a new gate, so stop/target/quantity are
+    completely untouched and "the model never decides risk" still holds.
+
     Market input beyond the above is still deliberately minimal -- see
     the Technical Agent's own narrower-than-Autonomous-AI feature set
     above. Structurally paper-only, same construction and reasoning as
@@ -1137,14 +1157,24 @@ regardless of your answer, so you are not this trade's only protection. Your job
 rules cannot make: whether to exit now because the original case for this trade no longer looks right, even
 though neither the stop nor the target has been hit yet.
 
-You are shown the position's own entry price, current price, running P&L, how long it has been open, and the
-same two independent sub-agent reads a fresh entry decision would be shown right now -- a Technical & Flow
-Agent's own directional lean, and a News & Sentiment Agent's own directional lean (either may read
-NEUTRAL/unavailable; treat that as missing information, not as either reassurance or an alarm). Weigh a
-read that plausibly explains an adverse move against this specific position, but ordinary readings are not
-by themselves a reason to exit a position that is otherwise fine. Prefer HOLD when you have no specific
-reason to exit -- cutting a position early on vague unease is not better risk management than letting the
-fixed stop/target do their job; it is a different, unmeasured kind of risk.
+You are shown the position's own entry price, current price, running P&L, its own PEAK P&L (the best
+unrealized gain it has reached so far, which may be well above its current running P&L), how long it has
+been open, and the same two independent sub-agent reads a fresh entry decision would be shown right now --
+a Technical & Flow Agent's own directional lean, and a News & Sentiment Agent's own directional lean (either
+may read NEUTRAL/unavailable; treat that as missing information, not as either reassurance or an alarm).
+
+A position that has given back a meaningful share of a real peak gain is a genuine reason to weigh exiting
+and locking in profit, not just a number to note -- especially when the Technical & Flow Agent's own read
+suggests the move that drove that peak has lost momentum or reversed. Weigh how much of the peak has been
+given back together with what both agents currently say, not the peak number alone: a position that never
+moved much giving back a little is not the same as one that ran up sharply and has already fallen most of
+the way back down. You are not required to exit just because peak and current differ -- if the Technical &
+Flow Agent's read still supports the original thesis and the pullback looks like ordinary short-term noise
+rather than a real reversal, HOLD remains correct. Weigh a read that plausibly explains an adverse move
+against this specific position, but ordinary readings are not by themselves a reason to exit a position
+that is otherwise fine. Prefer HOLD when you have no specific reason to exit -- cutting a position early on
+vague unease is not better risk management than letting the fixed stop/target do their job; it is a
+different, unmeasured kind of risk.
 
 Respond with a single valid JSON object only, with no markdown fences or extra text:
 {"decision": "EXIT" | "HOLD", "confidence": 0.0-1.0, "reasoning": "A few direct sentences"}"""
@@ -1254,6 +1284,26 @@ def _has_open_agentic_trade(db: Session, index_symbol: str) -> bool:
     )
 
 
+def _peak_pnl_percent(trade: StrategyTrade) -> float:
+    """The best unrealized gain this position has reached so far, from
+    trade.highest_price -- already tracked for every open trade regardless
+    of origin by the shared 30s monitor_open_trades backstop, just never
+    previously read by this module's own exit agent (see the module
+    docstring's 28 Oct 2026 entry). Same formula app.ai.autonomous's own
+    _peak_pnl_percent already uses, duplicated per this module's
+    established "deliberately independent" convention: highest_price is
+    the raw premium high, not a direction-adjusted figure, and every
+    Agentic AI trade (CE or PE) is a BUY -- a higher premium always means
+    more profit regardless of option_type, so no CE/PE sign-flip is
+    needed here, unlike pnl_percent's own sign conventions elsewhere in
+    this codebase for short-side strategies. Falls back to the trade's
+    own current pnl_percent (never a fabricated number) when highest_price
+    hasn't been populated yet."""
+    if not trade.entry_price or trade.highest_price is None:
+        return trade.pnl_percent or 0.0
+    return round((trade.highest_price - trade.entry_price) / trade.entry_price * 100, 2)
+
+
 def _format_verdict(label: str, verdict: Optional[_AgentVerdict]) -> str:
     """Shared rendering for both sub-agent verdicts into either the
     Orchestrator's or the exit prompt's text -- "unavailable" (never a
@@ -1310,6 +1360,7 @@ def _build_exit_prompt(
         f"Entry price: {trade.entry_price}\n"
         f"Current price: {trade.current_premium}\n"
         f"Running P&L: {trade.pnl_percent}%\n"
+        f"Peak P&L (highest point this position has reached): {_peak_pnl_percent(trade)}%\n"
         f"Time open: {f'{elapsed_minutes:.0f} minutes' if elapsed_minutes is not None else 'unknown'}\n\n"
         + _format_verdict("Technical & Flow Agent", technical_verdict)
         + "\n"

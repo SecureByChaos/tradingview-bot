@@ -23,6 +23,7 @@ from app.ai.agentic import (
     _parse_agent_verdict,
     _parse_entry_response,
     _parse_exit_response,
+    _peak_pnl_percent,
     _trend_regime_label,
     check_agentic_entry,
     check_agentic_exits,
@@ -134,15 +135,15 @@ def _make_settings(**overrides) -> AgenticAISettings:
     return AgenticAISettings(**base)
 
 
-def _seed_trade(db, trade_id, origin, status=TradeStatus.OPEN, current_premium=110.0, index_symbol="NIFTY"):
+def _seed_trade(db, trade_id, origin, status=TradeStatus.OPEN, current_premium=110.0, index_symbol="NIFTY", highest_price=None):
     trade = StrategyTrade(
         trade_id=trade_id, strategy_name=f"{origin} - Nifty 50", signal="BUY_CE",
         index_symbol=index_symbol, option_type="CE", tradingsymbol="X", symboltoken="1",
         strike=22500, expiry="27OCT2026", quantity=75, entry_price=100.0, target=130.0,
         stoploss=85.0, entry_time=utc_now(), origin=origin, status=status,
         result=TradeResult.OPEN if status == TradeStatus.OPEN else TradeResult.WIN,
-        current_premium=current_premium, highest_price=current_premium, lowest_price=100.0,
-        pnl_percent=10.0, sl_mode="FIXED",
+        current_premium=current_premium, highest_price=highest_price if highest_price is not None else current_premium,
+        lowest_price=100.0, pnl_percent=10.0, sl_mode="FIXED",
     )
     db.add(trade)
     db.commit()
@@ -451,6 +452,54 @@ def test_build_exit_prompt_shows_unavailable_when_verdicts_missing():
     prompt = _build_exit_prompt(trade, to_ist(utc_now()))
     assert "Technical & Flow Agent: unavailable" in prompt
     assert "News & Sentiment Agent: unavailable" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _peak_pnl_percent -- 28 Oct 2026, a real position ran to +19% and was still
+# open at +5% with the exit agent never having seen the peak at all.
+# ---------------------------------------------------------------------------
+
+
+def test_peak_pnl_percent_reflects_the_real_running_high():
+    db = _make_db()
+    # The real reported shape: entry 100, ran up to 119 (peak +19%), has
+    # since fallen back to 105 (current +5%) -- peak and current must read
+    # as two different numbers, not collapse to one.
+    trade = _seed_trade(db, "t1", "AGENTIC_AI", current_premium=105.0, highest_price=119.0)
+    assert _peak_pnl_percent(trade) == 19.0
+    assert trade.pnl_percent == 10.0  # the fixture's own stored running P&L, untouched by this helper
+
+
+def test_peak_pnl_percent_falls_back_to_running_pnl_without_a_stored_high():
+    db = _make_db()
+    trade = _seed_trade(db, "t1", "AGENTIC_AI", current_premium=105.0)
+    trade.highest_price = None
+    db.commit()
+    assert _peak_pnl_percent(trade) == trade.pnl_percent
+
+
+def test_peak_pnl_percent_falls_back_without_a_real_entry_price():
+    db = _make_db()
+    trade = _seed_trade(db, "t1", "AGENTIC_AI")
+    trade.entry_price = 0.0
+    db.commit()
+    assert _peak_pnl_percent(trade) == trade.pnl_percent
+
+
+def test_build_exit_prompt_shows_peak_distinct_from_current_pnl():
+    db = _make_db()
+    trade = _seed_trade(db, "t1", "AGENTIC_AI", current_premium=105.0, highest_price=119.0)
+    prompt = _build_exit_prompt(trade, to_ist(utc_now()))
+    assert "Peak P&L (highest point this position has reached): 19.0%" in prompt
+    assert "Running P&L: 10.0%" in prompt
+
+
+def test_orchestrator_exit_prompt_weighs_peak_against_current_in_the_system_prompt():
+    # Pins the new guidance's presence -- a soft, model-judgment framing,
+    # never a hard formula (per explicit instruction: the model decides).
+    assert "PEAK P&L" in SYSTEM_PROMPT_EXIT
+    assert "given back a meaningful share of a real peak gain" in SYSTEM_PROMPT_EXIT
+    assert "HOLD remains correct" in SYSTEM_PROMPT_EXIT
 
 
 # ---------------------------------------------------------------------------
