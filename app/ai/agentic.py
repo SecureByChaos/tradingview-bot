@@ -221,6 +221,46 @@ and nothing schedules it. What exists:
     non-AI_ORIGIN_* trade already gets for free from monitor_open_trades'
     shared branch, zero new code there.
 
+    28 Oct 2026, same day, second real-evidence pass (not a contradiction of
+    the paragraph above -- "no evidence of its own" stopped being true the
+    same day it was written): the peak-P&L prompt fix directly above still
+    wasn't enough on its own the first time real data looked at it. A real
+    Nifty BUY_PE ran to +43.42% peak MFE and the model's own exit judgment --
+    re-asked every 5 minutes, ~20+ times across the trade's 1h41m lifetime,
+    already shown its own peak on every one of those asks -- held through
+    nearly all of it, closing at +2.49%; a Bank Nifty BUY_CE the same day
+    gave back +7.64% MFE down to -1.42%. Fixed two ways, not one:
+
+      1. SYSTEM_PROMPT_EXIT's giveback paragraph now closes the specific
+         loophole this data exposed: restating that the Technical read
+         "still supports the thesis" was never, by itself, a resolution --
+         that same read was already true at the peak too, so repeating it
+         supplies no new information. Once the giveback is large, HOLD now
+         requires naming something concrete and CURRENT that still points
+         to further upside, not merely that nothing has technically broken
+         yet. A shallow pullback on a position that never ran up much still
+         needs none of this and stays an easy HOLD -- this only tightens
+         the case that was previously too easy to wave through on autopilot.
+         Still no fixed numeric giveback threshold in the prompt itself --
+         the model decides how "large" is large, per the same explicit
+         instruction behind the first peak-P&L pass.
+
+      2. Unlike the rest of Autonomous AI's matrix (still not imported, see
+         above), the peak-giveback GIVEBACK_STOP floor specifically now IS
+         added for this origin (app.multi_strategy._GIVEBACK_STOP_ORIGINS) --
+         not a new, unvalidated threshold invented for this strategy, but
+         the exact same already-backtested mechanism (floor=12% of entry,
+         locks in 70% of the peak gain once armed) already running live for
+         QUICK_SCALP/AUTONOMOUS_AI today, reused rather than retuned. This is
+         the floor UNDER the model's own judgment, not a replacement for it
+         -- the per-cycle EXIT/HOLD re-ask above still runs exactly as
+         before and can still exit earlier and smarter than this mechanical
+         floor would; this only bounds how much a slow or indecisive cycle
+         can give back while the model is still deciding. See that
+         constant's own module-level comment in app/multi_strategy.py for
+         the full reasoning on why this origin fits the same shape
+         QUICK_SCALP/AUTONOMOUS_AI already proved it on.
+
   - The news agent (app.ai.news, 25 Oct 2026) -- the headline-fetching and
     deterministic severe-event half of the news agent described above.
     Fetches recent India-market headlines from free, keyless RSS feeds. A
@@ -1168,13 +1208,20 @@ and locking in profit, not just a number to note -- especially when the Technica
 suggests the move that drove that peak has lost momentum or reversed. Weigh how much of the peak has been
 given back together with what both agents currently say, not the peak number alone: a position that never
 moved much giving back a little is not the same as one that ran up sharply and has already fallen most of
-the way back down. You are not required to exit just because peak and current differ -- if the Technical &
-Flow Agent's read still supports the original thesis and the pullback looks like ordinary short-term noise
-rather than a real reversal, HOLD remains correct. Weigh a read that plausibly explains an adverse move
-against this specific position, but ordinary readings are not by themselves a reason to exit a position
-that is otherwise fine. Prefer HOLD when you have no specific reason to exit -- cutting a position early on
-vague unease is not better risk management than letting the fixed stop/target do their job; it is a
-different, unmeasured kind of risk.
+the way back down.
+
+Once the giveback is large, simply noting that the Technical read "still supports the original thesis" is
+not by itself a resolution -- that same read was already true when the position was at its peak too, so
+repeating it is not new information and does not explain why holding from here is still the better bet.
+HOLD in that situation requires naming something concrete and current that still points to a further
+favorable move -- a fresh confirming reading, a level just held, a specific reason this pullback looks like
+noise rather than the move reversing -- not merely that nothing has technically broken yet. If your own
+reasoning only restates why the trade was entered, or notes the absence of a reversal signal, treat that as
+insufficient and lean toward EXIT instead. A position that never ran up much to begin with needs none of
+this scrutiny -- a shallow pullback below a small peak is ordinary noise and HOLD remains correct by default.
+Prefer HOLD when you have no specific reason to exit and the giveback itself is not large -- cutting a
+position early on vague unease about a trade that never really moved is not better risk management than
+letting the fixed stop/target do their job; it is a different, unmeasured kind of risk.
 
 Respond with a single valid JSON object only, with no markdown fences or extra text:
 {"decision": "EXIT" | "HOLD", "confidence": 0.0-1.0, "reasoning": "A few direct sentences"}"""

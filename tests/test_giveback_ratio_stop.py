@@ -104,12 +104,14 @@ def test_constants_match_the_validated_backtest_cell():
     assert _GIVEBACK_STOP_RATIO == 0.30
 
 
-def test_included_origins_are_exactly_the_two_no_trailing_strategies():
+def test_included_origins_are_exactly_the_three_no_trailing_strategies():
     # VALIDATED_SIGNAL was REMOVED 5 Sep 2026 when that origin was rebuilt to
     # its own complete, spot-level stop/target/stagnation exit engine (see
     # app.validated_signal) -- this trial's "zero existing protection" scope
-    # is no longer true for it.
-    assert _GIVEBACK_STOP_ORIGINS == frozenset({"QUICK_SCALP", "AUTONOMOUS_AI"})
+    # is no longer true for it. AGENTIC_AI was ADDED 28 Oct 2026 -- same
+    # "zero trailing/discretionary protection of its own" shape, confirmed
+    # by real same-day data (see the module-level comment above).
+    assert _GIVEBACK_STOP_ORIGINS == frozenset({"QUICK_SCALP", "AUTONOMOUS_AI", "AGENTIC_AI"})
 
 
 def test_toggle_off_by_default_behaves_exactly_as_before(monkeypatch, db_session: Session) -> None:
@@ -206,6 +208,19 @@ def test_toggle_on_applies_to_quick_scalp(monkeypatch, db_session: Session) -> N
 def test_toggle_on_applies_to_autonomous_ai(monkeypatch, db_session: Session) -> None:
     _enable_giveback_stop(db_session)
     _open_trade(db_session, origin="AUTONOMOUS_AI", entry_price=100.0, stoploss=50.0, target=300.0)
+    _run(monkeypatch, db_session, [115.0])
+    trade = _run(monkeypatch, db_session, [108.0])
+    assert trade.exit_reason == ExitReason.GIVEBACK_STOP.value
+
+
+def test_toggle_on_applies_to_agentic_ai(monkeypatch, db_session: Session) -> None:
+    # Added 28 Oct 2026 after real production data showed Agentic AI's own
+    # exit judgment (re-asked every 5 minutes) holding through a +43.42%
+    # peak all the way down to +2.49% on one trade, and +7.64% down to
+    # -1.42% on another, the same day it had already been shown its own
+    # peak P&L. This floor is the backstop under that judgment.
+    _enable_giveback_stop(db_session)
+    _open_trade(db_session, origin="AGENTIC_AI", entry_price=100.0, stoploss=50.0, target=300.0)
     _run(monkeypatch, db_session, [115.0])
     trade = _run(monkeypatch, db_session, [108.0])
     assert trade.exit_reason == ExitReason.GIVEBACK_STOP.value

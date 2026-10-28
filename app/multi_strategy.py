@@ -97,9 +97,28 @@ _AI_ORIGIN_TRAIL_OFFSET_PERCENT = 5.0
 # Review after the 2-week trial: if the real outcome supports it, this
 # becomes a permanent, unconditional mechanism for these origins; if not,
 # delete this block and the admin toggle rather than leaving it dormant.
+#
+# AGENTIC_AI added 28 Oct 2026, same reasoning as QUICK_SCALP/AUTONOMOUS_AI
+# above, not a new validation. Agentic AI's exit "protection" today is
+# entirely the model's own voluntary EXIT/HOLD judgment (app.ai.agentic's
+# check_agentic_exits) plus a plain stop/target -- no trailing mechanism of
+# its own, same shape QUICK_SCALP/AUTONOMOUS_AI were in before this trial,
+# and its stoploss/target are real premium levels (never the unreachable
+# sentinels VALIDATED_SIGNAL's own engine uses), so there's no analogous
+# conflict to the one that excluded VALIDATED_SIGNAL above. Real same-day
+# evidence this gap costs something concrete: a 28 Oct Nifty BUY_PE ran to
+# +43.42% MFE and the model's own exit judgment, re-asked every 5 minutes
+# (~20+ times across the trade's 1h41m), held through nearly all of it,
+# closing at +2.49%; a Bank Nifty BUY_CE the same day gave back from +7.64%
+# MFE to -1.42%. The model was shown its own peak P&L on both of these
+# (app.ai.agentic's exit prompt, merged earlier the same day) and still
+# didn't act -- this floor is the backstop under that judgment, not a
+# replacement for it; AGENTIC_AI keeps its own exit check running exactly as
+# before, this just bounds how much a slow or indecisive cycle can give back
+# in the meantime.
 _GIVEBACK_STOP_FLOOR_PERCENT = 12.0
 _GIVEBACK_STOP_RATIO = 0.30
-_GIVEBACK_STOP_ORIGINS = frozenset({"QUICK_SCALP", "AUTONOMOUS_AI"})
+_GIVEBACK_STOP_ORIGINS = frozenset({"QUICK_SCALP", "AUTONOMOUS_AI", "AGENTIC_AI"})
 
 # Fallback only -- PlatformSettings.trading_start_time/square_off_time (Settings
 # > General) are the real, admin-editable values. These match what was
