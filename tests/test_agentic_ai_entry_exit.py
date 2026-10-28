@@ -502,6 +502,24 @@ def test_orchestrator_exit_prompt_weighs_peak_against_current_in_the_system_prom
     assert "HOLD remains correct" in SYSTEM_PROMPT_EXIT
 
 
+def test_exit_prompt_closes_the_restate_the_thesis_loophole():
+    # 28 Oct 2026, same day, second real-evidence pass: a real position ran
+    # to +43.42% peak MFE and the model's exit judgment -- re-asked ~20+
+    # times, already shown its own peak every time -- held through nearly
+    # all of it anyway. The original peak-P&L wording left "the Technical
+    # read still supports the thesis" as an unconditional escape hatch;
+    # this pins that the prompt now requires something CURRENT and
+    # CONCRETE, not a restatement of why the trade was entered, once the
+    # giveback is large.
+    assert "not by itself a resolution" in SYSTEM_PROMPT_EXIT
+    assert "repeating it is not new information" in SYSTEM_PROMPT_EXIT
+    assert "lean toward EXIT instead" in SYSTEM_PROMPT_EXIT
+    # The shallow-pullback carve-out must survive -- this tightens the large-
+    # giveback case only, it doesn't turn every small wobble into a forced
+    # justification.
+    assert "needs none of\nthis scrutiny" in SYSTEM_PROMPT_EXIT or "needs none of this scrutiny" in SYSTEM_PROMPT_EXIT
+
+
 # ---------------------------------------------------------------------------
 # get_technical_verdict
 # ---------------------------------------------------------------------------
