@@ -677,6 +677,61 @@ def test_open_agentic_trade_opens_with_correct_fields(monkeypatch):
     assert trade.quantity == 600
     assert trade.ai_action == "BUY_CE"
     assert trade.ai_reasoning == "clean setup"
+    assert trade.ai_confidence is None  # no confidence passed -- defaults to None, never fabricated
+
+
+# ---------------------------------------------------------------------------
+# ai_confidence persistence -- 29 Oct 2026. The Orchestrator already
+# computes a confidence score on every decision; it was never stored on
+# the trade or read anywhere, so a real same-day incident ("why did it
+# take this trade") could only ever be answered from reasoning text, never
+# a number. This fixes the storage gap only -- no gate, no behavior
+# change, confirmed by test_open_agentic_trade_opens_with_correct_fields
+# above still passing unmodified with confidence simply omitted.
+# ---------------------------------------------------------------------------
+
+
+def test_open_agentic_trade_persists_the_passed_confidence(monkeypatch):
+    monkeypatch.setattr(agentic_module, "symmetric_premium_percent", _identity_rescale)
+    db = _make_db()
+    index = _make_index()
+    settings = AgenticAISettings(
+        id=1, account_capital_rupees=100000.0, max_risk_percent_per_trade=10.0,
+        nominal_stop_percent=15.0, nominal_target_percent=30.0,
+    )
+    contract = _make_contract(lot_size=75)
+    option_finder = FakeOptionFinder(contract)
+    smartapi = FakeSmartAPI(price=100.0)
+
+    trade = open_agentic_trade(
+        db, index, "BUY_CE", "clean setup", settings, smartapi, option_finder, confidence=0.82,
+    )
+
+    assert trade.ai_confidence == 0.82
+
+
+def test_check_agentic_entry_threads_the_orchestrator_confidence_into_the_trade(monkeypatch):
+    monkeypatch.setattr(agentic_module, "symmetric_premium_percent", _identity_rescale)
+    db = _make_db()
+    index = _make_index()
+    settings = _make_settings(account_capital_rupees=100000.0, max_risk_percent_per_trade=10.0)
+    option_finder = FakeOptionFinder(_make_contract(lot_size=75))
+    smartapi = FakeSmartAPI(price=100.0)
+    monkeypatch.setattr(
+        agentic_module, "_call_openai_live",
+        lambda *a, **k: agentic_module._LiveCallResult(
+            '{"decision": "BUY_CE", "confidence": 0.74, "reasoning": "clean"}', None,
+        ),
+    )
+
+    trade = check_agentic_entry(
+        db, index, _ist_now(), settings, smartapi, option_finder, {"NIFTY": {"price": 100.0}},
+        technical_verdict=_AgentVerdict("BULLISH", 0.7, "bullish"),
+        news_verdict=_AgentVerdict("NEUTRAL", None, ""),
+    )
+
+    assert trade is not None
+    assert trade.ai_confidence == 0.74
 
 
 def test_open_agentic_trade_forces_minimum_lot_when_risk_budget_too_small(monkeypatch):
