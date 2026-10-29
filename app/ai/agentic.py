@@ -313,16 +313,31 @@ and nothing schedules it. What exists:
     entry into stages, tracking a confirmation trigger against the
     existing deterministic position-sizing agent) than this pass's scope;
     worth a dedicated follow-up if the scratch rule alone doesn't prove
-    sufficient. (3) A confidence floor on the Orchestrator's own decision
-    -- found, while investigating this incident, that AgenticAISettings
-    computes a confidence score on every decision and neither stores it on
-    the trade nor gates on it at all (the "AI Confidence" column reads
-    blank in every export row for this strategy, confirmed by inspection,
-    not an export artifact). A real, separate gap, named here rather than
-    silently fixed in the same pass as the scratch rule -- it needs its own
-    change (persist ai_confidence on open_agentic_trade, decide a starting
-    floor) and its own decision on what starting value to use, since this
-    strategy has no backtest of its own yet to validate one against.
+    sufficient. (3) A confidence FLOOR (a gate that blocks a low-confidence
+    entry outright) on the Orchestrator's own decision -- found, while
+    investigating this incident, that the Orchestrator already computes a
+    confidence score on every decision and neither stored it on the trade
+    nor gated on it at all (the "AI Confidence" column read blank in every
+    export row for this strategy, confirmed by inspection, not an export
+    artifact). Deliberately split into two separate decisions, not one:
+
+    29 Oct 2026, the STORAGE half fixed -- open_agentic_trade() now takes
+    an optional confidence parameter and persists it as trade.ai_confidence
+    (the same shared column AI Origination already uses), and
+    check_agentic_entry() threads the Orchestrator's own parsed.confidence
+    through. Zero behavior change -- nothing reads this value yet, it only
+    stops being silently discarded. This alone makes every future "why did
+    it take this trade" question answerable with a real number instead of
+    reasoning text alone, and is the necessary first step before any gate
+    decision can be made with real evidence rather than a guess.
+
+    The GATE half remains deliberately deferred -- what floor value, and
+    whether to block outright vs. just downsize, is a real decision this
+    strategy has no backtest of its own yet to validate one against (the
+    same discipline AI Origination's own 0.60 floor was held to before it
+    shipped -- see scripts/confidence_sizing_backtest.py). Revisit once
+    enough Agentic AI history with a real confidence column exists to
+    bucket by.
 
   - The news agent (app.ai.news, 25 Oct 2026) -- the headline-fetching and
     deterministic severe-event half of the news agent described above.
@@ -1490,11 +1505,21 @@ def open_agentic_trade(
     settings: AgenticAISettings,
     smartapi: Any,
     option_finder: Any,
+    confidence: Optional[float] = None,
 ) -> Optional[StrategyTrade]:
     """Resolves a contract, computes stop/target/quantity entirely in
     Python (see module docstring), and opens the StrategyTrade row. The
     model's own action/reasoning are persisted for audit; nothing it says
-    about risk is read, because it was never asked for a risk number."""
+    about risk is read, because it was never asked for a risk number.
+
+    confidence is the Orchestrator's own stated confidence for THIS
+    decision (29 Oct 2026) -- persisted purely for later analysis, exactly
+    like ai_confidence already is for every other AI strategy in this
+    codebase (see app.ai.originator's own use of the same column). Gates
+    nothing here and never will on its own merit alone -- see this
+    module's own docstring for why a confidence FLOOR is a separate,
+    deliberately deferred decision from simply no longer discarding the
+    number."""
     option_type = "CE" if action == "BUY_CE" else "PE"
     signal = Signal.BUY_CE if option_type == "CE" else Signal.BUY_PE
 
@@ -1581,6 +1606,7 @@ def open_agentic_trade(
         origin=AGENTIC_AI_ORIGIN,
         ai_action=action,
         ai_reasoning=reasoning,
+        ai_confidence=confidence,
     )
     db.add(trade)
     db.commit()
@@ -1592,7 +1618,7 @@ def open_agentic_trade(
         + (" (forced to the paper-only minimum lot -- see reasoning)" if forced_minimum_lot else ""),
         payload={
             "trade_id": trade.trade_id, "reasoning": reasoning, "lots": lots,
-            "forced_minimum_lot": forced_minimum_lot,
+            "forced_minimum_lot": forced_minimum_lot, "confidence": confidence,
         },
     )
     logger.info(
@@ -1682,7 +1708,10 @@ def check_agentic_entry(
         )
         return None
 
-    return open_agentic_trade(db, index, parsed.action, parsed.reasoning, settings, smartapi, option_finder)
+    return open_agentic_trade(
+        db, index, parsed.action, parsed.reasoning, settings, smartapi, option_finder,
+        confidence=parsed.confidence,
+    )
 
 
 def check_agentic_exits(
