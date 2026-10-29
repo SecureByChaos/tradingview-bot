@@ -120,6 +120,36 @@ _GIVEBACK_STOP_FLOOR_PERCENT = 12.0
 _GIVEBACK_STOP_RATIO = 0.30
 _GIVEBACK_STOP_ORIGINS = frozenset({"QUICK_SCALP", "AUTONOMOUS_AI", "AGENTIC_AI"})
 
+# AGENTIC_AI only, 29 Oct 2026 -- a real trade's own MFE never once cleared
+# positive territory across its whole 34-minute hold before running to its
+# full -16.76% stop (StrategyTrade.highest_price stayed below entry_price
+# the entire time). GIVEBACK_STOP above only protects a trade that had
+# something real to give back; this is the mirror case, a trade that never
+# showed the first sign of working at all.
+#
+# A standard, real technique practitioners use for exactly this shape -- a
+# "time stop" or "scratch rule": exit early near breakeven/small-loss once
+# the expected confirmation fails to show up within a short window, rather
+# than riding the full stop on a thesis that never worked. Sources describe
+# this as running ALONGSIDE a price stop (whichever triggers first), which
+# is exactly how this is wired below -- it is checked in the same 30s tick
+# as the plain STOPLOSS/TARGET/GIVEBACK_STOP checks, as an earlier-firing
+# alternative to the plain stop, never a replacement for it.
+#
+# _AGENTIC_SCRATCH_WINDOW_MINUTES/_AGENTIC_SCRATCH_MFE_FLOOR_PERCENT are
+# reasoned starting points, NOT backtested against real Agentic AI history
+# -- this strategy is days old and has nowhere near the trade count this
+# project's own standard (a bootstrap CI on real closed trades) needs
+# before trusting a threshold. Revisit both once enough Agentic AI history
+# exists, same discipline every other new threshold in this codebase
+# carries before real data looks at it. The window is deliberately much
+# shorter than AI Origination's own STALL_EXIT (60 min, below) -- that one
+# catches a trade that's merely gone flat; this one targets a trade that
+# never showed even a brief, real favorable tick, which is detectable much
+# sooner.
+_AGENTIC_SCRATCH_WINDOW_MINUTES = 15
+_AGENTIC_SCRATCH_MFE_FLOOR_PERCENT = 1.0
+
 # Fallback only -- PlatformSettings.trading_start_time/square_off_time (Settings
 # > General) are the real, admin-editable values. These match what was
 # hardcoded before 19 Aug 2026 (AI Origination's own _TRADING_START_HOUR/
@@ -705,6 +735,32 @@ class MultiStrategyTradeManager:
                     elapsed_minutes = (now_ist - entry_time_ist).total_seconds() / 60 if entry_time_ist else 0
                     if elapsed_minutes >= _STALL_WINDOW_MINUTES and abs(trade.pnl_percent) <= _STALL_BAND_PERCENT:
                         reason = ExitReason.STALL_EXIT
+
+                # AGENTIC_AI only -- see _AGENTIC_SCRATCH_* constants' own
+                # comment above for the real incident and the real-trader
+                # "time stop"/"scratch rule" this mirrors. Fires only on a
+                # trade that is BOTH currently negative AND has never once
+                # shown a real favorable tick (MFE below the floor) -- a
+                # trade that's merely gone flat while still non-negative, or
+                # one that moved favorably at some point and is only now
+                # pulling back, is a different situation this check leaves
+                # alone (GIVEBACK_STOP above already covers a real pullback
+                # from a real peak).
+                if (
+                    reason is None
+                    and trade.origin == "AGENTIC_AI"
+                    and trade.entry_price > 0
+                    and trade.pnl_percent is not None
+                    and trade.pnl_percent < 0
+                ):
+                    entry_time_ist = to_ist(trade.entry_time)
+                    elapsed_minutes = (now_ist - entry_time_ist).total_seconds() / 60 if entry_time_ist else 0
+                    mfe_percent = (trade.highest_price - trade.entry_price) / trade.entry_price * 100.0
+                    if (
+                        elapsed_minutes >= _AGENTIC_SCRATCH_WINDOW_MINUTES
+                        and mfe_percent < _AGENTIC_SCRATCH_MFE_FLOOR_PERCENT
+                    ):
+                        reason = ExitReason.AGENTIC_SCRATCH_EXIT
 
                 if reason is None and (now_ist.hour, now_ist.minute) >= square_off_hm:
                     reason = ExitReason.TIME_EXIT

@@ -261,6 +261,69 @@ and nothing schedules it. What exists:
          the full reasoning on why this origin fits the same shape
          QUICK_SCALP/AUTONOMOUS_AI already proved it on.
 
+    29 Oct 2026, third real-evidence pass, a genuinely different failure
+    shape from the two above: a Nifty BUY_CE entered on a "reasonably
+    strong bullish setup" (bullish EMAs, established trend, clean
+    directional movement) never once showed a positive tick -- MFE stayed
+    negative across its entire 34-minute hold before running to its full
+    -16.76% stop. Not a giveback (there was never a peak to give back);
+    a thesis that was simply wrong from the first tick. Researched how
+    real intraday traders handle exactly this shape before building
+    anything, per explicit instruction to find something "practical and
+    must be applied by traders" rather than invent a mechanism from one
+    incident: a "time stop" / "scratch rule" -- exit early near breakeven
+    once the expected confirmation fails to show up within a short window,
+    run ALONGSIDE the price stop rather than replacing it -- is a standard,
+    widely-used real technique for this, and this project already has a
+    precedent for the concept in a different strategy (Quick Scalp's own
+    SCALP_TIME_STOP, narrowed 8 Sep 2026 to fire only when a position is
+    "still flat/negative" at its own 3-minute mark).
+
+    Added: app.multi_strategy._AGENTIC_SCRATCH_WINDOW_MINUTES (15) /
+    _AGENTIC_SCRATCH_MFE_FLOOR_PERCENT (1.0) -- a trade that is currently
+    negative AND has never once shown a real favorable tick (its own
+    highest_price has stayed within 1% of entry) by 15 minutes in now
+    exits via the new ExitReason.AGENTIC_SCRATCH_EXIT, checked every 30s by
+    the same shared monitor as GIVEBACK_STOP/STOPLOSS/TARGET for this
+    origin -- not gated on the 5-minute exit-agent cycle, since a time stop
+    needs to be fast, same reasoning GIVEBACK_STOP already established.
+    Deliberately does NOT touch a trade that moved favorably at some point
+    and is only now pulling back from a real peak -- that's GIVEBACK_STOP's
+    job, not this one's; the two conditions (never-positive vs.
+    given-back-from-a-peak) are mutually exclusive by construction (MFE
+    below the scratch floor vs. MFE above the giveback floor), so they can
+    never compete for the same trade. Both constants are reasoned starting
+    points, NOT backtested against real Agentic AI history -- this
+    strategy is days old and has nowhere near the sample size this
+    project's own standard needs before trusting a threshold; revisit once
+    enough history exists, same discipline every other new number in this
+    codebase carries before real data looks at it.
+
+    Deliberately NOT built, researched and set aside with reasons rather
+    than silently skipped: (1) requiring a confirmed structural break
+    (e.g. a completed candle close beyond a level) before any entry at
+    all -- real traders do use this, but this exact codebase already
+    tested a close cousin of it for AI Origination's own sibling
+    population (scripts/break_confirmation_backtest.py, 12 Aug 2026) and
+    found it NOT SUPPORTED; importing it here without dedicated evidence
+    for this population would repeat a conclusion this project already
+    has reason to doubt. (2) Probe/scale-in entries (enter a smaller
+    position first, add only on confirmation) -- also a standard real
+    technique, but a materially bigger architectural change (splitting
+    entry into stages, tracking a confirmation trigger against the
+    existing deterministic position-sizing agent) than this pass's scope;
+    worth a dedicated follow-up if the scratch rule alone doesn't prove
+    sufficient. (3) A confidence floor on the Orchestrator's own decision
+    -- found, while investigating this incident, that AgenticAISettings
+    computes a confidence score on every decision and neither stores it on
+    the trade nor gates on it at all (the "AI Confidence" column reads
+    blank in every export row for this strategy, confirmed by inspection,
+    not an export artifact). A real, separate gap, named here rather than
+    silently fixed in the same pass as the scratch rule -- it needs its own
+    change (persist ai_confidence on open_agentic_trade, decide a starting
+    floor) and its own decision on what starting value to use, since this
+    strategy has no backtest of its own yet to validate one against.
+
   - The news agent (app.ai.news, 25 Oct 2026) -- the headline-fetching and
     deterministic severe-event half of the news agent described above.
     Fetches recent India-market headlines from free, keyless RSS feeds. A

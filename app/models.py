@@ -148,6 +148,19 @@ class ExitReason(str, Enum):
     # generic and any future strategy could reuse it the same way TIME_EXIT
     # already is, this is just its first caller.
     NEWS_KILL_SWITCH = "NEWS_KILL_SWITCH"
+    # AGENTIC_AI only (app/multi_strategy.py), 29 Oct 2026 -- a real trade's
+    # MFE never once cleared positive territory across its whole 34-minute
+    # hold before running to its full -16.76% stop. A standard, widely-used
+    # real trading technique ("time stop" / "scratch rule": exit early near
+    # breakeven/small-loss once the expected confirmation fails to show up,
+    # rather than riding the full stop on a thesis that never worked at
+    # all), checked every 30s by the shared monitor alongside GIVEBACK_STOP
+    # for this origin, independent of the 5-minute exit-agent cycle.
+    # Distinct from STOPLOSS (the wider, slower backstop that still applies
+    # underneath this) and from Quick Scalp's own, differently-parameterized
+    # SCALP_TIME_STOP -- same "every mechanism gets its own value" rule this
+    # project applies everywhere so each can be measured on its own.
+    AGENTIC_SCRATCH_EXIT = "AGENTIC_SCRATCH_EXIT"
 
 
 class WebhookPayload(BaseModel):
