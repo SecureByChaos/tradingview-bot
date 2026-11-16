@@ -295,6 +295,88 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Full-history loss analysis: where the three live strategies fail -- analysis only, nothing built (15 Nov 2026)
+
+**Requested**: "How can we reduce losses... check where it is failing", against a full Trade History
+CSV export (789 closed trades, 3 Jul - 13 Nov 2026, all PAPER). Analysed with throwaway stdlib scripts
+against the export, not hand-read. **No code changed from this pass** -- the next step is waiting on a
+decision (see the end of this entry).
+
+**Headline**: net -Rs 1,77,742 overall, but Rs 1,36,027 of that is strategies already off (Signal,
+AI Origination, AI Alt, Validated Signal -- 349 trades, last entry 24 Sep). The three live strategies:
+440 trades, net -Rs 41,716.
+
+| Strategy | Trades | Win % | Gross (Rs) | Costs (Rs) | Net (Rs) |
+|---|---|---|---|---|---|
+| Autonomous AI | 256 | 38.3 | -2,921 | 19,452 | -22,372 |
+| Agentic AI | 82 | 40.2 | +1,458 | 7,096 | -5,638 |
+| Quick Scalp | 102 | 20.6 | -4,053 | 9,652 | -13,705 |
+
+**Findings, largest first:**
+
+1. **No gross edge -- costs are the loss.** Live-three gross is -Rs 5,515; costs are Rs 36,200
+   (~Rs 82/trade, 0.44% of capital deployed). Entries are roughly a coin flip before costs.
+2. **Never-confirmed trades are the whole loss.** 133 of 440 trades never reached +1% MFE and lost
+   Rs 1,04,034; the other 307 made Rs 62,319. Autonomous AI: 67 such trades, -Rs 57,845, mean -5.2%,
+   mostly closed by the model's own `AI_DISCRETION_EXIT` -- which only looks every ~5 min (its 5-15 min
+   holds via that exit: n=67, 13% wins, -Rs 48,048). Agentic AI: `AGENTIC_SCRATCH_EXIT` (15-min window)
+   fires after the damage -- 12 exits, mean -6.1%, worst -14.2%, MAE already -7% to -14% by then.
+3. **Autonomous AI time of day, consistent in all three months (Sep/Oct/Nov):** entries before 10:30:
+   69 trades, -Rs 21,682 (negative every month); 10:30-13:30: 94 trades, +Rs 14,387 (positive every
+   month); 13:30-14:30: 63 trades, -Rs 15,421 (negative every month). Bootstrap 90% CI on net% diff vs
+   midday: open `[-6.36, -1.28]` (reliable), 13:30-14:30 `[-5.30, +0.38]` (not quite). In-sample window
+   choice -- but lines up with the 31 Jul walk-forward's 11:00-14:00 finding.
+4. **Agentic AI loses on Nifty, not Bank Nifty:** Nifty 25 trades -Rs 9,835 (Nifty `BUY_CE` alone n=15,
+   -Rs 9,631), Bank Nifty 57 trades +Rs 4,197. CI on the difference `[-6.40, -0.76]` excludes zero, but
+   n=25 is thin.
+5. **Quick Scalp wins 1 in 5** against a 3.75%/2.5% construction that needs ~40%. 73 of 102 trades end
+   inside 5 minutes at a 12% win rate. Since the 8 Sep rebuild: Nifty 32 trades -Rs 8,747, Bank Nifty 32
+   trades +Rs 740 (difference not reliable, CI `[-2.04, +0.33]`).
+
+**What works:** `GIVEBACK_STOP` -- 35 exits, +Rs 53,361, all winners (27 Autonomous, 8 Agentic). Every
+live-strategy trade that reached 12% MFE finished green.
+
+**Counterfactual for finding 2 (in-sample, ignores 30s-tick slippage past the level):** a loss cap that
+exits at -X% while the trade has never been +1%. The part that is exact from the CSV (trades whose
+final MFE < 1%): Autonomous AI +Rs 13,646 at 5% / +Rs 24,587 at 3%; Agentic AI +Rs 8,011 at 5% /
++Rs 14,023 at 3%. For trades that later reached +1% the order of MFE vs MAE is unknown from an export:
+treating every one as stopped (= a plain hard stop) still leaves Autonomous AI positive at every level
+3-12% (+Rs 13,550 at 3%, +Rs 17,516 at 5%), but turns Agentic AI NEGATIVE (-Rs 7,497 at 5%) because
+several of its winners dipped 5%+ first. So the cap is robustly supported for Autonomous AI and needs a
+`strategy_trade_ticks` replay on production before it is trusted for Agentic AI.
+
+**Three earlier reads from the daily exports that this corrects:**
+
+- *Sub-12% giveback is NOT the dominant leak* (I had called it that from day-by-day anecdotes).
+  Autonomous AI trades peaking at 5-12% MFE are net positive as a group (62 trades); the 21 that ended
+  red cost Rs 13,643. Real, third-order.
+- *Cross-strategy duplicate entries are not a loss driver.* 31 of 82 Agentic trades had an Autonomous AI
+  entry on the same index+direction within 10 minutes; those Agentic trades netted +Rs 3,219.
+- *Confidence leans the right way but is unproven.* Agentic < 0.70: 31 trades, 29% wins, -Rs 8,710;
+  >= 0.70: 38 trades, about +Rs 2,400. CI `[-4.50, +1.19]` crosses zero.
+
+Also checked and discarded: "re-entry right after a loss" looked terrible at first (n=48, -Rs 20,852)
+but 39 of those were simply the other index's concurrent position, not a re-entry -- no finding.
+
+**A data-integrity problem found, not traced:** on 45 rows the stored `P&L %` disagrees with
+`P&L (Rs) / Capital` by more than 0.5pp -- 40 of them `AI_DISCRETION_EXIT` (26 Autonomous, 14 Agentic),
+e.g. a row recorded WIN, +Rs 109.50, with `P&L %` -1.96 (equal to its MAE). `close_trade` does recompute
+`pnl_percent` from the exit price, so the suspected cause is the 30s monitor's write session
+overwriting it after an LLM-driven close -- **unverified**. Rupee figures are right and are what this
+analysis used. Every `scripts/*_backtest.py` that reads `pnl_percent` is exposed to this for those exits.
+
+**Recommended, in order -- none built, none approved:**
+
+1. A never-confirmed loss cap on the 30s monitor (exit near -5% if the trade has never been +1%) for
+   Autonomous AI; the same cap in front of Agentic AI's 15-minute scratch rule only after a tick replay.
+2. Restrict Autonomous AI entries to 10:30-13:30, or at least block entries before 10:30.
+3. Turn Quick Scalp off on Nifty, or pause it.
+4. Watch Agentic AI on Nifty; pause it if the next ~20 trades look the same.
+
+Even all four together get the live system to roughly breakeven in-sample, not to profit -- the entries
+show no measured edge. The open question put to the user: build the tick-replay backtest for the loss
+cap first, to run on the production DB before any exit logic changes.
+
 ### `pull_option_candles.py` run for real against production -- found hardcoded to AI Origination only, generalized with `--origin` (2 Oct 2026, same day)
 
 **Run for real on production, directly after the backtest tooling above merged and deployed.** PART A
