@@ -150,6 +150,38 @@ _GIVEBACK_STOP_ORIGINS = frozenset({"QUICK_SCALP", "AUTONOMOUS_AI", "AGENTIC_AI"
 _AGENTIC_SCRATCH_WINDOW_MINUTES = 15
 _AGENTIC_SCRATCH_MFE_FLOOR_PERCENT = 1.0
 
+# AUTONOMOUS_AI only, 17 Nov 2026 -- recommendation #1 of the full-history
+# loss analysis (CLAUDE.md, 15 Nov 2026): 133 of 440 live trades across all
+# three live strategies never once reached +1% MFE before closing, a
+# combined -Rs 1,04,034; Autonomous AI alone accounted for 67 of those at
+# -Rs 57,845 (mean -5.2%), mostly closed by the model's own AI_DISCRETION_
+# EXIT only after the damage was already done -- that model is re-asked
+# HOLD/EXIT on a ~5-minute cycle, far slower than the 30s cadence this
+# backstop runs on.
+#
+# The counterfactual in that analysis (the "trades whose final MFE < 1%"
+# slice, exact from the real CSV export) found this cap net POSITIVE for
+# Autonomous AI at every floor tested 3-12% (+Rs 13,646 at 5%, +Rs 24,587 at
+# 3%) -- "robustly supported" per that analysis's own wording. The identical
+# cap turned NEGATIVE for Agentic AI at the same 5% floor (several of its
+# real winners dipped more than 5% before recovering, which this would have
+# cut off), and that analysis said plainly Agentic AI needs its own
+# strategy_trade_ticks replay before being trusted with this -- not done
+# here, so AGENTIC_AI is deliberately left out of scope. Quick Scalp wasn't
+# part of either side of that analysis and is also left out.
+#
+# Distinct from AGENTIC_SCRATCH_EXIT just above: same underlying idea (a
+# trade that never showed a real favorable tick), but that one fires on an
+# elapsed-TIME floor (15 min) regardless of how large the loss has gotten,
+# while this one fires on a LOSS floor alone with no time requirement, per
+# the analysis's own wording ("checked every 30 seconds... exit at about
+# -5% if the trade has never been up 1%"). Kept as two separate mechanisms
+# with two separate ExitReason values since they were validated
+# independently, on different populations, and must stay separately
+# measurable.
+_AUTONOMOUS_NEVER_CONFIRMED_LOSS_PERCENT = 5.0
+_AUTONOMOUS_NEVER_CONFIRMED_MFE_FLOOR_PERCENT = 1.0
+
 # Fallback only -- PlatformSettings.trading_start_time/square_off_time (Settings
 # > General) are the real, admin-editable values. These match what was
 # hardcoded before 19 Aug 2026 (AI Origination's own _TRADING_START_HOUR/
@@ -761,6 +793,23 @@ class MultiStrategyTradeManager:
                         and mfe_percent < _AGENTIC_SCRATCH_MFE_FLOOR_PERCENT
                     ):
                         reason = ExitReason.AGENTIC_SCRATCH_EXIT
+
+                # AUTONOMOUS_AI only -- see _AUTONOMOUS_NEVER_CONFIRMED_*
+                # constants' own comment above. Fires on a LOSS floor alone,
+                # no elapsed-time requirement -- a trade can hit this on the
+                # very first 30s tick after entry if it opens straight into
+                # an adverse move, unlike AGENTIC_SCRATCH_EXIT's 15-minute
+                # window for the analogous AGENTIC_AI check just above.
+                if (
+                    reason is None
+                    and trade.origin == "AUTONOMOUS_AI"
+                    and trade.entry_price > 0
+                    and trade.pnl_percent is not None
+                    and trade.pnl_percent <= -_AUTONOMOUS_NEVER_CONFIRMED_LOSS_PERCENT
+                ):
+                    mfe_percent = (trade.highest_price - trade.entry_price) / trade.entry_price * 100.0
+                    if mfe_percent < _AUTONOMOUS_NEVER_CONFIRMED_MFE_FLOOR_PERCENT:
+                        reason = ExitReason.AUTONOMOUS_NEVER_CONFIRMED_STOP
 
                 if reason is None and (now_ist.hour, now_ist.minute) >= square_off_hm:
                     reason = ExitReason.TIME_EXIT

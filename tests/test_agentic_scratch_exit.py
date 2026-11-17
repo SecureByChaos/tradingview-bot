@@ -152,12 +152,30 @@ def test_does_not_fire_while_still_non_negative(monkeypatch, db_session: Session
 
 
 def test_does_not_apply_to_other_origins(monkeypatch, db_session: Session) -> None:
-    for origin in ("QUICK_SCALP", "AUTONOMOUS_AI", "SIGNAL"):
+    # AUTONOMOUS_AI is handled separately below: since 17 Nov 2026 it has
+    # its OWN, differently-shaped never-confirmed mechanism (a loss floor,
+    # not this time window), which fires under these exact same numbers --
+    # so a blanket "stays open" assertion no longer holds for it, even
+    # though THIS mechanism (the scratch rule) still correctly never fires
+    # for it.
+    for origin in ("QUICK_SCALP", "SIGNAL"):
         db_session.query(StrategyTrade).delete()
         db_session.commit()
         _open_trade(db_session, origin=origin, entry_price=100.0, stoploss=85.0)
         trade = _run(monkeypatch, db_session, _ENTRY_TIME_IST + timedelta(minutes=20), [95.0])
         assert trade.status == TradeStatus.OPEN, f"scratch rule must not apply to {origin}"
+
+
+def test_does_not_apply_to_autonomous_ai_even_though_it_also_closes(monkeypatch, db_session: Session) -> None:
+    # Same numbers as the loop above (entry 100, stop 85, -5% at t+20min,
+    # MFE never cleared 1%) -- AUTONOMOUS_AI now closes, but via its own
+    # AUTONOMOUS_NEVER_CONFIRMED_STOP mechanism (app.multi_strategy), never
+    # via this one. See tests/test_autonomous_never_confirmed_stop.py for
+    # that mechanism's own dedicated coverage.
+    _open_trade(db_session, origin="AUTONOMOUS_AI", entry_price=100.0, stoploss=85.0)
+    trade = _run(monkeypatch, db_session, _ENTRY_TIME_IST + timedelta(minutes=20), [95.0])
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == ExitReason.AUTONOMOUS_NEVER_CONFIRMED_STOP.value
 
 
 def test_still_falls_through_to_plain_stoploss_when_actually_hit(monkeypatch, db_session: Session) -> None:

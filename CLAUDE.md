@@ -295,6 +295,97 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI gets a never-confirmed loss cap, checked every 30 seconds -- implements recommendation #1 of the 15 Nov 2026 analysis (17 Nov 2026, same day)
+
+**Requested**: "Add a loss cap for trades that never confirm, checked every 30 seconds: exit at about -5%
+if the trade has never been up 1%. Fix this." -- recommendation #1 from the 15 Nov 2026 full-history loss
+analysis (see the entry directly below this one): 133 of 440 real trades across all three live strategies
+never once reached +1% MFE before closing, for a combined -Rs 1,04,034; Autonomous AI alone accounted for
+67 of those at -Rs 57,845 (mean -5.2%). That analysis's own counterfactual (the exact "final MFE < 1%"
+slice from the real CSV export) found a loss cap net POSITIVE for Autonomous AI at every floor tested
+3-12% (+Rs 13,646 at 5%, +Rs 24,587 at 3%) -- "robustly supported" in its own words -- but the SAME cap at
+the SAME 5% floor turned Agentic AI NEGATIVE (-Rs 7,497 at 5%, several of its real winners dipped more
+than 5% first) and that analysis said plainly Agentic AI needs its own `strategy_trade_ticks` replay
+before being trusted with this.
+
+**Scoped to Autonomous AI only, per that analysis's own conclusion -- not "all three live strategies."**
+Agentic AI is deliberately left out (the tick replay the analysis called for has not been run); Quick
+Scalp was never part of either side of that analysis either. If the user's framing is read as covering
+every strategy, this is the one place this pass deviated from it, on the strength of the same analysis the
+request itself invoked -- the recommendation's own text already drew this line
+("...for Agentic AI only after a tick replay").
+
+**Implementation** (`app/multi_strategy.py`'s shared `monitor_open_trades`, the existing 30-second
+`trade-monitor` job -- no new scheduler job needed, this is the exact cadence the request asked for): new
+`_AUTONOMOUS_NEVER_CONFIRMED_LOSS_PERCENT = 5.0` / `_AUTONOMOUS_NEVER_CONFIRMED_MFE_FLOOR_PERCENT = 1.0`,
+checked immediately after the existing `AGENTIC_SCRATCH_EXIT` check in the same long-side branch: if
+`trade.origin == "AUTONOMOUS_AI"` and `trade.pnl_percent <= -5.0` and the trade's own MFE
+(`(highest_price - entry_price) / entry_price * 100`) has never cleared 1%, it closes immediately with new
+`ExitReason.AUTONOMOUS_NEVER_CONFIRMED_STOP`. **Deliberately distinct from `AGENTIC_SCRATCH_EXIT`**, which
+answers the same underlying question (never confirmed) on an elapsed-TIME floor (15 minutes) regardless of
+how large the loss has gotten -- this one fires on a LOSS floor alone with **no elapsed-time requirement**,
+exactly as specified ("checked every 30 seconds... exit at about -5%"): a trade can close on the very first
+tick after entry if it opens straight into an adverse move. Falls through correctly to the plain `STOPLOSS`/
+`TARGET`/`TRAIL_EXIT`/`GIVEBACK_STOP` checks already computed earlier in the same branch when any of those
+fire first (e.g. a trade whose own real stop sits tighter than -5%).
+
+**A real pre-existing test needed fixing, not just a new one adding.** `tests/test_agentic_scratch_exit.py`'s
+own `test_does_not_apply_to_other_origins` opened an `AUTONOMOUS_AI` trade with the exact same numbers
+(entry 100, stop 85, -5% at t+20min, MFE never cleared 1%) specifically to prove `AGENTIC_SCRATCH_EXIT`
+doesn't apply to it -- that part is still true, but the trade no longer stays `OPEN` the way the test's
+blanket assertion expected, since it now closes via this new, different mechanism. Split into two tests:
+the loop now only covers `QUICK_SCALP`/`SIGNAL` (which really do stay open), plus a new dedicated test
+confirming `AUTONOMOUS_AI` closes via `AUTONOMOUS_NEVER_CONFIRMED_STOP` specifically, not
+`AGENTIC_SCRATCH_EXIT` -- proving the scratch rule itself still correctly never fires for it.
+
+10 new tests: `tests/test_autonomous_never_confirmed_stop.py` (9, new file -- fires on the very first tick
+with no time window, the exact loss-floor boundary, does not fire above the floor, does not fire once a
+real favorable tick (MFE >= 1%) occurred at any point, does not fire while only mildly negative, does NOT
+apply to `AGENTIC_AI`/`QUICK_SCALP`/`SIGNAL`/`AI_ORIGIN_OPENAI`/`VALIDATED_SIGNAL`, still falls through to
+`STOPLOSS` when the real stop is tighter, still exits at `TARGET` when reached first) and 1 in
+`tests/test_agentic_scratch_exit.py` (the split described above). Full suite: 1327 collected, 1326 passed,
+1 pre-existing unrelated wall-clock-dependent flake in `tests/test_validated_signal.py` (documented
+repeatedly elsewhere in this file -- confirmed present identically via `git stash` on this exact tree
+before this change, fails after Validated Signal's own 11:15/15:10 IST hard session-exit cutoff).
+`python -c "import app.main"` imports cleanly. Checked `tests/test_giveback_ratio_stop.py`'s own
+`AUTONOMOUS_AI` cases directly -- every one of them peaks well past 1% MFE before any reversal, so none
+of them collide with this new check.
+
+`/autonomous-ai`'s own banner updated to describe the new 30-second cap alongside the existing stop-loss/
+target paragraph it's checked next to, and the trade table gets its own distinct "Never-confirmed loss cap
+(backstop)" badge, matching this project's established one-badge-per-mechanism convention.
+
+**Verified live**: started the real app via uvicorn against a scratch SQLite DB, seeded a real
+`AUTONOMOUS_AI` trade (entry 100, stop 50, no prior favorable tick) directly into it, ran the REAL
+`MultiStrategyTradeManager.monitor_open_trades` (not a mock) against a single tick at 95.0, and confirmed
+the row persisted with `status=CLOSED, exit_reason='AUTONOMOUS_NEVER_CONFIRMED_STOP', exit_price=95.0,
+pnl_percent=-5.0`. Logged in over real HTTP and confirmed `/autonomous-ai` renders 200 with the new banner
+text and the new badge showing for that exact seeded trade, and that `/` and `/settings` still render 200
+unaffected.
+
+**Not validated by a dedicated backtest script** -- this is a direct application of the full-history
+analysis's own counterfactual numbers, the same evidentiary standard the entry-window gate directly below
+this one, the trend-age gate (11 Aug 2026), and the same-direction consecutive-loss gate (17 Aug 2026) all
+shipped on before any of them had one. The downside of being wrong is a missed paper trade, not a real
+loss -- this strategy is structurally paper-only.
+
+**Not verified against a real live cycle** -- this sandbox cannot run the scheduler against real
+SmartAPI credentials. After deploying, watch for `exit_reason='AUTONOMOUS_NEVER_CONFIRMED_STOP'` rows and
+confirm each one really did close at or beyond -5% with a `highest_price` that never cleared 1% above
+`entry_price`:
+
+```sql
+SELECT trade_id, entry_price, highest_price, exit_price, pnl_percent, exit_time
+FROM strategy_trades
+WHERE origin = 'AUTONOMOUS_AI' AND exit_reason = 'AUTONOMOUS_NEVER_CONFIRMED_STOP'
+ORDER BY exit_time DESC LIMIT 20;
+```
+
+If a real cycle shows this closing trades that a human reading the live chart would call "still developing"
+(e.g. closing right as a reversal back toward profit was starting), that's the signal this floor is too
+tight for live conditions and worth revisiting -- same as every other reasoned-starting-point threshold in
+this module.
+
 ### Autonomous AI gets a third pre-call hard gate -- entries restricted to 10:30-13:30 IST (17 Nov 2026)
 
 **Requested**: "Lets fix the autonomous ai trading time as you suggested earlier" -- implements

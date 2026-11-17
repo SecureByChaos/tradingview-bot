@@ -161,6 +161,20 @@ class ExitReason(str, Enum):
     # SCALP_TIME_STOP -- same "every mechanism gets its own value" rule this
     # project applies everywhere so each can be measured on its own.
     AGENTIC_SCRATCH_EXIT = "AGENTIC_SCRATCH_EXIT"
+    # AUTONOMOUS_AI only (app/multi_strategy.py), 17 Nov 2026 -- recommendation
+    # #1 of the full-history loss analysis (CLAUDE.md, 15 Nov 2026): 133 of
+    # 440 real trades across all three live strategies never once reached
+    # +1% MFE before closing; Autonomous AI alone accounted for 67 of those,
+    # -Rs 57,845, mean -5.2%, mostly closed late by the model's own
+    # AI_DISCRETION_EXIT re-asked only every ~5 minutes. The counterfactual
+    # in that analysis found a loss cap net POSITIVE for Autonomous AI at
+    # every floor 3-12% tested -- "robustly supported" in that analysis's own
+    # words. Distinct from AGENTIC_SCRATCH_EXIT above, which answers the same
+    # underlying question (never confirmed) but on an elapsed-TIME floor
+    # regardless of how large the loss has gotten; this one fires on a LOSS
+    # floor alone, with no time requirement, checked every 30s by the same
+    # shared monitor.
+    AUTONOMOUS_NEVER_CONFIRMED_STOP = "AUTONOMOUS_NEVER_CONFIRMED_STOP"
 
 
 class WebhookPayload(BaseModel):
