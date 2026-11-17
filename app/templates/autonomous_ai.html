@@ -7,8 +7,11 @@
   <p class="mb-2"><strong>What this is:</strong> rebuilt 3 Sep 2026 around a real deterministic feature
   engine -- ADX(14), EMA9/21 trend regime, and an intraday VWAP computed from a futures contract's real
   volume (index instruments themselves report zero volume, so this is the first VWAP anywhere in this
-  app). Two hard Python gates run before the model is ever asked: no entry during OPENING_VOLATILITY
-  (before 9:30) or SQUARE_OFF_ZONE (3:00 PM on); and no entry when ADX is below 18. Above that floor,
+  app). Three hard Python gates run before the model is ever asked: no entry during OPENING_VOLATILITY
+  (before 9:30) or SQUARE_OFF_ZONE (3:00 PM on); no entry when ADX is below 18; and, added 17 Nov 2026
+  from a full-history review of the real trade export, no entry outside 10:30 AM&ndash;1:30 PM IST, the
+  one window this strategy's own real trades have made money in -- every other hour of the day was a net
+  loss in every month observed. Above the ADX floor,
   ADX&nbsp;&ge;&nbsp;20, spot strictly above/below VWAP, and no extension into PDH/PDL remain the model's
   own stated criteria, not a Python gate. CHOP_ZONE (11:15 AM&ndash;1:30 PM) was a third hard Python block
   until 18 Sep 2026 -- removed after it blocked a real, tradeable Nifty rally outright -- and is now a

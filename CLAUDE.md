@@ -295,6 +295,66 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Autonomous AI gets a third pre-call hard gate -- entries restricted to 10:30-13:30 IST (17 Nov 2026)
+
+**Requested**: "Lets fix the autonomous ai trading time as you suggested earlier" -- implements
+recommendation #2 from the 15 Nov 2026 full-history analysis directly below this entry: entries before
+10:30 IST and from 13:30-14:30 IST were net negative in every observed month (Sep/Oct/Nov); entries
+10:30-13:30 were net positive in every observed month. A bootstrap 90% CI on the pre-10:30 comparison
+excludes zero (`[-6.36, -1.28]`); the 13:30-14:30 comparison's own CI does not quite (`[-5.30, +0.38]`) --
+restricted anyway on the strength of being negative in all three months regardless, per this project's
+own established standard of trusting cross-partition consistency over a single marginal CI.
+
+**Implementation** (`app/ai/autonomous.py`): new `_ENTRY_WINDOW_START = (10, 30)` /
+`_ENTRY_WINDOW_END = (13, 30)`, checked first among the now-three pre-call deterministic gates in
+`check_autonomous_entry` -- cheapest and most certain of the three, independent of `session_phase`
+(whose own CHOP_ZONE boundary, 11:15-13:30, is a different question) and independent of
+`_DEFAULT_TRADING_START`/`_TRADING_END` (09:45/15:00), which still bound the whole cycle. New
+`block_reason="ENTRY_WINDOW"`, same marker-row pattern as `SESSION_PHASE`/`ADX_FLOOR`. **Exits are
+explicitly NOT gated by this window** -- an already-open position keeps being managed on the normal
+HOLD/EXIT cycle at any time, same convention as Quick Scalp's own entry-only cutoff.
+
+Not validated by a dedicated backtest script -- a direct application of the full-history analysis's own
+numbers, the same evidentiary standard the trend-age gate (11 Aug 2026) and the same-direction
+consecutive-loss gate (17 Aug 2026) both shipped on before either had one. The downside of being wrong is
+a missed paper trade, not a real loss (this strategy is structurally paper-only).
+
+7 new tests in `tests/test_autonomous_ai.py` (131 total, was 124, confirmed via `git stash`): both boundaries' block/pass cases
+(inclusive start, exclusive end), the `block_reason="ENTRY_WINDOW"` persistence, and confirmation the
+`POSITION_OPEN` check still fires first regardless of the window. **A real bug found and fixed while
+adding these**: ~28 existing `check_autonomous_entry` tests passed `to_ist(utc_now())` as `now_ist` --
+real wall-clock time, not a fixed fixture -- which this new gate would have made intermittently failing
+(blocked whenever the suite happened to run outside 10:30-13:30 IST) rather than reliably passing. Fixed
+by introducing a shared `_IN_WINDOW_NOW` fixture (a fixed instant inside the window) and repointing every
+one of those call sites at it; one `run_autonomous_checks` end-to-end test (`..._still_enters_before_the_
+3pm_cutoff`) used a real 10:00 IST and needed moving to 10:45 to keep reaching the model; one history-
+prompt test needed `module.utc_now` itself pinned to the same fixed instant, since `_todays_closed_trades`
+calls that directly rather than deriving "now" from the `now_ist` parameter. Full suite: 1317 passed.
+`python -c "import app.main"` and `python -c "import app.ai.autonomous"` both import cleanly.
+
+`/autonomous-ai`'s banner updated to describe the new gate and its real numbers.
+
+**Verified live**: started the app against a scratch SQLite DB, logged in, confirmed `/autonomous-ai`
+renders 200 with the updated banner text and no Jinja errors, and confirmed `/` and `/settings` render
+unaffected. Called `check_autonomous_entry` directly against the real DB at 10:00 IST with a feature set
+that would otherwise pass every other gate -- confirmed it returns `None`, the option finder is never
+touched (no contract resolution, no model call), and the persisted row reads
+`block_reason='ENTRY_WINDOW'` with the expected reasoning text.
+
+**Not verified against a real live cycle** -- this sandbox cannot run the scheduler against real
+SmartAPI/LLM credentials. After deploying, confirm no new `AUTONOMOUS_AI` trade opens outside 10:30-13:30
+IST, and watch `autonomous_ai_logs` for `block_reason='ENTRY_WINDOW'` rows: if the model keeps wanting to
+open the same losing-direction trades just outside the window regardless (i.e. the restriction isn't
+actually removing the population it was built from), that's the signal this needs a real backtest or a
+different boundary, not that it should be left as a one-time, unverified fix.
+
+```sql
+SELECT timestamp, index_name, raw_decision, block_reason
+FROM autonomous_ai_logs
+WHERE block_reason = 'ENTRY_WINDOW'
+ORDER BY timestamp DESC LIMIT 20;
+```
+
 ### Full-history loss analysis: where the three live strategies fail -- analysis only, nothing built (15 Nov 2026)
 
 **Requested**: "How can we reduce losses... check where it is failing", against a full Trade History
