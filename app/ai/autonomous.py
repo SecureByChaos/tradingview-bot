@@ -112,13 +112,17 @@ the entry or exit prompt is built (see _compute_features):
     VOLATILITY (<09:30), MORNING_MOMENTUM (09:30-11:15), CHOP_ZONE
     (11:15-13:30), AFTERNOON_TREND (13:30-15:00), SQUARE_OFF_ZONE (>=15:00).
 
-Two deterministic hard gates block a fresh entry before any LLM call, per
-the document's own AutonomousOptionsAgent.evaluate_entry sample code
+Three deterministic hard gates block a fresh entry before any LLM call, two
+per the document's own AutonomousOptionsAgent.evaluate_entry sample code
 specifically (not every criterion the prompt text lists -- see
-_ENTRY_BLOCKED_SESSION_PHASES and _ADX_HARD_FLOOR):
+_ENTRY_BLOCKED_SESSION_PHASES and _ADX_HARD_FLOOR), plus a third added
+later from this module's own real history (_ENTRY_WINDOW_START/_END, see
+the dated entry below):
   - session_phase in {OPENING_VOLATILITY, SQUARE_OFF_ZONE} (CHOP_ZONE was
     removed from this set 18 Sep 2026 -- see the dated entry below)
   - ADX < 18
+  - outside 10:30-13:30 IST (17 Nov 2026 -- the one window this module's own
+    trade history is reliably profitable in; see the dated entry below)
 
 VWAP relation, ADX >= 20, and PDH/PDL proximity remain the model's own
 judgment call, stated as explicit criteria in SYSTEM_PROMPT_ENTRY -- the
@@ -126,10 +130,10 @@ document's own design keeps these as LLM criteria rather than Python hard
 gates, and this rebuild preserves that split rather than tightening it
 further.
 
-A THIRD deterministic check was added 4 Sep 2026, after the document's own
-design: EMA-regime/action alignment (_regime_matches_action). This one is
-necessarily a POST-decision check, not a pre-call gate like the two above
--- it depends on which direction the model actually chose. Real production
+A deterministic POST-decision check was added 4 Sep 2026, after the
+document's own design: EMA-regime/action alignment (_regime_matches_action).
+This one is necessarily a post-decision check, not a pre-call gate like the
+three above -- it depends on which direction the model actually chose. Real production
 data (Autonomous AI's first two live trades under this rebuild, both real
 losses' companion trade included) showed the model deciding BUY_PE while
 its own returned reasoning explicitly named the EMA regime as bullish/
@@ -306,6 +310,64 @@ at all), which is useful context for judging this prompt's real effect
 even though it no longer gates whether the model gets asked in the first
 place.
 
+A THIRD pre-call hard gate: entries restricted to the one window this
+module's own history is reliably profitable in (17 Nov 2026)
+------------------------------------------------------------------------------
+Requested directly ("fix the autonomous ai trading time"), following a
+full-history analysis of the real trade export (789 closed trades, 3 Jul-13
+Nov 2026 -- CLAUDE.md's 15 Nov 2026 entry) that bucketed this module's own
+entries by clock hour and found a pattern consistent across every month
+observed (Sep, Oct, Nov alike):
+
+  entries before 10:30 IST : 69 trades, -Rs 21,682 net, negative every month
+  entries 10:30-13:30 IST  : 94 trades, +Rs 14,387 net, positive every month
+  entries 13:30-14:30 IST  : 63 trades, -Rs 15,421 net, negative every month
+
+A bootstrap 90% CI on the pre-10:30 window's own net% versus the 10:30-13:30
+window excludes zero ([-6.36, -1.28]) -- reliable on its own terms. The
+13:30-14:30 comparison's own CI does NOT quite exclude zero ([-5.30,
++0.38]) -- weaker evidence on that half alone, stated plainly rather than
+rounded up to match the stronger half. Restricted anyway, on the strength
+of reading negative in all three observed months regardless of the single
+CI: this project's own established standard elsewhere treats consistency
+across partitions as real evidence independent of whether any one CI
+clears (setup_significance.py's own docstring makes the same argument for
+setup significance), and the downside of being wrong here is a missed
+paper trade, not a real loss.
+
+New _ENTRY_WINDOW_START/_ENTRY_WINDOW_END (10:30/13:30 IST) gate a fresh
+entry in check_autonomous_entry, checked first among the three pre-call
+gates since it is the cheapest and most certain of the three. Deliberately
+NOT the same boundaries as session_phase (CHOP_ZONE is 11:15-13:30 IST, a
+question about chop within a session regardless of clock time, not about
+which clock hours this module's own entries actually make money in) and NOT
+a change to _DEFAULT_TRADING_START/_TRADING_END (09:45/15:00), which still
+bound the whole cycle and are shared with the session-close/square-off
+logic -- this is a narrower, independent restriction layered inside that
+existing window, with its own block_reason="ENTRY_WINDOW" so it is
+distinguishable from SESSION_PHASE/ADX_FLOOR in any future query.
+
+Exits are explicitly NOT gated by this window -- an already-open position
+keeps being re-asked HOLD/EXIT on the normal cycle (check_autonomous_exits)
+regardless of what time it is, same convention as every other time-of-day
+restriction already in this codebase (e.g. Quick Scalp's own entry cutoff,
+which leaves its own exit check running unconditionally). Blocking a
+position from managing itself just because its entry window has since
+closed would be a materially different, much riskier change than
+restricting new entries, and was not asked for.
+
+Not validated by a dedicated backtest script the way the trend-age hard
+gate (11 Aug 2026) or the same-direction consecutive-loss gate (17 Aug
+2026) eventually were -- this is a direct application of the full-history
+analysis's own numbers, the same evidentiary standard those two gates
+shipped on before either had a dedicated script. Watch real decisions after
+this deploys: if `block_reason='ENTRY_WINDOW'` rows in `autonomous_ai_logs`
+keep showing the model wanting to open the same losing-direction trades it
+was blocked from just outside the window (i.e. the restriction isn't
+actually removing the population it was built from), that is the signal
+this needs a real backtest or a different boundary, not that it should be
+left as a one-time, unverified fix.
+
 EXIT MATRIX -- DETERMINISTIC RULES CHECKED BEFORE THE MODEL, IN ORDER
 --------------------------------------------------------------------------
 check_autonomous_exits checks these in sequence, each one closing the trade
@@ -440,6 +502,20 @@ _DEFAULT_TRADING_START = (9, 45)
 # Unchanged by the 3 Sep rebuild -- also matches the design document's own
 # SQUARE_OFF_ZONE boundary (>=15:00) exactly, so no conflict to resolve.
 _TRADING_END = (15, 0)
+
+# 17 Nov 2026: a fresh entry is only ever considered inside this window,
+# regardless of session_phase/ADX -- the one clock-hour range the 15 Nov
+# 2026 full-history analysis found this module's own real entries reliably
+# profitable in (positive every observed month); before and after it, every
+# observed month was net negative. See the module docstring's dated entry
+# for the real numbers and the bootstrap CI behind the choice. Deliberately
+# independent of _DEFAULT_TRADING_START/_TRADING_END above and of
+# session_phase's own boundaries (CHOP_ZONE is 11:15-13:30, a different
+# question) -- narrower than, and layered inside, the existing trading
+# window rather than replacing any of it. Exits are unaffected; an
+# already-open position is still managed on the normal cycle at any time.
+_ENTRY_WINDOW_START = (10, 30)
+_ENTRY_WINDOW_END = (13, 30)
 
 # ---------------------------------------------------------------------------
 # Feature engine constants -- from the 3 Sep 2026 external design document,
@@ -1427,6 +1503,28 @@ def check_autonomous_entry(
     # / VWAP / PDH-PDL proximity remain the model's own job, stated in
     # SYSTEM_PROMPT_ENTRY -- the document does not hard-gate those in Python
     # either, and this rebuild preserves that split.
+    #
+    # Checked first: the 17 Nov 2026 entry-window gate (see module docstring's
+    # dated entry), independent of session_phase/ADX and the cheapest of the
+    # three to evaluate.
+    now_hm = (now_ist.hour, now_ist.minute)
+    if now_hm < _ENTRY_WINDOW_START or now_hm >= _ENTRY_WINDOW_END:
+        logger.info(
+            "[AUTONOMOUS_AI] %s: Deterministic block -- outside entry window (%02d:%02d-%02d:%02d IST)",
+            index.symbol, _ENTRY_WINDOW_START[0], _ENTRY_WINDOW_START[1],
+            _ENTRY_WINDOW_END[0], _ENTRY_WINDOW_END[1],
+        )
+        record_entry_decision(
+            db, index_symbol=index.symbol, features=features, raw_decision="NONE",
+            block_reason="ENTRY_WINDOW",
+            reasoning=(
+                f"Blocked before any model call -- outside the "
+                f"{_ENTRY_WINDOW_START[0]:02d}:{_ENTRY_WINDOW_START[1]:02d}-"
+                f"{_ENTRY_WINDOW_END[0]:02d}:{_ENTRY_WINDOW_END[1]:02d} IST entry window "
+                "(15 Nov 2026 full-history analysis)"
+            ),
+        )
+        return None
     if features.session_phase in _ENTRY_BLOCKED_SESSION_PHASES:
         logger.info(
             "[AUTONOMOUS_AI] %s: Deterministic block -- session phase %s", index.symbol, features.session_phase

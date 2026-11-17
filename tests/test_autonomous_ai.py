@@ -11,6 +11,8 @@ from app.multi_strategy import MultiStrategyTradeManager
 from app.time_utils import IST, to_ist, utc_now
 from app.ai.autonomous import (
     _ADX_HARD_FLOOR,
+    _ENTRY_WINDOW_START,
+    _ENTRY_WINDOW_END,
     _BACKSTOP_STOP_PERCENT_NOMINAL,
     _BACKSTOP_TARGET_PERCENT_NOMINAL,
     _BREAKEVEN_VIOLATION_ACTIVATE_PERCENT,
@@ -48,6 +50,17 @@ from app.ai.autonomous import (
     run_autonomous_checks,
 )
 from app.market_data import ONE_MINUTE, Bar, load_bars, store_bars
+
+# A fixed, deterministic instant inside the 17 Nov 2026 entry window
+# (_ENTRY_WINDOW_START-_ENTRY_WINDOW_END IST) -- used as check_autonomous_
+# entry's `now_ist` wherever a test needs *some* valid "now" but isn't
+# itself testing time-of-day gating, so these tests don't become wall-clock
+# flaky now that an entry-window gate exists. Real current time
+# (to_ist(utc_now())) is kept for call sites that don't pass through that
+# gate (_build_exit_prompt, expiry math, _recent_history_text/_todays_
+# closed_trades' own "today" boundary).
+assert _ENTRY_WINDOW_START < (12, 0) < _ENTRY_WINDOW_END
+_IN_WINDOW_NOW = datetime(2026, 8, 31, 12, 0, tzinfo=IST)
 
 
 def _make_session() -> Session:
@@ -726,7 +739,7 @@ def test_check_entry_overridden_when_recent_move_is_marginal(monkeypatch):
     result = check_autonomous_entry(
         db, index,
         _make_features(fast_ema=56800.0, slow_ema=57000.0, recent_price_change_percent=-0.035),
-        to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
 
     assert result is None
@@ -746,7 +759,7 @@ def test_check_entry_not_overridden_when_recent_move_is_decisive(monkeypatch):
     result = check_autonomous_entry(
         db, index,
         _make_features(fast_ema=56800.0, slow_ema=57000.0, recent_price_change_percent=-0.4),
-        to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
 
     assert result is not None
@@ -768,7 +781,7 @@ def test_check_entry_not_overridden_when_recent_move_is_marginal_but_opposing(mo
     result = check_autonomous_entry(
         db, index,
         _make_features(fast_ema=56800.0, slow_ema=57000.0, recent_price_change_percent=0.05),
-        to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
 
     assert result is not None
@@ -790,7 +803,7 @@ def test_check_entry_logs_the_raw_direction_even_when_recent_move_overrides_it(m
     check_autonomous_entry(
         db, index,
         _make_features(fast_ema=56800.0, slow_ema=57000.0, recent_price_change_percent=-0.035),
-        to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     row = _only_log_row(db)
     assert row.raw_decision == "BUY_PE"
@@ -913,7 +926,7 @@ def test_check_entry_skips_when_position_already_open(monkeypatch):
 
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call the model")))
 
-    result = check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    result = check_autonomous_entry(db, index, _make_features(), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder)
     assert result is None
     assert option_finder.calls == 0
 
@@ -925,8 +938,121 @@ def test_check_entry_skips_when_no_features(monkeypatch):
     import app.ai.autonomous as module
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call the model")))
 
-    result = check_autonomous_entry(db, index, None, to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    result = check_autonomous_entry(db, index, None, _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder)
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Entry window gate (17 Nov 2026) -- block_reason="ENTRY_WINDOW". Checked
+# first among the three pre-call gates, independent of session_phase/ADX.
+# ---------------------------------------------------------------------------
+
+def test_check_entry_deterministic_block_before_entry_window(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call before the entry window")))
+
+    assert _ENTRY_WINDOW_START == (10, 30)
+    before_window = datetime(2026, 8, 31, 10, 0, tzinfo=IST)
+    result = check_autonomous_entry(db, index, _make_features(), before_window, _Settings(), FakeSmartAPI(), option_finder)
+    assert result is None
+
+
+def test_check_entry_deterministic_block_after_entry_window(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call after the entry window")))
+
+    assert _ENTRY_WINDOW_END == (13, 30)
+    after_window = datetime(2026, 8, 31, 13, 45, tzinfo=IST)
+    result = check_autonomous_entry(db, index, _make_features(), after_window, _Settings(), FakeSmartAPI(), option_finder)
+    assert result is None
+
+
+def test_check_entry_blocked_outside_window_logs_entry_window_reason(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call the model")))
+
+    before_window = datetime(2026, 8, 31, 9, 50, tzinfo=IST)
+    check_autonomous_entry(db, index, _make_features(), before_window, _Settings(), FakeSmartAPI(), option_finder)
+
+    row = _only_log_row(db)
+    assert row.raw_decision == "NONE"
+    assert row.block_reason == "ENTRY_WINDOW"
+    assert row.trade_id is None
+
+
+def test_check_entry_reaches_llm_at_entry_window_start_boundary(monkeypatch):
+    # The start boundary is inclusive -- exactly 10:30 is already inside.
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    calls = []
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: calls.append(1) or module._RawCall('{"decision": "NONE", "reasoning": "marginal"}', None, 5.0),
+    )
+
+    at_start = datetime(2026, 8, 31, 10, 30, tzinfo=IST)
+    result = check_autonomous_entry(db, index, _make_features(), at_start, _Settings(), FakeSmartAPI(), option_finder)
+    assert result is None  # NONE decision, but the model was actually reached
+    assert len(calls) == 1
+
+
+def test_check_entry_deterministic_block_at_entry_window_end_boundary(monkeypatch):
+    # The end boundary is exclusive -- exactly 13:30 is already outside.
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call exactly at the end boundary")))
+
+    at_end = datetime(2026, 8, 31, 13, 30, tzinfo=IST)
+    result = check_autonomous_entry(db, index, _make_features(), at_end, _Settings(), FakeSmartAPI(), option_finder)
+    assert result is None
+
+
+def test_check_entry_reaches_llm_just_inside_entry_window_end_boundary(monkeypatch):
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    option_finder = FakeOptionFinder(_make_contract())
+    calls = []
+    monkeypatch.setattr(
+        module, "_call_provider",
+        lambda *a, **k: calls.append(1) or module._RawCall('{"decision": "NONE", "reasoning": "marginal"}', None, 5.0),
+    )
+
+    just_inside = datetime(2026, 8, 31, 13, 29, tzinfo=IST)
+    result = check_autonomous_entry(db, index, _make_features(), just_inside, _Settings(), FakeSmartAPI(), option_finder)
+    assert result is None  # NONE decision, but the model was actually reached
+    assert len(calls) == 1
+
+
+def test_check_entry_window_gate_does_not_block_an_already_open_position(monkeypatch):
+    # The POSITION_OPEN check must still fire first, outside the entry
+    # window or not -- an open position's marker row keeps the dashboard's
+    # market-conditions read fresh regardless of this new gate.
+    import app.ai.autonomous as module
+    db = _make_session()
+    index = _make_index()
+    _add_trade(db, trade_id="t1")
+    option_finder = FakeOptionFinder(_make_contract())
+    monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call the model")))
+
+    before_window = datetime(2026, 8, 31, 9, 50, tzinfo=IST)
+    result = check_autonomous_entry(db, index, _make_features(), before_window, _Settings(), FakeSmartAPI(), option_finder)
+    assert result is None
+    row = _only_log_row(db)
+    assert row.block_reason == "POSITION_OPEN"
 
 
 def test_check_entry_reaches_llm_during_chop_zone(monkeypatch):
@@ -947,7 +1073,7 @@ def test_check_entry_reaches_llm_during_chop_zone(monkeypatch):
     )
 
     result = check_autonomous_entry(
-        db, index, _make_features(session_phase="CHOP_ZONE"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(session_phase="CHOP_ZONE"), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     assert result is None  # NONE decision, but the model was actually reached
     assert len(calls) == 1
@@ -961,7 +1087,7 @@ def test_check_entry_deterministic_block_on_opening_volatility(monkeypatch):
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call during OPENING_VOLATILITY")))
 
     result = check_autonomous_entry(
-        db, index, _make_features(session_phase="OPENING_VOLATILITY"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(session_phase="OPENING_VOLATILITY"), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     assert result is None
 
@@ -974,7 +1100,7 @@ def test_check_entry_deterministic_block_on_square_off_zone(monkeypatch):
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call during SQUARE_OFF_ZONE")))
 
     result = check_autonomous_entry(
-        db, index, _make_features(session_phase="SQUARE_OFF_ZONE"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(session_phase="SQUARE_OFF_ZONE"), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     assert result is None
 
@@ -988,7 +1114,7 @@ def test_check_entry_deterministic_block_below_adx_hard_floor(monkeypatch):
 
     assert _ADX_HARD_FLOOR == 18.0
     result = check_autonomous_entry(
-        db, index, _make_features(adx=17.9), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(adx=17.9), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     assert result is None
 
@@ -1001,7 +1127,7 @@ def test_check_entry_deterministic_block_on_missing_adx(monkeypatch):
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call with missing ADX")))
 
     result = check_autonomous_entry(
-        db, index, _make_features(adx=None), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(adx=None), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     assert result is None
 
@@ -1015,7 +1141,7 @@ def test_check_entry_reaches_llm_at_or_above_adx_hard_floor_in_an_allowed_phase(
                          lambda *a, **k: module._RawCall('{"decision": "NONE", "reasoning": "borderline"}', None, 5.0))
 
     result = check_autonomous_entry(
-        db, index, _make_features(adx=18.0, session_phase="MORNING_MOMENTUM"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(adx=18.0, session_phase="MORNING_MOMENTUM"), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     assert result is None  # NONE decision, but the model WAS reached (no assertion exploded)
 
@@ -1077,7 +1203,7 @@ def test_check_entry_overridden_when_regime_contradicts_decision(monkeypatch):
     )
 
     result = check_autonomous_entry(
-        db, index, _make_features(fast_ema=23910.87, slow_ema=23908.96), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(fast_ema=23910.87, slow_ema=23908.96), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
 
     assert result is None
@@ -1095,7 +1221,7 @@ def test_check_entry_not_overridden_when_regime_agrees_with_decision(monkeypatch
     )
 
     result = check_autonomous_entry(
-        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
 
     assert result is not None
@@ -1115,7 +1241,7 @@ def test_check_entry_opens_a_trade_on_buy_decision(monkeypatch):
     # see test_check_entry_overridden_when_regime_contradicts_decision for
     # the case where it doesn't.
     result = check_autonomous_entry(
-        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder,
+        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(price=100.0), option_finder,
     )
     assert result is not None
     assert result.signal == "BUY_PE"
@@ -1131,7 +1257,7 @@ def test_check_entry_none_decision_opens_nothing(monkeypatch):
     monkeypatch.setattr(module, "_call_provider",
                          lambda *a, **k: module._RawCall('{"decision": "NONE", "reasoning": "nothing clear"}', None, 12.0))
 
-    result = check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder)
+    result = check_autonomous_entry(db, index, _make_features(), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(price=100.0), option_finder)
     assert result is None
     assert option_finder.calls == 0
 
@@ -1144,7 +1270,7 @@ def test_check_entry_provider_error_opens_nothing(monkeypatch):
 
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: module._RawCall(None, "HTTP 500", None))
 
-    result = check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder)
+    result = check_autonomous_entry(db, index, _make_features(), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(price=100.0), option_finder)
     assert result is None
     assert option_finder.calls == 0
 
@@ -1174,7 +1300,7 @@ def test_check_entry_logs_deterministic_session_phase_block(monkeypatch):
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no LLM call")))
 
     check_autonomous_entry(
-        db, index, _make_features(session_phase="OPENING_VOLATILITY"), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(session_phase="OPENING_VOLATILITY"), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     row = _only_log_row(db)
     assert row.raw_decision == "NONE"
@@ -1189,7 +1315,7 @@ def test_check_entry_logs_deterministic_adx_floor_block():
     option_finder = FakeOptionFinder(_make_contract())
 
     check_autonomous_entry(
-        db, index, _make_features(adx=17.9), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(adx=17.9), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     row = _only_log_row(db)
     assert row.raw_decision == "NONE"
@@ -1207,7 +1333,7 @@ def test_check_entry_logs_a_none_decision_with_full_reasoning(monkeypatch):
         lambda *a, **k: module._RawCall('{"decision": "NONE", "confidence": 0.3, "reasoning": "no clean setup"}', None, 9.5),
     )
 
-    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    check_autonomous_entry(db, index, _make_features(), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder)
     row = _only_log_row(db)
     assert row.raw_decision == "NONE"
     assert row.block_reason is None
@@ -1223,7 +1349,7 @@ def test_check_entry_logs_provider_error(monkeypatch):
     option_finder = FakeOptionFinder(_make_contract())
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: module._RawCall(None, "HTTP 500", None))
 
-    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    check_autonomous_entry(db, index, _make_features(), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder)
     row = _only_log_row(db)
     assert row.raw_decision == "ERROR"
     assert row.reasoning == "HTTP 500"
@@ -1245,7 +1371,7 @@ def test_check_entry_logs_the_raw_direction_even_when_ema_regime_overrides_it(mo
     )
 
     check_autonomous_entry(
-        db, index, _make_features(fast_ema=57000.0, slow_ema=56800.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(fast_ema=57000.0, slow_ema=56800.0), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     row = _only_log_row(db)
     assert row.raw_decision == "BUY_PE"
@@ -1264,7 +1390,7 @@ def test_check_entry_logs_execution_failed_when_open_trade_declines(monkeypatch)
     )
 
     result = check_autonomous_entry(
-        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder,
+        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder,
     )
     assert result is None
     row = _only_log_row(db)
@@ -1284,7 +1410,7 @@ def test_check_entry_logs_trade_id_on_a_real_opened_trade(monkeypatch):
     )
 
     result = check_autonomous_entry(
-        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder,
+        db, index, _make_features(fast_ema=56800.0, slow_ema=57000.0), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(price=100.0), option_finder,
     )
     assert result is not None
     row = _only_log_row(db)
@@ -1307,7 +1433,7 @@ def test_check_entry_logs_position_open_marker_when_a_position_is_already_open(m
     option_finder = FakeOptionFinder(_make_contract())
     monkeypatch.setattr(module, "_call_provider", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not call the model")))
 
-    result = check_autonomous_entry(db, index, _make_features(adx=27.4), to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    result = check_autonomous_entry(db, index, _make_features(adx=27.4), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder)
     assert result is None
     row = _only_log_row(db)
     assert row.raw_decision == "NONE"
@@ -1322,7 +1448,7 @@ def test_check_entry_does_not_log_when_position_open_and_no_features():
     _add_trade(db, trade_id="t1")
     option_finder = FakeOptionFinder(_make_contract())
 
-    result = check_autonomous_entry(db, index, None, to_ist(utc_now()), _Settings(), FakeSmartAPI(), option_finder)
+    result = check_autonomous_entry(db, index, None, _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(), option_finder)
     assert result is None
     assert list(db.scalars(select(AutonomousAILog))) == []
 
@@ -1438,8 +1564,16 @@ def test_check_entry_includes_history_in_the_prompt_sent_to_the_provider(monkeyp
     db = _make_session()
     index = _make_index()
     option_finder = FakeOptionFinder(_make_contract())
+    # "Today" relative to _IN_WINDOW_NOW (31 Aug 2026), not real current
+    # time. _todays_closed_trades' own SQL filter calls module.utc_now()
+    # directly (not the now_ist parameter), so that must also be pinned to
+    # the same fixed instant -- otherwise a trade exit_time aligned with
+    # _IN_WINDOW_NOW's calendar day still falls outside the function's own
+    # internal "last 30 hours from the real clock" lookback.
+    _IN_WINDOW_NOW_UTC = _IN_WINDOW_NOW.astimezone(UTC)
+    monkeypatch.setattr(module, "utc_now", lambda: _IN_WINDOW_NOW_UTC)
     _add_trade(db, trade_id="pe1", index_symbol="BANKNIFTY", signal="BUY_PE", status=TradeStatus.CLOSED,
-               pnl_percent=-4.0, exit_time=utc_now() - timedelta(hours=1), exit_reason="AUTONOMOUS_STALL_EXIT")
+               pnl_percent=-4.0, exit_time=_IN_WINDOW_NOW_UTC - timedelta(hours=1), exit_reason="AUTONOMOUS_STALL_EXIT")
 
     captured = {}
 
@@ -1449,7 +1583,7 @@ def test_check_entry_includes_history_in_the_prompt_sent_to_the_provider(monkeyp
 
     monkeypatch.setattr(module, "_call_provider", fake_call_provider)
 
-    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder)
+    check_autonomous_entry(db, index, _make_features(), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(price=100.0), option_finder)
 
     assert "Today's Autonomous AI history on this index so far:" in captured["user_prompt"]
     assert "BUY_PE: 1 closed today" in captured["user_prompt"]
@@ -1469,7 +1603,7 @@ def test_check_entry_prompt_omits_history_section_with_nothing_closed_today(monk
 
     monkeypatch.setattr(module, "_call_provider", fake_call_provider)
 
-    check_autonomous_entry(db, index, _make_features(), to_ist(utc_now()), _Settings(), FakeSmartAPI(price=100.0), option_finder)
+    check_autonomous_entry(db, index, _make_features(), _IN_WINDOW_NOW, _Settings(), FakeSmartAPI(price=100.0), option_finder)
 
     assert "Today's Autonomous AI history" not in captured["user_prompt"]
 
@@ -1928,11 +2062,12 @@ def test_run_autonomous_checks_still_enters_before_the_3pm_cutoff(monkeypatch):
     import app.ai.autonomous as module
     from app.ai.repository import create_settings
 
-    # 10:00 IST -- MORNING_MOMENTUM. (CHOP_ZONE, 11:15-13:30, is no longer
-    # deterministically blocked as of 18 Sep 2026 -- either window would now
-    # reach the model -- this just keeps the test unambiguous about which
-    # phase it's exercising.)
-    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 10, 0, tzinfo=IST))
+    # 10:45 IST -- MORNING_MOMENTUM, and inside the 17 Nov 2026 entry window
+    # (10:30-13:30) so this test still reaches the model. (CHOP_ZONE,
+    # 11:15-13:30, is no longer deterministically blocked as of 18 Sep 2026
+    # -- either phase would reach the model -- this just keeps the test
+    # unambiguous about which phase it's exercising.)
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 8, 31, 10, 45, tzinfo=IST))
     db = _make_session()
     db.add(_make_index())
     create_settings(db, id=1, enabled=True, mode="LIVE", provider="openai")
@@ -1947,10 +2082,10 @@ def test_run_autonomous_checks_still_enters_before_the_3pm_cutoff(monkeypatch):
 
     run_autonomous_checks(_TrendingSmartAPI(price=57000.0, spot=57000.0), option_finder, _make_trade_manager(), db=db)
 
-    # The model WAS actually asked (declined) -- confirms 10:00 IST is
-    # correctly inside the trading window (MORNING_MOMENTUM) and the feature
-    # engine produced a real, ADX-warm feature set that cleared both
-    # deterministic gates.
+    # The model WAS actually asked (declined) -- confirms 10:45 IST is
+    # correctly inside both the trading window (MORNING_MOMENTUM) and the
+    # 10:30-13:30 entry window, and the feature engine produced a real,
+    # ADX-warm feature set that cleared all three deterministic gates.
     assert len(calls) == 1
 
 
