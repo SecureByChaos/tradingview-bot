@@ -112,6 +112,21 @@ def test_apply_settings_can_enable_giveback_ratio_stop() -> None:
     assert settings.giveback_ratio_stop_enabled is True
 
 
+def test_apply_settings_defaults_quick_scalp_to_off() -> None:
+    # 18 Nov 2026 kill switch -- apply_settings' own default mirrors the DB
+    # column's: off, not "preserve current behaviour", per the explicit
+    # "Stop quick scalp" instruction.
+    settings = PlatformSettings(id=1)
+    apply_settings(settings, "14:30", "10:00", "token", "chat")
+    assert settings.quick_scalp_enabled is False
+
+
+def test_apply_settings_can_re_enable_quick_scalp() -> None:
+    settings = PlatformSettings(id=1)
+    apply_settings(settings, "14:30", "10:00", "token", "chat", quick_scalp_enabled=True)
+    assert settings.quick_scalp_enabled is True
+
+
 # ---------------------------------------------------------------------------
 # app.ai.originator: _still_observing / _past_trading_end now take explicit
 # (hour, minute) tuples instead of reading hardcoded module constants.

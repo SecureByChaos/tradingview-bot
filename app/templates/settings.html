@@ -40,6 +40,14 @@
           <div class="form-text">Once a trade's own peak clears 12% above entry, its stop ratchets up to protect 70% of the gain made so far (i.e. never gives back more than 30% of the peak). Applies only to Validated Signal, Quick Scalp, and Autonomous AI trades -- AI Origination already has its own trailing stop, and rule-based signal strategies are never touched. Validated against 227 real closed AI Origination trades (scripts/giveback_ratio_backtest.py): n=57 armed, 90% CI on mean P&amp;L delta [+1.07%, +3.64%]. This toggle is meant to run for a two-week trial on the three included strategies, then be reviewed and either kept permanently or removed.</div>
         </div>
       </div>
+      <h5 class="mt-4">Quick Scalp</h5>
+      <div class="form-grid">
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" name="quick_scalp_enabled" id="quick_scalp_enabled" {% if settings.quick_scalp_enabled %}checked{% endif %}>
+          <label class="form-check-label" for="quick_scalp_enabled">Enable Quick Scalp</label>
+          <div class="form-text">Stopped 18 Nov 2026 after the 17 Nov export showed a 1/6 win rate and net -&#8377;1,320.97 for the day, including one trade whose own stated 2.5% stop overshot to -8.68%. Gates NEW entries only -- any Quick Scalp position already open keeps being managed normally (stop/target/structural stop/time stop) until it closes.</div>
+        </div>
+      </div>
       <button class="btn btn-primary mt-4" type="submit">Save Settings</button>
     </form>
   </div>
@@ -49,6 +57,7 @@
       <input type="hidden" name="square_off_time" value="{{ settings.square_off_time }}">
       <input type="hidden" name="trading_start_time" value="{{ settings.trading_start_time }}">
       {% if settings.giveback_ratio_stop_enabled %}<input type="hidden" name="giveback_ratio_stop_enabled" value="on">{% endif %}
+      {% if settings.quick_scalp_enabled %}<input type="hidden" name="quick_scalp_enabled" value="on">{% endif %}
       <input type="hidden" name="active_tab" value="notifications">
       <h5>Telegram Notifications</h5>
       <div class="form-grid">

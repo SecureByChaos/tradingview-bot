@@ -80,6 +80,27 @@ class PlatformSettings(Base):
     # permanently or discarded after the trial window, not left toggled on
     # indefinitely.
     giveback_ratio_stop_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 18 Nov 2026: real per-strategy kill switch for Quick Scalp, the gap
+    # CLAUDE.md's own "Quick Scalp -- a deterministic, no-AI, paper-only
+    # scalping strategy" entry (31 Aug 2026) already named -- "the only way
+    # to stop it is a code deploy or disabling the relevant index." Direct
+    # instruction ("Stop quick scalp") after the 17 Nov export showed it at
+    # 1/6 win rate and net -Rs 1,320.97 for the day, one leg a 2.5%-stop
+    # Nifty trade that closed at -8.68% (a real, as-yet-unexplained stop-
+    # overshoot, separate from the win-rate question). Checked only by the
+    # live bar-close entry callback (app.quick_scalp._on_scalp_bar_closed)
+    # -- gates NEW entries only; any already-open Quick Scalp position keeps
+    # being managed by check_quick_scalp_exits/run_quick_scalp_exit_checks
+    # exactly as before, same "pause stops new entries, not open trades"
+    # convention as AI Origination's own pause toggle (7 Sep 2026).
+    #
+    # Deliberately DOES NOT follow this table's usual "default preserves
+    # current behaviour" rule -- both this column's own default AND the
+    # literal ALTER TABLE default in _ensure_columns() are False on purpose,
+    # so the migration itself turns Quick Scalp off the moment this deploys,
+    # on the existing single settings row, with no separate admin click
+    # needed to make the explicit request take effect.
+    quick_scalp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
