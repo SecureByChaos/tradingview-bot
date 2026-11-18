@@ -347,6 +347,12 @@ def _ensure_columns() -> None:
         settings_statements = {
             "trading_start_time": "ALTER TABLE settings ADD COLUMN trading_start_time VARCHAR(8) NOT NULL DEFAULT '09:45'",
             "giveback_ratio_stop_enabled": "ALTER TABLE settings ADD COLUMN giveback_ratio_stop_enabled BOOLEAN NOT NULL DEFAULT 0",
+            # 18 Nov 2026: DEFAULT 0 is deliberate, not this table's usual
+            # "preserve current behaviour" default -- see PlatformSettings.
+            # quick_scalp_enabled's own comment. SQLite applies this literal
+            # default to the existing settings row too, so the migration
+            # itself turns Quick Scalp off on deploy.
+            "quick_scalp_enabled": "ALTER TABLE settings ADD COLUMN quick_scalp_enabled BOOLEAN NOT NULL DEFAULT 0",
         }
         with engine.begin() as connection:
             for column, statement in settings_statements.items():

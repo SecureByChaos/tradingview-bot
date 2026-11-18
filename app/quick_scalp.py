@@ -154,7 +154,7 @@ from app.indicators import rsi
 from app.market_data import ONE_MINUTE, Bar, load_bars
 from app.models import ExitReason, Signal
 from app.option_finder import OptionFinder
-from app.platform import list_index_configs, log_event
+from app.platform import get_or_create_settings, list_index_configs, log_event
 from app.signal_validation import trading_day_reason
 from app.smartapi_client import SmartAPIClient
 from app.time_utils import to_ist, utc_now
@@ -592,6 +592,13 @@ def _on_scalp_bar_closed(index_symbol: str, smartapi: SmartAPIClient, option_fin
     db = None
     try:
         db = SessionLocal()
+        # 18 Nov 2026: real per-strategy kill switch -- see PlatformSettings.
+        # quick_scalp_enabled's own comment. Gates NEW entries only; an
+        # already-open Quick Scalp position keeps being managed normally by
+        # check_quick_scalp_exits, same as every other pause toggle in this
+        # project.
+        if not get_or_create_settings(db).quick_scalp_enabled:
+            return
         index = db.scalar(
             select(IndexConfig).where(IndexConfig.symbol == index_symbol, IndexConfig.enabled.is_(True))
         )

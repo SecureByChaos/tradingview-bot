@@ -295,6 +295,75 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Quick Scalp gets a real per-strategy kill switch, and is turned off by it (18 Nov 2026)
+
+**Requested**: "Stop quick scalp" -- following a 17 Nov same-day review of the real trade export showing
+Quick Scalp at 1/6 win rate, net -Rs 1,320.97 for the day, and a separate anomaly flagged in the same
+review: a Nifty `BUY_PE` whose own stated 2.5% stop overshot to -8.68% in 1m29s (that overshoot is a
+distinct, still-open question -- not fixed or explained by this change, which only stops new entries).
+
+**CLAUDE.md's own 31 Aug 2026 entry already named this exact gap**: "unlike every other strategy in this
+app, Quick Scalp has no admin-facing enable/disable of its own... today the only way to stop it is a code
+deploy or disabling the relevant index in Settings > Instruments" -- the latter would have also stopped
+every other strategy trading that index (AI Origination, Autonomous AI, Agentic AI, Validated Signal),
+far broader than what was asked. Built the real toggle that entry flagged as missing, rather than
+reaching for the index-level workaround.
+
+**Implementation**: new `PlatformSettings.quick_scalp_enabled` column (`app/db_models.py`), additive
+`_ensure_columns()` migration (`app/database.py`). Checked as the first thing inside Phase A of
+`app/quick_scalp.py`'s `_on_scalp_bar_closed` -- the WS feed's real, only live entry callback (confirmed
+by reading: `check_quick_scalp_entry` is explicitly documented dead-in-production, kept only for direct
+testing of the decide-then-open sequence) -- before even loading `IndexConfig` or scalp features.
+**Gates NEW entries only**, same convention as every other pause toggle in this project (AI Origination's
+own, 7 Sep 2026): `check_quick_scalp_exits`/`run_quick_scalp_exit_checks` never read this setting at all,
+so any Quick Scalp position already open keeps being managed exactly as before (structural stop, hard
+time-stop, the shared 30s monitor's premium stop/target) until it closes on its own.
+
+**Deliberately breaks this table's own "deploying this column changes nothing" convention, on purpose.**
+Every other `PlatformSettings` boolean (`giveback_ratio_stop_enabled`, AI Origination's own pause) defaults
+to whatever preserves current live behaviour, so a deploy alone never changes anything until an admin
+opts in. This one is the opposite by design: both the SQLAlchemy column's own `default=False` AND the
+literal `ALTER TABLE ... DEFAULT 0` in `_ensure_columns()` are `False` -- confirmed directly (not assumed)
+that SQLite backfills an *existing* row to that literal default when the column is added, so the real
+production settings row flips to disabled the moment this migration runs, with no separate admin click
+needed to make "stop quick scalp" actually take effect on deploy. Re-enabling afterward is a checkbox on
+Settings > General, no second deploy required either way.
+
+New "Quick Scalp" section on Settings > General (`settings.html`), same shape as the giveback-stop
+checkbox right above it, with the real 17 Nov numbers in its own tooltip; the Notifications tab's form
+(which also POSTs to `/settings`) got the same hidden-passthrough treatment the giveback toggle already
+established, so saving from that tab can't silently flip this one. `/api/settings` GET/POST extended for
+parity, same precedent as every other field in that payload.
+
+7 new tests: `tests/test_trading_window.py` (+2 -- `apply_settings`'s own default is off, and it can
+re-enable), `tests/test_quick_scalp.py` (+4, plus 1 existing test updated -- the real `_on_scalp_bar_closed`
+blocked by the column's own default with no `PlatformSettings` row seeded at all, confirmed never
+loading features or touching the option finder; blocked when explicitly disabled; an already-open trade
+still exit-checked and closed normally with the toggle off, reusing the existing hard-time-stop test
+shape; `test_bar_closed_callback_opens_a_trade_end_to_end` updated to seed `quick_scalp_enabled=True`
+explicitly, since it is specifically testing a real entry opening and the column's new default would
+otherwise have silently defeated it). Full suite: 1332 passed. `python -c "import app.main"` imports
+cleanly.
+
+**Migration verified against a simulated pre-migration DB**, not just a fresh schema: seeded a real
+settings row with `quick_scalp_enabled=True` (simulating "already running" before this deploy), dropped
+the column, re-ran `_ensure_columns()`, and confirmed the *existing* row reads back `0` afterward --
+proving the migration itself is what turns it off, not just a fresh-row default. A second run is a clean
+no-op.
+
+**Verified live**: started the real app via uvicorn against a scratch SQLite DB, called the real
+`_on_scalp_bar_closed` directly (not a mock) with no settings row seeded and an exploding feature-loader
+stand-in -- confirmed it returned before loading features, created the settings row with
+`quick_scalp_enabled=False` via `get_or_create_settings`, and opened zero trades. Logged in over real
+HTTP and round-tripped the checkbox both ways via real POSTs (unchecked by default, `checked` after
+enabling, unchecked again after disabling), confirmed saving from the Notifications tab doesn't silently
+flip it, and confirmed `/` and `/quick-scalp` still render 200 with the toggle off.
+
+**Not deployed** -- per this project's own ground rules, deployment is manual and separate. Once deployed,
+the migration itself (not a separate admin action) takes Quick Scalp out of new-entry rotation; confirm by
+watching for `[QUICK_SCALP]` entry log lines stopping entirely while `[QUICK_SCALP]`-adjacent exit activity
+(if anything is still open from before the deploy) continues until those positions close on their own.
+
 ### Autonomous AI gets a never-confirmed loss cap, checked every 30 seconds -- implements recommendation #1 of the 15 Nov 2026 analysis (17 Nov 2026, same day)
 
 **Requested**: "Add a loss cap for trades that never confirm, checked every 30 seconds: exit at about -5%

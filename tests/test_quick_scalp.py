@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from app.db_models import Base, IndexConfig, StrategyTrade, TradeResult, TradeStatus, TradingMode
+from app.db_models import Base, IndexConfig, PlatformSettings, StrategyTrade, TradeResult, TradeStatus, TradingMode
 from app.market_data import Bar
 from app.models import ExitReason, OptionContract, Signal
 from app.multi_strategy import MultiStrategyTradeManager
@@ -516,6 +516,10 @@ def test_bar_closed_callback_opens_a_trade_end_to_end(monkeypatch):
     Base.metadata.create_all(bind=engine)
     with Session(engine) as seed:
         seed.add(_make_index())
+        # 18 Nov 2026: quick_scalp_enabled now defaults to False (the kill
+        # switch) -- this end-to-end test is specifically exercising a real
+        # entry opening, so it must opt in explicitly.
+        seed.add(PlatformSettings(id=1, quick_scalp_enabled=True))
         seed.commit()
 
     monkeypatch.setattr(module, "SessionLocal", lambda: Session(engine))
@@ -528,6 +532,85 @@ def test_bar_closed_callback_opens_a_trade_end_to_end(monkeypatch):
     with Session(engine) as check:
         trades = check.query(StrategyTrade).filter(StrategyTrade.origin == ORIGIN).all()
         assert len(trades) == 1
+
+
+def test_bar_closed_callback_blocked_by_default_kill_switch(monkeypatch):
+    # No PlatformSettings row seeded -- get_or_create_settings creates one
+    # with the column's own default (quick_scalp_enabled=False, 18 Nov
+    # 2026). Must block before even loading index config/features.
+    import app.quick_scalp as module
+    from sqlalchemy.pool import StaticPool
+
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 9, 8, 11, 0, tzinfo=IST))
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as seed:
+        seed.add(_make_index())
+        seed.commit()
+
+    monkeypatch.setattr(module, "SessionLocal", lambda: Session(engine))
+    monkeypatch.setattr(
+        module, "_load_scalp_features",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not load features while Quick Scalp is disabled")),
+    )
+    monkeypatch.setattr(module, "vwap_scalp_action", lambda f: _make_signal("BUY_CE", trigger_level=24010.0, setup_low=23990.0, setup_high=24010.0))
+
+    option_finder = FakeOptionFinder(_make_contract())
+    callback = make_bar_closed_callback(FakeSmartAPI(price=100.0), option_finder)
+    callback("NIFTY")
+
+    assert option_finder.calls == 0
+    with Session(engine) as check:
+        assert check.query(StrategyTrade).filter(StrategyTrade.origin == ORIGIN).count() == 0
+
+
+def test_bar_closed_callback_blocked_when_explicitly_disabled(monkeypatch):
+    import app.quick_scalp as module
+    from sqlalchemy.pool import StaticPool
+
+    monkeypatch.setattr(module, "utc_now", lambda: datetime(2026, 9, 8, 11, 0, tzinfo=IST))
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    with Session(engine) as seed:
+        seed.add(_make_index())
+        seed.add(PlatformSettings(id=1, quick_scalp_enabled=False))
+        seed.commit()
+
+    monkeypatch.setattr(module, "SessionLocal", lambda: Session(engine))
+    monkeypatch.setattr(
+        module, "_load_scalp_features",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not load features while Quick Scalp is disabled")),
+    )
+
+    option_finder = FakeOptionFinder(_make_contract())
+    callback = make_bar_closed_callback(FakeSmartAPI(price=100.0), option_finder)
+    callback("NIFTY")
+
+    assert option_finder.calls == 0
+    with Session(engine) as check:
+        assert check.query(StrategyTrade).filter(StrategyTrade.origin == ORIGIN).count() == 0
+
+
+def test_exits_are_unaffected_by_the_kill_switch():
+    # The kill switch gates NEW entries only (app.quick_scalp's bar-close
+    # callback) -- check_quick_scalp_exits never reads PlatformSettings at
+    # all, so an already-open Quick Scalp position must keep closing
+    # normally regardless of quick_scalp_enabled. Reuses the exact hard-
+    # time-stop shape test_hard_time_stop_scratches_a_losing_trade already
+    # establishes, just with the toggle explicitly off.
+    db = _make_session()
+    db.add(PlatformSettings(id=1, quick_scalp_enabled=False))
+    now = utc_now()
+    _add_trade(db, trade_id="t1", entry_price=100.0, stoploss=97.5, current_premium=98.0,
+               entry_time=now - timedelta(minutes=3, seconds=1))
+    db.commit()
+    trade_manager = _make_trade_manager()
+
+    check_quick_scalp_exits(db, trade_manager, to_ist(now), current_spot_by_index=None)
+
+    trade = db.query(StrategyTrade).filter(StrategyTrade.trade_id == "t1").one()
+    assert trade.status == TradeStatus.CLOSED
+    assert trade.exit_reason == ExitReason.SCALP_TIME_STOP.value
 
 
 def test_bar_closed_callback_blocks_before_warmup_end(monkeypatch):

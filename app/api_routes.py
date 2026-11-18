@@ -44,6 +44,7 @@ class SettingsPayload(BaseModel):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     giveback_ratio_stop_enabled: bool = False
+    quick_scalp_enabled: bool = False
 
 
 def manager() -> TradeManager:
@@ -390,6 +391,7 @@ def get_settings_api(
             "telegram_bot_token",
             "telegram_chat_id",
             "giveback_ratio_stop_enabled",
+            "quick_scalp_enabled",
         ]
     }
 
