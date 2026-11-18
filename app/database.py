@@ -353,6 +353,14 @@ def _ensure_columns() -> None:
             # default to the existing settings row too, so the migration
             # itself turns Quick Scalp off on deploy.
             "quick_scalp_enabled": "ALTER TABLE settings ADD COLUMN quick_scalp_enabled BOOLEAN NOT NULL DEFAULT 0",
+            # 18 Nov 2026: mid-range (1-12% MFE) giveback cap for Agentic AI --
+            # see PlatformSettings.agentic_midrange_giveback_enabled's own
+            # comment. DEFAULT 0/2.0/0.6 here matches each column's own model
+            # default -- this table's usual "preserve current behaviour"
+            # convention, unlike quick_scalp_enabled above.
+            "agentic_midrange_giveback_enabled": "ALTER TABLE settings ADD COLUMN agentic_midrange_giveback_enabled BOOLEAN NOT NULL DEFAULT 0",
+            "agentic_midrange_giveback_floor_percent": "ALTER TABLE settings ADD COLUMN agentic_midrange_giveback_floor_percent FLOAT NOT NULL DEFAULT 2.0",
+            "agentic_midrange_giveback_ratio": "ALTER TABLE settings ADD COLUMN agentic_midrange_giveback_ratio FLOAT NOT NULL DEFAULT 0.6",
         }
         with engine.begin() as connection:
             for column, statement in settings_statements.items():

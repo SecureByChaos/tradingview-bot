@@ -930,6 +930,9 @@ def update_settings_page(
     telegram_chat_id: Annotated[str, Form()] = "",
     giveback_ratio_stop_enabled: Annotated[str | None, Form()] = None,
     quick_scalp_enabled: Annotated[str | None, Form()] = None,
+    agentic_midrange_giveback_enabled: Annotated[str | None, Form()] = None,
+    agentic_midrange_giveback_floor_percent: Annotated[float, Form()] = 2.0,
+    agentic_midrange_giveback_ratio: Annotated[float, Form()] = 0.60,
     active_tab: Annotated[str, Form()] = "general",
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> RedirectResponse:
@@ -949,6 +952,15 @@ def update_settings_page(
         or start_hm >= end_hm
     ):
         raise HTTPException(status_code=400, detail="Invalid trading window: start/close must be HH:MM, 09:15 <= start < close <= 15:15")
+    # Same bounds style as ai_origination_max_sl_percent/_chop_gate_min_
+    # efficiency_ratio on the AI tab -- floor_percent must be a real positive
+    # percent at or below GIVEBACK_STOP's own 12% floor (above that, this
+    # mechanism is redundant with GIVEBACK_STOP, which already covers it);
+    # ratio is a fraction of the peak gain, 0.0-1.0.
+    if not 0.1 <= agentic_midrange_giveback_floor_percent <= 12.0:
+        raise HTTPException(status_code=400, detail="Invalid Agentic AI midrange giveback floor: must be 0.1-12.0")
+    if not 0.0 <= agentic_midrange_giveback_ratio <= 1.0:
+        raise HTTPException(status_code=400, detail="Invalid Agentic AI midrange giveback ratio: must be 0.0-1.0")
     settings = get_or_create_settings(db)
     apply_settings(
         settings,
@@ -958,6 +970,9 @@ def update_settings_page(
         telegram_chat_id,
         giveback_ratio_stop_enabled == "on",
         quick_scalp_enabled == "on",
+        agentic_midrange_giveback_enabled == "on",
+        agentic_midrange_giveback_floor_percent,
+        agentic_midrange_giveback_ratio,
     )
     db.commit()
     log_event(db, "BOT", "Settings updated from dashboard")
@@ -1201,6 +1216,9 @@ def apply_settings(
     telegram_chat_id: str,
     giveback_ratio_stop_enabled: bool = False,
     quick_scalp_enabled: bool = False,
+    agentic_midrange_giveback_enabled: bool = False,
+    agentic_midrange_giveback_floor_percent: float = 2.0,
+    agentic_midrange_giveback_ratio: float = 0.60,
 ) -> None:
     settings.square_off_time = square_off_time
     settings.trading_start_time = trading_start_time
@@ -1208,6 +1226,9 @@ def apply_settings(
     settings.telegram_chat_id = telegram_chat_id
     settings.giveback_ratio_stop_enabled = giveback_ratio_stop_enabled
     settings.quick_scalp_enabled = quick_scalp_enabled
+    settings.agentic_midrange_giveback_enabled = agentic_midrange_giveback_enabled
+    settings.agentic_midrange_giveback_floor_percent = agentic_midrange_giveback_floor_percent
+    settings.agentic_midrange_giveback_ratio = agentic_midrange_giveback_ratio
 
 
 
