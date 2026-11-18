@@ -120,6 +120,16 @@ _GIVEBACK_STOP_FLOOR_PERCENT = 12.0
 _GIVEBACK_STOP_RATIO = 0.30
 _GIVEBACK_STOP_ORIGINS = frozenset({"QUICK_SCALP", "AUTONOMOUS_AI", "AGENTIC_AI"})
 
+# AGENTIC_AI only, 18 Nov 2026 -- a second giveback trail covering the gap
+# GIVEBACK_STOP above leaves open below its 12% floor. floor_percent/ratio
+# are admin-configured (PlatformSettings.agentic_midrange_giveback_*, see
+# that model's own comment for the full rationale and the real 18 Nov
+# trigger trades) rather than module constants, since this is meant to be
+# tuned from scripts/giveback_ratio_backtest.py's real output without a
+# second deploy. Checked alongside GIVEBACK_STOP in the same block below --
+# whichever computed level is tighter (closer to the running peak) wins and
+# supplies its own, separately-measurable ExitReason.
+
 # AGENTIC_AI only, 29 Oct 2026 -- a real trade's own MFE never once cleared
 # positive territory across its whole 34-minute hold before running to its
 # full -16.76% stop (StrategyTrade.highest_price stayed below entry_price
@@ -737,14 +747,49 @@ class MultiStrategyTradeManager:
                                 giveback_stop_level = trade.highest_price - _GIVEBACK_STOP_RATIO * (
                                     trade.highest_price - trade.entry_price
                                 )
+
+                        # AGENTIC_AI only -- see PlatformSettings.agentic_
+                        # midrange_giveback_enabled's own comment and the
+                        # constants-block comment above for the full
+                        # rationale. A second, independently-floored,
+                        # independently-ratioed giveback trail using the
+                        # exact same ratchet-up-with-each-new-peak shape as
+                        # GIVEBACK_STOP above -- it is never tighter than
+                        # trade.stoploss and never fires on a trade that is
+                        # still making new highs, only on a real reversal
+                        # past its own trailing floor.
+                        agentic_midrange_level: float | None = None
+                        if (
+                            platform_settings.agentic_midrange_giveback_enabled
+                            and trade.origin == "AGENTIC_AI"
+                            and trade.entry_price > 0
+                        ):
+                            mfe_percent = (trade.highest_price - trade.entry_price) / trade.entry_price * 100.0
+                            if mfe_percent >= platform_settings.agentic_midrange_giveback_floor_percent:
+                                agentic_midrange_level = trade.highest_price - platform_settings.agentic_midrange_giveback_ratio * (
+                                    trade.highest_price - trade.entry_price
+                                )
+
+                        # Whichever candidate level is tightest (closest to
+                        # the running peak, i.e. the largest value for a long
+                        # trade) wins and supplies its own exit reason -- this
+                        # is what lets both mechanisms coexist on the same
+                        # AGENTIC_AI population without either silently
+                        # shadowing the other in reporting.
                         operative_stop = trade.stoploss
-                        if giveback_stop_level is not None:
-                            operative_stop = max(operative_stop, giveback_stop_level)
+                        operative_reason: ExitReason | None = None
+                        for level, label in (
+                            (giveback_stop_level, ExitReason.GIVEBACK_STOP),
+                            (agentic_midrange_level, ExitReason.AGENTIC_MIDRANGE_GIVEBACK_STOP),
+                        ):
+                            if level is not None and level > operative_stop:
+                                operative_stop = level
+                                operative_reason = label
 
                         if trade.trailing_active and trade.trailing_stop is not None and premium <= trade.trailing_stop:
                             reason = ExitReason.TRAIL_EXIT
                         elif premium <= operative_stop:
-                            reason = ExitReason.GIVEBACK_STOP if operative_stop > trade.stoploss else ExitReason.STOPLOSS
+                            reason = operative_reason if operative_reason is not None else ExitReason.STOPLOSS
                         elif premium >= trade.target:
                             reason = ExitReason.TARGET
 

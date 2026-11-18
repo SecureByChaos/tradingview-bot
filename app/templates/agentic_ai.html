@@ -105,6 +105,7 @@
           {% elif trade.exit_reason == 'NEWS_KILL_SWITCH' %}<span class="badge text-bg-danger">News kill switch</span>
           {% elif trade.exit_reason == 'GIVEBACK_STOP' %}<span class="badge text-bg-warning text-dark">Giveback stop (backstop)</span>
           {% elif trade.exit_reason == 'AGENTIC_SCRATCH_EXIT' %}<span class="badge text-bg-warning text-dark">Scratch exit (never confirmed)</span>
+          {% elif trade.exit_reason == 'AGENTIC_MIDRANGE_GIVEBACK_STOP' %}<span class="badge text-bg-warning text-dark">Mid-range giveback cap (backstop)</span>
           {% elif trade.exit_reason %}<span class="badge text-bg-secondary">{{ trade.exit_reason }} (backstop)</span>
           {% endif %}
         </td>

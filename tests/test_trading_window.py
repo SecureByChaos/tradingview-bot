@@ -93,6 +93,39 @@ def test_update_settings_page_accepts_valid_window_and_persists(settings_db_sess
     assert row.square_off_time == "14:30"
 
 
+def test_update_settings_page_rejects_agentic_midrange_floor_out_of_range(settings_db_session: Session) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        update_settings_page(
+            db=settings_db_session, square_off_time="15:15", trading_start_time="09:45",
+            agentic_midrange_giveback_floor_percent=15.0,
+        )
+    assert exc_info.value.status_code == 400
+
+
+def test_update_settings_page_rejects_agentic_midrange_ratio_out_of_range(settings_db_session: Session) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        update_settings_page(
+            db=settings_db_session, square_off_time="15:15", trading_start_time="09:45",
+            agentic_midrange_giveback_ratio=1.5,
+        )
+    assert exc_info.value.status_code == 400
+
+
+def test_update_settings_page_accepts_and_persists_agentic_midrange_fields(settings_db_session: Session) -> None:
+    response = update_settings_page(
+        db=settings_db_session, square_off_time="15:15", trading_start_time="09:45",
+        agentic_midrange_giveback_enabled="on",
+        agentic_midrange_giveback_floor_percent=3.5,
+        agentic_midrange_giveback_ratio=0.45,
+    )
+    assert response.status_code == 303
+    settings_db_session.commit()
+    row = settings_db_session.get(PlatformSettings, 1)
+    assert row.agentic_midrange_giveback_enabled is True
+    assert row.agentic_midrange_giveback_floor_percent == 3.5
+    assert row.agentic_midrange_giveback_ratio == 0.45
+
+
 def test_apply_settings_sets_trading_start_time() -> None:
     settings = PlatformSettings(id=1)
     apply_settings(settings, "14:30", "10:00", "token", "chat")
@@ -125,6 +158,27 @@ def test_apply_settings_can_re_enable_quick_scalp() -> None:
     settings = PlatformSettings(id=1)
     apply_settings(settings, "14:30", "10:00", "token", "chat", quick_scalp_enabled=True)
     assert settings.quick_scalp_enabled is True
+
+
+def test_apply_settings_defaults_agentic_midrange_giveback_to_off_with_default_floor_and_ratio() -> None:
+    settings = PlatformSettings(id=1)
+    apply_settings(settings, "14:30", "10:00", "token", "chat")
+    assert settings.agentic_midrange_giveback_enabled is False
+    assert settings.agentic_midrange_giveback_floor_percent == 2.0
+    assert settings.agentic_midrange_giveback_ratio == 0.60
+
+
+def test_apply_settings_can_enable_agentic_midrange_giveback_with_custom_floor_and_ratio() -> None:
+    settings = PlatformSettings(id=1)
+    apply_settings(
+        settings, "14:30", "10:00", "token", "chat",
+        agentic_midrange_giveback_enabled=True,
+        agentic_midrange_giveback_floor_percent=5.0,
+        agentic_midrange_giveback_ratio=0.4,
+    )
+    assert settings.agentic_midrange_giveback_enabled is True
+    assert settings.agentic_midrange_giveback_floor_percent == 5.0
+    assert settings.agentic_midrange_giveback_ratio == 0.4
 
 
 # ---------------------------------------------------------------------------

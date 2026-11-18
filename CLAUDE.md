@@ -295,6 +295,93 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Agentic AI gets a second, mid-range (1-12% MFE) giveback cap -- admin opt-in, not yet backtested (18 Nov 2026)
+
+**Requested**: same-day follow-up to the 18 Nov export analysis (5 trades, net -Rs 5,583.53), which showed
+the exact gap flagged after the 17 Nov review quantified further: both Agentic AI losses that day earned a
+real favorable move first (MFE 4.55% and 2.57%) and gave it all back -- GIVEBACK_STOP needs 12% MFE to arm,
+and the 17 Nov AUTONOMOUS_NEVER_CONFIRMED_STOP cap is Autonomous-AI-only. "Lets build this... Build this
+with a scope to grow the profit as well. No just cut the profit unnecessary" -- an explicit requirement
+that this NOT be a flat early-exit that clips a trade the moment it shows a small gain, but something that
+lets a winner keep growing and only protects against an actual reversal.
+
+**Deliberately a SEPARATE mechanism from GIVEBACK_STOP, not a lowered GIVEBACK_STOP_FLOOR_PERCENT for
+everyone.** The 15 Nov full-history analysis already tested an almost-identical shape for Agentic AI --
+the never-confirmed loss cap at a 5% floor -- and found it net NEGATIVE specifically for this origin:
+several of its real winners dip below that floor before recovering to a bigger win, so an early hard cut
+there is exactly the "cuts profit unnecessarily" failure the request named directly. That finding is the
+reason this uses GIVEBACK_STOP's own proportional, ratchets-up-with-each-new-peak trail shape instead of a
+flat exit: it is never tighter than the running peak, never fires while the trade keeps making new highs,
+and the protected level only ever rises -- so a trade that keeps growing past the floor is never touched
+by it, only a real reversal past the trailing level closes it.
+
+**Implementation** (`app/multi_strategy.py`'s shared `monitor_open_trades`, same 30-second `trade-monitor`
+cadence GIVEBACK_STOP already runs on -- no new job): new `PlatformSettings.agentic_midrange_giveback_
+enabled`/`_floor_percent`/`_ratio` (`app/db_models.py`, additive `_ensure_columns()` migration in
+`app/database.py`), admin-configurable rather than module constants specifically so a future floor/ratio
+chosen by `scripts/giveback_ratio_backtest.py` can be set from Settings > General with no second deploy.
+Off by default (floor_percent=2.0, ratio=0.60 -- deliberately LOOSER than GIVEBACK_STOP's validated
+0.30, since a smaller move has proportionally less room before ordinary noise would trigger a tight trail;
+reasoned starting points, NOT backtested, same status every new threshold in this project carries before
+real history looks at it). Checked in the same block as the existing `giveback_stop_level` computation,
+scoped to `trade.origin == "AGENTIC_AI"` only -- whichever of the two candidate levels is tighter (closer
+to the running peak) wins and supplies its own, separately-measurable `ExitReason` (new
+`AGENTIC_MIDRANGE_GIVEBACK_STOP`), so the two mechanisms coexist on the same population without either
+shadowing the other's reporting. `scripts/giveback_ratio_backtest.py` needed zero code changes -- its
+existing `--origin-like`/`--floors`/`--giveback-ratios` flags already support exactly the sweep needed:
+
+```bash
+python -m scripts.giveback_ratio_backtest --origin-like AGENTIC_AI --floors 1,2,3,4,5,6,8,10,12 --giveback-ratios 0.3,0.4,0.5,0.6,0.7
+```
+
+New section on Settings > General ("Agentic AI Mid-Range Giveback Cap", flagged "Not yet backtested" in its
+own badge) with the checkbox plus two number inputs (floor %, protect fraction), the real 18 Nov trigger
+numbers and the exact backtest command in its own tooltip, same shape as every other admin-opt-in-without-
+a-backtest precedent in this project (the AI Origination chop gate, 27 Aug 2026). Notifications tab's form
+(which also POSTs to `/settings`) got the same hidden-passthrough treatment the giveback/quick-scalp
+toggles already established. `/api/settings` GET/POST extended for parity. `agentic_ai.html`'s trade table
+gets its own distinct "Mid-range giveback cap (backstop)" badge, matching the one-badge-per-mechanism
+convention.
+
+19 new tests: `tests/test_agentic_midrange_giveback.py` (new file, 16 -- toggle-off behaves exactly as
+before reproducing the real 18 Nov Nifty shape unprotected, arming at the default floor and catching a
+reversal, never arming below the floor, still exiting at TARGET, the ratchet never firing while new highs
+keep forming, the protected level ratcheting up with a new peak, admin-configured custom floor/ratio
+actually changing behaviour, five other origins parametrized as unaffected, GIVEBACK_STOP's own tighter
+level winning when both toggles are on and MFE clears 12%, this mechanism alone catching the sub-12% gap
+with both toggles on, and a direct reproduction of the real 18 Nov Bank Nifty trigger trade -- MFE 2.57%,
+real unprotected exit -20.71%, confirmed this closes well above that) and 3 in `tests/test_trading_window.py`
+(`apply_settings`'s own default-off-with-default-floor/ratio, enabling with custom values, and two route-
+level 400s for an out-of-range floor/ratio plus a persists-correctly case). Full suite: 1351 passed, 1
+pre-existing unrelated wall-clock-dependent flake in `tests/test_validated_signal.py` (documented
+repeatedly elsewhere in this file -- fails after Validated Signal's own 11:15/15:10 IST hard session-exit
+cutoff). `python -c "import app.main"` imports cleanly.
+
+**Migration verified against a simulated pre-migration DB**: seeded a real settings row with all three new
+fields set to non-default values, dropped the three columns, re-ran `_ensure_columns()`, and confirmed the
+columns reappear with the existing row backfilled to the model's own defaults (off/2.0/0.6) rather than the
+dropped values -- correct, since this is a new feature with no "current behaviour" beyond off to preserve.
+Confirmed a second run is a clean no-op.
+
+**Verified live against the real `monitor_open_trades`**, not a mock: started the real app via uvicorn
+against a scratch SQLite DB, seeded a trade reproducing the exact real 18 Nov Bank Nifty trigger shape
+(entry 466.9, stop 370.2, real MFE 2.57%/peak 478.9, real unprotected outcome -20.71%), ran the real
+`MultiStrategyTradeManager.monitor_open_trades` across two ticks with the cap enabled at its default
+floor/ratio, and confirmed it closed at +0.81% instead of running to the real -20.71% loss. Logged in over
+real HTTP and round-tripped the new controls both ways via real POSTs (unchecked/2.0/0.6 by default,
+checked/3.5/0.45 after enabling with custom values, confirmed saving from the Notifications tab doesn't
+silently reset them), confirmed `/`, `/agentic-ai`, `/settings`, and `/api/settings` all still render/respond
+200 with the new fields round-tripping correctly through the JSON API.
+
+**Not deployed** -- per this project's own ground rules, deployment is manual and separate. **Not backtest-
+validated -- stated explicitly in the Settings UI itself, not just here.** This is a manual risk decision
+available to make knowingly, not a finding this project has confirmed. Per this project's own standing
+discipline (every other real gate validated before shipping, every admin-opt-in exception named as such),
+run the backtest command above once enough real Agentic AI history exists and read the bootstrap CI before
+enabling this live -- "not yet enough evidence" on the first run is the expected, correct outcome at
+Agentic AI's current trade count, not a failure of the tooling. If a real floor/ratio cell clears the bar,
+set it directly on Settings > General -- no second deploy needed either way.
+
 ### Quick Scalp gets a real per-strategy kill switch, and is turned off by it (18 Nov 2026)
 
 **Requested**: "Stop quick scalp" -- following a 17 Nov same-day review of the real trade export showing

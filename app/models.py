@@ -175,6 +175,22 @@ class ExitReason(str, Enum):
     # floor alone, with no time requirement, checked every 30s by the same
     # shared monitor.
     AUTONOMOUS_NEVER_CONFIRMED_STOP = "AUTONOMOUS_NEVER_CONFIRMED_STOP"
+    # AGENTIC_AI only (app/multi_strategy.py), 18 Nov 2026 -- fills the
+    # mid-range MFE gap between GIVEBACK_STOP's 12% floor and nothing at all.
+    # Two real 18 Nov trades: a Nifty BUY_PE (MFE 4.55%, closed -6.87%) and a
+    # Bank Nifty BUY_PE (MFE 2.57%, closed -20.71%), neither ever close to
+    # 12% so GIVEBACK_STOP never armed. Deliberately NOT the same mechanism
+    # as AUTONOMOUS_NEVER_CONFIRMED_STOP above -- the 15 Nov analysis found an
+    # analogous low-floor cap turned net NEGATIVE for Agentic AI at a 5%
+    # floor (several real winners dip below that before recovering to a
+    # bigger win), so this uses GIVEBACK_STOP's own proportional, ratchets-
+    # up-with-each-new-peak trail shape instead of a flat early exit -- it
+    # never fires while the trade keeps moving favourably, only on a real
+    # reversal past a trailing floor that only ever rises. See
+    # PlatformSettings.agentic_midrange_giveback_enabled for the admin
+    # toggle and scoring, and monitor_open_trades for where this is checked
+    # alongside GIVEBACK_STOP itself (whichever level is tighter wins).
+    AGENTIC_MIDRANGE_GIVEBACK_STOP = "AGENTIC_MIDRANGE_GIVEBACK_STOP"
 
 
 class WebhookPayload(BaseModel):

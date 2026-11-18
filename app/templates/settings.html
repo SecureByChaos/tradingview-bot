@@ -48,6 +48,16 @@
           <div class="form-text">Stopped 18 Nov 2026 after the 17 Nov export showed a 1/6 win rate and net -&#8377;1,320.97 for the day, including one trade whose own stated 2.5% stop overshot to -8.68%. Gates NEW entries only -- any Quick Scalp position already open keeps being managed normally (stop/target/structural stop/time stop) until it closes.</div>
         </div>
       </div>
+      <h5 class="mt-4">Agentic AI Mid-Range Giveback Cap <span class="badge bg-warning text-dark">Not yet backtested</span></h5>
+      <div class="form-grid">
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" name="agentic_midrange_giveback_enabled" id="agentic_midrange_giveback_enabled" {% if settings.agentic_midrange_giveback_enabled %}checked{% endif %}>
+          <label class="form-check-label" for="agentic_midrange_giveback_enabled">Enable Agentic AI mid-range giveback cap</label>
+          <div class="form-text">Fills the gap below the giveback-ratio stop's 12% floor for Agentic AI only. Once a trade's own peak clears the floor below, its stop ratchets up to protect the configured fraction of the gain made so far -- it never fires while the trade keeps making new highs, only on a real reversal, and the protected level only ever rises with a new peak. Built 18 Nov 2026 after two same-day trades (MFE 4.55% &#8594; -6.87%, MFE 2.57% &#8594; -20.71%) showed this gap directly. Deliberately NOT yet validated: the 15 Nov full-history analysis found an analogous low-floor cap for Agentic AI turned net negative at 5% because several real winners dip below that before recovering to a bigger win -- run <code>python -m scripts.giveback_ratio_backtest --origin-like AGENTIC_AI --floors 1,2,3,4,5,6,8,10,12 --giveback-ratios 0.3,0.4,0.5,0.6,0.7</code> and read the bootstrap CI before enabling this live.</div>
+        </div>
+        <div><label class="form-label">Floor %</label><input class="form-control" type="number" step="0.1" min="0.1" max="12" name="agentic_midrange_giveback_floor_percent" value="{{ settings.agentic_midrange_giveback_floor_percent }}"><div class="form-text">MFE must clear this before the trail arms. Default 2.0 -- below GIVEBACK_STOP's own 12% floor on purpose, so this mechanism covers what that one can't reach.</div></div>
+        <div><label class="form-label">Protect Fraction</label><input class="form-control" type="number" step="0.01" min="0" max="1" name="agentic_midrange_giveback_ratio" value="{{ settings.agentic_midrange_giveback_ratio }}"><div class="form-text">Fraction of the peak-to-entry gain protected once armed. Default 0.60 (protects 60% of the gain, i.e. gives back at most 40%) -- looser than GIVEBACK_STOP's validated 0.30 on purpose, since a smaller move has less room before an ordinary pullback would trigger it.</div></div>
+      </div>
       <button class="btn btn-primary mt-4" type="submit">Save Settings</button>
     </form>
   </div>
@@ -58,6 +68,9 @@
       <input type="hidden" name="trading_start_time" value="{{ settings.trading_start_time }}">
       {% if settings.giveback_ratio_stop_enabled %}<input type="hidden" name="giveback_ratio_stop_enabled" value="on">{% endif %}
       {% if settings.quick_scalp_enabled %}<input type="hidden" name="quick_scalp_enabled" value="on">{% endif %}
+      {% if settings.agentic_midrange_giveback_enabled %}<input type="hidden" name="agentic_midrange_giveback_enabled" value="on">{% endif %}
+      <input type="hidden" name="agentic_midrange_giveback_floor_percent" value="{{ settings.agentic_midrange_giveback_floor_percent }}">
+      <input type="hidden" name="agentic_midrange_giveback_ratio" value="{{ settings.agentic_midrange_giveback_ratio }}">
       <input type="hidden" name="active_tab" value="notifications">
       <h5>Telegram Notifications</h5>
       <div class="form-grid">

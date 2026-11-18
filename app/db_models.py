@@ -101,6 +101,39 @@ class PlatformSettings(Base):
     # on the existing single settings row, with no separate admin click
     # needed to make the explicit request take effect.
     quick_scalp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # 18 Nov 2026: AGENTIC_AI only -- fills the mid-range MFE gap GIVEBACK_STOP
+    # above deliberately leaves open (that one only arms once MFE clears 12%).
+    # Two real 18 Nov trades show the gap directly: Nifty BUY_PE (MFE 4.55%,
+    # closed -6.87%) and Bank Nifty BUY_PE (MFE 2.57%, closed -20.71%), neither
+    # ever close to 12%.
+    #
+    # A SEPARATE mechanism from GIVEBACK_STOP, not just a lower GIVEBACK_STOP_
+    # FLOOR_PERCENT for everyone -- the 15 Nov 2026 full-history analysis
+    # already tested an analogous low-floor cap for Agentic AI (the
+    # AUTONOMOUS_NEVER_CONFIRMED_STOP shape, at a 5% floor) and found it NET
+    # NEGATIVE for this origin specifically: several of its real winners dip
+    # below that floor before recovering to a bigger win, so an early hard
+    # cut there would be exactly the "cuts profit unnecessarily" failure this
+    # exists to avoid, not repeat. Uses the SAME proportional, ratchets-up-
+    # with-each-new-peak trail shape GIVEBACK_STOP already uses (never fires
+    # while the trade keeps moving favourably -- only on an actual reversal
+    # past the trailing floor, and that floor only ever rises with a new
+    # peak) rather than a flat early exit, specifically so a trade that keeps
+    # growing past this floor is never touched by it.
+    #
+    # floor_percent/ratio default to 2.0/0.60 -- deliberately LOOSER than
+    # GIVEBACK_STOP's validated 12%/0.30 (protects only 40% of the gain once
+    # armed, vs. 70%), since a mid-range move has proportionally less room to
+    # give a tight trail before noise alone would trigger it. A reasoned
+    # starting point, NOT backtested. Off by default -- deploying these
+    # columns changes nothing. Validate with scripts/giveback_ratio_backtest.py
+    # --origin-like AGENTIC_AI --floors 1,2,3,4,5,6,8,10,12 --giveback-ratios
+    # 0.3,0.4,0.5,0.6,0.7 (the script's existing --floors/--giveback-ratios/
+    # --origin-like flags already support exactly this sweep, no script
+    # change needed) before enabling on Settings > General.
+    agentic_midrange_giveback_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    agentic_midrange_giveback_floor_percent: Mapped[float] = mapped_column(Float, default=2.0, nullable=False)
+    agentic_midrange_giveback_ratio: Mapped[float] = mapped_column(Float, default=0.60, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

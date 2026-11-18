@@ -45,6 +45,9 @@ class SettingsPayload(BaseModel):
     telegram_chat_id: str = ""
     giveback_ratio_stop_enabled: bool = False
     quick_scalp_enabled: bool = False
+    agentic_midrange_giveback_enabled: bool = False
+    agentic_midrange_giveback_floor_percent: float = 2.0
+    agentic_midrange_giveback_ratio: float = 0.60
 
 
 def manager() -> TradeManager:
@@ -392,6 +395,9 @@ def get_settings_api(
             "telegram_chat_id",
             "giveback_ratio_stop_enabled",
             "quick_scalp_enabled",
+            "agentic_midrange_giveback_enabled",
+            "agentic_midrange_giveback_floor_percent",
+            "agentic_midrange_giveback_ratio",
         ]
     }
 
