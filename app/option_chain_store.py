@@ -14,9 +14,15 @@ every week this isn't running a week permanently lost, which is the same
 argument that governed the pre-expiry candle pulls.
 
 This module is COLLECTION ONLY. Nothing here scores, thresholds, or interprets
-anything, and nothing in the live trading path reads it. Evaluating it needs
-months of accumulated history and the same significance machinery the price
-setups went through.
+anything -- that logic lives in whichever consumer reads recent_snapshots(),
+never here. Evaluating it for a real directional edge still needs months of
+accumulated history and the same significance machinery the price setups
+went through; a single admin-opt-in, not-yet-backtested live reader (app.ai.
+agentic's Flow Confirmation Gate, 22 Nov 2026) does not change that standard
+-- it is explicitly scoped to "does recent OI/PCR actively contradict a
+decision already made," never "does this archive predict direction," and it
+fails open (no reading, no block) whenever this archive is thin or absent,
+which is expected given how recently and intermittently collection has run.
 
 WHY A SEPARATE SQLITE FILE
 --------------------------
@@ -215,6 +221,44 @@ def store_snapshot(rows: list[dict]) -> int:
             session.execute(statement)
         session.commit()
     return len(rows)
+
+
+def recent_snapshots(index_symbol: str, since: datetime, until: datetime) -> list[OptionChainSnapshot]:
+    """Raw rows for one index within a time window, ordered oldest first.
+
+    22 Nov 2026: the first real live consumer of this archive -- app.ai.
+    agentic's admin-opt-in Flow Confirmation Gate reads these rows to
+    compute a put-call ratio and a near-strike open-interest trend, as a
+    second confirming signal alongside VWAP for its Technical Agent. This
+    module's own collection-only design is otherwise unchanged: no
+    scoring or interpretation happens here, only a plain read, and the
+    one SELECT this performs is still far cheaper than the 5-minute
+    collector's own write sweep.
+
+    Checks path.exists() first rather than calling get_session_factory()
+    unconditionally, for the exact reason archive_status() already does
+    -- a live caller running every cycle must never be what brings this
+    file into existence when collection is disabled (OPTION_CHAIN_
+    COLLECTION_ENABLED defaults False since the 5 Aug 2026 rate-limit
+    incident; see CLAUDE.md). An absent or empty archive returns [],
+    the caller's job to treat as "no reading available," never a reason
+    to fabricate one.
+    """
+    path = resolve_path()
+    if not path.exists():
+        return []
+    factory = get_session_factory()
+    with factory() as session:
+        rows = session.scalars(
+            select(OptionChainSnapshot)
+            .where(
+                OptionChainSnapshot.index_symbol == index_symbol,
+                OptionChainSnapshot.snapshot_ts >= since,
+                OptionChainSnapshot.snapshot_ts <= until,
+            )
+            .order_by(OptionChainSnapshot.snapshot_ts.asc())
+        ).all()
+    return list(rows)
 
 
 def archive_status() -> ArchiveStatus:

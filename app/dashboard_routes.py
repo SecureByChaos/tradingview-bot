@@ -408,6 +408,7 @@ def update_agentic_ai_settings_page(
     nominal_target_percent: Annotated[float, Form()] = 30.0,
     api_key: Annotated[str, Form()] = "",
     enabled: Annotated[str | None, Form()] = None,
+    flow_confirmation_enabled: Annotated[str | None, Form()] = None,
     _: Annotated[None, Depends(require_admin_page)] = None,
 ) -> RedirectResponse:
     valid_effort = {"none", "low", "medium", "high", "xhigh", "max"}
@@ -439,6 +440,7 @@ def update_agentic_ai_settings_page(
         "max_capital_deployed_percent": max_capital_deployed_percent,
         "nominal_stop_percent": nominal_stop_percent,
         "nominal_target_percent": nominal_target_percent,
+        "flow_confirmation_enabled": flow_confirmation_enabled == "on",
     }
     if api_key:
         values["api_key"] = api_key
