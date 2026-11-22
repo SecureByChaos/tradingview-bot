@@ -295,6 +295,112 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Agentic AI gets a Flow Confirmation Gate (VWAP + option-chain OI) -- admin opt-in, not yet backtested (22 Nov 2026)
+
+**Requested**: a real 3-month analysis (846 trades, 3 Jul-20 Nov 2026) found Agentic AI's `BUY_CE` on Nifty
+specifically -- not Nifty broadly -- reliably underperforms the same signal on Bank Nifty (90% bootstrap CI
+`[-9.25, -2.54]`, n=22 vs n=64, both clearing the trust minimum). A Nifty-specific confidence floor was tried
+first and came back unsupported at every cut swept (0.65-0.85): every cell thin, every CI crossing zero, and
+the one least-thin cut running *backwards* (the higher-confidence bucket was the worse one). Asked instead
+how real option traders actually trade Nifty differently, with an explicit instruction not to just pause an
+index the way real discretionary traders don't -- "Observe how they trade and implement similar strategies."
+Researched real-trader practice (web search, sources cited in chat): rising premium/EMA/ADX alone is
+explicitly NOT treated as proof of a breakout by retail/semi-pro traders -- the standard discipline is to
+also weigh option-chain open interest (falling call OI at the near-resistance strike reads as short covering,
+a real breakout; rising call OI there reads as fresh writing into the move, arguing against it) and whether
+spot is trading on the right side of session VWAP. Checked this against the actual code: `app.ai.agentic`'s
+Technical Agent fed the model exactly five numbers (EMA9/21, ADX, chop ratio, recent price change, PDH/PDL
+distance) -- no VWAP, no option-chain data at all. This is a genuine capability gap, not a tuning question.
+
+**Two real, named data-coverage risks flagged before building, not glossed over.** (1) `app.option_chain_
+store`'s own docstring states plainly it is collection-only, nothing live has ever read it, and real
+production coverage is unknown from this sandbox -- `OPTION_CHAIN_COLLECTION_ENABLED` has defaulted off since
+a 5 Aug 2026 rate-limit incident and this pass cannot confirm how much real history exists. (2) Building a
+live reader of that archive is the first time anything in the trading path has ever queried it, directly
+contradicting that module's own stated design ("nothing in the live trading path reads it") -- resolved by
+updating the module's own docstring to say so explicitly, rather than leaving it to quietly go stale.
+
+**Implementation, two new confirming signals, both fed to the Technical Agent's prompt unconditionally (ships
+now, no backtest needed -- same precedent as every other prompt-only addition in this project), plus one new
+admin-opt-in hard gate on top (needs a backtest before trusting it):**
+
+- **VWAP**: `app.ai.agentic._compute_futures_vwap`/`_vwap_relation`, a direct duplicate of `app.ai.autonomous`'s
+  own already-trusted mechanism (near-month FUTIDX futures contract's real volume, since index candles report
+  zero -- see CLAUDE.md's own earlier entries on this), per this module's established "deliberately
+  independent subsystems" convention rather than a cross-import. `_TechnicalFeatures` gained `vwap`/
+  `vwap_relation`; `_compute_technical_features` gained an `option_finder` parameter (defaulted to `None` so
+  every pre-existing caller and test is unaffected) to compute it.
+- **Option-chain OI/PCR**: new `app.option_chain_store.recent_snapshots(index_symbol, since, until)` -- a
+  plain read, explicitly no scoring (that stays out of the storage module, confirmed by its own updated
+  docstring), checking `path.exists()` first so a live caller running every cycle can never be what brings
+  the archive file into existence when collection is disabled, matching `archive_status()`'s own existing
+  care. New `app.ai.agentic._compute_flow_reading(index_symbol, spot, now_ist)`: reads the nearest expiry's
+  rows across a 45-minute lookback, computes PCR (put OI / call OI, shown as context only, never gates
+  anything) and the OI delta at the nearest strike above/below spot between the oldest and newest snapshot in
+  that window. Fails closed on every absence -- no archive file, fewer than two distinct snapshot timestamps,
+  or a newest snapshot older than 20 minutes (`_FLOW_MAX_SNAPSHOT_AGE_MINUTES`) -- never fabricates a reading
+  from thin data. A reading inside a 5-point noise band (`_FLOW_OI_DELTA_NOISE_BAND_PERCENT`) is reported but
+  never treated as a real trend by the gate below -- a reasoned starting point, not backtested, same status
+  every new threshold in this project carries before real history looks at it.
+- **The Flow Confirmation Gate itself** (`AgenticAISettings.flow_confirmation_enabled`, default `False` --
+  deploying this changes nothing until an admin opts in): a post-decision override on the Orchestrator's own
+  chosen `BUY_CE`/`BUY_PE`, same shape as `app.ai.autonomous`'s `_regime_matches_action` -- checked in
+  `check_agentic_entry` right after the Orchestrator decides and before `open_agentic_trade` is ever called,
+  so a block costs nothing (never reaches contract resolution). Blocks ONLY when a signal that IS available
+  actively contradicts the direction -- spot on the wrong side of VWAP, or near-strike OI moving the wrong
+  way by more than the noise band -- and NEVER requires confirmation from a signal that's missing or thin.
+  **Deliberately general, not hardcoded to Nifty or to `BUY_CE`** -- the mechanism (does recent OI/VWAP
+  contradict a bullish or bearish call) applies symmetrically to both indices and both directions, so a
+  future backtest can decide whether it should stay general or be narrowed to the specific combination the
+  3-month finding flagged, rather than baking today's one finding in as a permanent special case.
+
+32 new tests: `tests/test_option_chain_store_recent_snapshots.py` (4, new file -- `recent_snapshots` never
+creates the archive file as a side effect of a read, filters by index/time window correctly, returns rows
+oldest-first), `tests/test_agentic_flow_confirmation_gate.py` (27, new file -- `_compute_futures_vwap`'s
+real-volume computation and no-contract case, `_nearest_expiry`'s cross-month-boundary parsing, `_oi_delta_
+percent`'s rising/falling/missing-base cases, `_compute_flow_reading`'s every fail-closed path (empty
+archive, single snapshot, stale newest snapshot, wrong index) plus a real PCR+OI-delta computation matching
+a hand-computed example, `_vwap_confirms`/`_oi_contradicts`'s exact boundaries including the noise band and
+the missing-data-never-contradicts rule, `_flow_gate_blocks` combining both, and `check_agentic_entry`
+integration -- toggle off opens a trade despite contradicting data (the regression guarantee), toggle on
+blocks on a VWAP contradiction before even reaching contract resolution, blocks on an OI contradiction,
+still opens when nothing actually contradicts, still opens when `technical_features` is `None` entirely
+(fails open on missing data), and confirms the gate is never even evaluated on a NONE decision). Plus 1 new
+settings round-trip test in `tests/test_agentic_ai_settings.py` (unchecked by default, enables, disables
+again). Full suite: 1383 passed (was 1351), 1 pre-existing unrelated wall-clock-dependent flake in `tests/
+test_daily_report_origination.py` (confirmed present identically via `git stash -u` on this exact tree
+before this change). `python -c "import app.main"` imports cleanly.
+
+**Migration verified against a simulated pre-migration DB**: seeded a real `AgenticAISettings` row with
+`flow_confirmation_enabled=True`, dropped the column, re-ran `_ensure_columns()`, confirmed the column
+reappears backfilled to the model's own default (`False`), confirmed a second run is a clean no-op.
+
+**Verified live against the real `check_agentic_entry`**, not a mock: started the real app via uvicorn
+against scratch trading and option-chain SQLite DBs, seeded `AgenticAISettings` with the gate enabled,
+constructed a real `_TechnicalFeatures` object with spot clearly below VWAP (the exact contradiction shape
+the gate exists to catch), and called the real `check_agentic_entry` with a fake Orchestrator response of
+`BUY_CE` -- confirmed it returned `None` (blocked) with the fake option finder's `find_atm_contract` never
+even invoked. Logged in over real HTTP and round-tripped the new checkbox both ways via real POSTs to
+`/agentic-ai/settings` (unchecked by default, `checked` after enabling, unchecked again after disabling),
+and confirmed `/`, `/settings`, and `/history` all still render 200 unaffected.
+
+**Not deployed** -- per this project's own ground rules, deployment is manual and separate. **Not backtest-
+validated -- stated explicitly in the Settings UI itself**, with the real command to check first:
+
+```bash
+python -m scripts.collect_option_chain --status
+python -m scripts.collect_option_chain --once --probe
+```
+
+Confirm real, recent option-chain coverage exists for both indices before even considering enabling this
+live -- the archive has run intermittently and may simply not have enough history yet, which per this
+project's own standard is an expected, correct "not yet enough evidence" outcome, not a defect in the gate.
+Once there is real coverage, the next step is a proper backtest (same shape as `confidence_sizing_backtest.
+py`) replaying real closed Agentic AI trades against what the gate would have done, specifically checking
+whether it would have caught the real Nifty `BUY_CE` losses that motivated it without also blocking trades
+that went on to win. If enabled live before that, watch `[AGENTIC_AI] ... blocked by Flow Confirmation Gate`
+log lines against what those specific trades would have done unblocked.
+
 ### Agentic AI gets a second, mid-range (1-12% MFE) giveback cap -- admin opt-in, not yet backtested (18 Nov 2026)
 
 **Requested**: same-day follow-up to the 18 Nov export analysis (5 trades, net -Rs 5,583.53), which showed

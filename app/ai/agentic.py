@@ -388,6 +388,7 @@ from app.market_data import (
     BAR_FRESHNESS_SECONDS,
     FIFTEEN_MINUTE,
     FIVE_MINUTE,
+    FUTURES_CANDLE_SUFFIX,
     ONE_MINUTE,
     latest_bar_age_seconds,
     load_bars,
@@ -396,6 +397,7 @@ from app.market_data import (
     store_bars,
 )
 from app.models import ExitReason, Signal
+from app.option_chain_store import OptionChainSnapshot, recent_snapshots
 from app.platform import get_index_live_figures, get_or_create_settings, list_index_configs, log_event, today_ist
 from app.premium_model import days_to_expiry, symmetric_premium_percent
 from app.signal_validation import check_market_hours
@@ -998,13 +1000,195 @@ _MIN_LOTS_PAPER_FLOOR = 1
 _CANDLE_WARMUP_DAYS = 7
 _CANDLE_LOAD_LIMIT = 3000
 
+# 22 Nov 2026: Flow Confirmation Gate inputs (app.ai.autonomous's own
+# _compute_futures_vwap/_vwap_relation duplicated, not imported -- same
+# "deliberately independent" convention this module already follows for
+# _trend_regime_label/_chop_label above). Same 0.1% band autonomous.py
+# already uses: within that band of VWAP is "too close to call," neither
+# a confirmation nor a contradiction.
+_VWAP_CHOP_BAND_PERCENT = 0.1
+# How far back to look for a comparison snapshot when measuring whether
+# near-strike OI is rising or falling. Wide enough to usually span two
+# real 5-minute collector sweeps even allowing for a missed cycle.
+_FLOW_LOOKBACK_MINUTES = 45.0
+# The NEWEST snapshot found in that window must be at least this fresh,
+# or the whole reading is treated as stale and discarded -- a 40-minute-
+# old OI figure says nothing about the current setup. Looser than
+# BAR_FRESHNESS_SECONDS (candles) since this archive only writes once
+# per ~5 minutes by design, not continuously.
+_FLOW_MAX_SNAPSHOT_AGE_MINUTES = 20.0
+# A near-strike OI move smaller than this is noise, not a real trend --
+# reported as "no opinion," never as a contradiction. A reasoned
+# starting point, not backtested, same status every new threshold in
+# this module carries before real history looks at it.
+_FLOW_OI_DELTA_NOISE_BAND_PERCENT = 5.0
+
+
+def _vwap_relation(spot: float, vwap: Optional[float]) -> str:
+    """Same comparison app.ai.autonomous's own _vwap_relation already
+    uses, duplicated rather than imported."""
+    if vwap is None or vwap == 0:
+        return "UNKNOWN"
+    diff_percent = abs(spot - vwap) / vwap * 100
+    if diff_percent <= _VWAP_CHOP_BAND_PERCENT:
+        return "AT_VWAP"
+    return "ABOVE_VWAP" if spot > vwap else "BELOW_VWAP"
+
+
+def _compute_futures_vwap(
+    db: Session, index: IndexConfig, option_finder: Any, smartapi: Any, now_ist: datetime
+) -> Optional[float]:
+    """Today's session VWAP from the near-month futures contract's real
+    volume -- the exact mechanism and reasoning as app.ai.autonomous's
+    own _compute_futures_vwap (index-instrument candles report volume=0,
+    see CLAUDE.md), duplicated here rather than imported per this
+    module's "deliberately independent subsystems" convention. Fails
+    closed (returns None) on a missing contract, a failed fetch with
+    nothing already stored, or no real volume yet this session."""
+    try:
+        contract = option_finder.find_current_futures_contract(index)
+    except Exception as exc:
+        logger.info("[AGENTIC_AI][TECH] %s: futures contract lookup failed (%s), VWAP unavailable", index.symbol, exc)
+        return None
+    if contract is None:
+        logger.info("[AGENTIC_AI][TECH] %s: no futures contract found, VWAP unavailable", index.symbol)
+        return None
+
+    futures_key = f"{index.symbol}{FUTURES_CANDLE_SUFFIX}"
+    age = latest_bar_age_seconds(db, futures_key, ONE_MINUTE, now_ist)
+    if age is not None and age <= BAR_FRESHNESS_SECONDS:
+        logger.debug(
+            "[AGENTIC_AI][TECH] %s: futures 1-min history is %.0fs old (WebSocket-fed), skipping REST refresh",
+            index.symbol, age,
+        )
+    else:
+        try:
+            rows = smartapi.get_candles(
+                exchange=contract["exchange"],
+                symboltoken=contract["symboltoken"],
+                interval=ONE_MINUTE,
+                from_dt=now_ist.strftime("%Y-%m-%d 09:15"),
+                to_dt=now_ist.strftime("%Y-%m-%d %H:%M"),
+            )
+            if rows:
+                store_bars(db, futures_key, ONE_MINUTE, [parse_smartapi_row(row) for row in rows])
+        except Exception as exc:
+            logger.info("[AGENTIC_AI][TECH] %s: futures candle refresh failed (%s), using stored history", index.symbol, exc)
+
+    bars = load_bars(db, futures_key, ONE_MINUTE)
+    today_bars = [b for b in bars if b.ts_ist.date() == now_ist.date()]
+    total_volume = sum(b.volume for b in today_bars)
+    if not today_bars or total_volume <= 0:
+        return None
+    cumulative = sum(((b.high + b.low + b.close) / 3) * b.volume for b in today_bars)
+    return round(cumulative / total_volume, 2)
+
+
+@dataclass(frozen=True)
+class _FlowReading:
+    """A real-trader-style option-chain confirmation reading for one
+    index, one moment -- see _compute_flow_reading's own docstring for
+    where this comes from and every way it fails closed. pcr is shown to
+    the Technical Agent as context only; the two *_oi_delta_percent
+    fields are what the Flow Confirmation Gate itself actually checks."""
+
+    pcr: Optional[float]
+    call_oi_delta_percent: Optional[float]
+    put_oi_delta_percent: Optional[float]
+    snapshots_used: int
+
+
+def _nearest_expiry(rows: list[OptionChainSnapshot]) -> Optional[str]:
+    """Among whatever expiries this sweep happened to cover, the soonest
+    one -- parsed as a real date rather than sorted as text, since the
+    stored format ("27NOV2026") does not sort chronologically as a
+    string across month/year boundaries."""
+    parsed: dict[str, date_type] = {}
+    for row in rows:
+        if row.expiry not in parsed:
+            try:
+                parsed[row.expiry] = datetime.strptime(row.expiry, "%d%b%Y").date()
+            except ValueError:
+                continue
+    if not parsed:
+        return None
+    return min(parsed, key=lambda expiry: parsed[expiry])
+
+
+def _oi_delta_percent(old_oi: Optional[float], new_oi: Optional[float]) -> Optional[float]:
+    if old_oi is None or new_oi is None or old_oi <= 0:
+        return None
+    return round((new_oi - old_oi) / old_oi * 100, 2)
+
+
+def _compute_flow_reading(index_symbol: str, spot: float, now_ist: datetime) -> Optional[_FlowReading]:
+    """Reads the OPTIONAL, separately-collected option-chain OI archive
+    (app.option_chain_store -- collection-only by design, real production
+    coverage unknown from this pass since it has run intermittently; see
+    that module's own docstring) for a put-call ratio and a near-strike
+    open-interest trend, used ONLY by the admin-opt-in Flow Confirmation
+    Gate below. This is the real-trader technique the research behind
+    this feature named directly: a falling call OI at the near-resistance
+    strike (short covering) is read as supporting a bullish breakout,
+    rising call OI there (fresh writing into the move) as arguing against
+    one -- the mirror case on the put side for a bearish breakdown.
+
+    Fails closed (returns None) on every kind of absence: no archive
+    file at all, no rows for this index in the lookback window, fewer
+    than two distinct snapshot timestamps (nothing to compute a trend
+    from), or a newest snapshot older than _FLOW_MAX_SNAPSHOT_AGE_
+    MINUTES. A thin or missing reading must never be treated by any
+    caller as a contradiction -- only an actively disagreeing reading
+    may ever block anything."""
+    rows = recent_snapshots(index_symbol, now_ist - timedelta(minutes=_FLOW_LOOKBACK_MINUTES), now_ist)
+    if not rows:
+        return None
+
+    timestamps = sorted({row.snapshot_ts for row in rows})
+    if len(timestamps) < 2:
+        return None
+    newest_ts, oldest_ts = timestamps[-1], timestamps[0]
+    age_minutes = (now_ist.replace(tzinfo=None) - newest_ts).total_seconds() / 60.0
+    if age_minutes > _FLOW_MAX_SNAPSHOT_AGE_MINUTES:
+        return None
+
+    newest_rows = [r for r in rows if r.snapshot_ts == newest_ts]
+    oldest_rows = [r for r in rows if r.snapshot_ts == oldest_ts]
+    expiry = _nearest_expiry(newest_rows)
+    if expiry is None:
+        return None
+    newest_rows = [r for r in newest_rows if r.expiry == expiry]
+    oldest_by_key = {(r.strike, r.option_type): r.open_interest for r in oldest_rows if r.expiry == expiry}
+
+    call_oi_total = sum(r.open_interest or 0 for r in newest_rows if r.option_type == "CE")
+    put_oi_total = sum(r.open_interest or 0 for r in newest_rows if r.option_type == "PE")
+    pcr = round(put_oi_total / call_oi_total, 3) if call_oi_total > 0 else None
+
+    calls_above_spot = sorted((r for r in newest_rows if r.option_type == "CE" and r.strike >= spot), key=lambda r: r.strike)
+    puts_below_spot = sorted((r for r in newest_rows if r.option_type == "PE" and r.strike <= spot), key=lambda r: -r.strike)
+    near_call = calls_above_spot[0] if calls_above_spot else None
+    near_put = puts_below_spot[0] if puts_below_spot else None
+
+    call_delta = (
+        _oi_delta_percent(oldest_by_key.get((near_call.strike, "CE")), near_call.open_interest)
+        if near_call is not None else None
+    )
+    put_delta = (
+        _oi_delta_percent(oldest_by_key.get((near_put.strike, "PE")), near_put.open_interest)
+        if near_put is not None else None
+    )
+    return _FlowReading(pcr=pcr, call_oi_delta_percent=call_delta, put_oi_delta_percent=put_delta, snapshots_used=len(timestamps))
+
 
 @dataclass(frozen=True)
 class _TechnicalFeatures:
     """The Technical & Flow Agent's raw, already-computed indicator values
     for one index, one cycle -- never raw price alone. Deliberately
-    narrower than app.ai.autonomous's own _Features (no futures-VWAP
-    substitution in this first pass; see the module docstring)."""
+    narrower than app.ai.autonomous's own _Features until 22 Nov 2026,
+    when vwap/vwap_relation and the flow fields below were added as the
+    inputs behind the admin-opt-in Flow Confirmation Gate (see that
+    function's own docstring) -- shown to the Technical Agent as extra
+    context regardless of whether the gate itself is enabled."""
 
     ema9: Optional[float]
     ema21: Optional[float]
@@ -1017,6 +1201,9 @@ class _TechnicalFeatures:
     pdl: Optional[float]
     dist_to_pdh: Optional[float]
     dist_to_pdl: Optional[float]
+    vwap: Optional[float]
+    vwap_relation: str  # ABOVE_VWAP / BELOW_VWAP / AT_VWAP / UNKNOWN
+    flow: Optional[_FlowReading]
 
 
 def _trend_regime_label(fast_ema: Optional[float], slow_ema: Optional[float]) -> str:
@@ -1052,13 +1239,18 @@ def _compute_technical_features(
     spot: float,
     now_ist: datetime,
     smartapi: Any,
+    option_finder: Any = None,
 ) -> Optional[_TechnicalFeatures]:
     """This agent's OWN candle-fetch-and-refresh orchestration around the
     shared, already-battle-tested app.market_context.build_market_context()
     -- see the module docstring for why this mirrors rather than reuses
     app.ai.autonomous's private _compute_features. Returns None (fails
     closed) when there isn't enough INDEX candle history yet to compute
-    ADX/EMA honestly, same convention build_market_context itself uses."""
+    ADX/EMA honestly, same convention build_market_context itself uses.
+
+    option_finder defaults to None so every pre-22-Nov-2026 caller (and
+    every existing test) is unaffected -- VWAP/flow simply read as
+    unavailable in that case, same as a genuine lookup failure."""
     if not index.spot_token:
         return None
 
@@ -1100,6 +1292,20 @@ def _compute_technical_features(
 
     pdh = context.levels.previous_day_high
     pdl = context.levels.previous_day_low
+
+    vwap: Optional[float] = None
+    if option_finder is not None:
+        try:
+            vwap = _compute_futures_vwap(db, index, option_finder, smartapi, now_ist)
+        except Exception as exc:
+            logger.info("[AGENTIC_AI][TECH] %s: VWAP computation failed (%s), unavailable", index.symbol, exc)
+
+    flow: Optional[_FlowReading] = None
+    try:
+        flow = _compute_flow_reading(index.symbol, spot, now_ist)
+    except Exception as exc:
+        logger.info("[AGENTIC_AI][TECH] %s: flow reading failed (%s), unavailable", index.symbol, exc)
+
     return _TechnicalFeatures(
         ema9=context.ema9,
         ema21=context.ema21,
@@ -1112,6 +1318,9 @@ def _compute_technical_features(
         pdl=pdl,
         dist_to_pdh=round(pdh - spot, 2) if pdh is not None else None,
         dist_to_pdl=round(spot - pdl, 2) if pdl is not None else None,
+        vwap=vwap,
+        vwap_relation=_vwap_relation(spot, vwap),
+        flow=flow,
     )
 
 
@@ -1152,9 +1361,17 @@ interpret the already-computed technical indicator values you are shown into a s
 You are shown: the EMA9-vs-EMA21 regime (BULLISH/BEARISH/NEUTRAL), ADX (trend strength -- below ~20 generally
 means no real trend is established, above ~25 generally means one is), the Kaufman Efficiency Ratio label for
 the last ~1 hour (CHOPPY/MIXED/CLEAN -- how directly price has actually travelled, independent of ADX, which is
-a slower, more lagging signal), the recent ~15-minute price change, and distance to the previous day's high/low.
-Any of these can read UNKNOWN/unavailable -- treat that as missing information, never as a tiebreaker in either
-direction.
+a slower, more lagging signal), the recent ~15-minute price change, distance to the previous day's high/low,
+spot's relation to today's session VWAP, and -- when a real option-chain reading exists -- the put-call ratio
+and whether open interest just above/below spot is rising or falling. Any of these can read UNKNOWN/unavailable
+-- treat that as missing information, never as a tiebreaker in either direction.
+
+Rising call premium or a bullish EMA/ADX read is NOT, on its own, proof of a real breakout -- real options
+traders weigh it against open interest and VWAP first: falling call OI at the nearest strike above spot during
+an upward move suggests short covering (a real breakout holding), while RISING call OI there suggests fresh
+writing into the move, which argues against it even if price is still going up. The mirror is true for a
+downward move and put OI just below spot. Spot trading on the wrong side of VWAP for the direction you are
+leaning is also a reason for caution, not something to override with a stronger-looking indicator elsewhere.
 
 A CHOPPY efficiency reading or a NEUTRAL/UNKNOWN regime are both reasons to lean NEUTRAL yourself, even if one
 other reading looks superficially directional -- a single strong-looking number inside an otherwise mixed
@@ -1165,6 +1382,7 @@ Respond with a single valid JSON object only, with no markdown fences or extra t
 
 
 def _build_technical_prompt(index_display_name: str, features: _TechnicalFeatures) -> str:
+    flow = features.flow
     return (
         f"Index: {index_display_name}\n"
         f"EMA9/EMA21 regime: {features.trend_regime}"
@@ -1179,6 +1397,16 @@ def _build_technical_prompt(index_display_name: str, features: _TechnicalFeature
         + "\n"
         f"Distance to previous day's high: {features.dist_to_pdh if features.dist_to_pdh is not None else 'unavailable'}\n"
         f"Distance to previous day's low: {features.dist_to_pdl if features.dist_to_pdl is not None else 'unavailable'}\n"
+        f"Spot vs session VWAP: {features.vwap_relation}"
+        + (f" (VWAP={features.vwap})" if features.vwap is not None else "")
+        + "\n"
+        f"Put-call ratio (near strikes): {flow.pcr if flow and flow.pcr is not None else 'unavailable'}\n"
+        f"Call OI trend near spot: "
+        + (f"{flow.call_oi_delta_percent:+.1f}%" if flow and flow.call_oi_delta_percent is not None else "unavailable")
+        + "\n"
+        f"Put OI trend near spot: "
+        + (f"{flow.put_oi_delta_percent:+.1f}%" if flow and flow.put_oi_delta_percent is not None else "unavailable")
+        + "\n"
         "\nApply the evaluation rules above and respond with your lean."
     )
 
@@ -1628,6 +1856,74 @@ def open_agentic_trade(
     return trade
 
 
+def _vwap_confirms(action: str, spot: float, vwap: Optional[float]) -> Optional[bool]:
+    """True/False only when VWAP actually takes a side; None (no opinion)
+    when it's unavailable or spot is inside the AT_VWAP noise band --
+    missing or ambiguous information must never read as a contradiction."""
+    relation = _vwap_relation(spot, vwap)
+    if relation in ("UNKNOWN", "AT_VWAP"):
+        return None
+    if action == "BUY_CE":
+        return relation == "ABOVE_VWAP"
+    if action == "BUY_PE":
+        return relation == "BELOW_VWAP"
+    return None
+
+
+def _oi_contradicts(action: str, flow: Optional[_FlowReading]) -> Optional[bool]:
+    """True only when near-strike OI is actively moving AGAINST the
+    direction being evaluated -- rising call OI near spot while
+    evaluating a bullish breakout (fresh writing into the move, not
+    short covering -- see SYSTEM_PROMPT_TECHNICAL's own description of
+    this), or rising put OI near spot while evaluating a bearish
+    breakdown. None whenever the relevant leg is unavailable or its
+    move is inside the noise band -- this must never require
+    confirmation, only flag an active contradiction."""
+    if flow is None:
+        return None
+    if action == "BUY_CE":
+        delta = flow.call_oi_delta_percent
+        if delta is None or abs(delta) < _FLOW_OI_DELTA_NOISE_BAND_PERCENT:
+            return None
+        return delta > 0
+    if action == "BUY_PE":
+        delta = flow.put_oi_delta_percent
+        if delta is None or abs(delta) < _FLOW_OI_DELTA_NOISE_BAND_PERCENT:
+            return None
+        return delta > 0
+    return None
+
+
+def _flow_gate_blocks(action: str, spot: float, features: Optional[_TechnicalFeatures]) -> tuple[bool, str]:
+    """The Flow Confirmation Gate itself (AgenticAISettings.flow_
+    confirmation_enabled) -- a post-decision override on the
+    Orchestrator's own chosen action, same shape as app.ai.autonomous's
+    _regime_matches_action: blocks ONLY when a signal that IS available
+    actively contradicts the chosen direction, never requires
+    confirmation from a signal that is missing or thin. 22 Nov 2026,
+    built from a real finding: Agentic AI's BUY_CE on Nifty specifically
+    was reliably worse than the same signal on Bank Nifty (bootstrap 90%
+    CI excluding zero on 3 months of real trades), and several of the
+    worst Nifty losses had real confidence (0.65-0.78) and still ran
+    straight to stop -- exactly what rising call premium with no real
+    OI/VWAP confirmation behind it looks like. Not scoped to Nifty or to
+    BUY_CE alone, on purpose: the mechanism (does recent OI/VWAP
+    contradict a bullish or bearish call) applies symmetrically to both
+    indices and both directions, so a future backtest can tell whether
+    it should stay general or be narrowed, rather than baking today's
+    one finding in as a special case. Not yet backtested -- see
+    AgenticAISettings.flow_confirmation_enabled's own comment and the
+    Settings UI for the real command to run before trusting this."""
+    if features is None:
+        return False, ""
+    if _vwap_confirms(action, spot, features.vwap) is False:
+        return True, f"spot is on the wrong side of session VWAP for a {action}"
+    if _oi_contradicts(action, features.flow) is True:
+        leg = "call" if action == "BUY_CE" else "put"
+        return True, f"{leg} open interest near spot is rising, not falling, arguing against a {action}"
+    return False, ""
+
+
 def check_agentic_entry(
     db: Session,
     index: IndexConfig,
@@ -1640,6 +1936,7 @@ def check_agentic_entry(
     headlines_text: str = "",
     technical_verdict: Optional[_AgentVerdict] = None,
     news_verdict: Optional[_AgentVerdict] = None,
+    technical_features: Optional[_TechnicalFeatures] = None,
 ) -> Optional[StrategyTrade]:
     """One index's entry evaluation for this cycle. Gated, in order, by: the
     news agent's severe-event kill switch (app.ai.news.classify_severe_
@@ -1707,6 +2004,17 @@ def check_agentic_entry(
             },
         )
         return None
+
+    if settings.flow_confirmation_enabled:
+        blocked, reason = _flow_gate_blocks(parsed.action, figures["price"], technical_features)
+        if blocked:
+            logger.info("[AGENTIC_AI] %s: blocked by Flow Confirmation Gate -- %s", index.symbol, reason)
+            log_event(
+                db, "AGENTIC_AI", f"[{index.symbol}] blocked by Flow Confirmation Gate ({reason})",
+                level="WARNING",
+                payload={"action": parsed.action, "confidence": parsed.confidence, "orchestrator_reasoning": parsed.reasoning},
+            )
+            return None
 
     return open_agentic_trade(
         db, index, parsed.action, parsed.reasoning, settings, smartapi, option_finder,
@@ -1886,16 +2194,23 @@ def run_agentic_entry_exit_checks(
         # regardless, so neither verdict would ever be read.
         news_verdict: Optional[_AgentVerdict] = None
         technical_verdicts_by_index: dict[str, _AgentVerdict] = {}
+        # 22 Nov 2026: kept alongside the verdicts, not just the lean, so
+        # check_agentic_entry's Flow Confirmation Gate can read the raw
+        # VWAP/OI numbers directly rather than needing a second compute.
+        technical_features_by_index: dict[str, _TechnicalFeatures] = {}
         if not is_severe:
             news_verdict = get_news_verdict(settings, headlines_text)
             for index in indexes:
                 figures = figures_by_symbol.get(index.symbol)
                 if not figures or figures.get("price") is None:
                     continue
-                features = _compute_technical_features(session, index, figures["price"], now_ist, smartapi)
+                features = _compute_technical_features(
+                    session, index, figures["price"], now_ist, smartapi, option_finder,
+                )
                 if features is None:
                     logger.info("[AGENTIC_AI][TECH] %s: insufficient candle history this cycle", index.symbol)
                     continue
+                technical_features_by_index[index.symbol] = features
                 technical_verdicts_by_index[index.symbol] = get_technical_verdict(
                     settings, index.display_name or index.symbol, features,
                 )
@@ -1921,6 +2236,7 @@ def run_agentic_entry_exit_checks(
                     session, index, now_ist, settings, smartapi, option_finder, figures_by_symbol,
                     is_severe, headlines_text,
                     technical_verdicts_by_index.get(index.symbol), news_verdict,
+                    technical_features_by_index.get(index.symbol),
                 )
             except Exception:
                 logger.exception("[AGENTIC_AI] entry check failed for %s", index.symbol)

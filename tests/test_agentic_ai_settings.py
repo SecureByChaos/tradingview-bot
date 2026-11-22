@@ -102,3 +102,28 @@ def test_route_rejects_non_positive_timeout():
             db=db, live_model="", live_reasoning_effort="medium",
             qa_model="", qa_reasoning_effort="max", base_url="", timeout_seconds=0,
         )
+
+
+def test_route_flow_confirmation_gate_round_trips_both_ways():
+    """22 Nov 2026 -- default off, admin can enable and later disable it
+    again, same unchecked-box-persists-as-False convention as `enabled`."""
+    db = _make_session()
+    update_agentic_ai_settings_page(
+        db=db, live_model="", live_reasoning_effort="medium",
+        qa_model="", qa_reasoning_effort="max", base_url="", timeout_seconds=20,
+    )
+    assert get_agentic_settings(db).flow_confirmation_enabled is False
+
+    update_agentic_ai_settings_page(
+        db=db, live_model="", live_reasoning_effort="medium",
+        qa_model="", qa_reasoning_effort="max", base_url="", timeout_seconds=20,
+        flow_confirmation_enabled="on",
+    )
+    assert get_agentic_settings(db).flow_confirmation_enabled is True
+
+    update_agentic_ai_settings_page(
+        db=db, live_model="", live_reasoning_effort="medium",
+        qa_model="", qa_reasoning_effort="max", base_url="", timeout_seconds=20,
+        flow_confirmation_enabled=None,
+    )
+    assert get_agentic_settings(db).flow_confirmation_enabled is False

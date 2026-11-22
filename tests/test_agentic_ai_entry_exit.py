@@ -130,6 +130,7 @@ def _make_settings(**overrides) -> AgenticAISettings:
         account_capital_rupees=100000.0, max_risk_percent_per_trade=1.0, max_daily_loss_percent=3.0,
         max_concurrent_positions=1, max_capital_deployed_percent=20.0,
         nominal_stop_percent=15.0, nominal_target_percent=30.0,
+        flow_confirmation_enabled=False,
     )
     base.update(overrides)
     return AgenticAISettings(**base)
@@ -346,12 +347,19 @@ def test_build_technical_prompt_includes_real_readings():
         ema9=22600.0, ema21=22500.0, trend_regime="BULLISH", adx=27.3,
         chop_efficiency_ratio=0.62, chop_label="CLEAN", recent_price_change_percent=0.45,
         pdh=22750.0, pdl=22400.0, dist_to_pdh=50.0, dist_to_pdl=300.0,
+        vwap=22610.0, vwap_relation="ABOVE_VWAP",
+        flow=agentic_module._FlowReading(pcr=0.95, call_oi_delta_percent=-8.2, put_oi_delta_percent=3.1, snapshots_used=3),
     )
     prompt = _build_technical_prompt("Nifty 50", features)
     assert "BULLISH" in prompt
     assert "27.3" in prompt
     assert "CLEAN" in prompt
     assert "+0.45%" in prompt
+    assert "ABOVE_VWAP" in prompt
+    assert "22610.0" in prompt
+    assert "0.95" in prompt
+    assert "-8.2%" in prompt
+    assert "+3.1%" in prompt
 
 
 def test_build_technical_prompt_handles_unavailable_readings():
@@ -359,9 +367,11 @@ def test_build_technical_prompt_handles_unavailable_readings():
         ema9=None, ema21=None, trend_regime="UNKNOWN", adx=None,
         chop_efficiency_ratio=None, chop_label="UNKNOWN", recent_price_change_percent=None,
         pdh=None, pdl=None, dist_to_pdh=None, dist_to_pdl=None,
+        vwap=None, vwap_relation="UNKNOWN", flow=None,
     )
     prompt = _build_technical_prompt("Nifty 50", features)
     assert "unavailable" in prompt
+    assert "UNKNOWN" in prompt
 
 
 def test_build_news_prompt_includes_headlines():
@@ -530,6 +540,7 @@ def _make_features(**overrides) -> "agentic_module._TechnicalFeatures":
         ema9=22600.0, ema21=22500.0, trend_regime="BULLISH", adx=27.0,
         chop_efficiency_ratio=0.55, chop_label="CLEAN", recent_price_change_percent=0.3,
         pdh=22750.0, pdl=22400.0, dist_to_pdh=50.0, dist_to_pdl=300.0,
+        vwap=None, vwap_relation="UNKNOWN", flow=None,
     )
     base.update(overrides)
     return agentic_module._TechnicalFeatures(**base)

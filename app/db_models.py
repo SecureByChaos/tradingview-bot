@@ -276,6 +276,23 @@ class AgenticAISettings(Base):
     nominal_stop_percent: Mapped[float] = mapped_column(Float, default=15.0, nullable=False)
     nominal_target_percent: Mapped[float] = mapped_column(Float, default=30.0, nullable=False)
 
+    # 22 Nov 2026: Flow Confirmation Gate -- admin opt-in, OFF by default so
+    # deploying this changes nothing until explicitly enabled. Built from a
+    # real 3-month finding (Agentic AI's BUY_CE on Nifty specifically, not
+    # Nifty broadly, reliably underperforms the same signal on Bank Nifty --
+    # bootstrap 90% CI excluding zero, n=22 vs n=64) and real-trader practice
+    # (option-chain OI/VWAP confirmation before trusting a breakout, rather
+    # than rising premium alone) -- see app.ai.agentic._flow_gate_blocks's
+    # own comment for the full reasoning. NOT YET BACKTESTED: the OI/PCR
+    # archive (app.option_chain_store) has run intermittently and its real
+    # production coverage is unknown from this pass. Before enabling,
+    # confirm data/option_chain.db actually has enough recent history for
+    # both indices (python -m scripts.collect_option_chain --status), then
+    # read a few weeks of real "[AGENTIC_AI] ... blocked by Flow
+    # Confirmation Gate" log lines against what those trades would have
+    # done unblocked before trusting this live.
+    flow_confirmation_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

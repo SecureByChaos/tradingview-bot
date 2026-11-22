@@ -337,6 +337,9 @@ def _ensure_columns() -> None:
             "max_capital_deployed_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN max_capital_deployed_percent FLOAT NOT NULL DEFAULT 20.0",
             "nominal_stop_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN nominal_stop_percent FLOAT NOT NULL DEFAULT 15.0",
             "nominal_target_percent": "ALTER TABLE agentic_ai_settings ADD COLUMN nominal_target_percent FLOAT NOT NULL DEFAULT 30.0",
+            # 22 Nov 2026: preserves current behaviour -- DEFAULT 0, so
+            # deploying this changes nothing until an admin opts in.
+            "flow_confirmation_enabled": "ALTER TABLE agentic_ai_settings ADD COLUMN flow_confirmation_enabled BOOLEAN NOT NULL DEFAULT 0",
         }
         with engine.begin() as connection:
             for column, statement in agentic_statements.items():

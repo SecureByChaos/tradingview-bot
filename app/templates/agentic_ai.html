@@ -15,7 +15,9 @@
   strategy's real trade history; the logging agent, a scheduled cross-strategy daily digest; the risk/sizing
   agent (a deterministic pre-entry gate and position-size calculator, below); and a TRUE multi-agent entry/exit
   pipeline (rebuilt 25 Oct 2026) -- a Technical &amp; Flow Agent (its own candle-fetch orchestration feeding
-  EMA regime, ADX, chop efficiency, recent price action and PDH/PDL distance into its own directional lean), a
+  EMA regime, ADX, chop efficiency, recent price action, PDH/PDL distance, session VWAP and -- when available --
+  option-chain put-call ratio and near-strike OI trend into its own directional lean; 22 Nov 2026 added the
+  VWAP/OI reading plus an admin-opt-in Flow Confirmation Gate below, not yet backtested), a
   News &amp; Sentiment Agent (its own structured BULLISH/BEARISH/NEUTRAL read of real recent India-market
   headlines from free RSS feeds, not just a flat text dump), and a Master Orchestrator Agent that combines
   both verdicts into the final decision -- three independent model calls per index per cycle instead of one,
@@ -215,6 +217,29 @@ new Chart(document.getElementById('winChart'), {
     <div class="col-md-6"><label class="form-label">Nominal target (%)</label>
       <input class="form-control" type="number" min="0.01" max="100" step="0.01" name="nominal_target_percent"
         value="{{ settings.nominal_target_percent if settings else 30.0 }}"></div>
+
+    <div class="col-12"><hr class="my-1"></div>
+    <div class="col-12">
+      <h6 class="mb-1">Flow Confirmation Gate <span class="badge bg-warning text-dark">Not yet backtested</span></h6>
+      <p class="text-muted mb-2" style="font-size:0.9em;">
+        Built from a real 3-month finding: Agentic AI's <code>BUY_CE</code> on Nifty specifically (not Nifty
+        broadly) reliably underperformed the same signal on Bank Nifty (90% bootstrap CI excluding zero, n=22
+        vs n=64), and several of the worst losses had real confidence and still ran straight to stop -- the
+        shape rising call premium with no real OI/VWAP confirmation behind it leaves. When enabled, a new
+        Orchestrator decision is blocked ONLY if spot is on the wrong side of session VWAP for the direction,
+        or near-strike option-chain open interest is actively rising (not falling) against it -- never
+        requires confirmation from a signal that's missing, only blocks on an active contradiction. The
+        option-chain archive it reads has run intermittently and its real production coverage is unknown;
+        before enabling, check coverage and backtest with:
+      </p>
+      <pre class="text-muted mb-2" style="font-size:0.8em;white-space:pre-wrap;">python -m scripts.collect_option_chain --status
+python -m scripts.collect_option_chain --once --probe</pre>
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" name="flow_confirmation_enabled" id="flowConfirmationEnabled"
+          {% if settings and settings.flow_confirmation_enabled %}checked{% endif %}>
+        <label class="form-check-label" for="flowConfirmationEnabled">Enable Flow Confirmation Gate</label>
+      </div>
+    </div>
   </div>
   <button class="btn btn-primary mt-3" type="submit">Save Configuration</button>
 </form>
