@@ -100,9 +100,28 @@ def create_scheduler(
         # run_autonomous_checks calls check_market_hours() itself as its
         # first real gate, this cron is only here to stop the job waking up
         # 24/7 the way ai-origination-check used to before 18 Aug 2026.
+        #
+        # 25 Nov 2026: offset +1 minute off ai-origination-check's own */5,
+        # not the same minute="*/5" anymore. Real production logs
+        # ([DB_POOL] connection checkouts up to 27s, [THROTTLE] waits past
+        # 6s) showed ai-origination-check, autonomous-ai-check,
+        # agentic-ai-check and validated-signal-entry-check all waking up
+        # and opening a DB session -- each held across its own real LLM
+        # API call(s) and candle refresh, the exact "named residual" this
+        # file's own 9 Sep 2026 history flagged as deferred -- at the
+        # identical wall-clock second, every 5 minutes, all day. Four
+        # sessions queuing for the pool at once is what produced the
+        # measured spikes, not a RAM shortage. Same reasoning
+        # agentic-daily-log already used against ai-daily-summary (25 Oct
+        # 2026, "so the two independent report jobs don't open DB sessions
+        # / make LLM calls at the exact same instant") -- applied here to
+        # the four 5-minute AI cycles instead of the two daily reports.
+        # Spreading them a minute apart costs nothing (each cycle's own
+        # LLM round-trip is seconds, not a full minute) and needs no change
+        # to any job's own logic, cadence, or market-hours gate.
         scheduler.add_job(
             autonomous_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
+            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="1-56/5", timezone=IST),
             id="autonomous-ai-check",
             replace_existing=True,
             max_instances=1,
@@ -113,10 +132,15 @@ def create_scheduler(
         # Same coarse-cron-plus-in-job-market-hours-gate shape as
         # autonomous-ai-check directly above -- app.ai.agentic.
         # run_agentic_entry_exit_checks calls check_market_hours() itself as
-        # its first real gate.
+        # its first real gate. Offset +2 minutes off ai-origination-check's
+        # own */5 -- see autonomous-ai-check's comment just above for why;
+        # this is the heaviest of the four (News Agent once, Technical Agent
+        # and the Orchestrator once per enabled index -- up to 5 real LLM
+        # calls in one cycle), so it gets its own clear minute rather than
+        # sharing one with anything else.
         scheduler.add_job(
             agentic_entry_exit_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
+            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="2-57/5", timezone=IST),
             id="agentic-ai-check",
             replace_existing=True,
             max_instances=1,
@@ -152,10 +176,12 @@ def create_scheduler(
         # was: the Single Active Position Rule needs to see BOTH indices at
         # once per cycle to resolve a concurrent-signal tie-break. Same
         # coarse-cron-plus-in-job-check_market_hours-gate shape as every
-        # other AI-adjacent job in this file.
+        # other AI-adjacent job in this file. Offset +3 minutes off
+        # ai-origination-check's own */5 -- see autonomous-ai-check's
+        # comment above for why (25 Nov 2026 DB-pool-contention fix).
         scheduler.add_job(
             validated_signal_entry_job,
-            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone=IST),
+            trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="3-58/5", timezone=IST),
             id="validated-signal-entry-check",
             replace_existing=True,
             max_instances=1,

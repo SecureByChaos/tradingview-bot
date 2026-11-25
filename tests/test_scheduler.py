@@ -86,6 +86,10 @@ def test_ai_origination_check_not_registered_without_a_job():
 
 
 def test_autonomous_ai_check_uses_the_same_weekday_session_hours_cron():
+    # 25 Nov 2026: minute is offset +1 off ai-origination-check's own */5,
+    # not identical to it anymore -- real [DB_POOL]/[THROTTLE] contention
+    # in production traced to every 5-minute AI job opening a DB session
+    # (held across a real LLM call) at the exact same wall-clock second.
     scheduler = create_scheduler(_FakeMonitor(), autonomous_job=lambda: None)
     job = scheduler.get_job("autonomous-ai-check")
 
@@ -93,7 +97,49 @@ def test_autonomous_ai_check_uses_the_same_weekday_session_hours_cron():
     fields = _trigger_fields(job.trigger)
     assert fields["day_of_week"] == "mon-fri"
     assert fields["hour"] == "9-15"
-    assert fields["minute"] == "*/5"
+    assert fields["minute"] == "1-56/5"
+
+
+def test_agentic_ai_check_is_offset_from_the_other_5_minute_ai_jobs():
+    # 25 Nov 2026 DB-pool-contention fix -- see autonomous-ai-check's own
+    # test above for the real production evidence this responds to.
+    scheduler = create_scheduler(_FakeMonitor(), agentic_entry_exit_job=lambda: None)
+    job = scheduler.get_job("agentic-ai-check")
+
+    assert isinstance(job.trigger, CronTrigger)
+    fields = _trigger_fields(job.trigger)
+    assert fields["day_of_week"] == "mon-fri"
+    assert fields["hour"] == "9-15"
+    assert fields["minute"] == "2-57/5"
+
+
+def test_validated_signal_entry_check_is_offset_from_the_other_5_minute_ai_jobs():
+    # 25 Nov 2026 DB-pool-contention fix -- see autonomous-ai-check's own
+    # test above for the real production evidence this responds to.
+    scheduler = create_scheduler(_FakeMonitor(), validated_signal_entry_job=lambda: None)
+    job = scheduler.get_job("validated-signal-entry-check")
+
+    assert isinstance(job.trigger, CronTrigger)
+    fields = _trigger_fields(job.trigger)
+    assert fields["day_of_week"] == "mon-fri"
+    assert fields["hour"] == "9-15"
+    assert fields["minute"] == "3-58/5"
+
+
+def test_all_four_5_minute_ai_jobs_land_on_distinct_minute_offsets():
+    # The actual regression guarantee: no two of these should ever fire in
+    # the same wall-clock minute again, confirmed directly off the real
+    # registered triggers' own CronTrigger fields rather than by eye.
+    scheduler = create_scheduler(
+        _FakeMonitor(),
+        originator_job=lambda: None,
+        autonomous_job=lambda: None,
+        agentic_entry_exit_job=lambda: None,
+        validated_signal_entry_job=lambda: None,
+    )
+    job_ids = ["ai-origination-check", "autonomous-ai-check", "agentic-ai-check", "validated-signal-entry-check"]
+    minute_fields = [_trigger_fields(scheduler.get_job(job_id).trigger)["minute"] for job_id in job_ids]
+    assert len(set(minute_fields)) == len(minute_fields), minute_fields
 
 
 def test_autonomous_ai_check_not_registered_without_a_job():
