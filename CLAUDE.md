@@ -295,6 +295,87 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### The four 5-minute AI jobs no longer share a cron minute -- real DB-pool contention, fixed by staggering (25 Nov 2026)
+
+**Reported**: "Application is running very slow during market hours and throwing error. Optimise according to
+ur machine configuration." Diagnosed from real logs before changing anything, per this project's own standing
+discipline -- asked for the exact error and a `journalctl` grep rather than guessing:
+
+```
+database is locked: 0
+Access denied because of exceeding access rate: 4
+[DB_POOL] Connection checkout took 27.43s (...) checked_out=7, overflow=3
+[DB_POOL] Connection checkout took 6.22s (...) checked_out=9, overflow=7
+[THROTTLE] Call waited 6.67s total ...
+free -h: 412Mi total, 659Mi in swap
+```
+
+No SQLite lock contention (the 7 Sep 2026 WAL/busy-timeout fix is holding). The real signal is
+`[DB_POOL]` checkout waits as long as 27 seconds with up to 10 connections checked out against a pool
+sized for 5+10 -- a web/dashboard request stuck behind that queue is exactly what reads as "very slow."
+Swap usage (659Mi) confirmed real memory pressure too, and the user separately asked whether to upgrade
+the box to 1 GB -- recommended yes (cheap, consistent with this file's own prior RAM estimates for this
+box), but flagged explicitly that more RAM does not fix a connection-pool queue caused by logic holding
+sessions too long, which is a different problem.
+
+**Root cause, confirmed by reading `app/scheduler.py`, not guessed**: `ai-origination-check`,
+`autonomous-ai-check`, `agentic-ai-check` and `validated-signal-entry-check` all registered with the
+*identical* `CronTrigger(minute="*/5")`. Each of these holds a DB session across its own real LLM API
+call(s) and candle refresh for the whole cycle -- the exact "named residual" this file's own 9 Sep 2026
+entry already flagged as deferred ("Deferred as a follow-up if contention persists after this deploys").
+Agentic AI (25 Oct 2026) was the fourth job added onto that same collision point, and it is the heaviest
+of the four -- up to 5 real LLM calls in one cycle (News Agent once, Technical Agent and the Orchestrator
+once per enabled index) -- which lines up with contention getting measurably worse after it shipped.
+Four jobs opening a session and calling out to LLM/SmartAPI at the same wall-clock second, every 5
+minutes, all day, is what produced the measured spikes, not a RAM shortage.
+
+**Fixed with the same pattern this project already used once, not a new one.** `agentic-daily-log`
+(25 Oct 2026) was already deliberately offset from `ai-daily-summary` "so the two independent report
+jobs don't open DB sessions / make LLM calls at the exact same instant" -- applied here to the four
+5-minute AI cycles instead of the two daily reports. `ai-origination-check` keeps `minute="*/5"`
+unchanged; `autonomous-ai-check` moves to `minute="1-56/5"`, `agentic-ai-check` to `minute="2-57/5"`,
+`validated-signal-entry-check` to `minute="3-58/5"` -- one minute apart each, well clear of any single
+cycle's own LLM round-trip (seconds, not a full minute). No change to any job's own logic, market-hours
+gate, or cadence (still every 5 minutes, still Mon-Fri 09:00-15:59 IST) -- only when inside that window
+each one starts.
+
+**Deliberately NOT the bigger fix.** The real, fuller fix -- restructuring each of these four jobs into
+the same Phase A (short session, read) -> Phase B (no session, LLM/network calls) -> Phase C (short
+session, write) discipline already applied to the 5-second jobs and `trade-monitor` on 9 Sep 2026 -- is
+real surgery across `app/ai/originator.py`, `app/ai/autonomous.py`, `app/ai/agentic.py` and
+`app/validated_signal.py`, each already carrying its own documented risk profile. The 9 Sep entry itself
+named this as the next step "if contention persists after this deploys" -- staggering is the fast,
+near-zero-risk mitigation to try first; the Phase A/B/C rewrite is the next escalation if contention is
+still measurable after this ships, same escalation order this project has used for every other
+session-discipline fix.
+
+5 new/changed tests (`tests/test_scheduler.py`): `autonomous-ai-check`'s existing minute assertion
+updated to `1-56/5`; two new tests pin `agentic-ai-check` (`2-57/5`) and `validated-signal-entry-check`
+(`3-58/5`); one new test is the actual regression guarantee -- asserts all four jobs' registered minute
+fields are pairwise distinct, read directly off the real `CronTrigger` objects rather than by eye. Full
+suite: 1387 passed (unchanged count -- no behavior removed, only when each job starts). `python -c
+"import app.main"` imports cleanly, 15 scheduled jobs registering with no errors.
+
+**Verified live**: constructed the real `create_scheduler()` against a scratch SQLite DB with all four
+jobs wired in and read back each one's real `CronTrigger` minute field directly --
+`ai-origination-check=*/5`, `autonomous-ai-check=1-56/5`, `agentic-ai-check=2-57/5`,
+`validated-signal-entry-check=3-58/5`, confirming the cron expression itself round-trips through
+APScheduler exactly as written (not renormalized to something else) and the four are genuinely disjoint.
+
+**Not verified against real production load** -- this sandbox cannot reproduce the real market-hours
+collision. After deploying, re-run the same checks that found this:
+
+```bash
+sudo journalctl -u tradingview-bot --since today | grep "\[DB_POOL\]"
+sudo journalctl -u tradingview-bot --since today | grep "\[THROTTLE\] Call waited"
+```
+
+Expect both to drop sharply. If `[DB_POOL]` warnings keep appearing at a similar rate after this deploys
+(and after the RAM upgrade), that means staggering alone wasn't enough and the four jobs genuinely need
+the Phase A/B/C session-discipline rewrite next -- not a reason to widen the offsets further, since a
+single job's own LLM round-trip holding a session for several real seconds is the thing actually worth
+fixing at that point, not the schedule around it.
+
 ### Agentic AI gets a Flow Confirmation Gate (VWAP + option-chain OI) -- admin opt-in, not yet backtested (22 Nov 2026)
 
 **Requested**: a real 3-month analysis (846 trades, 3 Jul-20 Nov 2026) found Agentic AI's `BUY_CE` on Nifty
