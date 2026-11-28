@@ -1339,6 +1339,54 @@ def test_run_checks_severe_news_skips_computing_technical_and_news_verdicts(monk
     # No AssertionError raised above means neither exploding stand-in fired.
 
 
+def test_run_checks_prepends_todays_premarket_briefing_to_the_news_prompt(monkeypatch):
+    # 28 Nov 2026: app.ai.premarket's once-a-day briefing must reach the
+    # News Agent's existing per-cycle call as extra context -- no new LLM
+    # call, just more text in the same prompt it already builds.
+    monkeypatch.setattr(agentic_module, "check_market_hours", lambda _now: None)
+    monkeypatch.setattr(agentic_module, "fetch_market_headlines", lambda: [])
+    monkeypatch.setattr(
+        agentic_module, "get_todays_premarket_briefing_text",
+        lambda db, day: "Pre-market briefing: Nifty pivot 24216.67.",
+    )
+    captured: dict = {}
+
+    def _capture_news_verdict(settings, headlines_text):
+        captured["headlines_text"] = headlines_text
+        return _AgentVerdict("NEUTRAL", None, "no headlines")
+
+    monkeypatch.setattr(agentic_module, "get_news_verdict", _capture_news_verdict)
+    monkeypatch.setattr(agentic_module, "list_index_configs", lambda db: [])
+    db = _make_db()
+    db.add(AgenticAISettings(id=1, enabled=True, live_model="gpt-6-luna", api_key="sk-real"))
+    db.commit()
+
+    run_agentic_entry_exit_checks(FakeSmartAPI(), FakeOptionFinder(None), _make_trade_manager(), None, db)
+
+    assert "Nifty pivot 24216.67" in captured["headlines_text"]
+
+
+def test_run_checks_news_prompt_unaffected_when_no_briefing_generated_yet(monkeypatch):
+    monkeypatch.setattr(agentic_module, "check_market_hours", lambda _now: None)
+    monkeypatch.setattr(agentic_module, "fetch_market_headlines", lambda: [])
+    monkeypatch.setattr(agentic_module, "get_todays_premarket_briefing_text", lambda db, day: "")
+    captured: dict = {}
+
+    def _capture_news_verdict(settings, headlines_text):
+        captured["headlines_text"] = headlines_text
+        return _AgentVerdict("NEUTRAL", None, "no headlines")
+
+    monkeypatch.setattr(agentic_module, "get_news_verdict", _capture_news_verdict)
+    monkeypatch.setattr(agentic_module, "list_index_configs", lambda db: [])
+    db = _make_db()
+    db.add(AgenticAISettings(id=1, enabled=True, live_model="gpt-6-luna", api_key="sk-real"))
+    db.commit()
+
+    run_agentic_entry_exit_checks(FakeSmartAPI(), FakeOptionFinder(None), _make_trade_manager(), None, db)
+
+    assert captured["headlines_text"] == ""
+
+
 def test_run_checks_opens_a_trade_through_the_full_three_agent_pipeline(monkeypatch):
     """End to end: a real Technical Agent call (fed from a genuinely
     trending synthetic candle series), a real News Agent call, and a real

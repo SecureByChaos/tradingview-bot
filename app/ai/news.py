@@ -144,12 +144,22 @@ def _fetch_one_feed(source_label: str, url: str, timeout: int = _FETCH_TIMEOUT_S
 def fetch_market_headlines(
     now_utc: Optional[datetime] = None,
     feeds: Optional[list[tuple[str, str]]] = None,
+    lookback_minutes: Optional[int] = None,
 ) -> list[Headline]:
     """Pulls recent headlines from every configured feed independently,
-    filters to the last _HEADLINE_LOOKBACK_MINUTES minutes, and returns
-    them newest-first. Never raises -- a total failure of every feed
-    returns an empty list, same fail-soft-never-block-trading philosophy
-    this project already applies to the live index-price feed.
+    filters to the last lookback_minutes minutes (default:
+    _HEADLINE_LOOKBACK_MINUTES, the intraday 90-minute window every existing
+    caller relies on), and returns them newest-first. Never raises -- a
+    total failure of every feed returns an empty list, same
+    fail-soft-never-block-trading philosophy this project already applies
+    to the live index-price feed.
+
+    lookback_minutes exists for app.ai.premarket's overnight global-markets
+    read (28 Nov 2026) -- 90 minutes is the right window for "is this
+    happening right now" during a live session, but a pre-market briefing
+    needs to see headlines from hours earlier (the prior US close, the
+    Asian morning session), so it passes a much wider value explicitly
+    rather than this function silently stretching its own intraday default.
 
     Deliberately not cached beyond one call's lifetime -- these feeds
     update roughly as often as this strategy's own 5-minute cycle anyway,
@@ -157,7 +167,7 @@ def fetch_market_headlines(
     nothing worth caching against, unlike SmartAPI's real quote throttle
     budget."""
     now_utc = now_utc or datetime.now(timezone.utc)
-    cutoff = now_utc - timedelta(minutes=_HEADLINE_LOOKBACK_MINUTES)
+    cutoff = now_utc - timedelta(minutes=lookback_minutes if lookback_minutes is not None else _HEADLINE_LOOKBACK_MINUTES)
     active_feeds = feeds if feeds is not None else _NEWS_FEEDS
     all_headlines: list[Headline] = []
     for source_label, url in active_feeds:

@@ -165,6 +165,30 @@ def test_quick_scalp_exit_check_not_registered_without_a_job():
     assert scheduler.get_job("quick-scalp-exit-check") is None
 
 
+def test_pre_market_briefing_job_is_registered_unconditionally_before_market_open():
+    # 28 Nov 2026: app.ai.premarket's once-a-day briefing -- no job-enabling
+    # parameter (unlike originator_job/autonomous_job etc.), same unconditional
+    # registration as ai-daily-summary/agentic-daily-log. Deliberately a
+    # different minute from pre-market-health (08:50 vs 09:00) so the two
+    # don't open DB sessions at the same instant.
+    scheduler = create_scheduler(_FakeMonitor())
+    job = scheduler.get_job("pre-market-briefing")
+
+    assert job is not None
+    assert isinstance(job.trigger, CronTrigger)
+    fields = _trigger_fields(job.trigger)
+    assert fields["day_of_week"] == "mon-fri"
+    assert fields["hour"] == "8"
+    assert fields["minute"] == "50"
+
+
+def test_pre_market_briefing_and_pre_market_health_land_on_distinct_minutes():
+    scheduler = create_scheduler(_FakeMonitor(), health_manager=_FakeHealthManager())
+    briefing_fields = _trigger_fields(scheduler.get_job("pre-market-briefing").trigger)
+    health_fields = _trigger_fields(scheduler.get_job("pre-market-health").trigger)
+    assert (briefing_fields["hour"], briefing_fields["minute"]) != (health_fields["hour"], health_fields["minute"])
+
+
 def test_pre_market_health_job_wired_through_the_scheduler():
     health_manager = _FakeHealthManager()
     scheduler = create_scheduler(_FakeMonitor(), health_manager=health_manager)
@@ -265,7 +289,7 @@ def test_cron_jobs_get_explicit_60_second_misfire_grace_time_once_started():
     try:
         cron_job_ids = [
             "ai-origination-check", "autonomous-ai-check", "validated-signal-entry-check",
-            "option-chain-collect", "daily-square-off", "pre-market-health",
+            "option-chain-collect", "daily-square-off", "pre-market-briefing", "pre-market-health",
             "ai-daily-summary", "ai-weekly-report", "ai-monthly-report", "agentic-daily-log",
         ]
         for job_id in cron_job_ids:

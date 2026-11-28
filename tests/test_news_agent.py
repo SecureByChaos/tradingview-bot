@@ -165,6 +165,41 @@ def test_fetch_market_headlines_filters_out_stale_items(monkeypatch):
     assert [h.title for h in result] == ["Fresh"]
 
 
+def test_fetch_market_headlines_default_lookback_unchanged(monkeypatch):
+    # Omitting lookback_minutes must behave exactly as before this parameter
+    # existed -- a 100-minute-old headline still drops at the default 90.
+    now = datetime(2026, 10, 25, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        news_module, "_fetch_one_feed",
+        lambda *a, **k: [Headline("Old", "Feed", now - timedelta(minutes=100))],
+    )
+    result = fetch_market_headlines(now_utc=now, feeds=[("Feed", "u")])
+    assert result == []
+
+
+def test_fetch_market_headlines_custom_lookback_widens_the_window(monkeypatch):
+    # app.ai.premarket's overnight briefing needs headlines far older than
+    # the 90-minute intraday default -- lookback_minutes must let a much
+    # older item through.
+    now = datetime(2026, 10, 25, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        news_module, "_fetch_one_feed",
+        lambda *a, **k: [Headline("Overnight", "Feed", now - timedelta(hours=10))],
+    )
+    result = fetch_market_headlines(now_utc=now, feeds=[("Feed", "u")], lookback_minutes=16 * 60)
+    assert [h.title for h in result] == ["Overnight"]
+
+
+def test_fetch_market_headlines_custom_lookback_still_excludes_older_items(monkeypatch):
+    now = datetime(2026, 10, 25, 7, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        news_module, "_fetch_one_feed",
+        lambda *a, **k: [Headline("Too old", "Feed", now - timedelta(hours=20))],
+    )
+    result = fetch_market_headlines(now_utc=now, feeds=[("Feed", "u")], lookback_minutes=16 * 60)
+    assert result == []
+
+
 def test_fetch_market_headlines_keeps_headlines_with_no_known_date(monkeypatch):
     now = datetime(2026, 10, 25, 7, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(

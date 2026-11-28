@@ -45,6 +45,7 @@ from app.platform import (
     get_agentic_ai_trades,
 )
 from app.ai import agentic as agentic_ai
+from app.ai import premarket as premarket_briefing
 from sqlalchemy import func, select
 from app.signal_validation import check_market_hours
 from app.smartapi_client import SmartAPIError
@@ -354,6 +355,12 @@ def agentic_ai_page(
         for report in reports.list_reports(db, "AGENTIC_DAILY_LOG")
     ]
     risk_status = agentic_ai.evaluate_risk_now(db)
+    # 28 Nov 2026: app.ai.premarket's once-a-day briefing -- a single cheap
+    # read of today's row (or "" before the 08:50 IST job has run yet),
+    # same shape as every other read already on this page. Already shown
+    # to the News Agent itself every cycle; this just makes it visible
+    # without needing a direct DB query.
+    todays_premarket_briefing = premarket_briefing.get_todays_premarket_briefing_text(db)
 
     size_result = None
     if size_entry is not None and size_stop is not None and size_lot is not None:
@@ -383,6 +390,7 @@ def agentic_ai_page(
             "net_pnl_amount": performance["kpis"]["net_pnl_amount"],
             "qa_reports": qa_reports,
             "daily_logs": daily_logs,
+            "todays_premarket_briefing": todays_premarket_briefing,
             "risk_status": risk_status,
             "size_result": size_result,
             **performance,

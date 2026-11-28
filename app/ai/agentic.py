@@ -372,6 +372,7 @@ from sqlalchemy.orm import Session
 from app.ai.client import AIClient
 from app.ai.json_utils import extract_json_object
 from app.ai.news import classify_severe_event, fetch_market_headlines, format_headlines_for_prompt
+from app.ai.premarket import get_todays_premarket_briefing_text
 from app.db_models import (
     AgenticAISettings,
     AIReport,
@@ -2175,6 +2176,16 @@ def run_agentic_entry_exit_checks(
         headlines = fetch_market_headlines()
         is_severe, severe_matches = classify_severe_event(headlines)
         headlines_text = format_headlines_for_prompt(headlines)
+        # 28 Nov 2026: app.ai.premarket's once-a-day briefing (support/
+        # resistance levels + an overnight global-markets headline read),
+        # prepended ahead of this cycle's own live India headlines. One
+        # cheap indexed read against the session already open this cycle --
+        # no new LLM call, the News Agent's own existing call below just
+        # sees more context than before. "" on a day nothing was generated
+        # (job didn't run yet, or failed) leaves headlines_text untouched.
+        premarket_text = get_todays_premarket_briefing_text(session, now_ist.date())
+        if premarket_text:
+            headlines_text = f"{premarket_text}\n\nLive headlines this cycle:\n{headlines_text}" if headlines_text else premarket_text
         if is_severe:
             logger.warning("[AGENTIC_AI] Severe-event news kill switch triggered: %s", severe_matches)
             log_event(
