@@ -279,6 +279,20 @@ entry opened by the Orchestrator itself calls.</p>
 </div>
 {% endif %}
 
+<div class="section-header"><h4 class="mb-0">Pre-Market Briefing</h4></div>
+<p class="text-muted mb-2">Runs once, automatically, at 08:50 IST on every trading day -- support/resistance
+levels for each enabled index plus a genuine overnight global-markets headline read (no GIFT Nifty quote,
+no Dow/Nikkei point value: neither is available from any free data source). Already shown to the News &amp;
+Sentiment Agent as extra context on every one of today's 5-minute cycles; shown here so it's checkable
+without a direct database query.</p>
+{% if todays_premarket_briefing %}
+<div class="card bg-dark border-secondary mb-4">
+  <div class="card-body">
+    <p class="mb-0" style="white-space: pre-wrap;">{{ todays_premarket_briefing }}</p>
+  </div>
+</div>
+{% else %}{{ empty_state("No briefing generated yet today (job runs 08:50 IST on trading days).") }}{% endif %}
+
 <div class="section-header"><h4 class="mb-0">Backtest / QA Agent</h4></div>
 <form method="post" action="/agentic-ai/qa-report" class="panel mb-4 d-flex flex-wrap gap-2 align-items-end">
   <div><label class="form-label">Origin pattern</label>

@@ -295,6 +295,110 @@ python -m scripts.collect_option_chain --once --probe       # check broker field
 
 ## Current state / open items
 
+### Pre-market briefing -- support/resistance levels + a real overnight global-markets headline read, feeding Agentic AI's News Agent (28 Nov 2026)
+
+**Requested**: after a same-day review of a real Agentic AI Nifty 50 trade that lost -25.84% (see the entry
+two below this one -- concluded "one bad trade," nothing built), asked whether the AI trading agents have
+any awareness of overnight global markets before the Indian session opens, and shared a real broker-style
+"Global Market Cues" briefing (US/Europe/Asia index levels, GIFT Nifty, Nifty/Sensex/Bank Nifty
+support-resistance tables) as the shape wanted. Asked via `AskUserQuestion` whether this should be a one-off
+answer, a permanent daily feature, or skip the global-cues part entirely -- chosen: **a permanent daily
+feature**. Immediately followed by an explicit, standing instruction for everything built from here on:
+*"before building anything make sure that we have limited ram. So build everything in such a way that it
+consumes less usage of resources. Always remember this."* -- directly motivated by this project's own real
+RAM/DB-pool incidents this same week (the entry directly below this one, and the 1GB Lightsail upgrade).
+
+**Checked what's honestly buildable before writing anything.** Live research (WebSearch) confirmed there is
+no free, keyless, documented data source for GIFT Nifty or any Asian-market index level -- fabricating those
+numbers to match the pasted example would break this project's own standing "never invent a number that
+isn't in the data" rule (the same rule `app.ai.news`'s own headline formatter and severe-event gate are
+already built around). So this ships only the two pieces that genuinely are buildable for free: real
+support/resistance levels from this app's own already-stored candles, and a real (not fabricated) overnight
+global-markets headline read. **No GIFT Nifty quote, no Dow/Nikkei/other global-index point value, and no
+numeric "Nifty will open at X" prediction are produced anywhere in this feature.**
+
+**Implementation, new `app/ai/premarket.py`, built throughout to the resource-consciousness instruction --
+every design choice favours minimal footprint over completeness, stated explicitly in the module's own
+docstring:**
+
+- **Levels**: `_levels_for_index()` calls `app.market_context.compute_levels()` -- the exact function every
+  other live module already calls for PDH/PDL -- against 5-minute candles already sitting in this app's own
+  `Candle` table (`app.market_data.load_bars`, capped at 400 bars so this can never load an unbounded
+  history by accident). Zero new SmartAPI cost, zero new computation; a classic (H+L+C)/3 pivot plus
+  R1/S1 computed locally from the same previous-day high/low/close `compute_levels` already returns.
+- **Global headlines**: reuses `app.ai.news.fetch_market_headlines()` **verbatim** with a new, wider Google
+  News RSS query (`"Wall Street" OR "Dow Jones" OR Nasdaq OR "S&P 500" OR "Asian markets" OR Nikkei OR
+  "Federal Reserve"`, one feed only -- Google News already aggregates many outlets per query, and this job
+  runs once a day with no latency pressure, so a second HTTP round trip wasn't worth it). `fetch_market_
+  headlines()` itself gained one small, backward-compatible addition -- an optional `lookback_minutes`
+  parameter (every existing call site keeps its unchanged 90-minute default) -- since the existing hardcoded
+  90-minute intraday window answers "is this happening right now," a genuinely different question from what
+  an overnight briefing needs (the prior US close through the Asian morning, ~16 hours).
+- **No LLM call, anywhere in this feature.** The plain-text levels and headlines are persisted as-is with no
+  synthesis/narrative step -- Agentic AI's own News & Sentiment Agent, on its own already-scheduled 5-minute
+  cycles, reads this text as extra prompt context and does the interpretation itself as part of a call it
+  was already making. A dedicated "write the narrative" call would have been a second LLM call this project
+  doesn't need, and is leaner than even this project's own `AGENTIC_DAILY_LOG` precedent (which calls an LLM
+  only when configured, falling back to a template otherwise) -- this calls one never.
+- **No new table or migration.** Persisted on the existing `AIReport` table under a new short `ReportType.
+  PRE_MARKET` value -- the same "wholesale reuse" precedent `AGENTIC_QA`/`AGENTIC_DAILY_LOG` already
+  established (25 Oct 2026), not a new model/table/index.
+- **New scheduler job, `pre-market-briefing`** (`app/scheduler.py`), a `CronTrigger(day_of_week="mon-fri",
+  hour=8, minute=50)` -- once a day, well before the session opens, registered unconditionally (same as
+  `ai-daily-summary`/`agentic-daily-log`, no enable/disable job parameter needed). Deliberately a different
+  minute from `pre-market-health` (09:00) purely so the two unrelated jobs don't open DB sessions at the same
+  instant, same precedent `agentic-daily-log`'s own offset from `ai-daily-summary` already set. Its own
+  in-job `trading_day_reason()` check (mirrors `run_daily_log_job`'s exact shape) is the real holiday/weekend
+  gate; the cron's `day_of_week` is only a coarse first filter, same convention as every other job here.
+- **Wired into `app.ai.agentic.run_agentic_entry_exit_checks`**: `get_todays_premarket_briefing_text(db)` --
+  one cheap indexed query against the session already open that cycle -- is prepended ahead of that cycle's
+  own live India headlines, right where `headlines_text` is already built. No change to `get_news_verdict`'s
+  signature; it already took `headlines_text: str`, so this is strictly more context in the same string, not
+  a new parameter or a new call.
+- **Surfaced on `/agentic-ai`** under a new "Pre-Market Briefing" section (`agentic_ai.html`), one cheap read
+  of today's row (`todays_premarket_briefing`) -- so the feature is checkable without a direct database
+  query, same shape as the existing QA/daily-log report cards on the same page.
+
+16 new tests in `tests/test_premarket_briefing.py` (new file -- `_levels_for_index`'s pivot/R1/S1 math against
+a hand-computed example, the no-bars/disabled-index/display-name-fallback cases, `_format_briefing_text`'s
+three render shapes, `generate_premarket_briefing` persisting correctly with `provider="dummy"` (confirming
+no LLM call), surviving both a headline-fetch failure and a levels-computation failure without raising,
+passing the wide global lookback/feed list through, `get_todays_premarket_briefing_text`'s empty/present/
+wrong-day/latest-row cases, and `run_premarket_briefing_job` skipping on a holiday without ever opening a
+session versus running normally on a trading day). 3 new tests in `tests/test_news_agent.py` (the new
+`lookback_minutes` parameter's default-unchanged, widened, and still-excludes-older-items cases). 2 new in
+`tests/test_scheduler.py` (the job's own trigger fields, and that it lands on a different minute from
+`pre-market-health`), plus the job added to the existing full-registration/`misfire_grace_time=60` sweep. 2
+new in `tests/test_agentic_ai_entry_exit.py` (confirms the premarket text actually reaches the real prompt
+string handed to `get_news_verdict`, and that an un-generated-yet day leaves `headlines_text` unaffected).
+Full suite: 1410 passed, 1 pre-existing unrelated flake in `tests/test_daily_report_origination.py`
+(confirmed present identically via `git stash -u` on this exact tree before this change).
+`python -c "import app.main"` imports cleanly, 16 scheduled jobs registering with no errors (was 15).
+
+**A real bug found and fixed while writing the "pick the latest row" test**: `get_todays_premarket_briefing_
+text` originally ordered by `AIReport.generated_at.desc()` -- a server-side `CURRENT_TIMESTAMP` with only
+second resolution, which two rows inserted in the same second (a manual re-trigger shortly after the
+scheduled run, say) can tie on, making "latest" ambiguous. Fixed to order by `id.desc()` instead, which is
+strictly monotonic and unambiguous; caught by the test itself failing, not by review.
+
+**Verified live, not just unit-tested**: seeded a scratch SQLite DB with two enabled indexes and real
+previous-day candle rows, generated a real briefing with a faked headline fetch, and confirmed the persisted
+`summary_text` and `get_todays_premarket_briefing_text()`'s own read-back both show the correct computed
+pivot/R1/S1 for both indexes and the real headline text. Rendered the actual `agentic_ai.html` template
+end-to-end (via the app's real `Jinja2Templates` instance, with the `ist` filter and `components.html`
+macros it needs, not a bare Jinja environment) against that same seeded data and confirmed the new
+"Pre-Market Briefing" section renders with no errors and the real levels/headline text visible in the output
+HTML.
+
+**Not verified against a real trading day** -- this sandbox cannot run the scheduler through a real 08:50
+IST firing or fetch from the real Google News RSS endpoint. After deploying, confirm `pre-market-briefing`
+fires once each trading morning (`sudo journalctl -u tradingview-bot | grep PRE_MARKET`), confirm a real
+`AIReport` row with `report_type='PRE_MARKET'` appears for that day, and read a few real `[AGENTIC_AI][NEWS]`
+decisions on a day the briefing ran to confirm the model is actually being shown the extra context (the
+headlines text it receives should visibly include the "Pre-market briefing" block, not just that day's live
+India headlines) -- same "not yet enough evidence" standard as every other fresh addition in this project
+before real usage looks at it.
+
 ### The four 5-minute AI jobs no longer share a cron minute -- real DB-pool contention, fixed by staggering (25 Nov 2026)
 
 **Reported**: "Application is running very slow during market hours and throwing error. Optimise according to

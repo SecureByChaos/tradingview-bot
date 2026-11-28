@@ -8,7 +8,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from zoneinfo import ZoneInfo
 
 from app import reports
-from app.ai import agentic
+from app.ai import agentic, premarket
 from app.monitor import TradeMonitor
 from app.signal_validation import trading_day_reason
 from app.time_utils import to_ist, utc_now
@@ -284,6 +284,24 @@ def create_scheduler(
             coalesce=True,
             misfire_grace_time=60,
         )
+    # 28 Nov 2026: app.ai.premarket's once-a-day briefing (support/resistance
+    # levels + a genuine overnight global-markets headline read) -- run once,
+    # before the session opens, same low-cadence class as pre-market-health
+    # directly below. Deliberately at a different minute from that job (08:50
+    # vs 09:00) purely to avoid two unrelated jobs opening DB sessions at the
+    # exact same instant, same precedent as agentic-daily-log's own offset
+    # from ai-daily-summary. Its own in-job trading_day_reason() check is the
+    # real holiday/weekend gate, same as every other job here -- the cron's
+    # day_of_week="mon-fri" is only a coarse first filter.
+    scheduler.add_job(
+        premarket.run_premarket_briefing_job,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=8, minute=50, timezone=IST),
+        id="pre-market-briefing",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
     if health_manager is not None:
         scheduler.add_job(
             lambda: _run_pre_market_health_if_trading_day(health_manager),

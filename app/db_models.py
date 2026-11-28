@@ -956,6 +956,12 @@ class ReportType:
     # Validated Signal, and this strategy's own AGENTIC_AI bucket) replacing
     # the manual "upload today's export" chat routine. Same AIReport reuse.
     AGENTIC_DAILY_LOG = "AGENTIC_DAILY_LOG"
+    # 28 Nov 2026: app.ai.premarket's once-a-day briefing (support/resistance
+    # levels + a genuine overnight global-markets headline read), persisted
+    # here rather than a new table so Agentic AI's News Agent can read it
+    # back with a single cheap query -- same AIReport-reuse precedent as
+    # every entry above, kept short to stay well within this column's width.
+    PRE_MARKET = "PRE_MARKET"
 
 
 class AIReport(Base):
